@@ -2,9 +2,10 @@
 #[macro_use] extern crate rocket;
 
 use clap::{Parser, Subcommand};
-use std::{io::{self}, path::Path};
+use std::{io::{self}, path::PathBuf, path::Path};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use serde::Deserialize;
 
 mod api;
 mod fs;
@@ -16,11 +17,19 @@ mod nbd;
 use fs::{FileSystem};
 use raidz::{RaidZ};
 
+#[derive(Deserialize, Debug)]
+struct Config {
+    disks: Vec<String>,
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Optional name to operate on
     name: Option<String>,
+
+    #[arg(short, long, global = true, default_value = "~/.raidish.yaml")]
+    config: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -52,9 +61,31 @@ enum Commands {
     }
 }
 
+fn load_config(path: &str) -> io::Result<Config> {
+    // Expand tilde to home directory
+    let expanded_path = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME environment variable not set"))?;
+        PathBuf::from(home).join(&path[2..])
+    } else {
+        PathBuf::from(path)
+    };
+
+    if !expanded_path.exists() {
+        eprintln!("Error: Config file does not exist: {}", expanded_path.display());
+        std::process::exit(1);
+    }
+
+    let config_str = std::fs::read_to_string(&expanded_path)?;
+    let config: Config = serde_yaml::from_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config: {}", e)))?;
+
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let raid = RaidZ::new(["disks/disk1","disks/disk2","disks/disk3","disks/disk4","disks/disk5"]).await;
+    //let raid = RaidZ::new(["disks/disk1","disks/disk2","disks/disk3","disks/disk4","disks/disk5"]).await;
     /*let raid = 
         RaidZ::new(
             ["http://127.0.0.1:8881/api/v1/disks/0",
@@ -65,6 +96,17 @@ async fn main() -> io::Result<()> {
         ).await;*/
 
     let cli = Cli::parse();
+    let config = load_config(&cli.config)?;
+
+    if config.disks.len() != 5 {
+        eprintln!("Error: 5 disks are required");
+        std::process::exit(1);
+    }
+
+    let disk_refs: Vec<&str> = config.disks.iter().map(|s| s.as_str()).collect();
+    let disk_array: [&str; 5] = disk_refs.as_slice().try_into()
+        .expect("Expected exactly 5 disks");
+    let raid = RaidZ::new(disk_array).await;
 
     match cli.command {
         Commands::Nbd { name, size } => {

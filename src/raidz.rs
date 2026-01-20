@@ -127,20 +127,52 @@ impl RaidZ {
     }
 
     pub fn write_raw_block_checked_txg(&mut self, lba: BlockId, data: &[u8]) {
-        self.txg_state.writes.push(TxgWrite {
+        // Check if we already have a pending write for this block
+        let mut found_index = None;
+        for (i, write) in self.txg_state.writes.iter().enumerate().rev() {
+            if write.lba == lba {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let new_write = TxgWrite {
             lba,
             data: TxgPayload::Raw(data.to_vec()),
-        });
+        };
+
+        if let Some(idx) = found_index {
+            // Replace existing pending write (avoid duplicates)
+            self.txg_state.writes[idx] = new_write;
+        } else {
+            // Add new pending write
+            self.txg_state.writes.push(new_write);
+        }
     }
 
     pub fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) {
         let payload = bincode::serialize(value).unwrap();
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
 
-        self.txg_state.writes.push(TxgWrite {
+        // Same deduplication logic
+        let mut found_index = None;
+        for (i, write) in self.txg_state.writes.iter().enumerate().rev() {
+            if write.lba == lba {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let new_write = TxgWrite {
             lba,
             data: TxgPayload::Checked(payload),
-        });
+        };
+
+        if let Some(idx) = found_index {
+            self.txg_state.writes[idx] = new_write;
+        } else {
+            self.txg_state.writes.push(new_write);
+        }
     }
 
     pub async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> u64 {
@@ -157,10 +189,10 @@ impl RaidZ {
             }
         }
 
-        // 2️⃣ Flush all disks to ensure all blocks are durable before uberblock
+        // Flush all disks to ensure all blocks are durable before uberblock
         self.flush_all_disks();
 
-        // 3️⃣ Rotate and write uberblock
+        // Rotate and write uberblock
         let uberblock_lba = UBERBLOCK_START + (txg % UBERBLOCK_COUNT) as u64;
         let uberblock = Uberblock {
             magic: UBERBLOCK_MAGIC,
@@ -172,10 +204,10 @@ impl RaidZ {
 
         self.write_block_checked(uberblock_lba, txg, &uberblock).await;
 
-        // 4️⃣ Flush again to ensure uberblock is durable
+        // Flush again to ensure uberblock is durable
         self.flush_all_disks();
 
-        // 5️⃣ Clear TXG writes and increment txg
+        // Clear TXG writes and increment txg
         self.txg_state = TxgState { txg: txg + 1, uberblock: Some(uberblock), writes: Vec::new() };
 
         txg
@@ -189,9 +221,6 @@ impl RaidZ {
 
     /// Write raw bytes to a block with checksum (no serialization)
     async fn write_raw_block_checked(&mut self, lba: BlockId, txg: u64, data: &[u8]) {
-        use crate::raidz::BLOCK_HEADER_SIZE;
-        use blake3;
-        
         assert!(data.len() <= BLOCK_PAYLOAD_SIZE, 
                 "Raw data too large: {} > {}", data.len(), BLOCK_PAYLOAD_SIZE);
 
@@ -216,9 +245,17 @@ impl RaidZ {
 
     /// Read raw bytes from a block with checksum validation (no deserialization)
     pub async fn read_raw_block_checked(&mut self, lba: BlockId) -> Option<(u64, Vec<u8>)> {
-        use crate::raidz::{BlockHeader, BLOCK_HEADER_SIZE};
-        use blake3;
-        
+        // Check pending writes first 
+        let cur_txg = self.txg_state.txg;
+        for write in self.txg_state.writes.iter().rev() {
+            if write.lba == lba {
+                match &write.data {
+                    TxgPayload::Raw(d) => return Some((cur_txg, d.clone())),
+                    TxgPayload::Checked(d) => (),
+                };
+            }
+        }
+
         let mut buf = vec![0u8; BLOCK_SIZE];
         self.read_logical_block(lba, &mut buf).await;
 
@@ -268,6 +305,20 @@ impl RaidZ {
         &mut self,
         lba: BlockId,
     ) -> Option<(u64, T)> {
+        // Check pending writes first 
+        let cur_txg = self.txg_state.txg;
+        for write in self.txg_state.writes.iter().rev() {
+            if write.lba == lba {
+                match &write.data {
+                    TxgPayload::Raw(_) => (),
+                    TxgPayload::Checked(d) => {
+                        let value = bincode::deserialize(d).ok()?;
+                        return Some((cur_txg, value))
+                    },
+                };
+            }
+        }
+
         let mut buf = vec![0u8; BLOCK_SIZE];
         self.read_logical_block(lba, &mut buf).await;
 

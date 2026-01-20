@@ -1,0 +1,7 @@
+---
+disks:
+  - disks/disk1
+  - disks/disk2
+  - disks/disk3
+  - disks/disk4
+  - disks/disk5
