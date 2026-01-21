@@ -176,6 +176,7 @@ impl FileSystem {
 
         println!("  -> Starting read loop, max_read={}", max_read);
 
+        let mut block_buf = [0u8; BLOCK_SIZE];
         while bytes_read < max_read {
             println!("    -> Loop iteration: bytes_read={}, current_offset={}", bytes_read, current_offset);
             let (block_lba, byte_offset) = match map_offset_to_extent(
@@ -195,23 +196,23 @@ impl FileSystem {
 
             println!("    -> About to call read_raw_block_checked({})", block_lba);
 
-            let block_data = match self.dev.read_raw_block_checked(block_lba).await {
-                Some((_, data)) => {
-                    println!("    -> Successfully read block, data.len={}", data.len());
-                    data
-                },
-                None => {
-                    println!("Warning: Failed to read zvol block at {}", block_lba);
+            let (_txg, payload_len) = match self.dev.read_raw_block_checked_into(
+                block_lba, 
+                &mut block_buf
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    println!("Warning: Failed to read block at {}", block_lba);
                     break;
                 }
             };
 
-            let available_in_block = block_data.len().saturating_sub(byte_offset);
+            let payload = &block_buf[..payload_len];
+            let available_in_block = payload.len().saturating_sub(byte_offset);
             let to_copy = available_in_block.min(max_read - bytes_read);
 
-            println!("    -> Copying {} bytes", to_copy);
             buf[bytes_read..bytes_read + to_copy]
-                .copy_from_slice(&block_data[byte_offset..byte_offset + to_copy]);
+                .copy_from_slice(&payload[byte_offset..byte_offset + to_copy]);
 
             bytes_read += to_copy;
             current_offset += to_copy as u64;
@@ -245,6 +246,7 @@ impl FileSystem {
         let mut bytes_written = 0;
         let mut current_offset = offset;
 
+        let mut block_buf = [0u8; BLOCK_SIZE];
         while bytes_written < max_write {
             let (block_lba, byte_offset) = match map_offset_to_extent(
                 &extents,
@@ -264,20 +266,34 @@ impl FileSystem {
                     &data[bytes_written..bytes_written + to_write],
                 );
             } else {
-                // Partial block write - read, modify, write
-                let mut block_data = match self.dev.read_raw_block_checked(block_lba).await {
-                    Some((_, data)) => data,
-                    None => vec![0u8; BLOCK_PAYLOAD_SIZE],
+                let (_txg, payload_len) = match self.dev.read_raw_block_checked_into(
+                    block_lba, 
+                    &mut block_buf
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        println!("Warning: Failed to read block at {}", block_lba);
+                        break;
+                    }
                 };
-
-                if block_data.len() < byte_offset + to_write {
-                    block_data.resize(byte_offset + to_write, 0);
+                // Ensure we have enough space for the write
+                let needed_len = byte_offset + to_write;
+                
+                if needed_len > payload_len {
+                    // Zero-extend if writing beyond current payload
+                    block_buf[payload_len..needed_len].fill(0);
                 }
 
-                block_data[byte_offset..byte_offset + to_write]
+                // Copy the data to write into the appropriate offset
+                block_buf[byte_offset..byte_offset + to_write]
                     .copy_from_slice(&data[bytes_written..bytes_written + to_write]);
 
-                self.dev.write_raw_block_checked_txg(block_lba, &block_data);
+                // Write back the modified payload (only up to what we need)
+                let final_len = needed_len.max(payload_len);
+                self.dev.write_raw_block_checked_txg(
+                    block_lba, 
+                    &block_buf[..final_len]
+                );
             }
 
             bytes_written += to_write;
@@ -832,16 +848,13 @@ impl FileSystem {
         let mut out = Vec::with_capacity(inode.inode_type.size_bytes() as usize);
         let mut remaining = inode.inode_type.size_bytes();
 
+        let mut block_buf = [0u8; BLOCK_SIZE];
         for extent in inode.inode_type.extents() {
             for i in 0..extent.len {
-                if let Some((_, chunk)) = self.dev.read_raw_block_checked(extent.start + i).await {
-                    let take = remaining.min(chunk.len() as u64) as usize;
-                    out.extend_from_slice(&chunk[..take]);
+                if let Ok((_, len)) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await {
+                    let take = remaining.min(len as u64) as usize;
+                    out.extend_from_slice(&block_buf[..take]);
                     remaining -= take as u64;
-
-                    if remaining == 0 {
-                        return out;
-                    }
                 } else {
                     panic!("Checksum failure reading file '{}' at block {}", name, extent.start + i);
                 }

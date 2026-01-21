@@ -298,33 +298,37 @@ impl RaidZ {
         futures::future::join_all(write_futures).await;
     }
 
-    pub async fn read_raw_block_checked(&mut self, lba: BlockId) -> Option<(u64, Vec<u8>)> {
-        // Check pending writes first 
-        let cur_txg = self.txg_state.txg;
-        for write in self.txg_state.writes.iter().rev() {
-            if write.lba == lba {
-                match &write.data {
-                    TxgPayload::Raw(d) => return Some((cur_txg, d.clone())),
-                    TxgPayload::Checked(_) => (),
-                };
-            }
+    /// Refactored to take a mutable buffer instead of returning a Vec
+    pub async fn read_raw_block_checked_into(
+        &mut self,
+        lba: BlockId,
+        buf: &mut [u8],
+    ) -> Result<(u64, usize), String> {
+        assert!(buf.len() >= BLOCK_SIZE);
+
+        // read_logical_block still allocates shards internally for RS-decoding, 
+        // but we avoid the extra allocation for the return payload.
+        self.read_logical_block(lba, buf).await;
+        
+        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])
+            .map_err(|e| e.to_string())?;
+
+        if header.magic != 0x52414944 {
+            return Err("Invalid magic number".to_string());
         }
 
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        self.read_logical_block(lba, &mut buf).await;
+        let payload_len = header.payload_len as usize;
+        let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + header.payload_len as usize];
 
-        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE]).ok()?;
-
-        let payload_start = BLOCK_HEADER_SIZE;
-        let payload_end = payload_start + header.payload_len as usize;
-        let payload = &buf[payload_start..payload_end];
-
+        // Checksum verification
         let checksum = *blake3::hash(payload).as_bytes();
         if checksum != header.checksum {
-            return None;
+            return Err("Checksum mismatch".to_string());
         }
 
-        Some((header.txg, payload.to_vec()))
+        buf.copy_within(BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len, 0);
+
+        Ok((header.txg, payload_len))
     }
 
     pub async fn read_block_checked<T: for<'a> Deserialize<'a>>(
