@@ -14,7 +14,7 @@ pub type FileId = u64;
 
 #[derive(Debug)]
 enum DiskBackend {
-    Local(File),
+    Local(Arc<Mutex<File>>),
     Remote {
         base_url: String,
         disk_id: String,
@@ -85,7 +85,7 @@ impl Disk {
                 //.custom_flags(libc::O_DIRECT | libc::O_SYNC) // On Linux
                 .open(path)
                 .unwrap();
-            Disk { backend: DiskBackend::Local(file) }
+            Disk { backend: DiskBackend::Local(Arc::new(Mutex::new(file))) }
         }
     }
 
@@ -93,9 +93,10 @@ impl Disk {
 
     }
 
-    pub async fn read_block(&mut self, block: BlockId, buf: &mut [u8]) {
-        match &mut self.backend {
+    pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) {
+        match &self.backend {
             DiskBackend::Local(file) => {
+                let mut file = file.lock().await;
                 file
                     .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
                     .unwrap();
@@ -172,9 +173,10 @@ impl Disk {
         }
     }
 
-    pub async fn write_block(&mut self, block: BlockId, buf: &[u8]) {
-        match &mut self.backend {
+    pub async fn write_block(&self, block: BlockId, buf: &[u8]) {
+        match &self.backend {
             DiskBackend::Local(file) => {
+                let mut file = file.lock().await;
                 file
                     .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
                     .unwrap();

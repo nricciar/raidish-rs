@@ -369,8 +369,21 @@ impl RaidZ {
 
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
 
-        for (i, shard) in shards.iter_mut().enumerate() {
-            self.disks[i].read_block(stripe as u64, shard).await;
+        let futures: Vec<_> = self.disks.iter()
+            .enumerate()
+            .map(|(i, disk)| {
+                async move {
+                    let mut shard = vec![0u8; BLOCK_SIZE];
+                    disk.read_block(stripe as u64, &mut shard).await;
+                    (i, shard)
+                }
+            })
+            .collect();
+        
+        let results = join_all(futures).await;
+        
+        for (i, shard) in results {
+            shards[i] = shard;
         }
 
         // Reconstruction would go here if shards missing
