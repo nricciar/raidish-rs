@@ -49,6 +49,9 @@ enum Commands {
         name: String,
         size: u64
     },
+    Delete {
+        file: String
+    },
     Read {
         file: String
     },
@@ -85,16 +88,6 @@ fn load_config(path: &str) -> io::Result<Config> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    //let raid = RaidZ::new(["disks/disk1","disks/disk2","disks/disk3","disks/disk4","disks/disk5"]).await;
-    /*let raid = 
-        RaidZ::new(
-            ["http://127.0.0.1:8881/api/v1/disks/0",
-             "http://127.0.0.1:8881/api/v1/disks/1",
-             "http://127.0.0.1:8881/api/v1/disks/2",
-             "http://127.0.0.1:8881/api/v1/disks/3",
-             "http://127.0.0.1:8881/api/v1/disks/4"]
-        ).await;*/
-
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
 
@@ -111,9 +104,10 @@ async fn main() -> io::Result<()> {
     match cli.command {
         Commands::Nbd { name, size } => {
             let fs = FileSystem::load(raid).await;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:10809").await?;
-            let (stream, _) = listener.accept().await?;
-            nbd::handle_nbd_client(stream, Arc::new(Mutex::new(fs)), name, size).await.unwrap();
+            //let listener = tokio::net::TcpListener::bind("127.0.0.1:10809").await?;
+            //let (stream, _) = listener.accept().await?;
+            //nbd::handle_nbd_client(stream, Arc::new(Mutex::new(fs)), name, size).await.unwrap();
+            nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809).await.unwrap();
         },
         Commands::Block { name, size } => {
             let mut fs = FileSystem::load(raid).await;
@@ -139,6 +133,10 @@ async fn main() -> io::Result<()> {
             let file = Path::new(&file);
             let data = std::fs::read(file).unwrap();
             fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data).await;
+        },
+        Commands::Delete { file } => {
+            let mut fs = FileSystem::load(raid).await;
+            fs.delete(&file).await;
         },
         Commands::Format => {
             let fs = FileSystem::format(raid, 500_000).await;

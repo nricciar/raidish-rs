@@ -68,7 +68,7 @@ async fn get_block(
     block_id: u64,
     server: &State<RaidZServer>,
 ) -> Result<Vec<u8>, Status> {
-    let mut raidz = server.raidz.lock().await;
+    let raidz = server.raidz.lock().await;
     
     // Check if disk_index is valid
     if disk_index >= raidz.disks.len() {
@@ -104,7 +104,7 @@ async fn put_block(
         return Err(Status::BadRequest);
     }
     
-    let mut raidz = server.raidz.lock().await;
+    let raidz = server.raidz.lock().await;
     
     // Check if disk_index is valid
     if disk_index >= raidz.disks.len() {
@@ -208,7 +208,7 @@ async fn handle_ws_message(
         data[3..11].try_into().unwrap()
     );
     
-    let mut raidz_lock = raidz.lock().await;
+    let raidz_lock = raidz.lock().await;
     
     // Check disk validity
     if disk_index >= raidz_lock.disks.len() {

@@ -18,7 +18,7 @@ const NBD_OPT_ABORT: u32 = 2;
 const NBD_OPT_GO: u32 = 7;
 
 const NBD_REP_ACK: u32 = 1;
-const NBD_REP_SERVER: u32 = 2;
+//const NBD_REP_SERVER: u32 = 2;
 const NBD_REP_INFO: u32 = 3;
 const NBD_REP_ERR_UNSUP: u32 = 0x80000001;
 
@@ -179,7 +179,7 @@ async fn transmission_phase(
             ));
         }
         
-        let flags = stream.read_u16().await?;
+        let _flags = stream.read_u16().await?;
         let cmd = stream.read_u16().await?;
         let handle = stream.read_u64().await?;
         let offset = stream.read_u64().await?;

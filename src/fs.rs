@@ -71,20 +71,6 @@ impl InodeType {
         }
     }
 
-    pub fn extents_mut(&mut self) -> &mut Vec<Extent> {
-        match self {
-            InodeType::File { extents, .. } => extents,
-            InodeType::Block { extents, .. } => extents,
-        }
-    }
-
-    pub fn set_size(&mut self, new_size: u64) {
-        match self {
-            InodeType::File { size_bytes, .. } => *size_bytes = new_size,
-            InodeType::Block { size_bytes, .. } => *size_bytes = new_size,
-        }
-    }
-
     pub fn is_block(&self) -> bool {
         matches!(self, InodeType::Block { .. })
     }
@@ -416,7 +402,7 @@ impl FileSystem {
         };
         
         // TXG 0 is reserved for initial format
-        dev.write_block_checked(SUPERBLOCK_LBA, 0, &superblock).await;
+        dev.write_block_checked_txg(SUPERBLOCK_LBA, &superblock);
 
         let mut metaslabs = Vec::new();
         for i in 0..metaslab_count {
@@ -430,11 +416,10 @@ impl FileSystem {
             };
 
             // Write metaslab header with checksum
-            dev.write_block_checked(
+            dev.write_block_checked_txg(
                 METASLAB_TABLE_START + i as u64,
-                0,
                 &header,
-            ).await;
+            );
 
             let entry = SpaceMapEntry::Free {
                 start: start_block,
@@ -442,7 +427,7 @@ impl FileSystem {
             };
 
             // Write initial space map entry with checksum
-            dev.write_block_checked(header.spacemap_start, 0, &entry).await;
+            dev.write_block_checked_txg(header.spacemap_start, &entry);
 
             let mut free_extents = BTreeMap::new();
             free_extents.insert(start_block, METASLAB_SIZE_BLOCKS);
@@ -468,18 +453,7 @@ impl FileSystem {
             current_file_index_extent: Vec::new()
         };
 
-        // Zero out uberblock slots (TXG 0)
-        let zero_uber = Uberblock {
-            magic: 0,
-            version: 0,
-            txg: 0,
-            timestamp: 0,
-            file_index_extent: Vec::new(),
-        };
-        for slot in 0..UBERBLOCK_COUNT {
-            fs.dev.write_block_checked(UBERBLOCK_START + slot, 0, &zero_uber).await;
-        }
-        
+        fs.dev.format();
         fs.persist_file_index().await;
         fs
     }
