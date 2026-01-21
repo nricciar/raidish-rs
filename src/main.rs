@@ -38,6 +38,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Map,
+    Metaslab,
     Orphaned,
     Format,
     Load,
@@ -104,9 +105,6 @@ async fn main() -> io::Result<()> {
     match cli.command {
         Commands::Nbd { name, size } => {
             let fs = FileSystem::load(raid).await;
-            //let listener = tokio::net::TcpListener::bind("127.0.0.1:10809").await?;
-            //let (stream, _) = listener.accept().await?;
-            //nbd::handle_nbd_client(stream, Arc::new(Mutex::new(fs)), name, size).await.unwrap();
             nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809).await.unwrap();
         },
         Commands::Block { name, size } => {
@@ -116,7 +114,10 @@ async fn main() -> io::Result<()> {
         Commands::Map => {
             let fs = FileSystem::load(raid).await;
             fs.display_block_map();
-            //fs.display_metaslab_info();
+        },
+        Commands::Metaslab => {
+            let fs = FileSystem::load(raid).await;
+            fs.display_metaslab_info();
         },
         Commands::Orphaned => { 
             let fs = FileSystem::load(raid).await;

@@ -317,6 +317,9 @@ impl FileSystem {
             let allocated_blocks = total_blocks - free_blocks;
             let utilization = (allocated_blocks as f64 / total_blocks as f64) * 100.0;
             let fragmentation = ms.free_extents.len();
+            if allocated_blocks == 0 {
+                continue;
+            }
 
             println!("Metaslab #{}", i);
             println!("  Range: {} - {}", ms.header.start_block, 
