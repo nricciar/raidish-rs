@@ -5,6 +5,7 @@ use std::future::AsyncDrop;
 use std::pin::Pin;
 use futures::future::join_all;
 use crate::disk::{Disk,BLOCK_SIZE,BlockId};
+use std::collections::BTreeMap;
 
 pub const DISKS: usize = 5;
 pub const DATA_SHARDS: usize = 3;
@@ -175,18 +176,58 @@ impl RaidZ {
         }
     }
 
+    fn prepare_block_buffer(&self, lba: BlockId, txg: u64, data: &[u8]) -> Vec<u8> {
+        let checksum = *blake3::hash(data).as_bytes();
+        let header = BlockHeader {
+            magic: 0x52414944,
+            txg,
+            checksum,
+            payload_len: data.len() as u32,
+        };
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let header_bytes = bincode::serialize(&header).unwrap();
+        buf[..header_bytes.len()].copy_from_slice(&header_bytes);
+        buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data.len()].copy_from_slice(data);
+        buf
+    }
+
     pub async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> u64 {
         let txg = self.txg_state.txg;
 
         // Take ownership of writes to avoid borrowing conflicts
         let writes = std::mem::take(&mut self.txg_state.writes);
 
-        // Write all blocks
+        // Group writes by Stripe ID
+        let mut stripes: BTreeMap<u64, Vec<Option<Vec<u8>>>> = BTreeMap::new();
         for w in writes {
-            match w.data {
-                TxgPayload::Raw(data) => self.write_raw_block_checked(w.lba, txg, &data).await,
-                TxgPayload::Checked(data) => self.write_raw_block_checked(w.lba, txg, &data).await,
+            let data = match w.data {
+                TxgPayload::Raw(d) | TxgPayload::Checked(d) => d,
+            };
+            
+            // Re-package into the block format (Header + Payload)
+            let full_block = self.prepare_block_buffer(w.lba, txg, &data);
+            
+            let stripe_id = w.lba / DATA_SHARDS as u64;
+            let shard_index = (w.lba % DATA_SHARDS as u64) as usize;
+            
+            let stripe_entry = stripes.entry(stripe_id)
+                .or_insert_with(|| vec![None; DATA_SHARDS]);
+            stripe_entry[shard_index] = Some(full_block);
+        }
+
+        // TODO: Write full stripes
+        // FIXME: this should eventually be unnessicary once everything is fully on board with the
+        // stripe alignment and using the write_block_checked_txg method
+        for (stripe_id, mut data_shards) in stripes {
+            for i in 0..DATA_SHARDS {
+                if data_shards[i].is_none() {
+                    println!("WARN: RMW: operation in commit_txg for stripe {}", stripe_id);
+                    let mut existing = vec![0u8; BLOCK_SIZE];
+                    self.disks[i].read_block(stripe_id, &mut existing).await;
+                    data_shards[i] = Some(existing);
+                }
             }
+            self.write_full_stripe(stripe_id, data_shards).await;
         }
 
         // Flush all disks to ensure all blocks are durable before uberblock
@@ -219,31 +260,6 @@ impl RaidZ {
         }
     }
 
-    /// Write raw bytes to a block with checksum (no serialization)
-    async fn write_raw_block_checked(&mut self, lba: BlockId, txg: u64, data: &[u8]) {
-        assert!(data.len() <= BLOCK_PAYLOAD_SIZE, 
-                "Raw data too large: {} > {}", data.len(), BLOCK_PAYLOAD_SIZE);
-
-        let checksum = *blake3::hash(data).as_bytes();
-        
-        let header = crate::raidz::BlockHeader {
-            magic: 0x52414944, // "RAID"
-            txg,
-            checksum,
-            payload_len: data.len() as u32,
-        };
-
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        let header_bytes = bincode::serialize(&header).unwrap();
-        
-        buf[..header_bytes.len()].copy_from_slice(&header_bytes);
-        buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data.len()]
-            .copy_from_slice(data);
-
-        self.write_logical_block(lba, &buf).await;
-    }
-
-    /// Read raw bytes from a block with checksum validation (no deserialization)
     pub async fn read_raw_block_checked(&mut self, lba: BlockId) -> Option<(u64, Vec<u8>)> {
         // Check pending writes first 
         let cur_txg = self.txg_state.txg;
@@ -338,18 +354,34 @@ impl RaidZ {
         Some((header.txg, value))
     }
 
+    async fn write_full_stripe(&mut self, stripe_id: u64, data_shards: Vec<Option<Vec<u8>>>) {
+        let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
+
+        for (i, data) in data_shards.into_iter().enumerate() {
+            if let Some(d) = data {
+                shards[i] = d;
+            }
+        }
+
+        self.rs.encode(&mut shards).expect("RS encoding failed");
+
+        let write_futures = shards
+            .into_iter()
+            .zip(self.disks.iter_mut())
+            .map(|(shard, disk)| {
+                async move {
+                    disk.write_block(stripe_id, &shard).await
+                }
+            });
+
+        futures::future::join_all(write_futures).await;
+    }
+
     async fn write_logical_block(&mut self, lba: BlockId, data: &[u8]) {
         let stripe = lba as usize / DATA_SHARDS;
         let data_index = lba as usize % DATA_SHARDS;
 
-        // In a simulation, if we aren't doing full stripe writes, 
-        // we must ensure we don't have a race condition on the parity.
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
-
-        // TEMPORARY: Zero-fill instead of reading to test if RMW is the cause
-        // for (i, shard) in shards.iter_mut().enumerate() {
-        //     self.disks[i].read_block(stripe as u64, shard);
-        // }
 
         for (i, shard) in shards.iter_mut().enumerate() {
             self.disks[i].read_block(stripe as u64, shard).await;

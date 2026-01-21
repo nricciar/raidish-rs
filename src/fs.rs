@@ -124,7 +124,7 @@ impl FileSystem {
         }
 
         let blocks_needed = Self::calculate_blocks_needed(size_bytes as usize);
-        let allocated_extents = self.allocate_blocks(blocks_needed)
+        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)
             .expect("out of space for virtual block device");
 
         println!("Created virtual block device '{}' with {} blocks: {:?}", name, blocks_needed, allocated_extents);
@@ -550,59 +550,114 @@ impl FileSystem {
         }
     }
 
-    pub fn allocate_blocks(&mut self, mut blocks_needed: u64) -> Option<Vec<Extent>> {
-        println!("ALLOCATE_BLOCKS CALLED: need {} blocks", blocks_needed);
+    pub fn allocate_blocks_stripe_aligned(&mut self, blocks_needed: u64) -> Option<Vec<Extent>> {
         if blocks_needed == 0 { return Some(Vec::new()); }
+        
+        // Round up to stripe boundary
+        let alignment = crate::raidz::DATA_SHARDS as u64;
+        let aligned_blocks = ((blocks_needed + alignment - 1) / alignment) * alignment;
+        
+        println!("allocate_blocks_stripe_aligned: requested {}, allocating {} (aligned to {} block stripes)", 
+                 blocks_needed, aligned_blocks, alignment);
+        
         let mut allocated_extents = Vec::new();
+        let mut remaining = aligned_blocks;
 
         for (ms_idx, ms) in self.metaslabs.iter_mut().enumerate() {
             let ms_start = ms.header.start_block;
             let ms_end = ms_start + ms.header.block_count;
             
-            println!("DEBUG: Metaslab {} range [{}, {}), free_extents: {:?}", 
-                    ms_idx, ms_start, ms_end, ms.free_extents);
+            // Collect extents we've rejected to avoid infinite loop
+            let mut rejected_extents = Vec::new();
             
-            while blocks_needed > 0 {
-                let found = ms.free_extents.iter().map(|(&s, &l)| (s, l)).next();
+            while remaining > 0 {
+                // Skip extents we've already rejected
+                let found = ms.free_extents.iter()
+                    .map(|(&s, &l)| (s, l))
+                    .find(|(s, _)| !rejected_extents.iter().any(|(rs, _)| rs == s));
                 
                 if let Some((start, len)) = found {
-                    println!("  -> Found extent {{{}:{}}}, removing from map", start, len);
                     ms.free_extents.remove(&start);
 
-                    let max_in_metaslab = ms_end.saturating_sub(start);
-                    let available = len.min(max_in_metaslab);
-                    let take = available.min(blocks_needed);
+                    // Align start to stripe boundary
+                    let aligned_start = ((start + alignment - 1) / alignment) * alignment;
+                    let skip = aligned_start.saturating_sub(start);
                     
-                    println!("  -> Allocating {{{}:{}}} from this extent", start, take);
-
-                    if take == 0 {
+                    if skip >= len {
+                        // Extent too small/misaligned, reject it and try next
+                        rejected_extents.push((start, len));
                         continue;
                     }
                     
-                    // Persist allocation with current TXG
-                    let entry = SpaceMapEntry::Alloc { start, len: take };
-                    self.dev.write_block_checked_txg(ms.write_cursor, &entry);
+                    let usable_len = len - skip;
+                    let max_in_metaslab = ms_end.saturating_sub(aligned_start);
+                    let available = usable_len.min(max_in_metaslab);
                     
+                    // Round down to stripe boundary
+                    let aligned_available = (available / alignment) * alignment;
+                    
+                    if aligned_available == 0 {
+                        // Extent too small after alignment, reject it
+                        rejected_extents.push((start, len));
+                        continue;
+                    }
+                    
+                    let take = aligned_available.min(remaining);
+                    
+                    println!("  MS{}: Allocating stripe-aligned extent {{{}: {}}} from {{{}: {}}}", 
+                             ms_idx, aligned_start, take, start, len);
+
+                    // Return skipped blocks before alignment
+                    if skip > 0 {
+                        ms.free_extents.insert(start, skip);
+                        println!("    -> Returned {} pre-alignment blocks to free pool", skip);
+                    }
+                    
+                    // Persist allocation
+                    let entry = SpaceMapEntry::Alloc { start: aligned_start, len: take };
+                    self.dev.write_block_checked_txg(ms.write_cursor, &entry);
                     ms.write_cursor += 1;
                     ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-                    
-                    // Update metaslab header with current TXG
                     self.dev.write_block_checked_txg(ms.header_block, &ms.header);
 
-                    if available > take {
-                        ms.free_extents.insert(start + take, available - take);
+                    // Return remainder after allocation
+                    let remainder = aligned_available - take;
+                    if remainder > 0 {
+                        ms.free_extents.insert(aligned_start + take, remainder);
+                        println!("    -> Returned {} post-allocation blocks to free pool", remainder);
                     }
 
-                    allocated_extents.push(Extent { start, len: take });
-                    blocks_needed -= take;
+                    allocated_extents.push(Extent { start: aligned_start, len: take });
+                    remaining -= take;
                 } else {
+                    // No more suitable extents in this metaslab
+                    // Return rejected extents back to free pool
+                    for (start, len) in rejected_extents.drain(..) {
+                        ms.free_extents.insert(start, len);
+                    }
                     break;
                 }
             }
-            if blocks_needed == 0 { break; }
+            
+            // Return any remaining rejected extents
+            for (start, len) in rejected_extents.drain(..) {
+                if ms.free_extents.get(&start).is_none() {
+                    ms.free_extents.insert(start, len);
+                }
+            }
+            
+            if remaining == 0 { break; }
         }
 
-        if blocks_needed == 0 { Some(allocated_extents) } else { None }
+        if remaining == 0 { 
+            Some(allocated_extents) 
+        } else { 
+            // Rollback: return all allocated blocks
+            for extent in allocated_extents {
+                self.free(extent.start, extent.len);
+            }
+            None 
+        }
     }
 
     /// Calculate how many blocks are needed considering payload overhead
@@ -618,7 +673,7 @@ impl FileSystem {
         let blocks_needed = Self::calculate_blocks_needed(data.len());
 
         let allocated_extents = self
-            .allocate_blocks(blocks_needed)
+            .allocate_blocks_stripe_aligned(blocks_needed)
             .expect("out of space for file index");
 
         // Write index data using checksummed blocks
@@ -836,7 +891,7 @@ impl FileSystem {
         // Calculate blocks needed accounting for header overhead
         let blocks_needed = Self::calculate_blocks_needed(data.len());
         
-        let allocated_extents = self.allocate_blocks(blocks_needed).expect("out of space");
+        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).expect("out of space");
         println!("allocated extents: {:?}", allocated_extents);
 
         // Write file data in chunks that fit in BLOCK_PAYLOAD_SIZE
