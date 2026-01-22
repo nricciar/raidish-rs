@@ -81,7 +81,7 @@ async fn get_block(
     }
     
     let mut buf = vec![0u8; BLOCK_SIZE];
-    raidz.disks[disk_index].read_block(block_id, &mut buf).await;
+    raidz.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
     
     Ok(buf)
 }
@@ -116,7 +116,7 @@ async fn put_block(
         return Err(Status::BadRequest);
     }
     
-    raidz.disks[disk_index].write_block(block_id, &bytes).await;
+    raidz.disks[disk_index].write_block(block_id, &bytes).await.unwrap();
     
     Ok(Status::Ok)
 }
@@ -223,7 +223,7 @@ async fn handle_ws_message(
         // Read operation
         0 => {
             let mut buf = vec![0u8; BLOCK_SIZE];
-            raidz_lock.disks[disk_index].read_block(block_id, &mut buf).await;
+            raidz_lock.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
             
             let mut response = vec![0]; // Success
             response.extend_from_slice(&buf);
@@ -236,7 +236,7 @@ async fn handle_ws_message(
             }
             
             let block_data = &data[11..11+BLOCK_SIZE];
-            raidz_lock.disks[disk_index].write_block(block_id, block_data).await;
+            raidz_lock.disks[disk_index].write_block(block_id, block_data).await.unwrap();
             
             vec![0] // Success
         }

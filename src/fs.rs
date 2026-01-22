@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::collections::BTreeMap;
-use crate::disk::{BLOCK_SIZE,FileId};
-use crate::raidz::{RaidZ,BLOCK_PAYLOAD_SIZE,UBERBLOCK_START,UBERBLOCK_COUNT,Uberblock,Extent,UBERBLOCK_MAGIC};
+use crate::disk::{BLOCK_SIZE,FileId,DiskError};
+use crate::raidz::{RaidZ,BLOCK_PAYLOAD_SIZE,UBERBLOCK_START,UBERBLOCK_COUNT,Uberblock,Extent,UBERBLOCK_MAGIC,RaidZError};
 
 // TODO
 // Superblock, Uberblock and Metaslab alignment to stripe needs to be considered
@@ -11,6 +11,25 @@ pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
 pub const SUPERBLOCK_LBA: u64 = 0;
 pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT + 2; // +2 is to keep stripe alignment
 pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
+
+#[derive(Debug)]
+pub enum FileSystemError {
+    DiskError(DiskError),
+    RaidZError(RaidZError),
+    UnableToAllocateBlocks(u64)
+}
+
+impl From<DiskError> for FileSystemError {
+    fn from(error: DiskError) -> Self {
+        FileSystemError::DiskError(error)
+    }
+}
+
+impl From<RaidZError> for FileSystemError {
+    fn from(error: RaidZError) -> Self {
+        FileSystemError::RaidZError(error)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Superblock {
@@ -105,7 +124,7 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    pub async fn create_block(&mut self, name: &str, size_bytes: u64, block_size: u32) -> FileId {
+    pub async fn create_block(&mut self, name: &str, size_bytes: u64, block_size: u32) -> Result<FileId, FileSystemError> {
         // Check if name already exists
         if self.file_index.files.contains_key(name) {
             panic!("File or block device '{}' already exists", name);
@@ -122,7 +141,7 @@ impl FileSystem {
             for i in 0..extent.len {
                 //let empty: &[u8] = &[];
                 let zeros = vec![0u8; BLOCK_PAYLOAD_SIZE];
-                self.dev.write_raw_block_checked_txg(extent.start + i, &zeros);
+                self.dev.write_raw_block_checked_txg(extent.start + i, &zeros)?;
             }
         }
 
@@ -141,13 +160,13 @@ impl FileSystem {
         self.file_index.files.insert(name.to_string(), file_id);
         self.file_index.inodes.insert(file_id, inode);
 
-        self.persist_file_index().await;
+        self.persist_file_index().await?;
 
-        file_id
+        Ok(file_id)
     }
 
     /// Read data from a virtual block device at a specific byte offset
-    pub async fn block_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> usize {
+    pub async fn block_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
         println!("block_read called: name={}, offset={}, buf.len={}", name, offset, buf.len());
 
         let file_id = *self.file_index.files.get(name)
@@ -169,7 +188,7 @@ impl FileSystem {
         println!("  -> size_bytes={}, extents.len={}", size_bytes, extents.len());
 
         if offset >= size_bytes {
-            return 0;
+            return Ok(0);
         }
 
         let max_read = ((size_bytes - offset) as usize).min(buf.len());
@@ -198,16 +217,10 @@ impl FileSystem {
 
             println!("    -> About to call read_raw_block_checked({})", block_lba);
 
-            let (_txg, payload_len) = match self.dev.read_raw_block_checked_into(
+            let (_txg, payload_len) = self.dev.read_raw_block_checked_into(
                 block_lba, 
                 &mut block_buf
-            ).await {
-                Ok(result) => result,
-                Err(_) => {
-                    println!("Warning: Failed to read block at {}", block_lba);
-                    break;
-                }
-            };
+            ).await?;
 
             let payload = &block_buf[..payload_len];
             let available_in_block = payload.len().saturating_sub(byte_offset);
@@ -222,11 +235,11 @@ impl FileSystem {
 
         println!("  -> block_read returning {}", bytes_read);
 
-        bytes_read
+        Ok(bytes_read)
     }
 
     /// Write data to a virtual block device at a specific byte offset
-    pub async fn block_write(&mut self, name: &str, offset: u64, data: &[u8]) -> usize {
+    pub async fn block_write(&mut self, name: &str, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
         let file_id = *self.file_index.files.get(name)
             .expect(&format!("'{}' does not exist", name));
         
@@ -241,7 +254,7 @@ impl FileSystem {
         let extents = inode.inode_type.extents().to_vec();
 
         if offset >= size_bytes {
-            return 0;
+            return Ok(0);
         }
 
         let max_write = ((size_bytes - offset) as usize).min(data.len());
@@ -266,18 +279,12 @@ impl FileSystem {
                 self.dev.write_raw_block_checked_txg(
                     block_lba,
                     &data[bytes_written..bytes_written + to_write],
-                );
+                )?;
             } else {
-                let (_txg, payload_len) = match self.dev.read_raw_block_checked_into(
+                let (_txg, payload_len) = self.dev.read_raw_block_checked_into(
                     block_lba, 
                     &mut block_buf
-                ).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        println!("Warning: Failed to read block at {}", block_lba);
-                        break;
-                    }
-                };
+                ).await?;
                 // Ensure we have enough space for the write
                 let needed_len = byte_offset + to_write;
                 
@@ -295,23 +302,23 @@ impl FileSystem {
                 self.dev.write_raw_block_checked_txg(
                     block_lba, 
                     &block_buf[..final_len]
-                );
+                )?;
             }
 
             bytes_written += to_write;
             current_offset += to_write as u64;
         }
 
-        bytes_written
+        Ok(bytes_written)
     }
 
     /// Delete a virtual block device or file
-    pub async fn delete(&mut self, name: &str) {
+    pub async fn delete(&mut self, name: &str) -> Result<(), FileSystemError> {
         let file_id = match self.file_index.files.remove(name) {
             Some(id) => id,
             None => {
                 println!("'{}' does not exist", name);
-                return;
+                return Ok(());
             }
         };
 
@@ -320,10 +327,12 @@ impl FileSystem {
 
         // Free all blocks
         for extent in inode.inode_type.extents() {
-            self.free(extent.start, extent.len);
+            self.free(extent.start, extent.len)?;
         }
 
-        self.persist_file_index().await;
+        self.persist_file_index().await?;
+
+        Ok(())
     }
 
     /// Find all blocks that are allocated but not referenced by any live data
@@ -398,7 +407,7 @@ impl FileSystem {
         orphaned
     }
     
-    pub async fn format(mut dev: RaidZ, total_blocks: u64) -> Self {
+    pub async fn format(mut dev: RaidZ, total_blocks: u64) -> Result<Self, FileSystemError> {
         let metaslab_count = (total_blocks / METASLAB_SIZE_BLOCKS) as u32;
 
         // Calculate metadata layout
@@ -420,7 +429,7 @@ impl FileSystem {
         };
         
         // TXG 0 is reserved for initial format
-        dev.write_block_checked_txg(SUPERBLOCK_LBA, &superblock);
+        dev.write_block_checked_txg(SUPERBLOCK_LBA, &superblock)?;
 
         let mut metaslabs = Vec::new();
         for i in 0..metaslab_count {
@@ -437,7 +446,7 @@ impl FileSystem {
             dev.write_block_checked_txg(
                 METASLAB_TABLE_START + i as u64,
                 &header,
-            );
+            )?;
 
             let entry = SpaceMapEntry::Free {
                 start: start_block,
@@ -445,7 +454,7 @@ impl FileSystem {
             };
 
             // Write initial space map entry with checksum
-            dev.write_block_checked_txg(header.spacemap_start, &entry);
+            dev.write_block_checked_txg(header.spacemap_start, &entry)?;
 
             let mut free_extents = BTreeMap::new();
             free_extents.insert(start_block, METASLAB_SIZE_BLOCKS);
@@ -471,12 +480,12 @@ impl FileSystem {
             current_file_index_extent: Vec::new()
         };
 
-        fs.dev.format();
-        fs.persist_file_index().await;
-        fs
+        fs.dev.format()?;
+        fs.persist_file_index().await?;
+        Ok(fs)
     }
 
-    pub fn free(&mut self, start: u64, len: u64) {
+    pub fn free(&mut self, start: u64, len: u64) -> Result<(), FileSystemError> {
         println!("free called: start: {}, len: {}", start, len);
         
         for (ms_idx, ms) in self.metaslabs.iter_mut().enumerate() {
@@ -493,7 +502,7 @@ impl FileSystem {
                 if let Some(&existing_len) = ms.free_extents.get(&start) {
                     if existing_len == len {
                         println!("WARNING: Attempted to free already-free extent {{{}:{}}}", start, len);
-                        return;
+                        return Ok(());
                     }
                 }
                 
@@ -527,23 +536,25 @@ impl FileSystem {
 
                 // Write the merged extent to space map log with current TXG
                 let entry = SpaceMapEntry::Free { start: new_start, len: new_len };
-                self.dev.write_block_checked_txg(ms.write_cursor, &entry);
+                self.dev.write_block_checked_txg(ms.write_cursor, &entry)?;
                 ms.write_cursor += 1;
 
                 ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-                self.dev.write_block_checked_txg(ms.header_block, &ms.header);
+                self.dev.write_block_checked_txg(ms.header_block, &ms.header)?;
 
                 println!("  -> After merge, inserting {{{}:{}}}", new_start, new_len);
                 //println!("  -> Writing to space map log at block {} with TXG {}", 
                 //         ms.write_cursor - 1, self.dev.txg_state.txg);
 
-                return;
+                return Ok(());
             }
         }
+
+        Ok(())
     }
 
-    pub fn allocate_blocks_stripe_aligned(&mut self, blocks_needed: u64) -> Option<Vec<Extent>> {
-        if blocks_needed == 0 { return Some(Vec::new()); }
+    pub fn allocate_blocks_stripe_aligned(&mut self, blocks_needed: u64) -> Result<Vec<Extent>, FileSystemError> {
+        if blocks_needed == 0 { return Ok(Vec::new()); }
         
         // Round up to stripe boundary
         let alignment = crate::raidz::DATA_SHARDS as u64;
@@ -607,10 +618,10 @@ impl FileSystem {
                     
                     // Persist allocation
                     let entry = SpaceMapEntry::Alloc { start: aligned_start, len: take };
-                    self.dev.write_block_checked_txg(ms.write_cursor, &entry);
+                    self.dev.write_block_checked_txg(ms.write_cursor, &entry)?;
                     ms.write_cursor += 1;
                     ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-                    self.dev.write_block_checked_txg(ms.header_block, &ms.header);
+                    self.dev.write_block_checked_txg(ms.header_block, &ms.header)?;
 
                     // Return remainder after allocation
                     let remainder = aligned_available - take;
@@ -642,13 +653,13 @@ impl FileSystem {
         }
 
         if remaining == 0 { 
-            Some(allocated_extents) 
+            Ok(allocated_extents) 
         } else { 
             // Rollback: return all allocated blocks
             for extent in allocated_extents {
-                self.free(extent.start, extent.len);
+                self.free(extent.start, extent.len)?;
             }
-            None 
+            Err(FileSystemError::UnableToAllocateBlocks(remaining)) 
         }
     }
 
@@ -657,7 +668,7 @@ impl FileSystem {
         ((data_len + BLOCK_PAYLOAD_SIZE - 1) / BLOCK_PAYLOAD_SIZE) as u64
     }
 
-    async fn persist_file_index(&mut self) {
+    async fn persist_file_index(&mut self) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
         let data = bincode::serialize(&self.file_index).unwrap();
         
@@ -665,8 +676,7 @@ impl FileSystem {
         let blocks_needed = Self::calculate_blocks_needed(data.len());
 
         let allocated_extents = self
-            .allocate_blocks_stripe_aligned(blocks_needed)
-            .expect("out of space for file index");
+            .allocate_blocks_stripe_aligned(blocks_needed)?;
 
         // Write index data using checksummed blocks
         let mut bytes_left = &data[..];
@@ -677,105 +687,99 @@ impl FileSystem {
                 if take > 0 {
                     let chunk = &bytes_left[..take];
                     // Write with current TXG + 1 (the new transaction)
-                    self.dev.write_block_checked_txg(extent.start + i, &chunk);
+                    self.dev.write_block_checked_txg(extent.start + i, &chunk)?;
                     bytes_left = &bytes_left[take..];
                 } else {
                     // Write empty block to maintain extent structure
                     let empty: &[u8] = &[];
-                    self.dev.write_block_checked_txg(extent.start + i, &empty);
+                    self.dev.write_block_checked_txg(extent.start + i, &empty)?;
                 }
             }
         }
 
-        self.dev.commit_txg(allocated_extents.clone()).await;
+        self.dev.commit_txg(allocated_extents.clone()).await?;
 
         // Free old index blocks AFTER commit
         let old_extents = std::mem::replace(&mut self.current_file_index_extent, allocated_extents);
         for extent in old_extents {
-            self.free(extent.start, extent.len);
+            self.free(extent.start, extent.len)?;
         }
+        Ok(())
     }
 
-    pub async fn load(mut dev: RaidZ) -> Self {
+    pub async fn load(mut dev: RaidZ) -> Result<Self, FileSystemError> {
         // Load superblock (TXG 0 from format)
         let (_, superblock): (_, Superblock) =
-            dev.read_block_checked(SUPERBLOCK_LBA).await.expect("invalid superblock");
+            dev.read_block_checked(SUPERBLOCK_LBA).await?;
         assert_eq!(superblock.magic, FS_ID);
 
         // Load metaslabs and replay space maps
         let mut metaslabs = Vec::new();
         for i in 0..superblock.metaslab_count {
-            let header: MetaslabHeader = dev.read_block_checked(superblock.metaslab_table_start + i as u64).await
-                .map(|(_, h)| h)
-                .expect("failed to read metaslab header");
+            let (_, header) : (u64, MetaslabHeader) = 
+                dev.read_block_checked(superblock.metaslab_table_start + i as u64).await?;
             
             let mut free_extents = BTreeMap::new();
 
             // Replay spacemap log entries
             for b in 0..header.spacemap_blocks {
                 // Try to read the space map entry
-                if let Some((_entry_txg, entry)) = dev.read_block_checked::<SpaceMapEntry>(
+                let (_entry_txg, entry) = dev.read_block_checked::<SpaceMapEntry>(
                     header.spacemap_start + b as u64
-                ).await {
-                    // Process valid entries only
-                    match entry {
-                        SpaceMapEntry::Alloc { start, len } => {
-                            if len == 0 { continue; }
-                            
-                            // Remove allocated chunk from free map (slicing logic)
-                            let mut to_add = Vec::new();
-                            let mut to_rem = Vec::new();
-                            for (&fs, &fl) in free_extents.iter() {
-                                let fe = fs + fl;
-                                let ae = start + len;
-                                if ae <= fs || start >= fe { continue; }
-                                to_rem.push(fs);
-                                if fs < start { to_add.push((fs, start - fs)); }
-                                if ae < fe { to_add.push((ae, fe - ae)); }
-                            }
-                            for r in to_rem { free_extents.remove(&r); }
-                            for (s, l) in to_add { free_extents.insert(s, l); }
-                            
-                            //println!("LOAD: Replayed Alloc {{{}:{}}}, TXG {}", start, len, entry_txg);
+                ).await?;
+                // Process valid entries only
+                match entry {
+                    SpaceMapEntry::Alloc { start, len } => {
+                        if len == 0 { continue; }
+                        
+                        // Remove allocated chunk from free map (slicing logic)
+                        let mut to_add = Vec::new();
+                        let mut to_rem = Vec::new();
+                        for (&fs, &fl) in free_extents.iter() {
+                            let fe = fs + fl;
+                            let ae = start + len;
+                            if ae <= fs || start >= fe { continue; }
+                            to_rem.push(fs);
+                            if fs < start { to_add.push((fs, start - fs)); }
+                            if ae < fe { to_add.push((ae, fe - ae)); }
                         }
-                        SpaceMapEntry::Free { start, len } => {
-                            if len == 0 { continue; }
-                            
-                            // Apply merge logic consistent with free()
-                            let mut new_start = start;
-                            let mut new_len = len;
+                        for r in to_rem { free_extents.remove(&r); }
+                        for (s, l) in to_add { free_extents.insert(s, l); }
+                        
+                        //println!("LOAD: Replayed Alloc {{{}:{}}}, TXG {}", start, len, entry_txg);
+                    }
+                    SpaceMapEntry::Free { start, len } => {
+                        if len == 0 { continue; }
+                        
+                        // Apply merge logic consistent with free()
+                        let mut new_start = start;
+                        let mut new_len = len;
 
-                            if let Some((&prev_start, &prev_len)) = free_extents.range(..start).next_back() {
-                                if prev_start + prev_len >= start {
-                                    new_start = prev_start;
-                                    new_len = (prev_start + prev_len).max(start + len) - new_start;
-                                    free_extents.remove(&prev_start);
-                                }
+                        if let Some((&prev_start, &prev_len)) = free_extents.range(..start).next_back() {
+                            if prev_start + prev_len >= start {
+                                new_start = prev_start;
+                                new_len = (prev_start + prev_len).max(start + len) - new_start;
+                                free_extents.remove(&prev_start);
                             }
+                        }
 
-                            loop {
-                                if let Some((&next_start, &next_len)) = free_extents.range(new_start..).next() {
-                                    if next_start <= new_start + new_len {
-                                        new_len = (next_start + next_len).max(new_start + new_len) - new_start;
-                                        free_extents.remove(&next_start);
-                                    } else {
-                                        break;
-                                    }
+                        loop {
+                            if let Some((&next_start, &next_len)) = free_extents.range(new_start..).next() {
+                                if next_start <= new_start + new_len {
+                                    new_len = (next_start + next_len).max(new_start + new_len) - new_start;
+                                    free_extents.remove(&next_start);
                                 } else {
                                     break;
                                 }
+                            } else {
+                                break;
                             }
-
-                            free_extents.insert(new_start, new_len);
-                            //println!("LOAD: Replayed Free {{{}:{}}}, TXG {}", new_start, new_len, entry_txg);
                         }
-                        SpaceMapEntry::Invalid => break, 
+
+                        free_extents.insert(new_start, new_len);
+                        //println!("LOAD: Replayed Free {{{}:{}}}, TXG {}", new_start, new_len, entry_txg);
                     }
-                } else {
-                    // Checksum failure or invalid block - stop replaying this log
-                    println!("LOAD: Skipping corrupt space map entry at block {}", 
-                             header.spacemap_start + b as u64);
-                    break;
+                    SpaceMapEntry::Invalid => break, 
                 }
             }
 
@@ -793,7 +797,7 @@ impl FileSystem {
         for slot in 0..UBERBLOCK_COUNT {
             let lba = UBERBLOCK_START + slot;
             
-            if let Some((txg, uber)) = dev.read_block_checked::<Uberblock>(lba).await {
+            if let Ok((txg, uber)) = dev.read_block_checked::<Uberblock>(lba).await {
                 if uber.magic == UBERBLOCK_MAGIC && uber.version == 1 {
                     match &best_uber {
                         Some((best_txg, _, _)) if *best_txg >= txg => {}
@@ -813,16 +817,13 @@ impl FileSystem {
         let mut index_bytes = Vec::new();
         for extent in &uber.file_index_extent {
             for i in 0..extent.len {
-                if let Some((block_txg, chunk)) = dev.read_block_checked::<Vec<u8>>(extent.start + i).await {
-                    // Validate TXG matches or is from earlier transaction
-                    if block_txg <= current_txg {
-                        index_bytes.extend_from_slice(&chunk);
-                    } else {
-                        println!("WARNING: File index block has TXG {} > uberblock TXG {}", 
-                                 block_txg, current_txg);
-                    }
+                let (block_txg, chunk) = dev.read_block_checked::<Vec<u8>>(extent.start + i).await?;
+                // Validate TXG matches or is from earlier transaction
+                if block_txg <= current_txg {
+                    index_bytes.extend_from_slice(&chunk);
                 } else {
-                    panic!("Failed to read file index block at {} - corruption detected", extent.start + i);
+                    println!("WARNING: File index block has TXG {} > uberblock TXG {}", 
+                             block_txg, current_txg);
                 }
             }
         }
@@ -830,16 +831,16 @@ impl FileSystem {
         let file_index: FileIndex = bincode::deserialize(&index_bytes)
             .expect("Failed to deserialize FileIndex");
 
-        FileSystem {
+        Ok(FileSystem {
             dev,
             superblock,
             metaslabs,
             file_index,
             current_file_index_extent: uber.file_index_extent
-        }
+        })
     }
 
-    pub async fn read_file(&mut self, name: &str) -> Vec<u8> {
+    pub async fn read_file(&mut self, name: &str) -> Result<Vec<u8>, FileSystemError> {
         let file_id = self.file_index.files[name];
         let inode = &self.file_index.inodes[&file_id];
 
@@ -853,20 +854,17 @@ impl FileSystem {
         let mut block_buf = [0u8; BLOCK_SIZE];
         for extent in inode.inode_type.extents() {
             for i in 0..extent.len {
-                if let Ok((_, len)) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await {
-                    let take = remaining.min(len as u64) as usize;
-                    out.extend_from_slice(&block_buf[..take]);
-                    remaining -= take as u64;
-                } else {
-                    panic!("Checksum failure reading file '{}' at block {}", name, extent.start + i);
-                }
+                let (_, len) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await?;
+                let take = remaining.min(len as u64) as usize;
+                out.extend_from_slice(&block_buf[..take]);
+                remaining -= take as u64;
             }
         }
 
-        out
+        Ok(out)
     }
 
-    pub async fn write_file(&mut self, name: &str, data: &[u8]) -> FileId {
+    pub async fn write_file(&mut self, name: &str, data: &[u8]) -> Result<FileId, FileSystemError> {
         let old_inode = self.file_index.files.get(name)
             .and_then(|fid| self.file_index.inodes.get(fid)).cloned();
 
@@ -880,7 +878,7 @@ impl FileSystem {
         // Calculate blocks needed accounting for header overhead
         let blocks_needed = Self::calculate_blocks_needed(data.len());
         
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).expect("out of space");
+        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)?;
         println!("allocated extents: {:?}", allocated_extents);
 
         // Write file data in chunks that fit in BLOCK_PAYLOAD_SIZE
@@ -890,14 +888,14 @@ impl FileSystem {
                 if current_offset >= data.len() { 
                     // Write empty block for unused allocated space
                     let empty: &[u8] = &[];
-                    self.dev.write_raw_block_checked_txg(extent.start + i, &empty);
+                    self.dev.write_raw_block_checked_txg(extent.start + i, &empty)?;
                     continue; 
                 }
                 
                 let take = (data.len() - current_offset).min(BLOCK_PAYLOAD_SIZE);
                 let chunk = &data[current_offset..current_offset + take];
                 
-                self.dev.write_raw_block_checked_txg(extent.start + i, &chunk);
+                self.dev.write_raw_block_checked_txg(extent.start + i, &chunk)?;
                 current_offset += take;
             }
         }
@@ -916,15 +914,15 @@ impl FileSystem {
             },
         });
 
-        self.persist_file_index().await;
+        self.persist_file_index().await?;
 
         if let Some(old) = old_inode {
             for extent in old.inode_type.extents() { 
-                self.free(extent.start, extent.len); 
+                self.free(extent.start, extent.len)?; 
             }
         }
         
-        file_id
+        Ok(file_id)
     }
 }
 

@@ -194,7 +194,7 @@ async fn transmission_phase(
                 
                 {
                     let mut fs = fs.lock().await;
-                    let bytes_read = fs.block_read(&zvol_name, offset, &mut buf).await;
+                    let bytes_read = fs.block_read(&zvol_name, offset, &mut buf).await.unwrap();
                     println!("  -> Read {} bytes from filesystem", bytes_read);
                     
                     if bytes_read != buf.len() {
@@ -219,7 +219,7 @@ async fn transmission_phase(
                 
                 let error = {
                     let mut fs = fs.lock().await;
-                    let bytes_written = fs.block_write(&zvol_name, offset, &buf).await;
+                    let bytes_written = fs.block_write(&zvol_name, offset, &buf).await.unwrap();
                     println!("  -> Wrote {} bytes to filesystem", bytes_written);
                     
                     if bytes_written != buf.len() {
@@ -243,7 +243,7 @@ async fn transmission_phase(
                     let mut fs = fs.lock().await;
                     // Get the current file index extents to commit the txg
                     let file_index_extents = fs.current_file_index_extent.clone();
-                    fs.dev.commit_txg(file_index_extents).await;
+                    fs.dev.commit_txg(file_index_extents).await.unwrap();
                 }
                 // Optionally call fs.sync() or similar
                 stream.write_u32(NBD_REPLY_MAGIC).await?;

@@ -13,6 +13,31 @@ pub type BlockId = u64;
 pub type FileId = u64;
 
 #[derive(Debug)]
+pub enum DiskError {
+    IoError(std::io::Error),
+    ReqwestError(reqwest::Error),
+    TungsteniteError(tungstenite::error::Error)
+}
+
+impl From<std::io::Error> for DiskError {
+    fn from(error: std::io::Error) -> Self {
+        DiskError::IoError(error)
+    }
+}
+
+impl From<reqwest::Error> for DiskError {
+    fn from(error: reqwest::Error) -> Self {
+        DiskError::ReqwestError(error)
+    }
+}
+
+impl From<tungstenite::error::Error> for DiskError {
+    fn from(error: tungstenite::error::Error) -> Self {
+        DiskError::TungsteniteError(error)
+    }
+}
+
+#[derive(Debug)]
 enum DiskBackend {
     Local(Arc<Mutex<File>>),
     Remote {
@@ -36,7 +61,7 @@ impl Disk {
         matches!(self.backend, DiskBackend::Local(_))
     }
 
-    pub async fn open(path: &str) -> Self {
+    pub async fn open(path: &str) -> Result<Self, DiskError> {
         if path.starts_with("http://") || path.starts_with("https://") {
             // Try WebSocket connection first
             let url = url::Url::parse(path).expect("Invalid URL");
@@ -56,36 +81,34 @@ impl Disk {
             if let Ok((ws_stream, _)) = connect_async(&ws_url).await {
                 // Parse disk_id as u16
                 if let Ok(disk_id) = disk_id_str.parse::<u16>() {
-                    return Disk {
+                    return Ok(Disk {
                         backend: DiskBackend::WebSocket {
                             disk_id,
                             ws: Arc::new(Mutex::new(ws_stream)),
                         }
-                    };
+                    });
                 }
             }
 
             let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(3))
-                .build()
-                .unwrap();
+                .build()?;
             
-            Disk {
+            Ok(Disk {
                 backend: DiskBackend::Remote {
                     base_url,
                     disk_id,
                     client,
                 }
-            }
+            })
         } else {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 //.custom_flags(libc::O_DIRECT | libc::O_SYNC) // On Linux
-                .open(path)
-                .unwrap();
-            Disk { backend: DiskBackend::Local(Arc::new(Mutex::new(file))) }
+                .open(path)?;
+            Ok(Disk { backend: DiskBackend::Local(Arc::new(Mutex::new(file))) })
         }
     }
 
@@ -93,19 +116,19 @@ impl Disk {
 
     }
 
-    pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) {
+    pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
                 file
-                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
-                    .unwrap();
+                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))?;
                 match file.read_exact(buf) {
                     Ok(_) => {}
+                    // TODO: is this actually a good idea?
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         buf.fill(0);
                     }
-                    Err(e) => panic!("disk read error: {:?}", e),
+                    Err(e) => return Err(DiskError::IoError(e))
                 }
             },
             DiskBackend::Remote { base_url, disk_id, client } => {
@@ -113,20 +136,20 @@ impl Disk {
                 match client.get(&url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
-                            let bytes = response.bytes().await.unwrap();
+                            let bytes = response.bytes().await?;
                             if bytes.len() == BLOCK_SIZE {
                                 buf.copy_from_slice(&bytes);
                             } else if bytes.is_empty() {
                                 buf.fill(0);
                             } else {
-                                panic!("Invalid block size from remote: {}", bytes.len());
+                                return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()))
                             }
                         } else {
                             // Treat errors as empty blocks
                             buf.fill(0);
                         }
                     }
-                    Err(e) => panic!("Remote disk read error: {:?}", e),
+                    Err(e) => return Err(DiskError::ReqwestError(e))
                 }
             },
             DiskBackend::WebSocket { disk_id, ws } => {
@@ -139,15 +162,13 @@ impl Disk {
                 let mut ws_lock = ws.lock().await;
                 
                 // Send request
-                if let Err(e) = ws_lock.send(Message::Binary(request.into())).await {
-                    panic!("WebSocket send error: {:?}", e);
-                }
+                ws_lock.send(Message::Binary(request.into())).await?;
                 
                 // Receive response
                 match ws_lock.next().await {
                     Some(Ok(Message::Binary(data))) => {
                         if data.is_empty() {
-                            panic!("Empty WebSocket response");
+                            return Err(DiskError::IoError(std::io::ErrorKind::UnexpectedEof.into()))
                         }
                         
                         let status = data[0];
@@ -157,40 +178,41 @@ impl Disk {
                                 if data.len() == 1 + BLOCK_SIZE {
                                     buf.copy_from_slice(&data[1..]);
                                 } else {
-                                    panic!("Invalid block size from WebSocket: {}", data.len() - 1);
+                                    return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()))
                                 }
                             },
-                            1 => panic!("WebSocket read error: not found or not local"),
-                            2 => panic!("WebSocket read error: invalid request"),
-                            _ => panic!("WebSocket read error: unknown status {}", status),
+                            1 => return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
+                            2 => return Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into())),
+                            _ => return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::Other, 
+                                    format!("WebSocket read error: unknown status {}", status))))
                         }
                     },
-                    Some(Ok(_)) => panic!("Unexpected WebSocket message type"),
-                    Some(Err(e)) => panic!("WebSocket receive error: {:?}", e),
-                    None => panic!("WebSocket connection closed"),
+                    Some(Ok(_)) => return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into())),
+                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
+                    None => return Err(DiskError::TungsteniteError(tungstenite::error::Error::ConnectionClosed))
                 }
             }
         }
+        Ok(())
     }
 
-    pub async fn write_block(&self, block: BlockId, buf: &[u8]) {
+    pub async fn write_block(&self, block: BlockId, buf: &[u8]) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
                 file
-                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
-                    .unwrap();
-                file.write_all(buf).unwrap();
+                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))?;
+                file.write_all(buf)?;
             },
             DiskBackend::Remote { base_url, disk_id, client } => {
                 let url = format!("{}/{}/blocks/{}", base_url, disk_id, block);
                 let response = client.put(&url)
                     .body(buf.to_vec())
-                    .send().await
-                    .unwrap();
+                    .send().await?;
                 
                 if !response.status().is_success() {
-                    panic!("Remote disk write error: {}", response.status());
+                    return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::Other, 
+                        format!("Remote disk write error: {}", response.status()))))
                 }
             },
             DiskBackend::WebSocket { disk_id, ws } => {
@@ -204,30 +226,30 @@ impl Disk {
                 let mut ws_lock = ws.lock().await;
                 
                 // Send request
-                if let Err(e) = ws_lock.send(Message::Binary(request.into())).await {
-                    panic!("WebSocket send error: {:?}", e);
-                }
+                ws_lock.send(Message::Binary(request.into())).await?;
                 
                 // Receive response
                 match ws_lock.next().await {
                     Some(Ok(Message::Binary(data))) => {
                         if data.is_empty() {
-                            panic!("Empty WebSocket response");
+                            return Err(DiskError::IoError(std::io::ErrorKind::UnexpectedEof.into()))
                         }
                         
                         let status = data[0];
                         match status {
                             0 => {}, // Success
-                            1 => panic!("WebSocket write error: not found or not local"),
-                            2 => panic!("WebSocket write error: invalid request"),
-                            _ => panic!("WebSocket write error: unknown status {}", status),
+                            1 => return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
+                            2 => return Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into())),
+                            _ => return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::Other, 
+                                    format!("WebSocket write error: unknown status {}", status))))
                         }
                     },
-                    Some(Ok(_)) => panic!("Unexpected WebSocket message type"),
-                    Some(Err(e)) => panic!("WebSocket receive error: {:?}", e),
-                    None => panic!("WebSocket connection closed"),
+                    Some(Ok(_)) => return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into())),
+                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
+                    None => return Err(DiskError::TungsteniteError(tungstenite::error::Error::ConnectionClosed))
                 }
             }
         }
+        Ok(())
     }
 }

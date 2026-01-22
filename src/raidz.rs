@@ -4,8 +4,9 @@ use blake3;
 use std::future::AsyncDrop;
 use std::pin::Pin;
 use futures::future::join_all;
-use crate::disk::{Disk,BLOCK_SIZE,BlockId};
+use crate::disk::{BLOCK_SIZE, BlockId, Disk, DiskError};
 use std::collections::BTreeMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 pub const DISKS: usize = 5;
 pub const DATA_SHARDS: usize = 3;
@@ -15,6 +16,34 @@ pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const UBERBLOCK_START: u64 = 1;
 pub const UBERBLOCK_COUNT: u64 = 16;
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
+
+#[derive(Debug)]
+pub enum RaidZError {
+    DiskError(DiskError),
+    ReedSolomonError(reed_solomon_erasure::Error),
+    SerializationError(bincode::Error),
+    ChecksumMismatch,
+    InvalidMagic,
+    IncompleteStripe(u64),
+}
+
+impl From<DiskError> for RaidZError {
+    fn from(error: DiskError) -> Self {
+        RaidZError::DiskError(error)
+    }
+}
+
+impl From<bincode::Error> for RaidZError {
+    fn from(error: bincode::Error) -> Self {
+        RaidZError::SerializationError(error)
+    }
+}
+
+impl From<reed_solomon_erasure::Error> for RaidZError {
+    fn from(error: reed_solomon_erasure::Error) -> Self {
+        RaidZError::ReedSolomonError(error)
+    }
+}
 
 #[derive(Debug)]
 struct StripeBuffer {
@@ -109,7 +138,7 @@ pub struct RaidZ {
 
 impl AsyncDrop for RaidZ {
     async fn drop(mut self: Pin<&mut RaidZ>) {
-        self.sync().await
+        self.sync().await.expect("sync failure")
     }
 }
 impl Drop for RaidZ {
@@ -126,7 +155,22 @@ impl RaidZ {
     pub async fn new(paths: [&str; DISKS]) -> Self {
         // Open all disks concurrently
         let disk_futures: Vec<_> = paths.into_iter().map(|path| Disk::open(path)).collect();
-        let disks: Vec<Disk> = join_all(disk_futures).await;
+        let (disks, errors): (Vec<_>, Vec<_>) =
+            join_all(disk_futures)
+                .await
+                .into_iter()
+                .fold((Vec::new(), Vec::new()), |(mut oks, mut errs), r| {
+                    match r {
+                        Ok(d) => oks.push(d),
+                        Err(e) => errs.push(e),
+                    }
+                    (oks, errs)
+                });
+
+        if errors.len() > 0 {
+            // FIXME: this should be more descriptive and/or pass errors back as a Result
+            panic!("disk open failure")
+        }
 
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS).expect("reed solomon initialization failure");
 
@@ -143,7 +187,7 @@ impl RaidZ {
 
         for i in 0..UBERBLOCK_COUNT {
             let lba = UBERBLOCK_START + i;
-            if let Some((txg, ub)) = self.read_block_checked::<Uberblock>(lba).await {
+            if let Ok((txg, ub)) = self.read_block_checked::<Uberblock>(lba).await {
                 if ub.magic != UBERBLOCK_MAGIC {
                     continue;
                 }
@@ -168,7 +212,7 @@ impl RaidZ {
         best
     }
 
-    pub fn format(&mut self) {
+    pub fn format(&mut self) -> Result<(), RaidZError> {
         self.txg_state.txg = 0;
         // Zero out uberblock slots (TXG 0)
         let zero_uber = Uberblock {
@@ -179,25 +223,27 @@ impl RaidZ {
             file_index_extent: Vec::new(),
         };
         for slot in 0..UBERBLOCK_COUNT {
-            self.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber);
+            self.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber)?;
         }
+        Ok(())
     }
 
-    pub async fn sync(&mut self) {
+    pub async fn sync(&mut self) -> Result<(), RaidZError> {
         //println!("sync called with {} pending writes", self.txg_state.writes.len());
         if !self.txg_state.stripes.is_empty() {
             let uber = self.txg_state.uberblock.as_ref().expect("cannot sync to a device with no uberblocks");
-            self.commit_txg(uber.file_index_extent.clone()).await;
+            self.commit_txg(uber.file_index_extent.clone()).await?;
         }
+        Ok(())
     }
 
-    pub fn write_raw_block_checked_txg(&mut self, lba: BlockId, data: &[u8]) {
+    pub fn write_raw_block_checked_txg(&mut self, lba: BlockId, data: &[u8]) -> Result<(), RaidZError> {
         let stripe_id = lba / DATA_SHARDS as u64;
         let shard_idx = (lba % DATA_SHARDS as u64) as usize;
         
         // Prepare the full block with header
         let mut block_buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(self.txg_state.txg, data, &mut block_buf);
+        self.prepare_block_buffer(self.txg_state.txg, data, &mut block_buf)?;
         
         // Get or create stripe buffer
         let stripe = self.txg_state.stripes
@@ -205,10 +251,11 @@ impl RaidZ {
             .or_insert_with(StripeBuffer::new);
         
         stripe.set_shard(shard_idx, &block_buf);
+        Ok(())
     }
 
-    pub fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) {
-        let payload = bincode::serialize(value).unwrap();
+    pub fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) -> Result<(), RaidZError> {
+        let payload = bincode::serialize(value)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
 
         let stripe_id = lba / DATA_SHARDS as u64;
@@ -216,7 +263,7 @@ impl RaidZ {
         
         // Prepare the full block with header
         let mut block_buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(self.txg_state.txg, &payload, &mut block_buf);
+        self.prepare_block_buffer(self.txg_state.txg, &payload, &mut block_buf)?;
         
         // Get or create stripe buffer
         let stripe = self.txg_state.stripes
@@ -225,9 +272,10 @@ impl RaidZ {
         
         // Convert Vec to array reference for set_shard
         stripe.set_shard(shard_idx, &block_buf);
+        Ok(())
     }
 
-    fn prepare_block_buffer(&self, txg: u64, data: &[u8], buf: &mut [u8; BLOCK_SIZE]) {
+    fn prepare_block_buffer(&self, txg: u64, data: &[u8], buf: &mut [u8; BLOCK_SIZE]) -> Result<(), RaidZError> {
         let checksum = *blake3::hash(data).as_bytes();
         let header = BlockHeader {
             magic: 0x52414944,
@@ -236,12 +284,13 @@ impl RaidZ {
             payload_len: data.len() as u32,
         };
         buf.fill(0);
-        let header_bytes = bincode::serialize(&header).unwrap();
+        let header_bytes = bincode::serialize(&header)?;
         buf[..header_bytes.len()].copy_from_slice(&header_bytes);
         buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data.len()].copy_from_slice(data);
+        Ok(())
     }
 
-    pub async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> u64 {
+    pub async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> Result<u64, RaidZError> {
         let txg = self.txg_state.txg;
 
         // Take ownership of stripes
@@ -273,12 +322,12 @@ impl RaidZ {
                 let data = stripe_buf.data.as_mut().unwrap();
                 for i in missing_shards {
                     let offset = i * BLOCK_SIZE;
-                    self.disks[i].read_block(stripe_id, &mut data[offset..offset + BLOCK_SIZE]).await;
+                    self.disks[i].read_block(stripe_id, &mut data[offset..offset + BLOCK_SIZE]).await?;
                 }
             }
             
             // Now stripe is complete, write it
-            self.write_full_stripe(&stripe_buf, stripe_id).await;
+            self.write_full_stripe(&stripe_buf, stripe_id).await?;
         }
 
         // Flush all disks to ensure all blocks are durable before uberblock
@@ -294,7 +343,7 @@ impl RaidZ {
             file_index_extent,
         };
 
-        self.write_block_checked(uberblock_lba, txg, &uberblock).await;
+        self.write_block_checked(uberblock_lba, txg, &uberblock).await?;
 
         // Flush again to ensure uberblock is durable
         self.flush_all_disks();
@@ -302,7 +351,7 @@ impl RaidZ {
         // Clear TXG writes and increment txg
         self.txg_state = TxgState { txg: txg + 1, uberblock: Some(uberblock), stripes: BTreeMap::new() };
 
-        txg
+        Ok(txg)
     }
 
     fn flush_all_disks(&mut self) {
@@ -311,7 +360,7 @@ impl RaidZ {
         }
     }
 
-    async fn write_full_stripe(&mut self, stripe_buf: &StripeBuffer, stripe_id: u64) {
+    async fn write_full_stripe(&mut self, stripe_buf: &StripeBuffer, stripe_id: u64) -> Result<(), RaidZError> {
         let data = stripe_buf.data.as_ref().expect("Cannot write stripe without data");
 
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
@@ -321,18 +370,48 @@ impl RaidZ {
             shards[i].copy_from_slice(&data[offset..offset + BLOCK_SIZE]);
         }
 
-        self.rs.encode(&mut shards).expect("RS encoding failed");
+        self.rs.encode(&mut shards)?;
 
         let write_futures = shards
             .into_iter()
             .zip(self.disks.iter_mut())
-            .map(|(shard, disk)| {
+            .enumerate()
+            .map(|(disk_idx, (shard, disk))| {
                 async move {
-                    disk.write_block(stripe_id, &shard).await
+                    match disk.write_block(stripe_id, &shard).await {
+                        Ok(()) => Ok(disk_idx),
+                        Err(e) => Err((disk_idx, e))
+                    }
                 }
             });
 
-        futures::future::join_all(write_futures).await;
+        let results = futures::future::join_all(write_futures).await;
+
+        let mut successes = 0;
+        let mut failures = Vec::new();
+
+        for result in results {
+            match result {
+                Ok(_) => {
+                    successes += 1;
+                }
+                Err((disk_idx, disk_error)) => {
+                    println!("WARN: Failed to write stripe {} to disk {}: {:?}", stripe_id, disk_idx, disk_error);
+                    failures.push((disk_idx, disk_error));
+                }
+            }
+        }
+
+        // We need at least DATA_SHARDS (3) successful writes to be able to reconstruct
+        if successes >= DATA_SHARDS {
+            if !failures.is_empty() {
+                println!("Stripe {} written with {} successes and {} failures (recoverable)", 
+                        stripe_id, successes, failures.len());
+            }
+            Ok(())
+        } else {
+            Err(RaidZError::IncompleteStripe(stripe_id))
+        }
     }
 
     /// Refactored to take a mutable buffer instead of returning a Vec
@@ -340,16 +419,15 @@ impl RaidZ {
         &mut self,
         lba: BlockId,
         buf: &mut [u8],
-    ) -> Result<(u64, usize), String> {
+    ) -> Result<(u64, usize), RaidZError> {
         assert!(buf.len() >= BLOCK_SIZE);
 
-        self.read_logical_block(lba, buf).await;
+        self.read_logical_block(lba, buf).await?;
         
-        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])
-            .map_err(|e| e.to_string())?;
+        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
 
         if header.magic != 0x52414944 {
-            return Err("Invalid magic number".to_string());
+            return Err(RaidZError::InvalidMagic)
         }
 
         let payload_len = header.payload_len as usize;
@@ -358,7 +436,7 @@ impl RaidZ {
         // Checksum verification
         let checksum = *blake3::hash(payload).as_bytes();
         if checksum != header.checksum {
-            return Err("Checksum mismatch".to_string());
+            return Err(RaidZError::ChecksumMismatch);
         }
 
         buf.copy_within(BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len, 0);
@@ -369,7 +447,7 @@ impl RaidZ {
     pub async fn read_block_checked<T: for<'a> Deserialize<'a>>(
         &mut self,
         lba: BlockId,
-    ) -> Option<(u64, T)> {
+    ) -> Result<(u64, T), RaidZError> {
         let mut buf = vec![0u8; BLOCK_SIZE];
         let stripe_id = lba / DATA_SHARDS as u64;
         let shard_idx = (lba % DATA_SHARDS as u64) as usize;
@@ -380,12 +458,12 @@ impl RaidZ {
             },
             Some(_) |
             None => {
-                self.read_logical_block(lba, &mut buf).await;
+                self.read_logical_block(lba, &mut buf).await?;
             }
         }
 
         let header: BlockHeader =
-            bincode::deserialize(&buf[..BLOCK_HEADER_SIZE]).ok()?;
+            bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
 
         let payload_start = BLOCK_HEADER_SIZE;
         let payload_end = payload_start + header.payload_len as usize;
@@ -393,57 +471,95 @@ impl RaidZ {
 
         let checksum = *blake3::hash(payload).as_bytes();
         if checksum != header.checksum {
-            return None;
+            return Err(RaidZError::ChecksumMismatch);
         }
 
-        let value = bincode::deserialize(payload).ok()?;
-        Some((header.txg, value))
+        let value = bincode::deserialize(payload)?;
+        Ok((header.txg, value))
     }
 
-    async fn read_logical_block(&mut self, lba: BlockId, buf: &mut [u8]) {
+    async fn read_logical_block(&mut self, lba: BlockId, buf: &mut [u8]) -> Result<(), RaidZError> {
         let stripe = lba as usize / DATA_SHARDS;
         let data_index = lba as usize % DATA_SHARDS;
+        
+        match self.disks[data_index].read_block(stripe as u64, buf).await {
+            Ok(()) => return Ok(()),
+            Err(_disk_error) => {
+                // Primary disk failed, need to reconstruct from stripe
+                let mut shards: Vec<Option<Vec<u8>>> = vec![None; DISKS];
+                
+                // Read all other disks
+                let mut futures = self.disks.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != data_index) // Skip the failed disk
+                    .map(|(i, disk)| {
+                        async move {
+                            let mut shard = vec![0u8; BLOCK_SIZE];
+                            disk.read_block(stripe as u64, &mut shard).await?;
+                            Ok::<_, RaidZError>((i, shard))
+                        }
+                    })
+                    .collect::<FuturesUnordered<_>>();
+                
+                let mut successful_reads = 0;
+                let mut failed_indices = vec![data_index];
+                
+                while let Some(result) = futures.next().await {
+                    match result {
+                        Ok((i, shard)) => {
+                            shards[i] = Some(shard);
+                            successful_reads += 1;
+                            
+                            // We need DATA_SHARDS successful reads (3 out of the other 4 disks)
+                            if successful_reads >= DATA_SHARDS {
+                                self.rs.reconstruct_data(&mut shards)?;
 
-        let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
-
-        let futures: Vec<_> = self.disks.iter()
-            .enumerate()
-            .map(|(i, disk)| {
-                async move {
-                    let mut shard = vec![0u8; BLOCK_SIZE];
-                    disk.read_block(stripe as u64, &mut shard).await;
-                    (i, shard)
+                                if let Some(reconstructed) = &shards[data_index] {
+                                    buf.copy_from_slice(reconstructed);
+                                    return Ok(());
+                                } else {
+                                    return Err(RaidZError::IncompleteStripe(stripe as u64));
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            if let RaidZError::DiskError(_de) = e {
+                                failed_indices.push(failed_indices.len());
+                            }
+                            
+                            // Can tolerate up to PARITY_SHARDS (2) failures total
+                            if failed_indices.len() > PARITY_SHARDS {
+                                // Too many failures to reconstruct
+                                return Err(RaidZError::IncompleteStripe(stripe as u64));
+                            }
+                        }
+                    }
                 }
-            })
-            .collect();
-        
-        let results = join_all(futures).await;
-        
-        for (i, shard) in results {
-            shards[i] = shard;
+                
+                Err(RaidZError::IncompleteStripe(stripe as u64))
+            }
         }
-
-        // Reconstruction would go here if shards missing
-        buf.copy_from_slice(&shards[data_index]);
     }
 
     // FIXME: need to remove only used for writing the uberblocks
-    async fn write_logical_block(&mut self, lba: BlockId, data: &[u8]) {
+    async fn write_logical_block(&mut self, lba: BlockId, data: &[u8]) -> Result<(), RaidZError> {
         let stripe = lba as usize / DATA_SHARDS;
         let data_index = lba as usize % DATA_SHARDS;
 
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
 
         for (i, shard) in shards.iter_mut().enumerate() {
-            self.disks[i].read_block(stripe as u64, shard).await;
+            self.disks[i].read_block(stripe as u64, shard).await?;
         }
 
         shards[data_index][..data.len()].copy_from_slice(data);
-        self.rs.encode(&mut shards).unwrap();
+        self.rs.encode(&mut shards)?;
 
         for (i, shard) in shards.iter().enumerate() {
-            self.disks[i].write_block(stripe as u64, shard).await;
+            self.disks[i].write_block(stripe as u64, shard).await?;
         }
+
+        Ok(())
     }
 
     // FIXME: need to remove only used for writing the uberblocks
@@ -452,8 +568,8 @@ impl RaidZ {
         lba: BlockId,
         txg: u64,
         value: &T,
-    ) {
-        let payload = bincode::serialize(value).unwrap();
+    ) -> Result<(), RaidZError> {
+        let payload = bincode::serialize(value)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
 
         let checksum = *blake3::hash(&payload).as_bytes();
@@ -466,12 +582,14 @@ impl RaidZ {
         };
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        let header_bytes = bincode::serialize(&header).unwrap();
+        let header_bytes = bincode::serialize(&header)?;
 
         buf[..header_bytes.len()].copy_from_slice(&header_bytes);
         buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload.len()]
             .copy_from_slice(&payload);
 
-        self.write_logical_block(lba, &buf).await;
+        self.write_logical_block(lba, &buf).await?;
+
+        Ok(())
     }
 }

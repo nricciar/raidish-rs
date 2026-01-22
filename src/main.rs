@@ -13,6 +13,7 @@ mod disk;
 mod raidz;
 mod ui;
 mod nbd;
+mod nvme;
 
 use fs::{FileSystem};
 use raidz::{RaidZ};
@@ -45,6 +46,9 @@ enum Commands {
     Nbd {
         name: String,
         size: u64
+    },
+    Nvme {
+        name: String
     },
     Block {
         name: String,
@@ -104,47 +108,52 @@ async fn main() -> io::Result<()> {
 
     match cli.command {
         Commands::Nbd { name, size } => {
-            let fs = FileSystem::load(raid).await;
+            let fs = FileSystem::load(raid).await.unwrap();
             nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809).await.unwrap();
         },
+        Commands::Nvme { name } => {
+            let fs = FileSystem::load(raid).await.unwrap();
+            let server = nvme::NvmeTcpServer::new(fs, name, 4420);
+            server.run().await.unwrap();
+        },
         Commands::Block { name, size } => {
-            let mut fs = FileSystem::load(raid).await;
-            fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32).await;
+            let mut fs = FileSystem::load(raid).await.unwrap();
+            fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32).await.unwrap();
         },
         Commands::Map => {
-            let fs = FileSystem::load(raid).await;
+            let fs = FileSystem::load(raid).await.unwrap();
             fs.display_block_map();
         },
         Commands::Metaslab => {
-            let fs = FileSystem::load(raid).await;
+            let fs = FileSystem::load(raid).await.unwrap();
             fs.display_metaslab_info();
         },
         Commands::Orphaned => { 
-            let fs = FileSystem::load(raid).await;
+            let fs = FileSystem::load(raid).await.unwrap();
             let orphans = fs.find_orphaned_blocks();
             println!("orphans: {:?}", orphans);
         },
         Commands::Read{ file } => {
-            let mut fs = FileSystem::load(raid).await;
-            let data = fs.read_file(&file).await;
+            let mut fs = FileSystem::load(raid).await.unwrap();
+            let data = fs.read_file(&file).await.unwrap();
             std::fs::write("output.png", data)?;
         },
         Commands::Write { file } => {
-            let mut fs = FileSystem::load(raid).await;
+            let mut fs = FileSystem::load(raid).await.unwrap();
             let file = Path::new(&file);
             let data = std::fs::read(file).unwrap();
-            fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data).await;
+            fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data).await.unwrap();
         },
         Commands::Delete { file } => {
-            let mut fs = FileSystem::load(raid).await;
-            fs.delete(&file).await;
+            let mut fs = FileSystem::load(raid).await.unwrap();
+            fs.delete(&file).await.unwrap();
         },
         Commands::Format => {
-            let fs = FileSystem::format(raid, 500_000).await;
+            let fs = FileSystem::format(raid, 500_000).await.unwrap();
             println!("index: {:?}", fs.file_index);
         },
         Commands::Load => {
-            let fs = FileSystem::load(raid).await;
+            let fs = FileSystem::load(raid).await.unwrap();
             println!("index: {:?}", fs.file_index);
         },
         Commands::Listen { port } => {
