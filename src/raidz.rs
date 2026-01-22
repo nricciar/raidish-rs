@@ -17,22 +17,63 @@ pub const UBERBLOCK_COUNT: u64 = 16;
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
 
 #[derive(Debug)]
-enum TxgPayload {
-    Raw(Vec<u8>),
-    Checked(Vec<u8>), // Already serialized + ready to write
+struct StripeBuffer {
+    data: Option<Box<[u8; BLOCK_SIZE * DATA_SHARDS]>>,
+    shard_mask: u8,
+    dirty: bool,
+    flushed: bool,  // For optimistic writes
 }
 
-#[derive(Debug)]
-struct TxgWrite {
-    lba: BlockId,
-    data: TxgPayload,
+impl StripeBuffer {
+    fn new() -> Self {
+        StripeBuffer {
+            data: None,
+            shard_mask: 0,
+            dirty: false,
+            flushed: false,
+        }
+    }
+    
+    fn set_shard(&mut self, shard_idx: usize, block_data: &[u8; BLOCK_SIZE]) {
+        assert!(shard_idx < DATA_SHARDS);
+        
+        // Lazy allocation on first write
+        if self.data.is_none() {
+            self.data = Some(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
+        }
+        
+        let offset = shard_idx * BLOCK_SIZE;
+        self.data.as_mut().unwrap()[offset..offset + BLOCK_SIZE]
+            .copy_from_slice(block_data);
+        
+        self.shard_mask |= 1 << shard_idx;
+        self.dirty = true;
+        self.flushed = false; // Mark as needing flush again
+    }
+    
+    fn has_shard(&self, shard_idx: usize) -> bool {
+        (self.shard_mask & (1 << shard_idx)) != 0
+    }
+    
+    fn is_complete(&self) -> bool {
+        self.shard_mask == 0b111  // All 3 data shards present
+    }
+    
+    fn get_shard(&self, shard_idx: usize, buf: &mut [u8]) -> bool {
+        if !self.has_shard(shard_idx) {
+            return false;
+        }
+        let offset = shard_idx * BLOCK_SIZE;
+        buf.copy_from_slice(&self.data.as_ref().unwrap()[offset..offset + BLOCK_SIZE]);
+        true
+    }
 }
 
 #[derive(Debug)]
 struct TxgState {
     txg: u64,
     uberblock: Option<Uberblock>,
-    writes: Vec<TxgWrite>,
+    stripes: BTreeMap<u64, StripeBuffer>,
 }
 
 #[repr(C)]
@@ -86,12 +127,14 @@ impl RaidZ {
         // Open all disks concurrently
         let disk_futures: Vec<_> = paths.into_iter().map(|path| Disk::open(path)).collect();
         let disks: Vec<Disk> = join_all(disk_futures).await;
-        //let disks: Vec<Disk> = paths.into_iter().map(Disk::open).collect();
-        let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS).unwrap();
-        let txg_state = TxgState { txg: 0, uberblock: None, writes: Vec::new() };
 
+        let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS).expect("reed solomon initialization failure");
+
+        // find our last txg and setup txg_state
+        let txg_state = TxgState { txg: 0, uberblock: None, stripes: BTreeMap::new() };
         let mut rz = RaidZ { disks, rs, txg_state };
         rz.scan_uberblocks().await;
+
         rz
     }
 
@@ -104,8 +147,14 @@ impl RaidZ {
                 if ub.magic != UBERBLOCK_MAGIC {
                     continue;
                 }
-                if best.is_none() || txg > best.as_ref().unwrap().0 {
-                    best = Some((txg, ub));
+                match &best {
+                    None => {
+                        best = Some((txg, ub));
+                    }
+                    Some((best_txg, _)) if txg > *best_txg => {
+                        best = Some((txg, ub));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -136,62 +185,49 @@ impl RaidZ {
 
     pub async fn sync(&mut self) {
         //println!("sync called with {} pending writes", self.txg_state.writes.len());
-        if !self.txg_state.writes.is_empty() {
+        if !self.txg_state.stripes.is_empty() {
             let uber = self.txg_state.uberblock.as_ref().expect("cannot sync to a device with no uberblocks");
             self.commit_txg(uber.file_index_extent.clone()).await;
         }
     }
 
     pub fn write_raw_block_checked_txg(&mut self, lba: BlockId, data: &[u8]) {
-        // Check if we already have a pending write for this block
-        let mut found_index = None;
-        for (i, write) in self.txg_state.writes.iter().enumerate().rev() {
-            if write.lba == lba {
-                found_index = Some(i);
-                break;
-            }
-        }
-
-        let new_write = TxgWrite {
-            lba,
-            data: TxgPayload::Raw(data.to_vec()),
-        };
-
-        if let Some(idx) = found_index {
-            // Replace existing pending write (avoid duplicates)
-            self.txg_state.writes[idx] = new_write;
-        } else {
-            // Add new pending write
-            self.txg_state.writes.push(new_write);
-        }
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let shard_idx = (lba % DATA_SHARDS as u64) as usize;
+        
+        // Prepare the full block with header
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(self.txg_state.txg, data, &mut block_buf);
+        
+        // Get or create stripe buffer
+        let stripe = self.txg_state.stripes
+            .entry(stripe_id)
+            .or_insert_with(StripeBuffer::new);
+        
+        stripe.set_shard(shard_idx, &block_buf);
     }
 
     pub fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) {
         let payload = bincode::serialize(value).unwrap();
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
 
-        // Same deduplication logic
-        let mut found_index = None;
-        for (i, write) in self.txg_state.writes.iter().enumerate().rev() {
-            if write.lba == lba {
-                found_index = Some(i);
-                break;
-            }
-        }
-
-        let new_write = TxgWrite {
-            lba,
-            data: TxgPayload::Checked(payload),
-        };
-
-        if let Some(idx) = found_index {
-            self.txg_state.writes[idx] = new_write;
-        } else {
-            self.txg_state.writes.push(new_write);
-        }
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let shard_idx = (lba % DATA_SHARDS as u64) as usize;
+        
+        // Prepare the full block with header
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(self.txg_state.txg, &payload, &mut block_buf);
+        
+        // Get or create stripe buffer
+        let stripe = self.txg_state.stripes
+            .entry(stripe_id)
+            .or_insert_with(StripeBuffer::new);
+        
+        // Convert Vec to array reference for set_shard
+        stripe.set_shard(shard_idx, &block_buf);
     }
 
-    fn prepare_block_buffer(&self, txg: u64, data: &[u8]) -> Vec<u8> {
+    fn prepare_block_buffer(&self, txg: u64, data: &[u8], buf: &mut [u8; BLOCK_SIZE]) {
         let checksum = *blake3::hash(data).as_bytes();
         let header = BlockHeader {
             magic: 0x52414944,
@@ -199,50 +235,50 @@ impl RaidZ {
             checksum,
             payload_len: data.len() as u32,
         };
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        buf.fill(0);
         let header_bytes = bincode::serialize(&header).unwrap();
         buf[..header_bytes.len()].copy_from_slice(&header_bytes);
         buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data.len()].copy_from_slice(data);
-        buf
     }
 
     pub async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> u64 {
         let txg = self.txg_state.txg;
 
-        // Take ownership of writes to avoid borrowing conflicts
-        let writes = std::mem::take(&mut self.txg_state.writes);
+        // Take ownership of stripes
+        let stripes = std::mem::take(&mut self.txg_state.stripes);
 
-        // Group writes by Stripe ID
-        let mut stripes: BTreeMap<u64, Vec<Option<Vec<u8>>>> = BTreeMap::new();
-        for w in writes {
-            let data = match w.data {
-                TxgPayload::Raw(d) | TxgPayload::Checked(d) => d,
-            };
+        for (stripe_id, mut stripe_buf) in stripes {
+            // Check if already flushed
+            if stripe_buf.flushed && !stripe_buf.dirty {
+                continue;
+            }
             
-            // Re-package into the block format (Header + Payload)
-            let full_block = self.prepare_block_buffer(txg, &data);
-            
-            let stripe_id = w.lba / DATA_SHARDS as u64;
-            let shard_index = (w.lba % DATA_SHARDS as u64) as usize;
-            
-            let stripe_entry = stripes.entry(stripe_id)
-                .or_insert_with(|| vec![None; DATA_SHARDS]);
-            stripe_entry[shard_index] = Some(full_block);
-        }
+            // Handle incomplete stripes (RMW)
+            // FIXME: if we can ensure that all writes are full stripes we can get rid of this
+            if !stripe_buf.is_complete() {
+                //println!("WARN: RMW operation in commit_txg for stripe {}", stripe_id);
+                
+                if stripe_buf.data.is_none() {
+                    stripe_buf.data = Some(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
+                }
+                
+                let mut missing_shards = Vec::new();
+                for i in 0..DATA_SHARDS {
+                    if !stripe_buf.has_shard(i) {
+                        missing_shards.push(i);
+                    }
+                }
 
-        // TODO: Write full stripes
-        // FIXME: this should eventually be unnessicary once everything is fully on board with the
-        // stripe alignment and using the write_block_checked_txg method
-        for (stripe_id, mut data_shards) in stripes {
-            for i in 0..DATA_SHARDS {
-                if data_shards[i].is_none() {
-                    //println!("WARN: RMW: operation in commit_txg for stripe {}", stripe_id);
-                    let mut existing = vec![0u8; BLOCK_SIZE];
-                    self.disks[i].read_block(stripe_id, &mut existing).await;
-                    data_shards[i] = Some(existing);
+                // read missing shards
+                let data = stripe_buf.data.as_mut().unwrap();
+                for i in missing_shards {
+                    let offset = i * BLOCK_SIZE;
+                    self.disks[i].read_block(stripe_id, &mut data[offset..offset + BLOCK_SIZE]).await;
                 }
             }
-            self.write_full_stripe(stripe_id, data_shards).await;
+            
+            // Now stripe is complete, write it
+            self.write_full_stripe(&stripe_buf, stripe_id).await;
         }
 
         // Flush all disks to ensure all blocks are durable before uberblock
@@ -264,7 +300,7 @@ impl RaidZ {
         self.flush_all_disks();
 
         // Clear TXG writes and increment txg
-        self.txg_state = TxgState { txg: txg + 1, uberblock: Some(uberblock), writes: Vec::new() };
+        self.txg_state = TxgState { txg: txg + 1, uberblock: Some(uberblock), stripes: BTreeMap::new() };
 
         txg
     }
@@ -275,13 +311,14 @@ impl RaidZ {
         }
     }
 
-    async fn write_full_stripe(&mut self, stripe_id: u64, data_shards: Vec<Option<Vec<u8>>>) {
+    async fn write_full_stripe(&mut self, stripe_buf: &StripeBuffer, stripe_id: u64) {
+        let data = stripe_buf.data.as_ref().expect("Cannot write stripe without data");
+
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
 
-        for (i, data) in data_shards.into_iter().enumerate() {
-            if let Some(d) = data {
-                shards[i] = d;
-            }
+        for i in 0..DATA_SHARDS {
+            let offset = i * BLOCK_SIZE;
+            shards[i].copy_from_slice(&data[offset..offset + BLOCK_SIZE]);
         }
 
         self.rs.encode(&mut shards).expect("RS encoding failed");
@@ -306,8 +343,6 @@ impl RaidZ {
     ) -> Result<(u64, usize), String> {
         assert!(buf.len() >= BLOCK_SIZE);
 
-        // read_logical_block still allocates shards internally for RS-decoding, 
-        // but we avoid the extra allocation for the return payload.
         self.read_logical_block(lba, buf).await;
         
         let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])
@@ -335,22 +370,19 @@ impl RaidZ {
         &mut self,
         lba: BlockId,
     ) -> Option<(u64, T)> {
-        // Check pending writes first 
-        let cur_txg = self.txg_state.txg;
-        for write in self.txg_state.writes.iter().rev() {
-            if write.lba == lba {
-                match &write.data {
-                    TxgPayload::Raw(_) => (),
-                    TxgPayload::Checked(d) => {
-                        let value = bincode::deserialize(d).ok()?;
-                        return Some((cur_txg, value))
-                    },
-                };
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let shard_idx = (lba % DATA_SHARDS as u64) as usize;
+
+        match self.txg_state.stripes.get(&stripe_id) {
+            Some(stripe_buf) if stripe_buf.has_shard(shard_idx) => {
+                stripe_buf.get_shard(shard_idx, &mut buf);
+            },
+            Some(_) |
+            None => {
+                self.read_logical_block(lba, &mut buf).await;
             }
         }
-
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        self.read_logical_block(lba, &mut buf).await;
 
         let header: BlockHeader =
             bincode::deserialize(&buf[..BLOCK_HEADER_SIZE]).ok()?;

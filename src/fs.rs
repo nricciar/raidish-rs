@@ -3,11 +3,13 @@ use std::collections::BTreeMap;
 use crate::disk::{BLOCK_SIZE,FileId};
 use crate::raidz::{RaidZ,BLOCK_PAYLOAD_SIZE,UBERBLOCK_START,UBERBLOCK_COUNT,Uberblock,Extent,UBERBLOCK_MAGIC};
 
+// TODO
+// Superblock, Uberblock and Metaslab alignment to stripe needs to be considered
 pub const FS_ID: &str = "RAIDISHV10";
-pub const METASLAB_SIZE_BLOCKS: u64 = 1024; // 4MB metaslabs
+pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
 //pub const MAX_METASLABS: u32 = 128;
 pub const SUPERBLOCK_LBA: u64 = 0;
-pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT;
+pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT + 2; // +2 is to keep stripe alignment
 pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
