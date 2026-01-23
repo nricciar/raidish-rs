@@ -1,5 +1,5 @@
-use crate::fs::{FileSystem,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
-use crate::raidz::{UBERBLOCK_COUNT,UBERBLOCK_START};
+use crate::fs::{FileSystem};
+use crate::raidz::{UBERBLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
@@ -72,9 +72,11 @@ impl FileSystem {
             return BlockType::Uberblock;
         }
 
+        let superblock = self.dev.superblock().unwrap();
+
         // Metaslab headers
         let metaslab_headers_start = METASLAB_TABLE_START;
-        let metaslab_headers_end = metaslab_headers_start + self.superblock.metaslab_count as u64;
+        let metaslab_headers_end = metaslab_headers_start + superblock.metaslab_count as u64;
         if lba >= metaslab_headers_start && lba < metaslab_headers_end {
             return BlockType::MetaslabHeader;
         }
@@ -82,7 +84,7 @@ impl FileSystem {
         // Space map logs
         let spacemap_logs_start = metaslab_headers_end;
         let spacemap_logs_end = spacemap_logs_start + 
-            (self.superblock.metaslab_count as u64 * SPACEMAP_LOG_BLOCKS_PER_METASLAB);
+            (superblock.metaslab_count as u64 * SPACEMAP_LOG_BLOCKS_PER_METASLAB);
         if lba >= spacemap_logs_start && lba < spacemap_logs_end {
             return BlockType::SpaceMapLog;
         }
@@ -119,7 +121,8 @@ impl FileSystem {
 
     /// Build a complete block type map efficiently
     fn build_block_map(&self) -> Vec<BlockType> {
-        let total_blocks = self.superblock.total_blocks as usize;
+        let superblock = self.dev.superblock().unwrap();
+        let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
         
         // Mark free blocks first (since they're the base state for data region)
@@ -155,14 +158,14 @@ impl FileSystem {
         
         // Mark metadata regions (these override data allocations)
         let metaslab_headers_start = METASLAB_TABLE_START as usize;
-        let metaslab_headers_end = metaslab_headers_start + self.superblock.metaslab_count as usize;
+        let metaslab_headers_end = metaslab_headers_start + superblock.metaslab_count as usize;
         for i in metaslab_headers_start..metaslab_headers_end.min(total_blocks) {
             block_map[i] = BlockType::MetaslabHeader;
         }
         
         let spacemap_logs_start = metaslab_headers_end;
         let spacemap_logs_end = spacemap_logs_start + 
-            (self.superblock.metaslab_count as usize * SPACEMAP_LOG_BLOCKS_PER_METASLAB as usize);
+            (superblock.metaslab_count as usize * SPACEMAP_LOG_BLOCKS_PER_METASLAB as usize);
         for i in spacemap_logs_start..spacemap_logs_end.min(total_blocks) {
             block_map[i] = BlockType::SpaceMapLog;
         }
@@ -184,9 +187,11 @@ impl FileSystem {
 
     /// Display a visual map of block usage
     pub fn display_block_map(&self) {
+        let superblock = self.dev.superblock().unwrap();
+
         const RESET: &str = "\x1b[0m";
         
-        let total_blocks = self.superblock.total_blocks;
+        let total_blocks = superblock.total_blocks;
         let (term_width, term_height) = Self::get_terminal_dimensions();
         
         // Reserve space for labels and margins (10 chars for block numbers + 3 for " │ " + 1 for safety)

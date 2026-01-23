@@ -1,22 +1,26 @@
 use serde::{Serialize, Deserialize};
 use std::collections::BTreeMap;
 use crate::disk::{BLOCK_SIZE,FileId,DiskError};
-use crate::raidz::{RaidZ,BLOCK_PAYLOAD_SIZE,UBERBLOCK_START,UBERBLOCK_COUNT,Uberblock,Extent,UBERBLOCK_MAGIC,RaidZError};
-
-// TODO
-// Superblock, Uberblock and Metaslab alignment to stripe needs to be considered
-pub const FS_ID: &str = "RAIDISHV10";
-pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
-//pub const MAX_METASLABS: u32 = 128;
-pub const SUPERBLOCK_LBA: u64 = 0;
-pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT + 2; // +2 is to keep stripe alignment
-pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
+use crate::raidz::{
+    RaidZ,
+    BLOCK_PAYLOAD_SIZE,
+    UBERBLOCK_START,
+    UBERBLOCK_COUNT,
+    Uberblock,
+    Extent,
+    UBERBLOCK_MAGIC,
+    RaidZError,
+    METASLAB_SIZE_BLOCKS,
+    METASLAB_TABLE_START,
+    SPACEMAP_LOG_BLOCKS_PER_METASLAB
+};
 
 #[derive(Debug)]
 pub enum FileSystemError {
     DiskError(DiskError),
     RaidZError(RaidZError),
-    UnableToAllocateBlocks(u64)
+    UnableToAllocateBlocks(u64),
+    NotFormatted
 }
 
 impl From<DiskError> for FileSystemError {
@@ -29,16 +33,6 @@ impl From<RaidZError> for FileSystemError {
     fn from(error: RaidZError) -> Self {
         FileSystemError::RaidZError(error)
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Superblock {
-    pub magic: String,
-    pub block_size: u32,
-    pub total_blocks: u64,
-    pub metaslab_count: u32,
-    pub metaslab_size_blocks: u64,
-    pub metaslab_table_start: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -117,7 +111,6 @@ pub struct FileIndex {
 #[derive(Debug)]
 pub struct FileSystem {
     pub dev: RaidZ,
-    pub superblock: Superblock,
     pub metaslabs: Vec<MetaslabState>,
     pub file_index: FileIndex,
     pub current_file_index_extent: Vec<Extent>,
@@ -419,18 +412,6 @@ impl FileSystem {
         
         let data_blocks_start = spacemap_logs_end;
 
-        let superblock = Superblock {
-            magic: FS_ID.to_string(),
-            block_size: BLOCK_SIZE as u32,
-            total_blocks,
-            metaslab_count,
-            metaslab_size_blocks: METASLAB_SIZE_BLOCKS,
-            metaslab_table_start: METASLAB_TABLE_START,
-        };
-        
-        // TXG 0 is reserved for initial format
-        dev.write_block_checked_txg(SUPERBLOCK_LBA, &superblock)?;
-
         let mut metaslabs = Vec::new();
         for i in 0..metaslab_count {
             let start_block = data_blocks_start + (i as u64 * METASLAB_SIZE_BLOCKS);
@@ -470,7 +451,6 @@ impl FileSystem {
 
         let mut fs = FileSystem {
             dev,
-            superblock,
             metaslabs,
             file_index: FileIndex {
                 next_file_id: 1,
@@ -480,7 +460,7 @@ impl FileSystem {
             current_file_index_extent: Vec::new()
         };
 
-        fs.dev.format()?;
+        fs.dev.format(total_blocks)?;
         fs.persist_file_index().await?;
         Ok(fs)
     }
@@ -708,13 +688,12 @@ impl FileSystem {
     }
 
     pub async fn load(mut dev: RaidZ) -> Result<Self, FileSystemError> {
-        // Load superblock (TXG 0 from format)
-        let (_, superblock): (_, Superblock) =
-            dev.read_block_checked(SUPERBLOCK_LBA).await?;
-        assert_eq!(superblock.magic, FS_ID);
+        let superblock =
+            dev.superblock().ok_or(FileSystemError::NotFormatted)?.clone();
 
         // Load metaslabs and replay space maps
         let mut metaslabs = Vec::new();
+
         for i in 0..superblock.metaslab_count {
             let (_, header) : (u64, MetaslabHeader) = 
                 dev.read_block_checked(superblock.metaslab_table_start + i as u64).await?;
@@ -833,7 +812,6 @@ impl FileSystem {
 
         Ok(FileSystem {
             dev,
-            superblock,
             metaslabs,
             file_index,
             current_file_index_extent: uber.file_index_extent

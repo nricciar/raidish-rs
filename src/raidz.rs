@@ -8,14 +8,19 @@ use crate::disk::{BLOCK_SIZE, BlockId, Disk, DiskError};
 use std::collections::BTreeMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+pub const FS_ID: &str = "RAIDISHV10";
 pub const DISKS: usize = 5;
 pub const DATA_SHARDS: usize = 3;
 pub const PARITY_SHARDS: usize = 2;
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
-pub const UBERBLOCK_START: u64 = 1;
-pub const UBERBLOCK_COUNT: u64 = 16;
+pub const SUPERBLOCK_LBA: u64 = 0;
+pub const UBERBLOCK_START: u64 = 3;
+pub const UBERBLOCK_COUNT: u64 = 15;
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
+pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
+pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT;
+pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
 
 #[derive(Debug)]
 pub enum RaidZError {
@@ -66,18 +71,14 @@ impl StripeBuffer {
     fn set_shard(&mut self, shard_idx: usize, block_data: &[u8; BLOCK_SIZE]) {
         assert!(shard_idx < DATA_SHARDS);
         
-        // Lazy allocation on first write
-        if self.data.is_none() {
-            self.data = Some(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
-        }
+        let data_ptr = self.data.get_or_insert_with(|| Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
         
         let offset = shard_idx * BLOCK_SIZE;
-        self.data.as_mut().unwrap()[offset..offset + BLOCK_SIZE]
-            .copy_from_slice(block_data);
+        data_ptr[offset..offset + BLOCK_SIZE].copy_from_slice(block_data);
         
         self.shard_mask |= 1 << shard_idx;
         self.dirty = true;
-        self.flushed = false; // Mark as needing flush again
+        self.flushed = false;
     }
     
     fn has_shard(&self, shard_idx: usize) -> bool {
@@ -89,12 +90,14 @@ impl StripeBuffer {
     }
     
     fn get_shard(&self, shard_idx: usize, buf: &mut [u8]) -> bool {
-        if !self.has_shard(shard_idx) {
-            return false;
+        match &self.data {
+            Some(d) if self.has_shard(shard_idx) => {
+                let offset = shard_idx * BLOCK_SIZE;
+                buf.copy_from_slice(&d[offset..offset + BLOCK_SIZE]);
+                true
+            }
+            _ => false,
         }
-        let offset = shard_idx * BLOCK_SIZE;
-        buf.copy_from_slice(&self.data.as_ref().unwrap()[offset..offset + BLOCK_SIZE]);
-        true
     }
 }
 
@@ -112,6 +115,16 @@ pub struct BlockHeader {
     pub txg: u64,
     pub checksum: [u8; 32],
     pub payload_len: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Superblock {
+    pub magic: String,
+    pub block_size: u32,
+    pub total_blocks: u64,
+    pub metaslab_count: u32,
+    pub metaslab_size_blocks: u64,
+    pub metaslab_table_start: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,6 +145,7 @@ pub struct Extent {
 #[derive(Debug)]
 pub struct RaidZ {
     pub disks: Vec<Disk>,
+    superblock: Option<Superblock>,
     rs: ReedSolomon,
     txg_state: TxgState
 }
@@ -150,6 +164,14 @@ impl Drop for RaidZ {
 impl RaidZ {
     pub fn is_local_disk(&self, index: usize) -> bool {
         self.disks[index].is_local()
+    }
+
+    pub fn superblock(&self) -> Option<&Superblock> {
+        self.superblock.as_ref()
+    }
+
+    pub fn is_formatted(&self) -> bool {
+        self.superblock.is_some() && self.txg_state.uberblock.is_some()
     }
 
     pub async fn new(paths: [&str; DISKS]) -> Self {
@@ -176,13 +198,23 @@ impl RaidZ {
 
         // find our last txg and setup txg_state
         let txg_state = TxgState { txg: 0, uberblock: None, stripes: BTreeMap::new() };
-        let mut rz = RaidZ { disks, rs, txg_state };
+        let mut rz = RaidZ { disks, rs, txg_state, superblock: None };
         rz.scan_uberblocks().await;
 
         rz
     }
 
     async fn scan_uberblocks(&mut self) -> Option<(u64, Uberblock)> {
+        // Load superblock (TXG 0 from format)
+        match self.read_block_checked::<Superblock>(SUPERBLOCK_LBA).await {
+            Ok((_, superblock)) => {
+                self.superblock = Some(superblock)
+            },
+            Err(e) => {
+                println!("WARNING! {:?}", e);
+            }
+        }
+
         let mut best: Option<(u64, Uberblock)> = None;
 
         for i in 0..UBERBLOCK_COUNT {
@@ -212,7 +244,23 @@ impl RaidZ {
         best
     }
 
-    pub fn format(&mut self) -> Result<(), RaidZError> {
+    pub fn format(&mut self, total_blocks: u64) -> Result<(), RaidZError> {
+        let metaslab_count = (total_blocks / METASLAB_SIZE_BLOCKS) as u32;
+
+        let superblock = Superblock {
+            magic: FS_ID.to_string(),
+            block_size: BLOCK_SIZE as u32,
+            total_blocks,
+            metaslab_count,
+            metaslab_size_blocks: METASLAB_SIZE_BLOCKS,
+            metaslab_table_start: METASLAB_TABLE_START,
+        };
+        
+        // TXG 0 is reserved for initial format
+        for mirror_idx in 0..3 {
+            self.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock)?;
+        }
+
         self.txg_state.txg = 0;
         // Zero out uberblock slots (TXG 0)
         let zero_uber = Uberblock {
@@ -296,6 +344,9 @@ impl RaidZ {
         // Take ownership of stripes
         let stripes = std::mem::take(&mut self.txg_state.stripes);
 
+        // increment the txg for the buffer
+        self.txg_state.txg += 1;
+
         for (stripe_id, mut stripe_buf) in stripes {
             // Check if already flushed
             if stripe_buf.flushed && !stripe_buf.dirty {
@@ -306,23 +357,32 @@ impl RaidZ {
             // FIXME: if we can ensure that all writes are full stripes we can get rid of this
             if !stripe_buf.is_complete() {
                 //println!("WARN: RMW operation in commit_txg for stripe {}", stripe_id);
-                
-                if stripe_buf.data.is_none() {
-                    stripe_buf.data = Some(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
-                }
-                
-                let mut missing_shards = Vec::new();
+                // Identify missing shards before borrowing the data buffer
+                let mut missing_indices = Vec::new();
                 for i in 0..DATA_SHARDS {
                     if !stripe_buf.has_shard(i) {
-                        missing_shards.push(i);
+                        missing_indices.push(i);
                     }
                 }
 
-                // read missing shards
-                let data = stripe_buf.data.as_mut().unwrap();
-                for i in missing_shards {
-                    let offset = i * BLOCK_SIZE;
-                    self.disks[i].read_block(stripe_id, &mut data[offset..offset + BLOCK_SIZE]).await?;
+                let data = stripe_buf.data.get_or_insert_with(|| {
+                    Box::new([0u8; BLOCK_SIZE * DATA_SHARDS])
+                });
+                
+                let mut read_tasks = FuturesUnordered::new();
+                for i in missing_indices {
+                    let disk = &self.disks[i];
+                    read_tasks.push(async move {
+                        let mut buf = [0u8; BLOCK_SIZE];
+                        disk.read_block(stripe_id, &mut buf).await.map(|_| (i, buf))
+                    });
+                }
+
+                while let Some(result) = read_tasks.next().await {
+                    let (shard_idx, buf) = result?;
+                    let offset = shard_idx * BLOCK_SIZE;
+                    data[offset..offset + BLOCK_SIZE].copy_from_slice(&buf);
+                    stripe_buf.shard_mask |= 1 << shard_idx;
                 }
             }
             
@@ -348,8 +408,7 @@ impl RaidZ {
         // Flush again to ensure uberblock is durable
         self.flush_all_disks();
 
-        // Clear TXG writes and increment txg
-        self.txg_state = TxgState { txg: txg + 1, uberblock: Some(uberblock), stripes: BTreeMap::new() };
+        self.txg_state.uberblock = Some(uberblock);
 
         Ok(txg)
     }
