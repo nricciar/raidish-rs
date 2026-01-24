@@ -529,7 +529,7 @@ impl RaidZ {
     }
 
     pub async fn read_block_checked<T: for<'a> Deserialize<'a>>(
-        &mut self,
+        &self,
         lba: BlockId,
     ) -> Result<(u64, T), RaidZError> {
         let mut buf = vec![0u8; BLOCK_SIZE];
@@ -562,7 +562,7 @@ impl RaidZ {
         Ok((header.txg, value))
     }
 
-    async fn read_logical_block(&mut self, lba: BlockId, buf: &mut [u8]) -> Result<(), RaidZError> {
+    async fn read_logical_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), RaidZError> {
         let stripe = lba as usize / DATA_SHARDS;
         let data_index = lba as usize % DATA_SHARDS;
         

@@ -247,18 +247,14 @@ impl NvmeTcpServer {
         // Get device size
         let device_size = {
             let fs_lock = fs.lock().await;
-            let file_id = *fs_lock.file_index.files.get(&device_name)
+            let inode_ref = fs_lock.file_index.files.get(&device_name)
                 .ok_or_else(|| std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("Device '{}' not found", device_name)
                 ))?;
             
-            let inode = fs_lock.file_index.inodes.get(&file_id)
-                .ok_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Inode not found"
-                ))?;
-            
+            let inode = fs_lock.read_inode(&inode_ref).await.unwrap();
+
             inode.inode_type.size_bytes()
         };
 

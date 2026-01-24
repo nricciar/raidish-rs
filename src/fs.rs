@@ -16,7 +16,8 @@ pub enum FileSystemError {
     DiskError(DiskError),
     RaidZError(RaidZError),
     UnableToAllocateBlocks(u64),
-    NotFormatted
+    NotFormatted,
+    FileNotFound
 }
 
 impl From<DiskError> for FileSystemError {
@@ -98,10 +99,15 @@ pub struct FileInode {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InodeRef {
+    pub file_id: FileId,
+    pub inode_extent: Vec<Extent>,  // Where the inode is stored on disk
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileIndex {
     pub next_file_id: FileId,
-    pub files: BTreeMap<String, FileId>,
-    pub inodes: BTreeMap<FileId, FileInode>,
+    pub files: BTreeMap<String, InodeRef>
 }
 
 #[derive(Debug)]
@@ -115,19 +121,24 @@ pub struct FileSystem {
 impl FileSystem {
     /// Delete a virtual block device or file
     pub async fn delete(&mut self, name: &str) -> Result<(), FileSystemError> {
-        let file_id = match self.file_index.files.remove(name) {
-            Some(id) => id,
+        let inode_ref = match self.file_index.files.remove(name) {
+            Some(iref) => iref,
             None => {
                 println!("'{}' does not exist", name);
                 return Ok(());
             }
         };
 
-        let inode = self.file_index.inodes.remove(&file_id)
-            .expect("Inode missing");
+        // Read the inode to get its extents
+        let inode = self.read_inode(&inode_ref).await?;
 
-        // Free all blocks
+        // Free file data blocks
         for extent in inode.inode_type.extents() {
+            self.free(extent.start, extent.len)?;
+        }
+
+        // Free inode blocks
+        for extent in &inode_ref.inode_extent {
             self.free(extent.start, extent.len)?;
         }
 
@@ -137,12 +148,21 @@ impl FileSystem {
     }
 
     /// Find all blocks that are allocated but not referenced by any live data
-    pub fn find_orphaned_blocks(&self) -> Vec<(u64, u64)> {
+    pub async fn find_orphaned_blocks(&self) -> Result<Vec<(u64, u64)>, FileSystemError> {
         // Step 1: Build set of all blocks that SHOULD be allocated
         let mut live_blocks = std::collections::HashSet::new();
         
-        // Mark file data blocks
-        for inode in self.file_index.inodes.values() {
+        // Mark file data blocks AND inode blocks
+        for inode_ref in self.file_index.files.values() {
+            // Mark inode storage blocks
+            for extent in &inode_ref.inode_extent {
+                for i in 0..extent.len {
+                    live_blocks.insert(extent.start + i);
+                }
+            }
+            
+            // Read inode and mark its data blocks
+            let inode = self.read_inode(inode_ref).await?;
             for extent in inode.inode_type.extents() {
                 for i in 0..extent.len {
                     live_blocks.insert(extent.start + i);
@@ -205,7 +225,7 @@ impl FileSystem {
             }
         }
         
-        orphaned
+        Ok(orphaned)
     }
     
     pub async fn format(mut dev: RaidZ, total_blocks: u64) -> Result<Self, FileSystemError> {
@@ -263,7 +283,6 @@ impl FileSystem {
             file_index: FileIndex {
                 next_file_id: 1,
                 files: BTreeMap::new(),
-                inodes: BTreeMap::new(),
             },
             current_file_index_extent: Vec::new()
         };
@@ -608,9 +627,11 @@ impl FileSystem {
     }
 
     pub async fn read_file(&mut self, name: &str) -> Result<Vec<u8>, FileSystemError> {
-        let file_id = self.file_index.files[name];
-        let inode = &self.file_index.inodes[&file_id];
-
+        let inode_ref = self.file_index.files.get(name)
+            .ok_or_else(|| FileSystemError::FileNotFound)?.clone();
+        
+        let inode = self.read_inode(&inode_ref).await?;
+        
         if !inode.inode_type.is_file() {
             panic!("'{}' is not a regular file", name);
         }
@@ -632,12 +653,12 @@ impl FileSystem {
     }
 
     pub async fn write_file(&mut self, name: &str, data: &[u8]) -> Result<FileId, FileSystemError> {
-        let old_inode = self.file_index.files.get(name)
-            .and_then(|fid| self.file_index.inodes.get(fid)).cloned();
+        let old_inode_ref = self.file_index.files.get(name).cloned();
 
         // If exists, ensure it's a file not a virtual block device
-        if let Some(ref inode) = old_inode {
-            if !inode.inode_type.is_file() {
+        if let Some(ref inode_ref) = old_inode_ref {
+            let old_inode = self.read_inode(inode_ref).await?;
+            if !old_inode.inode_type.is_file() {
                 panic!("'{}' is a block device, not a file", name);
             }
         }
@@ -667,28 +688,97 @@ impl FileSystem {
             }
         }
 
-        let file_id = *self.file_index.files.get(name).unwrap_or(&self.file_index.next_file_id);
-        if !self.file_index.files.contains_key(name) {
+        // Create or update file ID
+        let file_id = old_inode_ref
+            .as_ref()
+            .map(|r| r.file_id)
+            .unwrap_or(self.file_index.next_file_id);
+
+        if old_inode_ref.is_none() {
             self.file_index.next_file_id += 1;
-            self.file_index.files.insert(name.to_string(), file_id);
         }
 
-        self.file_index.inodes.insert(file_id, FileInode {
+        // Create new inode
+        let new_inode = FileInode {
             id: file_id,
             inode_type: InodeType::File {
                 size_bytes: data.len() as u64,
                 extents: allocated_extents,
             },
-        });
+        };
+
+        // Write inode and get its extent
+        let inode_extent = self.write_inode(&new_inode).await?;
+
+        // Update file index with new inode reference
+        self.file_index.files.insert(
+            name.to_string(), 
+            InodeRef {
+                file_id,
+                inode_extent,
+            }
+        );
 
         self.persist_file_index().await?;
 
-        if let Some(old) = old_inode {
-            for extent in old.inode_type.extents() { 
+        // Free old inode and data blocks
+        if let Some(old_ref) = old_inode_ref {
+            let old_inode = self.read_inode(&old_ref).await?;
+            
+            // Free old data blocks
+            for extent in old_inode.inode_type.extents() { 
                 self.free(extent.start, extent.len)?; 
+            }
+            
+            // Free old inode blocks
+            for extent in &old_ref.inode_extent {
+                self.free(extent.start, extent.len)?;
+            }
+        }
+
+        Ok(file_id)
+    }
+
+
+    pub async fn read_inode(&self, inode_ref: &InodeRef) -> Result<FileInode, FileSystemError> {
+        let mut inode_bytes = Vec::new();
+        
+        for extent in &inode_ref.inode_extent {
+            for i in 0..extent.len {
+                let (_, chunk) = self.dev.read_block_checked::<Vec<u8>>(extent.start + i).await?;
+                inode_bytes.extend_from_slice(&chunk);
             }
         }
         
-        Ok(file_id)
+        let inode: FileInode = bincode::deserialize(&inode_bytes)
+            .expect("Failed to deserialize inode");
+        
+        Ok(inode)
     }
+
+    pub async fn write_inode(&mut self, inode: &FileInode) -> Result<Vec<Extent>, FileSystemError> {
+        let inode_data = bincode::serialize(inode).unwrap();
+        let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
+        
+        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)?;
+        
+        let mut bytes_left = &inode_data[..];
+        for extent in &allocated_extents {
+            for i in 0..extent.len {
+                let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
+                
+                if take > 0 {
+                    let chunk = &bytes_left[..take];
+                    self.dev.write_block_checked_txg(extent.start + i, &chunk)?;
+                    bytes_left = &bytes_left[take..];
+                } else {
+                    let empty: &[u8] = &[];
+                    self.dev.write_block_checked_txg(extent.start + i, &empty)?;
+                }
+            }
+        }
+        
+        Ok(allocated_extents)
+    }
+
 }

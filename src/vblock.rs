@@ -3,7 +3,7 @@ use crate::raidz::{
     BLOCK_PAYLOAD_SIZE,
     Extent,
 };
-use crate::fs::{FileInode,FileSystem,FileSystemError,InodeType};
+use crate::fs::{FileInode,FileSystem,FileSystemError,InodeType,InodeRef};
 
 impl FileSystem {
     pub async fn create_block(&mut self, name: &str, size_bytes: u64, block_size: u32) -> Result<FileId, FileSystemError> {
@@ -39,8 +39,17 @@ impl FileSystem {
             },
         };
 
-        self.file_index.files.insert(name.to_string(), file_id);
-        self.file_index.inodes.insert(file_id, inode);
+        // Write inode and get its extent
+        let inode_extent = self.write_inode(&inode).await?;
+
+        // Update file index with new inode reference
+        self.file_index.files.insert(
+            name.to_string(), 
+            InodeRef {
+                file_id,
+                inode_extent,
+            }
+        );
 
         self.persist_file_index().await?;
 
@@ -51,11 +60,10 @@ impl FileSystem {
     pub async fn block_read(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
         println!("block_read called: name={}, offset={}, buf.len={}", name, offset, buf.len());
 
-        let file_id = *self.file_index.files.get(name)
-            .expect(&format!("'{}' does not exist", name));
+        let inode_ref = self.file_index.files.get(name)
+            .ok_or_else(|| FileSystemError::FileNotFound)?.clone();
         
-        let inode = self.file_index.inodes.get(&file_id)
-            .expect("Inode missing");
+        let inode = self.read_inode(&inode_ref).await?;
 
         println!("  -> Inode type: {:?}", inode.inode_type.is_block());
 
@@ -122,11 +130,10 @@ impl FileSystem {
 
     /// Write data to a virtual block device at a specific byte offset
     pub async fn block_write(&mut self, name: &str, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
-        let file_id = *self.file_index.files.get(name)
-            .expect(&format!("'{}' does not exist", name));
+        let inode_ref = self.file_index.files.get(name)
+            .ok_or_else(|| FileSystemError::FileNotFound)?.clone();
         
-        let inode = self.file_index.inodes.get(&file_id)
-            .expect("Inode missing");
+        let inode = self.read_inode(&inode_ref).await?;
 
         if !inode.inode_type.is_block() {
             panic!("'{}' is not a block device", name);

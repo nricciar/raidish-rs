@@ -8,6 +8,7 @@ enum BlockType {
     MetaslabHeader,
     SpaceMapLog,
     FileIndex,
+    InodeData,  // NEW: inode storage blocks
     FileData,
     Free,
 }
@@ -20,6 +21,7 @@ impl BlockType {
             BlockType::MetaslabHeader => "\x1b[48;5;226m",  // Yellow background
             BlockType::SpaceMapLog => "\x1b[48;5;220m",     // Gold background
             BlockType::FileIndex => "\x1b[48;5;39m",        // Bright blue background
+            BlockType::InodeData => "\x1b[48;5;51m",        // Cyan background
             BlockType::FileData => "\x1b[48;5;34m",         // Green background
             BlockType::Free => "\x1b[48;5;240m",            // Dark gray background
         }
@@ -32,6 +34,7 @@ impl BlockType {
             BlockType::MetaslabHeader => "H",
             BlockType::SpaceMapLog => "L",
             BlockType::FileIndex => "I",
+            BlockType::InodeData => "N",
             BlockType::FileData => "D",
             BlockType::Free => "·",
         }
@@ -44,6 +47,7 @@ impl BlockType {
             BlockType::MetaslabHeader => "Metaslab Headers",
             BlockType::SpaceMapLog => "Space Map Logs",
             BlockType::FileIndex => "File Index",
+            BlockType::InodeData => "Inode Data",
             BlockType::FileData => "File Data",
             BlockType::Free => "Free Space",
         }
@@ -60,67 +64,8 @@ impl FileSystem {
         }
     }
 
-    /// Classify what type of block a given LBA represents
-    fn classify_block(&self, lba: u64) -> BlockType {
-        // Superblock
-        if lba == SUPERBLOCK_LBA {
-            return BlockType::Superblock;
-        }
-
-        // Uberblocks
-        if lba >= UBERBLOCK_START && lba < UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT {
-            return BlockType::Uberblock;
-        }
-
-        let superblock = self.dev.superblock().unwrap();
-
-        // Metaslab headers
-        let metaslab_headers_start = METASLAB_TABLE_START;
-        let metaslab_headers_end = metaslab_headers_start + superblock.metaslab_count as u64;
-        if lba >= metaslab_headers_start && lba < metaslab_headers_end {
-            return BlockType::MetaslabHeader;
-        }
-
-        // Space map logs
-        let spacemap_logs_start = metaslab_headers_end;
-        let spacemap_logs_end = spacemap_logs_start + 
-            (superblock.metaslab_count as u64 * SPACEMAP_LOG_BLOCKS_PER_METASLAB);
-        if lba >= spacemap_logs_start && lba < spacemap_logs_end {
-            return BlockType::SpaceMapLog;
-        }
-
-        // File index
-        for extent in &self.current_file_index_extent {
-            if lba >= extent.start && lba < extent.start + extent.len {
-                return BlockType::FileIndex;
-            }
-        }
-
-        // File data
-        for inode in self.file_index.inodes.values() {
-            for extent in inode.inode_type.extents() {
-                if lba >= extent.start && lba < extent.start + extent.len {
-                    return BlockType::FileData;
-                }
-            }
-        }
-
-        // Check if free in any metaslab
-        for ms in &self.metaslabs {
-            for (&free_start, &free_len) in &ms.free_extents {
-                if lba >= free_start && lba < free_start + free_len {
-                    return BlockType::Free;
-                }
-            }
-        }
-
-        // If allocated but not referenced, it's technically allocated (not free)
-        // We'll show it as FileData with a note
-        BlockType::FileData
-    }
-
-    /// Build a complete block type map efficiently
-    fn build_block_map(&self) -> Vec<BlockType> {
+    /// Build a complete block type map efficiently (async version)
+    async fn build_block_map(&self) -> Vec<BlockType> {
         let superblock = self.dev.superblock().unwrap();
         let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
@@ -136,13 +81,26 @@ impl FileSystem {
             }
         }
         
-        // Mark file data
-        for inode in self.file_index.inodes.values() {
-            for extent in inode.inode_type.extents() {
+        // Mark inode data blocks
+        for inode_ref in self.file_index.files.values() {
+            for extent in &inode_ref.inode_extent {
                 let start = extent.start as usize;
                 let end = (extent.start + extent.len) as usize;
                 for i in start..end.min(total_blocks) {
-                    block_map[i] = BlockType::FileData;
+                    block_map[i] = BlockType::InodeData;
+                }
+            }
+        }
+        
+        // Mark file data (requires reading inodes)
+        for inode_ref in self.file_index.files.values() {
+            if let Ok(inode) = self.read_inode(inode_ref).await {
+                for extent in inode.inode_type.extents() {
+                    let start = extent.start as usize;
+                    let end = (extent.start + extent.len) as usize;
+                    for i in start..end.min(total_blocks) {
+                        block_map[i] = BlockType::FileData;
+                    }
                 }
             }
         }
@@ -185,8 +143,8 @@ impl FileSystem {
         block_map
     }
 
-    /// Display a visual map of block usage
-    pub fn display_block_map(&self) {
+    /// Display a visual map of block usage (now async)
+    pub async fn display_block_map(&self) {
         let superblock = self.dev.superblock().unwrap();
 
         const RESET: &str = "\x1b[0m";
@@ -194,31 +152,29 @@ impl FileSystem {
         let total_blocks = superblock.total_blocks;
         let (term_width, term_height) = Self::get_terminal_dimensions();
         
-        // Reserve space for labels and margins (10 chars for block numbers + 3 for " │ " + 1 for safety)
+        // Reserve space for labels and margins
         let available_width = term_width.saturating_sub(14);
         
         // Reserve space for headers, legend, statistics, and footer
-        // Header: 4 lines, Legend: 9 lines, Stats: 2 lines, Footer: 3 lines = ~18 lines
         let available_height = term_height.saturating_sub(20).max(10);
         
         // Calculate total available characters in the grid
         let total_chars_available = available_width * available_height;
         
         // Calculate how many blocks each character should represent
-        // We want to fit all blocks into the available grid
         let blocks_per_char = ((total_blocks as f64) / (total_chars_available as f64)).ceil() as u64;
         let blocks_per_char = blocks_per_char.max(1);
         
-        println!("\n╔════════════════════════════════════════════════════════════════════════════╗");
+        println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
         println!("║                          RAIDZ BLOCK USAGE MAP                             ║");
-        println!("╚════════════════════════════════════════════════════════════════════════════╝");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝");
         println!();
         println!("Total Blocks: {}  |  Blocks per char: {}  |  Grid: {}x{} ({}x{} terminal)", 
                  total_blocks, blocks_per_char, available_width, available_height, term_width, term_height);
         println!();
 
         // Build the complete block map once
-        let block_map = self.build_block_map();
+        let block_map = self.build_block_map().await;
 
         // Count blocks by type for statistics
         let mut counts = std::collections::HashMap::new();
@@ -234,6 +190,7 @@ impl FileSystem {
             BlockType::MetaslabHeader,
             BlockType::SpaceMapLog,
             BlockType::FileIndex,
+            BlockType::InodeData,
             BlockType::FileData,
             BlockType::Free,
         ] {
@@ -294,15 +251,16 @@ impl FileSystem {
         println!();
 
         // Print orphaned block warning if any exist
-        let orphaned = self.find_orphaned_blocks();
-        if !orphaned.is_empty() {
-            let total_orphaned: u64 = orphaned.iter().map(|(_, len)| len).sum();
-            println!("⚠️  WARNING: {} orphaned blocks detected in {} extents", 
-                     total_orphaned, orphaned.len());
-            if orphaned.len() <= 10 {
-                println!("   Orphaned extents:");
-                for (start, len) in &orphaned {
-                    println!("     - Block {} (length {})", start, len);
+        if let Ok(orphaned) = self.find_orphaned_blocks().await {
+            if !orphaned.is_empty() {
+                let total_orphaned: u64 = orphaned.iter().map(|(_, len)| len).sum();
+                println!("⚠️  WARNING: {} orphaned blocks detected in {} extents", 
+                         total_orphaned, orphaned.len());
+                if orphaned.len() <= 10 {
+                    println!("   Orphaned extents:");
+                    for (start, len) in &orphaned {
+                        println!("     - Block {} (length {})", start, len);
+                    }
                 }
             }
         }
@@ -312,9 +270,9 @@ impl FileSystem {
 
     /// Display detailed metaslab information
     pub fn display_metaslab_info(&self) {
-        println!("\n╔════════════════════════════════════════════════════════════════════════════╗");
+        println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
         println!("║                         METASLAB INFORMATION                               ║");
-        println!("╚════════════════════════════════════════════════════════════════════════════╝\n");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
         for (i, ms) in self.metaslabs.iter().enumerate() {
             let total_blocks = ms.header.block_count;

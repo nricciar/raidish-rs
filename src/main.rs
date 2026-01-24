@@ -123,7 +123,7 @@ async fn main() -> io::Result<()> {
         },
         Commands::Map => {
             let fs = FileSystem::load(raid).await.unwrap();
-            fs.display_block_map();
+            fs.display_block_map().await;
         },
         Commands::Metaslab => {
             let fs = FileSystem::load(raid).await.unwrap();
@@ -131,7 +131,7 @@ async fn main() -> io::Result<()> {
         },
         Commands::Orphaned => { 
             let fs = FileSystem::load(raid).await.unwrap();
-            let orphans = fs.find_orphaned_blocks();
+            let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
         },
         Commands::Read{ file } => {
