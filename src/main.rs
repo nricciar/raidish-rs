@@ -14,6 +14,7 @@ mod raidz;
 mod ui;
 mod nbd;
 mod nvme;
+mod vblock;
 
 use fs::{FileSystem};
 use raidz::{RaidZ};

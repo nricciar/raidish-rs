@@ -16,10 +16,11 @@ pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
 pub const UBERBLOCK_START: u64 = 3;
-pub const UBERBLOCK_COUNT: u64 = 15;
+pub const UBERBLOCK_BLOCK_COUNT: u64 = 15;
+pub const UBERBLOCK_STRIPE_COUNT: u64 = UBERBLOCK_BLOCK_COUNT / 3; // needs to be a multiple of DATA_SHARDS
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
 pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
-pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_COUNT;
+pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT;
 pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
 
 #[derive(Debug)]
@@ -30,6 +31,7 @@ pub enum RaidZError {
     ChecksumMismatch,
     InvalidMagic,
     IncompleteStripe(u64),
+    NotFormatted
 }
 
 impl From<DiskError> for RaidZError {
@@ -170,8 +172,16 @@ impl RaidZ {
         self.superblock.as_ref()
     }
 
+    pub fn uberblock(&self) -> Option<&Uberblock> {
+        self.txg_state.uberblock.as_ref()
+    }
+
     pub fn is_formatted(&self) -> bool {
         self.superblock.is_some() && self.txg_state.uberblock.is_some()
+    }
+
+    pub fn txg(&self) -> u64 {
+        self.txg_state.txg
     }
 
     pub async fn new(paths: [&str; DISKS]) -> Self {
@@ -217,7 +227,7 @@ impl RaidZ {
 
         let mut best: Option<(u64, Uberblock)> = None;
 
-        for i in 0..UBERBLOCK_COUNT {
+        for i in 0..UBERBLOCK_BLOCK_COUNT {
             let lba = UBERBLOCK_START + i;
             if let Ok((txg, ub)) = self.read_block_checked::<Uberblock>(lba).await {
                 if ub.magic != UBERBLOCK_MAGIC {
@@ -270,7 +280,7 @@ impl RaidZ {
             timestamp: 0,
             file_index_extent: Vec::new(),
         };
-        for slot in 0..UBERBLOCK_COUNT {
+        for slot in 0..UBERBLOCK_BLOCK_COUNT {
             self.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber)?;
         }
         Ok(())
@@ -279,7 +289,7 @@ impl RaidZ {
     pub async fn sync(&mut self) -> Result<(), RaidZError> {
         //println!("sync called with {} pending writes", self.txg_state.writes.len());
         if !self.txg_state.stripes.is_empty() {
-            let uber = self.txg_state.uberblock.as_ref().expect("cannot sync to a device with no uberblocks");
+            let uber = self.txg_state.uberblock.as_ref().ok_or(RaidZError::NotFormatted)?;
             self.commit_txg(uber.file_index_extent.clone()).await?;
         }
         Ok(())
@@ -394,7 +404,7 @@ impl RaidZ {
         self.flush_all_disks();
 
         // Rotate and write uberblock
-        let uberblock_lba = UBERBLOCK_START + (txg % UBERBLOCK_COUNT) as u64;
+        //let uberblock_lba = UBERBLOCK_START + (txg % UBERBLOCK_COUNT) as u64;
         let uberblock = Uberblock {
             magic: UBERBLOCK_MAGIC,
             version: 1,
@@ -403,7 +413,22 @@ impl RaidZ {
             file_index_extent,
         };
 
-        self.write_block_checked(uberblock_lba, txg, &uberblock).await?;
+        // Determine which stripe to use (rotating through UBERBLOCK_COUNT stripes)
+        let uberblock_stripe_idx = (txg % UBERBLOCK_STRIPE_COUNT) as u64;
+        let uberblock_stripe_id = (UBERBLOCK_START / DATA_SHARDS as u64) + uberblock_stripe_idx;
+
+        // Serialize and prepare the uberblock block
+        let payload = bincode::serialize(&uberblock)?;
+        assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
+        
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(txg, &payload, &mut block_buf)?;
+
+        let mut uber_stripe = StripeBuffer::new();
+        uber_stripe.set_shard(0, &block_buf);
+        uber_stripe.set_shard(1, &block_buf);
+        uber_stripe.set_shard(2, &block_buf);
+        self.write_full_stripe(&uber_stripe, uberblock_stripe_id).await?;
 
         // Flush again to ensure uberblock is durable
         self.flush_all_disks();
@@ -598,57 +623,5 @@ impl RaidZ {
                 Err(RaidZError::IncompleteStripe(stripe as u64))
             }
         }
-    }
-
-    // FIXME: need to remove only used for writing the uberblocks
-    async fn write_logical_block(&mut self, lba: BlockId, data: &[u8]) -> Result<(), RaidZError> {
-        let stripe = lba as usize / DATA_SHARDS;
-        let data_index = lba as usize % DATA_SHARDS;
-
-        let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
-
-        for (i, shard) in shards.iter_mut().enumerate() {
-            self.disks[i].read_block(stripe as u64, shard).await?;
-        }
-
-        shards[data_index][..data.len()].copy_from_slice(data);
-        self.rs.encode(&mut shards)?;
-
-        for (i, shard) in shards.iter().enumerate() {
-            self.disks[i].write_block(stripe as u64, shard).await?;
-        }
-
-        Ok(())
-    }
-
-    // FIXME: need to remove only used for writing the uberblocks
-    async fn write_block_checked<T: Serialize>(
-        &mut self,
-        lba: BlockId,
-        txg: u64,
-        value: &T,
-    ) -> Result<(), RaidZError> {
-        let payload = bincode::serialize(value)?;
-        assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
-
-        let checksum = *blake3::hash(&payload).as_bytes();
-
-        let header = BlockHeader {
-            magic: 0x52414944, // "RAID"
-            txg,
-            checksum,
-            payload_len: payload.len() as u32,
-        };
-
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        let header_bytes = bincode::serialize(&header)?;
-
-        buf[..header_bytes.len()].copy_from_slice(&header_bytes);
-        buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload.len()]
-            .copy_from_slice(&payload);
-
-        self.write_logical_block(lba, &buf).await?;
-
-        Ok(())
     }
 }

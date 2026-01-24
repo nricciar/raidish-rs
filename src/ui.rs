@@ -1,5 +1,5 @@
 use crate::fs::{FileSystem};
-use crate::raidz::{UBERBLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
+use crate::raidz::{UBERBLOCK_BLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
@@ -68,7 +68,7 @@ impl FileSystem {
         }
 
         // Uberblocks
-        if lba >= UBERBLOCK_START && lba < UBERBLOCK_START + UBERBLOCK_COUNT {
+        if lba >= UBERBLOCK_START && lba < UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT {
             return BlockType::Uberblock;
         }
 
@@ -172,7 +172,7 @@ impl FileSystem {
         
         // Mark uberblocks
         let uberblock_start = UBERBLOCK_START as usize;
-        let uberblock_end = (UBERBLOCK_START + UBERBLOCK_COUNT) as usize;
+        let uberblock_end = (UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT) as usize;
         for i in uberblock_start..uberblock_end.min(total_blocks) {
             block_map[i] = BlockType::Uberblock;
         }
