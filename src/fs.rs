@@ -104,6 +104,12 @@ pub struct InodeRef {
     pub inode_extent: Vec<Extent>,  // Where the inode is stored on disk
 }
 
+impl InodeRef {
+    pub fn extents(&self) -> &[Extent] {
+        &self.inode_extent
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileIndex {
     pub next_file_id: FileId,
@@ -743,10 +749,11 @@ impl FileSystem {
     pub async fn read_inode(&self, inode_ref: &InodeRef) -> Result<FileInode, FileSystemError> {
         let mut inode_bytes = Vec::new();
         
-        for extent in &inode_ref.inode_extent {
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        for extent in inode_ref.extents() {
             for i in 0..extent.len {
-                let (_, chunk) = self.dev.read_block_checked::<Vec<u8>>(extent.start + i).await?;
-                inode_bytes.extend_from_slice(&chunk);
+                let (_, _chunk) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await?;
+                inode_bytes.extend_from_slice(&block_buf);
             }
         }
         
@@ -769,11 +776,11 @@ impl FileSystem {
                 
                 if take > 0 {
                     let chunk = &bytes_left[..take];
-                    self.dev.write_block_checked_txg(extent.start + i, &chunk)?;
+                    self.dev.write_raw_block_checked_txg(extent.start + i, &chunk)?;
                     bytes_left = &bytes_left[take..];
                 } else {
                     let empty: &[u8] = &[];
-                    self.dev.write_block_checked_txg(extent.start + i, &empty)?;
+                    self.dev.write_raw_block_checked_txg(extent.start + i, &empty)?;
                 }
             }
         }

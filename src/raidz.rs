@@ -500,7 +500,7 @@ impl RaidZ {
 
     /// Refactored to take a mutable buffer instead of returning a Vec
     pub async fn read_raw_block_checked_into(
-        &mut self,
+        &self,
         lba: BlockId,
         buf: &mut [u8],
     ) -> Result<(u64, usize), RaidZError> {
