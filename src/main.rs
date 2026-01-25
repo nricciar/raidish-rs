@@ -61,6 +61,9 @@ enum Commands {
     Read {
         file: String
     },
+    Inode {
+        file: String,
+    },
     Write {
         file: String
     },
@@ -138,6 +141,12 @@ async fn main() -> io::Result<()> {
             let mut fs = FileSystem::load(raid).await.unwrap();
             let data = fs.read_file(&file).await.unwrap();
             std::fs::write("output.png", data)?;
+        },
+        Commands::Inode { file } => {
+            let fs = FileSystem::load(raid).await.unwrap();
+            let inode_ref = fs.file_index.files.get(&file).unwrap();
+            let inode = fs.read_inode(&inode_ref).await.unwrap();
+            println!("inode: {:?}", inode);
         },
         Commands::Write { file } => {
             let mut fs = FileSystem::load(raid).await.unwrap();

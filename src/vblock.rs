@@ -20,10 +20,9 @@ impl FileSystem {
 
         // Zero out the blocks
         for extent in &allocated_extents {
-            for i in 0..extent.len {
-                //let empty: &[u8] = &[];
+            for i in 0..extent.len() {
                 let zeros = vec![0u8; BLOCK_PAYLOAD_SIZE];
-                self.dev.write_raw_block_checked_txg(extent.start + i, &zeros)?;
+                self.dev.write_raw_block_checked_txg(extent.start() + i, &zeros)?;
             }
         }
 
@@ -91,7 +90,7 @@ impl FileSystem {
         while bytes_read < max_read {
             println!("    -> Loop iteration: bytes_read={}, current_offset={}", bytes_read, current_offset);
             let (block_lba, byte_offset) = match map_offset_to_extent(
-                extents,
+                &extents,
                 current_offset,
                 size_bytes,
             ) {
@@ -216,14 +215,14 @@ fn map_offset_to_extent(
     let mut bytes_traversed = 0u64;
     
     for extent in extents {
-        let extent_bytes = extent.len * BLOCK_PAYLOAD_SIZE as u64;
+        let extent_bytes = extent.len() * BLOCK_PAYLOAD_SIZE as u64;
         
         if offset < bytes_traversed + extent_bytes {
             let offset_in_extent = offset - bytes_traversed;
             let block_offset = offset_in_extent / BLOCK_PAYLOAD_SIZE as u64;
             let byte_offset = (offset_in_extent % BLOCK_PAYLOAD_SIZE as u64) as usize;
             
-            return Some((extent.start + block_offset, byte_offset));
+            return Some((extent.start() + block_offset, byte_offset));
         }
         
         bytes_traversed += extent_bytes;

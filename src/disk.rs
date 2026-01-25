@@ -1,5 +1,3 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use reqwest::Client;
 use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
@@ -7,6 +5,9 @@ use futures_util::{SinkExt, StreamExt};
 use tungstenite::Message;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::fs::{File,OpenOptions};
+use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
@@ -16,7 +17,9 @@ pub type FileId = u64;
 pub enum DiskError {
     IoError(std::io::Error),
     ReqwestError(reqwest::Error),
-    TungsteniteError(tungstenite::error::Error)
+    TungsteniteError(tungstenite::error::Error),
+    UnhealthyDisk,
+    InvalidUri(ParseError)
 }
 
 impl From<std::io::Error> for DiskError {
@@ -34,6 +37,12 @@ impl From<reqwest::Error> for DiskError {
 impl From<tungstenite::error::Error> for DiskError {
     fn from(error: tungstenite::error::Error) -> Self {
         DiskError::TungsteniteError(error)
+    }
+}
+
+impl From<ParseError> for DiskError {
+    fn from(error: ParseError) -> Self {
+        DiskError::InvalidUri(error)
     }
 }
 
@@ -64,9 +73,9 @@ impl Disk {
     pub async fn open(path: &str) -> Result<Self, DiskError> {
         if path.starts_with("http://") || path.starts_with("https://") {
             // Try WebSocket connection first
-            let url = url::Url::parse(path).expect("Invalid URL");
+            let url = url::Url::parse(path)?;
             let scheme = if path.starts_with("https://") { "wss" } else { "ws" };
-            let host = url.host_str().expect("No host in URL");
+            let host = url.host_str().ok_or(ParseError::EmptyHost)?;
             let port = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
             
             // Construct WebSocket URL
@@ -107,13 +116,59 @@ impl Disk {
                 .write(true)
                 .create(true)
                 //.custom_flags(libc::O_DIRECT | libc::O_SYNC) // On Linux
-                .open(path)?;
+                .open(path).await?;
             Ok(Disk { backend: DiskBackend::Local(Arc::new(Mutex::new(file))) })
         }
     }
 
-    pub fn flush(&mut self) {
-
+    pub async fn flush(&self) -> Result<(),DiskError> {
+        match &self.backend {
+            DiskBackend::Local(file) => {
+                let mut file = file.lock().await;
+                file.flush().await?;
+            },
+            DiskBackend::Remote { base_url, disk_id, client } => {
+                let url = format!("{}/{}/flush", base_url, disk_id);
+                match client.post(&url).send().await {
+                    Ok(_response) => (),
+                    Err(e) => return Err(DiskError::ReqwestError(e))
+                }
+            },
+            DiskBackend::WebSocket { disk_id, ws } => {
+                // Build read request: [op:1][disk_index:2][block_id:8]
+                let mut request = Vec::with_capacity(11);
+                request.push(2); // op=2 for flush
+                request.extend_from_slice(&disk_id.to_le_bytes());
+                request.extend_from_slice(&(0 as u64).to_le_bytes());
+                
+                let mut ws_lock = ws.lock().await;
+                
+                // Send request
+                ws_lock.send(Message::Binary(request.into())).await?;
+                
+                // Receive response
+                match ws_lock.next().await {
+                    Some(Ok(Message::Binary(data))) => {
+                        if data.is_empty() {
+                            return Err(DiskError::IoError(std::io::ErrorKind::UnexpectedEof.into()))
+                        }
+                        
+                        let status = data[0];
+                        match status {
+                            0 => (), // Success
+                            1 => return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
+                            2 => return Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into())),
+                            _ => return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::Other, 
+                                    format!("WebSocket read error: unknown status {}", status))))
+                        }
+                    },
+                    Some(Ok(_)) => return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into())),
+                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
+                    None => return Err(DiskError::TungsteniteError(tungstenite::error::Error::ConnectionClosed))
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
@@ -121,8 +176,8 @@ impl Disk {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
                 file
-                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))?;
-                match file.read_exact(buf) {
+                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64)).await?;
+                match file.read_exact(buf).await {
                     Ok(_) => {}
                     // TODO: is this actually a good idea?
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -201,8 +256,8 @@ impl Disk {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
                 file
-                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))?;
-                file.write_all(buf)?;
+                    .seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64)).await?;
+                file.write_all(buf).await?;
             },
             DiskBackend::Remote { base_url, disk_id, client } => {
                 let url = format!("{}/{}/blocks/{}", base_url, disk_id, block);

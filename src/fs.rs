@@ -13,11 +13,18 @@ use crate::raidz::{
 
 #[derive(Debug)]
 pub enum FileSystemError {
+    SerializationError(bincode::Error),
     DiskError(DiskError),
     RaidZError(RaidZError),
     UnableToAllocateBlocks(u64),
     NotFormatted,
     FileNotFound
+}
+
+impl From<bincode::Error> for FileSystemError {
+    fn from(error: bincode::Error) -> Self {
+        FileSystemError::SerializationError(error)
+    }
 }
 
 impl From<DiskError> for FileSystemError {
@@ -55,6 +62,12 @@ pub struct MetaslabState {
     pub write_cursor: u64, // next space map log block
 }
 
+#[derive(Debug,Serialize,Deserialize,Clone)]
+pub enum SparseExtent {
+    Allocated(Extent),
+    Sparse(u64)
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum InodeType {
     File {
@@ -76,10 +89,18 @@ impl InodeType {
         }
     }
 
-    pub fn extents(&self) -> &[Extent] {
+    pub fn extents(&self) -> &[Extent] { //Vec<Extent> {
         match self {
-            InodeType::File { extents, .. } => extents,
-            InodeType::Block { extents, .. } => extents,
+            InodeType::File { extents, .. } => extents, //.clone(),
+            InodeType::Block { extents, size_bytes, block_size } => extents, /*{
+                extents.iter().filter_map(|value| {
+                    if let SparseExtent::Allocated(e) = value {
+                        Some(e.clone())
+                    } else {
+                        None
+                    }
+                }).collect()
+            }*/
         }
     }
 
@@ -90,6 +111,13 @@ impl InodeType {
     pub fn is_file(&self) -> bool {
         matches!(self, InodeType::File { .. })
     }
+
+    /*pub fn sparse_extents(&self) -> &[SparseExtent] {
+        match self {
+            InodeType::Block { extents, .. } => extents,
+            _ => panic!("Not a block device"),
+        }
+    }*/
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -140,12 +168,12 @@ impl FileSystem {
 
         // Free file data blocks
         for extent in inode.inode_type.extents() {
-            self.free(extent.start, extent.len)?;
+            self.free(extent.start(), extent.len())?;
         }
 
         // Free inode blocks
         for extent in &inode_ref.inode_extent {
-            self.free(extent.start, extent.len)?;
+            self.free(extent.start(), extent.len())?;
         }
 
         self.persist_file_index().await?;
@@ -162,24 +190,24 @@ impl FileSystem {
         for inode_ref in self.file_index.files.values() {
             // Mark inode storage blocks
             for extent in &inode_ref.inode_extent {
-                for i in 0..extent.len {
-                    live_blocks.insert(extent.start + i);
+                for i in 0..extent.len() {
+                    live_blocks.insert(extent.start() + i);
                 }
             }
             
             // Read inode and mark its data blocks
             let inode = self.read_inode(inode_ref).await?;
             for extent in inode.inode_type.extents() {
-                for i in 0..extent.len {
-                    live_blocks.insert(extent.start + i);
+                for i in 0..extent.len() {
+                    live_blocks.insert(extent.start() + i);
                 }
             }
         }
         
         // Mark file index blocks
         for extent in &self.current_file_index_extent {
-            for i in 0..extent.len {
-                live_blocks.insert(extent.start + i);
+            for i in 0..extent.len() {
+                live_blocks.insert(extent.start() + i);
             }
         }
         
@@ -301,68 +329,79 @@ impl FileSystem {
     pub fn free(&mut self, start: u64, len: u64) -> Result<(), FileSystemError> {
         println!("free called: start: {}, len: {}", start, len);
         
-        for (ms_idx, ms) in self.metaslabs.iter_mut().enumerate() {
+        for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
             let ms_start = ms.header.start_block;
             let ms_end = ms_start + ms.header.block_count;
 
-            println!("  Checking metaslab {} range [{}, {})", ms_idx, ms_start, ms_end);
-
             if start >= ms_start && start < ms_end {
-                println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
-                println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
-
-                // Check if this exact extent is already free
-                if let Some(&existing_len) = ms.free_extents.get(&start) {
-                    if existing_len == len {
-                        println!("WARNING: Attempted to free already-free extent {{{}:{}}}", start, len);
-                        return Ok(());
-                    }
+                // Check if compaction needed
+                let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
+                let log_used = ms.write_cursor - ms.header.spacemap_start;
+                
+                if log_used >= log_capacity {
+                    drop(ms); // Release the immutable borrow
+                    self.compact_spacemap_log(ms_idx)?;
                 }
                 
-                let mut new_start = start;
-                let mut new_len = len;
+                return self.free_in_metaslab(ms_idx, start, len);
+            }
+        }
+        
+        Ok(())
+    }
 
-                // Merge with preceding overlapping/adjacent free blocks
-                if let Some((&prev_start, &prev_len)) = ms.free_extents.range(..start).next_back() {
-                    if prev_start + prev_len >= start {
-                        new_start = prev_start;
-                        new_len = (prev_start + prev_len).max(start + len) - new_start;
-                        ms.free_extents.remove(&prev_start);
-                    }
-                }
+    fn free_in_metaslab(&mut self, ms_idx: usize, start: u64, len: u64) -> Result<(), FileSystemError> {
+        let ms = &mut self.metaslabs[ms_idx];
+        
+        println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
+        println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
 
-                // Merge with following overlapping/adjacent free blocks
-                loop {
-                    if let Some((&next_start, &next_len)) = ms.free_extents.range(new_start..).next() {
-                        if next_start <= new_start + new_len {
-                            new_len = (next_start + next_len).max(new_start + new_len) - new_start;
-                            ms.free_extents.remove(&next_start);
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                ms.free_extents.insert(new_start, new_len);
-
-                // Write the merged extent to space map log with current TXG
-                let entry = SpaceMapEntry::Free { start: new_start, len: new_len };
-                self.dev.write_block_checked_txg(ms.write_cursor, &entry)?;
-                ms.write_cursor += 1;
-
-                ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-                self.dev.write_block_checked_txg(ms.header_block, &ms.header)?;
-
-                println!("  -> After merge, inserting {{{}:{}}}", new_start, new_len);
-                //println!("  -> Writing to space map log at block {} with TXG {}", 
-                //         ms.write_cursor - 1, self.dev.txg_state.txg);
-
+        // Check if this exact extent is already free
+        if let Some(&existing_len) = ms.free_extents.get(&start) {
+            if existing_len == len {
+                println!("WARNING: Attempted to free already-free extent {{{}:{}}}", start, len);
                 return Ok(());
             }
         }
+        
+        let mut new_start = start;
+        let mut new_len = len;
 
+        // Merge with preceding overlapping/adjacent free blocks
+        if let Some((&prev_start, &prev_len)) = ms.free_extents.range(..start).next_back() {
+            if prev_start + prev_len >= start {
+                new_start = prev_start;
+                new_len = (prev_start + prev_len).max(start + len) - new_start;
+                ms.free_extents.remove(&prev_start);
+            }
+        }
+
+        // Merge with following overlapping/adjacent free blocks
+        loop {
+            if let Some((&next_start, &next_len)) = ms.free_extents.range(new_start..).next() {
+                if next_start <= new_start + new_len {
+                    new_len = (next_start + next_len).max(new_start + new_len) - new_start;
+                    ms.free_extents.remove(&next_start);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        ms.free_extents.insert(new_start, new_len);
+
+        // Write the merged extent to space map log with current TXG
+        let entry = SpaceMapEntry::Free { start: new_start, len: new_len };
+        self.dev.write_metaslab_block_checked_txg(ms.write_cursor, &entry)?;
+        ms.write_cursor += 1;
+
+        ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
+        self.dev.write_metaslab_block_checked_txg(ms.header_block, &ms.header)?;
+
+        println!("  -> After merge, inserting {{{}:{}}}", new_start, new_len);
+        
         Ok(())
     }
 
@@ -380,6 +419,16 @@ impl FileSystem {
         let mut remaining = aligned_blocks;
 
         for (ms_idx, ms) in self.metaslabs.iter_mut().enumerate() {
+            // skip this metaslab if log capacity is full
+            let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
+            let log_used = ms.write_cursor - ms.header.spacemap_start;
+            
+            if log_used >= log_capacity {
+                println!("  MS{}: Skipping - log at capacity ({}/{})", 
+                        ms_idx, log_used, log_capacity);
+                continue;
+            }
+
             let ms_start = ms.header.start_block;
             let ms_end = ms_start + ms.header.block_count;
             
@@ -387,6 +436,13 @@ impl FileSystem {
             let mut rejected_extents = Vec::new();
             
             while remaining > 0 {
+                // do not allocate anymore from this metaslab if it would
+                // overfill the log
+                let current_log_used = ms.write_cursor - ms.header.spacemap_start;
+                if current_log_used >= log_capacity {
+                    println!("  MS{}: Log filled during allocation sequence", ms_idx);
+                    break; 
+                }
                 // Skip extents we've already rejected
                 let found = ms.free_extents.iter()
                     .map(|(&s, &l)| (s, l))
@@ -443,7 +499,14 @@ impl FileSystem {
                         println!("    -> Returned {} post-allocation blocks to free pool", remainder);
                     }
 
-                    allocated_extents.push(Extent { start: aligned_start, len: take });
+                    let extent =
+                        if blocks_needed < 3 {
+                            Extent::Partial { start: aligned_start, len: take, used: blocks_needed }
+                        } else {
+                            Extent::Full { start: aligned_start, len: take }
+                        };
+
+                    allocated_extents.push(extent);
                     remaining -= take;
                 } else {
                     // No more suitable extents in this metaslab
@@ -470,10 +533,47 @@ impl FileSystem {
         } else { 
             // Rollback: return all allocated blocks
             for extent in allocated_extents {
-                self.free(extent.start, extent.len)?;
+                self.free(extent.start(), extent.len())?;
             }
             Err(FileSystemError::UnableToAllocateBlocks(remaining)) 
         }
+    }
+
+    fn compact_spacemap_log(&mut self, ms_idx: usize) -> Result<(), FileSystemError> {
+        let ms = &mut self.metaslabs[ms_idx];
+        
+        println!("  COMPACTING spacemap log for metaslab {} (was at {}/{})", 
+                ms_idx, 
+                ms.write_cursor - ms.header.spacemap_start,
+                SPACEMAP_LOG_BLOCKS_PER_METASLAB);
+        
+        // Save current free extents
+        let free_extents = ms.free_extents.clone();
+        
+        // Reset cursor to start
+        ms.write_cursor = ms.header.spacemap_start;
+        
+        // Write compacted state - one Free entry per extent
+        for (&start, &len) in &free_extents {
+            let entry = SpaceMapEntry::Free { start, len };
+            self.dev.write_metaslab_block_checked_txg(ms.write_cursor, &entry)?;
+            ms.write_cursor += 1;
+            
+            // Safety check
+            if ms.write_cursor - ms.header.spacemap_start >= SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64 {
+                panic!("Metaslab {} still doesn't fit after compaction! Has {} free extents", 
+                    ms_idx, free_extents.len());
+            }
+        }
+        
+        ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
+        self.dev.write_metaslab_block_checked_txg(ms.header_block, &ms.header)?;
+        
+        println!("  Compacted to {}/{} entries", 
+                ms.write_cursor - ms.header.spacemap_start,
+                SPACEMAP_LOG_BLOCKS_PER_METASLAB);
+        
+        Ok(())
     }
 
     /// Calculate how many blocks are needed considering payload overhead
@@ -494,18 +594,18 @@ impl FileSystem {
         // Write index data using checksummed blocks
         let mut bytes_left = &data[..];
         for extent in &allocated_extents {
-            for i in 0..extent.len {
+            for i in 0..extent.len() {
                 let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
                 
                 if take > 0 {
                     let chunk = &bytes_left[..take];
                     // Write with current TXG + 1 (the new transaction)
-                    self.dev.write_block_checked_txg(extent.start + i, &chunk)?;
+                    self.dev.write_block_checked_txg(extent.start() + i, &chunk)?;
                     bytes_left = &bytes_left[take..];
                 } else {
                     // Write empty block to maintain extent structure
                     let empty: &[u8] = &[];
-                    self.dev.write_block_checked_txg(extent.start + i, &empty)?;
+                    self.dev.write_block_checked_txg(extent.start() + i, &empty)?;
                 }
             }
         }
@@ -515,12 +615,12 @@ impl FileSystem {
         // Free old index blocks AFTER commit
         let old_extents = std::mem::replace(&mut self.current_file_index_extent, allocated_extents);
         for extent in old_extents {
-            self.free(extent.start, extent.len)?;
+            self.free(extent.start(), extent.len())?;
         }
         Ok(())
     }
 
-    pub async fn load(mut dev: RaidZ) -> Result<Self, FileSystemError> {
+    pub async fn load(dev: RaidZ) -> Result<Self, FileSystemError> {
         let superblock =
             dev.superblock().ok_or(FileSystemError::NotFormatted)?.clone();
         let uber =
@@ -609,8 +709,8 @@ impl FileSystem {
         // Reconstruct file index from extents with validation
         let mut index_bytes = Vec::new();
         for extent in &uber.file_index_extent {
-            for i in 0..extent.len {
-                let (block_txg, chunk) = dev.read_block_checked::<Vec<u8>>(extent.start + i).await?;
+            for i in 0..extent.len() {
+                let (block_txg, chunk) = dev.read_block_checked::<Vec<u8>>(extent.start() + i).await?;
                 // Validate TXG matches or is from earlier transaction
                 if block_txg <= dev.txg() {
                     index_bytes.extend_from_slice(&chunk);
@@ -647,8 +747,8 @@ impl FileSystem {
 
         let mut block_buf = [0u8; BLOCK_SIZE];
         for extent in inode.inode_type.extents() {
-            for i in 0..extent.len {
-                let (_, len) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await?;
+            for i in 0..extent.len() {
+                let (_, len) = self.dev.read_raw_block_checked_into(extent.start() + i, &mut block_buf).await?;
                 let take = remaining.min(len as u64) as usize;
                 out.extend_from_slice(&block_buf[..take]);
                 remaining -= take as u64;
@@ -678,18 +778,18 @@ impl FileSystem {
         // Write file data in chunks that fit in BLOCK_PAYLOAD_SIZE
         let mut current_offset = 0;
         for extent in &allocated_extents {
-            for i in 0..extent.len {
+            for i in 0..extent.len() {
                 if current_offset >= data.len() { 
                     // Write empty block for unused allocated space
                     let empty: &[u8] = &[];
-                    self.dev.write_raw_block_checked_txg(extent.start + i, &empty)?;
+                    self.dev.write_raw_block_checked_txg(extent.start() + i, &empty)?;
                     continue; 
                 }
                 
                 let take = (data.len() - current_offset).min(BLOCK_PAYLOAD_SIZE);
                 let chunk = &data[current_offset..current_offset + take];
                 
-                self.dev.write_raw_block_checked_txg(extent.start + i, &chunk)?;
+                self.dev.write_raw_block_checked_txg(extent.start() + i, &chunk)?;
                 current_offset += take;
             }
         }
@@ -733,12 +833,12 @@ impl FileSystem {
             
             // Free old data blocks
             for extent in old_inode.inode_type.extents() { 
-                self.free(extent.start, extent.len)?; 
+                self.free(extent.start(), extent.len())?; 
             }
             
             // Free old inode blocks
             for extent in &old_ref.inode_extent {
-                self.free(extent.start, extent.len)?;
+                self.free(extent.start(), extent.len())?;
             }
         }
 
@@ -751,14 +851,13 @@ impl FileSystem {
         
         let mut block_buf = [0u8; BLOCK_SIZE];
         for extent in inode_ref.extents() {
-            for i in 0..extent.len {
-                let (_, _chunk) = self.dev.read_raw_block_checked_into(extent.start + i, &mut block_buf).await?;
+            for i in 0..extent.len() {
+                let (_, _chunk) = self.dev.read_raw_block_checked_into(extent.start() + i, &mut block_buf).await?;
                 inode_bytes.extend_from_slice(&block_buf);
             }
         }
         
-        let inode: FileInode = bincode::deserialize(&inode_bytes)
-            .expect("Failed to deserialize inode");
+        let inode: FileInode = bincode::deserialize(&inode_bytes)?;
         
         Ok(inode)
     }
@@ -771,16 +870,16 @@ impl FileSystem {
         
         let mut bytes_left = &inode_data[..];
         for extent in &allocated_extents {
-            for i in 0..extent.len {
+            for i in 0..extent.len() {
                 let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
                 
                 if take > 0 {
                     let chunk = &bytes_left[..take];
-                    self.dev.write_raw_block_checked_txg(extent.start + i, &chunk)?;
+                    self.dev.write_raw_block_checked_txg(extent.start() + i, &chunk)?;
                     bytes_left = &bytes_left[take..];
                 } else {
                     let empty: &[u8] = &[];
-                    self.dev.write_raw_block_checked_txg(extent.start + i, &empty)?;
+                    self.dev.write_raw_block_checked_txg(extent.start() + i, &empty)?;
                 }
             }
         }

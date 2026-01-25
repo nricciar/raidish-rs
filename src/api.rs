@@ -154,16 +154,22 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
 }
 
 /// HTTP: POST /api/v1/flush - Flush all local disks
-#[post("/api/v1/flush")]
-async fn flush_disks(server: &State<RaidZServer>) -> Status {
-    let mut raidz = server.raidz.lock().await;
+#[post("/api/v1/disks/<disk_index>/flush")]
+async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
+    let raidz = server.raidz.lock().await;
     
-    for (_, disk) in raidz.disks.iter_mut().enumerate() {
-        if disk.is_local() {
-            disk.flush();
-        }
+    // Check if disk_index is valid
+    if disk_index >= raidz.disks.len() {
+        return Status::NotFound;
     }
     
+    // Check if this is a local disk (not remote)
+    if !raidz.is_local_disk(disk_index) {
+        return Status::BadRequest;
+    }
+    
+    raidz.disks[disk_index].flush().await.unwrap();
+
     Status::Ok
 }
 
@@ -239,6 +245,11 @@ async fn handle_ws_message(
             raidz_lock.disks[disk_index].write_block(block_id, block_data).await.unwrap();
             
             vec![0] // Success
+        }
+        2 => {
+            println!("flush req for {:?}", raidz_lock.disks[disk_index]);
+            raidz_lock.disks[disk_index].flush().await.unwrap();
+            vec![0]
         }
         _ => vec![2], // Unknown operation
     }

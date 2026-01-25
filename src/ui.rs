@@ -84,8 +84,8 @@ impl FileSystem {
         // Mark inode data blocks
         for inode_ref in self.file_index.files.values() {
             for extent in &inode_ref.inode_extent {
-                let start = extent.start as usize;
-                let end = (extent.start + extent.len) as usize;
+                let start = extent.start() as usize;
+                let end = (extent.start() + extent.len()) as usize;
                 for i in start..end.min(total_blocks) {
                     block_map[i] = BlockType::InodeData;
                 }
@@ -96,8 +96,8 @@ impl FileSystem {
         for inode_ref in self.file_index.files.values() {
             if let Ok(inode) = self.read_inode(inode_ref).await {
                 for extent in inode.inode_type.extents() {
-                    let start = extent.start as usize;
-                    let end = (extent.start + extent.len) as usize;
+                    let start = extent.start() as usize;
+                    let end = (extent.start() + extent.len()) as usize;
                     for i in start..end.min(total_blocks) {
                         block_map[i] = BlockType::FileData;
                     }
@@ -107,8 +107,8 @@ impl FileSystem {
         
         // Mark file index
         for extent in &self.current_file_index_extent {
-            let start = extent.start as usize;
-            let end = (extent.start + extent.len) as usize;
+            let start = extent.start() as usize;
+            let end = (extent.start() + extent.len()) as usize;
             for i in start..end.min(total_blocks) {
                 block_map[i] = BlockType::FileIndex;
             }
@@ -277,6 +277,10 @@ impl FileSystem {
         for (i, ms) in self.metaslabs.iter().enumerate() {
             let total_blocks = ms.header.block_count;
             let free_blocks: u64 = ms.free_extents.values().sum();
+            println!("Metaslab {}: total_blocks={}, free_blocks={}, log_blocks={}/{}", 
+         i, total_blocks, free_blocks, 
+         ms.write_cursor - ms.header.spacemap_start,
+         SPACEMAP_LOG_BLOCKS_PER_METASLAB);
             let allocated_blocks = total_blocks - free_blocks;
             let utilization = (allocated_blocks as f64 / total_blocks as f64) * 100.0;
             let fragmentation = ms.free_extents.len();

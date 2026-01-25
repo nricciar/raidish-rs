@@ -31,7 +31,7 @@ pub enum RaidZError {
     ChecksumMismatch,
     InvalidMagic,
     IncompleteStripe(u64),
-    NotFormatted
+    NotFormatted,
 }
 
 impl From<DiskError> for RaidZError {
@@ -108,6 +108,7 @@ struct TxgState {
     txg: u64,
     uberblock: Option<Uberblock>,
     stripes: BTreeMap<u64, StripeBuffer>,
+    deferred_frees: BTreeMap<u64, StripeBuffer>,
 }
 
 #[repr(C)]
@@ -138,15 +139,79 @@ pub struct Uberblock {
     pub file_index_extent: Vec<Extent>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Extent {
-    pub start: BlockId,
-    pub len: u64, // number of blocks
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Extent {
+    Full { start: u64, len: u64 },
+    Partial { start: u64, len: u64, used: u64 },
+}
+
+impl Extent {
+    pub fn start(&self) -> u64 {
+        match self {
+            Extent::Full { start, .. } => *start,
+            Extent::Partial { start, .. } => *start,
+        }
+    }
+    
+    pub fn len(&self) -> u64 {
+        match self {
+            Extent::Full { len, .. } => *len,
+            Extent::Partial { len, .. } => *len,
+        }
+    }
+    
+    pub fn used(&self) -> u64 {
+        match self {
+            Extent::Full { len, .. } => *len,  // Fully used
+            Extent::Partial { used, .. } => *used,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Caddy {
+    Healthy(String, Disk),
+    Unhealthy(String, DiskError)
+}
+
+impl Caddy {
+    pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(_, disk) => {
+                disk.read_block(block, buf).await
+            }
+        }
+    }
+    pub async fn write_block(&self, block: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(_, disk) => {
+                disk.write_block(block, buf).await
+            }
+        }
+    }
+    pub async fn flush(&self) -> Result<(), DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(_, disk) => {
+                disk.flush().await
+            }
+        }
+    }
+    pub fn is_local(&self) -> bool {
+        match self {
+            Caddy::Unhealthy(_, _) => false,
+            Caddy::Healthy(_, disk) => {
+                disk.is_local()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct RaidZ {
-    pub disks: Vec<Disk>,
+    pub disks: Vec<Caddy>,
     superblock: Option<Superblock>,
     rs: ReedSolomon,
     txg_state: TxgState
@@ -186,29 +251,26 @@ impl RaidZ {
 
     pub async fn new(paths: [&str; DISKS]) -> Self {
         // Open all disks concurrently
-        let disk_futures: Vec<_> = paths.into_iter().map(|path| Disk::open(path)).collect();
-        let (disks, errors): (Vec<_>, Vec<_>) =
-            join_all(disk_futures)
-                .await
-                .into_iter()
-                .fold((Vec::new(), Vec::new()), |(mut oks, mut errs), r| {
-                    match r {
-                        Ok(d) => oks.push(d),
-                        Err(e) => errs.push(e),
-                    }
-                    (oks, errs)
-                });
-
-        if errors.len() > 0 {
-            // FIXME: this should be more descriptive and/or pass errors back as a Result
-            panic!("disk open failure")
-        }
+        let disk_futures: Vec<_> = paths.iter().map(|path| Disk::open(path)).collect();
+        let results = join_all(disk_futures).await;
+        
+        // Convert each result into a Caddy
+        let caddies: Vec<Caddy> = results
+            .into_iter()
+            .zip(paths.iter())
+            .map(|(result, &path)| {
+                match result {
+                    Ok(disk) => Caddy::Healthy(path.to_string(), disk),
+                    Err(error) => Caddy::Unhealthy(path.to_string(), error),
+                }
+            })
+            .collect();
 
         let rs = ReedSolomon::new(DATA_SHARDS, PARITY_SHARDS).expect("reed solomon initialization failure");
 
         // find our last txg and setup txg_state
-        let txg_state = TxgState { txg: 0, uberblock: None, stripes: BTreeMap::new() };
-        let mut rz = RaidZ { disks, rs, txg_state, superblock: None };
+        let txg_state = TxgState { txg: 0, uberblock: None, stripes: BTreeMap::new(), deferred_frees: BTreeMap::new() };
+        let mut rz = RaidZ { disks: caddies, rs, txg_state, superblock: None };
         rz.scan_uberblocks().await;
 
         rz
@@ -312,6 +374,27 @@ impl RaidZ {
         Ok(())
     }
 
+    pub fn write_metaslab_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) -> Result<(), RaidZError> {
+        let payload = bincode::serialize(value)?;
+        assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
+
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let shard_idx = (lba % DATA_SHARDS as u64) as usize;
+        
+        // Prepare the full block with header
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(self.txg_state.txg, &payload, &mut block_buf)?;
+        
+        // Get or create stripe buffer
+        let stripe = self.txg_state.deferred_frees
+            .entry(stripe_id)
+            .or_insert_with(StripeBuffer::new);
+        
+        // Convert Vec to array reference for set_shard
+        stripe.set_shard(shard_idx, &block_buf);
+        Ok(())
+    }
+
     pub fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) -> Result<(), RaidZError> {
         let payload = bincode::serialize(value)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
@@ -354,54 +437,57 @@ impl RaidZ {
         // Take ownership of stripes
         let stripes = std::mem::take(&mut self.txg_state.stripes);
 
+        let deferred_frees = std::mem::take(&mut self.txg_state.deferred_frees);
+
         // increment the txg for the buffer
         self.txg_state.txg += 1;
 
-        for (stripe_id, mut stripe_buf) in stripes {
-            // Check if already flushed
-            if stripe_buf.flushed && !stripe_buf.dirty {
-                continue;
-            }
-            
-            // Handle incomplete stripes (RMW)
-            // FIXME: if we can ensure that all writes are full stripes we can get rid of this
-            if !stripe_buf.is_complete() {
-                //println!("WARN: RMW operation in commit_txg for stripe {}", stripe_id);
-                // Identify missing shards before borrowing the data buffer
-                let mut missing_indices = Vec::new();
-                for i in 0..DATA_SHARDS {
-                    if !stripe_buf.has_shard(i) {
-                        missing_indices.push(i);
+        for queue in [deferred_frees,stripes] {
+            for (stripe_id, mut stripe_buf) in queue {
+                // Check if already flushed
+                if stripe_buf.flushed && !stripe_buf.dirty {
+                    continue;
+                }
+                
+                // Handle incomplete stripes (RMW)
+                // FIXME: if we can ensure that all writes are full stripes we can get rid of this
+                if !stripe_buf.is_complete() {
+                    //println!("WARN: RMW operation in commit_txg for stripe {}", stripe_id);
+                    // Identify missing shards before borrowing the data buffer
+                    let mut missing_indices = Vec::new();
+                    for i in 0..DATA_SHARDS {
+                        if !stripe_buf.has_shard(i) {
+                            missing_indices.push(i);
+                        }
+                    }
+
+                    let data = stripe_buf.data.get_or_insert_with(|| {
+                        Box::new([0u8; BLOCK_SIZE * DATA_SHARDS])
+                    });
+                    
+                    let mut read_tasks = FuturesUnordered::new();
+                    for i in missing_indices {
+                        let disk = &self.disks[i];
+                        read_tasks.push(async move {
+                            let mut buf = [0u8; BLOCK_SIZE];
+                            disk.read_block(stripe_id, &mut buf).await.map(|_| (i, buf))
+                        });
+                    }
+
+                    while let Some(result) = read_tasks.next().await {
+                        let (shard_idx, buf) = result?;
+                        let offset = shard_idx * BLOCK_SIZE;
+                        data[offset..offset + BLOCK_SIZE].copy_from_slice(&buf);
+                        stripe_buf.shard_mask |= 1 << shard_idx;
                     }
                 }
-
-                let data = stripe_buf.data.get_or_insert_with(|| {
-                    Box::new([0u8; BLOCK_SIZE * DATA_SHARDS])
-                });
                 
-                let mut read_tasks = FuturesUnordered::new();
-                for i in missing_indices {
-                    let disk = &self.disks[i];
-                    read_tasks.push(async move {
-                        let mut buf = [0u8; BLOCK_SIZE];
-                        disk.read_block(stripe_id, &mut buf).await.map(|_| (i, buf))
-                    });
-                }
-
-                while let Some(result) = read_tasks.next().await {
-                    let (shard_idx, buf) = result?;
-                    let offset = shard_idx * BLOCK_SIZE;
-                    data[offset..offset + BLOCK_SIZE].copy_from_slice(&buf);
-                    stripe_buf.shard_mask |= 1 << shard_idx;
-                }
+                // Now stripe is complete, write it
+                self.write_full_stripe(&stripe_buf, stripe_id).await?;
             }
-            
-            // Now stripe is complete, write it
-            self.write_full_stripe(&stripe_buf, stripe_id).await?;
-        }
 
-        // Flush all disks to ensure all blocks are durable before uberblock
-        self.flush_all_disks();
+            self.flush_all_disks().await?;
+        }
 
         // Rotate and write uberblock
         //let uberblock_lba = UBERBLOCK_START + (txg % UBERBLOCK_COUNT) as u64;
@@ -431,17 +517,18 @@ impl RaidZ {
         self.write_full_stripe(&uber_stripe, uberblock_stripe_id).await?;
 
         // Flush again to ensure uberblock is durable
-        self.flush_all_disks();
+        self.flush_all_disks().await?;
 
         self.txg_state.uberblock = Some(uberblock);
 
         Ok(txg)
     }
 
-    fn flush_all_disks(&mut self) {
-        for disk in &mut self.disks {
-            disk.flush();
+    async fn flush_all_disks(&self) -> Result<(), DiskError> {
+        for disk in &self.disks {
+            disk.flush().await?;
         }
+        Ok(())
     }
 
     async fn write_full_stripe(&mut self, stripe_buf: &StripeBuffer, stripe_id: u64) -> Result<(), RaidZError> {
