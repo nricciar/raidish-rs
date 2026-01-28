@@ -1,8 +1,8 @@
-use reed_solomon_erasure::galois_8::ReedSolomon;
-use crate::disk::{BLOCK_SIZE, BlockId, DiskError, BlockDevice};
-use std::collections::BTreeMap;
+use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError};
+use crate::stripe::{DISKS, Stripe};
 use futures::stream::{FuturesUnordered, StreamExt};
-use crate::stripe::{Stripe, DISKS};
+use reed_solomon_erasure::galois_8::ReedSolomon;
+use std::collections::BTreeMap;
 
 pub const DATA_SHARDS: usize = 3;
 pub const PARITY_SHARDS: usize = 2;
@@ -39,7 +39,7 @@ pub struct StripeBuffer {
     data: Option<Box<[u8; BLOCK_SIZE * DATA_SHARDS]>>,
     shard_mask: u8,
     dirty: bool,
-    flushed: bool,  // For optimistic writes
+    flushed: bool, // For optimistic writes
 }
 
 impl StripeBuffer {
@@ -51,28 +51,30 @@ impl StripeBuffer {
             flushed: false,
         }
     }
-    
+
     pub fn set_shard(&mut self, shard_idx: usize, block_data: &[u8; BLOCK_SIZE]) {
         assert!(shard_idx < DATA_SHARDS);
-        
-        let data_ptr = self.data.get_or_insert_with(|| Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
-        
+
+        let data_ptr = self
+            .data
+            .get_or_insert_with(|| Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
+
         let offset = shard_idx * BLOCK_SIZE;
         data_ptr[offset..offset + BLOCK_SIZE].copy_from_slice(block_data);
-        
+
         self.shard_mask |= 1 << shard_idx;
         self.dirty = true;
         self.flushed = false;
     }
-    
+
     pub fn has_shard(&self, shard_idx: usize) -> bool {
         (self.shard_mask & (1 << shard_idx)) != 0
     }
-    
+
     pub fn is_complete(&self) -> bool {
-        self.shard_mask == 0b111  // All 3 data shards present
+        self.shard_mask == 0b111 // All 3 data shards present
     }
-    
+
     pub fn get_shard(&self, shard_idx: usize, buf: &mut [u8]) -> bool {
         match &self.data {
             Some(d) if self.has_shard(shard_idx) => {
@@ -94,7 +96,7 @@ pub struct RaidZ {
 
 #[async_trait]
 impl BlockDevice for RaidZ {
-    async fn flush(&mut self) -> Result<(),DiskError> {
+    async fn flush(&mut self) -> Result<(), DiskError> {
         let stripes = std::mem::take(&mut self.writes);
 
         for (stripe_id, mut stripe_buf) in stripes {
@@ -102,7 +104,7 @@ impl BlockDevice for RaidZ {
             if stripe_buf.flushed && !stripe_buf.dirty {
                 continue;
             }
-            
+
             if !stripe_buf.is_complete() {
                 let mut missing_indices = Vec::new();
                 for i in 0..DATA_SHARDS {
@@ -111,10 +113,10 @@ impl BlockDevice for RaidZ {
                     }
                 }
 
-                let data = stripe_buf.data.get_or_insert_with(|| {
-                    Box::new([0u8; BLOCK_SIZE * DATA_SHARDS])
-                });
-                
+                let data = stripe_buf
+                    .data
+                    .get_or_insert_with(|| Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
+
                 let mut read_tasks = FuturesUnordered::new();
                 for i in missing_indices {
                     let disk = &self.stripe.disks[i];
@@ -131,9 +133,11 @@ impl BlockDevice for RaidZ {
                     stripe_buf.shard_mask |= 1 << shard_idx;
                 }
             }
-            
+
             // Now stripe is complete, write it
-            self.write_full_stripe(&stripe_buf, stripe_id).await.unwrap();
+            self.write_full_stripe(&stripe_buf, stripe_id)
+                .await
+                .unwrap();
         }
 
         self.stripe.flush().await?;
@@ -147,7 +151,7 @@ impl BlockDevice for RaidZ {
 
         if let Some(stripe_buf) = self.writes.get(&(stripe as u64)) {
             if stripe_buf.has_shard(data_index) && stripe_buf.get_shard(data_index, buf) {
-                return Ok(())
+                return Ok(());
             }
         }
 
@@ -156,36 +160,39 @@ impl BlockDevice for RaidZ {
             Err(_disk_error) => {
                 // Primary disk failed, need to reconstruct from stripe
                 let mut shards: Vec<Option<Vec<u8>>> = vec![None; DISKS];
-                
+
                 // Read all other disks
-                let mut futures = self.stripe.disks.iter()
+                let mut futures = self
+                    .stripe
+                    .disks
+                    .iter()
                     .enumerate()
                     .filter(|(i, _)| *i != data_index) // Skip the failed disk
-                    .map(|(i, disk)| {
-                        async move {
-                            let mut shard = vec![0u8; BLOCK_SIZE];
-                            disk.read_block(stripe as u64, &mut shard).await?;
-                            Ok::<_, RaidZError>((i, shard))
-                        }
+                    .map(|(i, disk)| async move {
+                        let mut shard = vec![0u8; BLOCK_SIZE];
+                        disk.read_block(stripe as u64, &mut shard).await?;
+                        Ok::<_, RaidZError>((i, shard))
                     })
                     .collect::<FuturesUnordered<_>>();
-                
+
                 let mut successful_reads = 0;
                 let mut failed_indices = vec![data_index];
-                
+
                 while let Some(result) = futures.next().await {
                     match result {
                         Ok((i, shard)) => {
                             shards[i] = Some(shard);
                             successful_reads += 1;
-                            
+
                             // We need DATA_SHARDS successful reads (3 out of the other 4 disks)
                             if successful_reads >= DATA_SHARDS {
                                 match self.rs.reconstruct_data(&mut shards) {
                                     Ok(_) => (),
                                     Err(e) => {
-                                        return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, 
-                                            format!("unable to reconstruct data: {}", e))));
+                                        return Err(DiskError::IoError(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("unable to reconstruct data: {}", e),
+                                        )));
                                     }
                                 }
 
@@ -193,27 +200,33 @@ impl BlockDevice for RaidZ {
                                     buf.copy_from_slice(reconstructed);
                                     return Ok(());
                                 } else {
-                                    return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, 
-                                        format!("incomplete stripe: {}", stripe))));
+                                    return Err(DiskError::IoError(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("incomplete stripe: {}", stripe),
+                                    )));
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             if let RaidZError::DiskError(_de) = e {
                                 failed_indices.push(failed_indices.len());
                             }
-                            
+
                             // Can tolerate up to PARITY_SHARDS (2) failures total
                             if failed_indices.len() > PARITY_SHARDS {
-                                return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, 
-                                        format!("too many failures to reconstruct data"))));
+                                return Err(DiskError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("too many failures to reconstruct data"),
+                                )));
                             }
                         }
                     }
                 }
-                
-                return Err(DiskError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, 
-                        format!("incomplete stripe: {}", stripe))));
+
+                return Err(DiskError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("incomplete stripe: {}", stripe),
+                )));
             }
         }
     }
@@ -221,12 +234,13 @@ impl BlockDevice for RaidZ {
     async fn write_block(&mut self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         let stripe_id = lba / DATA_SHARDS as u64;
         let shard_idx = (lba % DATA_SHARDS as u64) as usize;
-        
+
         // Get or create stripe buffer
-        let stripe = self.writes
+        let stripe = self
+            .writes
             .entry(stripe_id)
             .or_insert_with(StripeBuffer::new);
-        
+
         stripe.set_shard(shard_idx, buf);
         Ok(())
     }
@@ -238,15 +252,25 @@ impl RaidZ {
     }
 
     pub async fn new(stripe: Stripe) -> Self {
-        let rs = 
-            ReedSolomon::new(stripe.data_shards(), stripe.len()-stripe.data_shards())
-                .expect("reed solomon initialization failure");
+        let rs = ReedSolomon::new(stripe.data_shards(), stripe.len() - stripe.data_shards())
+            .expect("reed solomon initialization failure");
 
-        RaidZ { stripe, rs, writes: BTreeMap::new() }
+        RaidZ {
+            stripe,
+            rs,
+            writes: BTreeMap::new(),
+        }
     }
 
-    async fn write_full_stripe(&mut self, stripe_buf: &StripeBuffer, stripe_id: u64) -> Result<(), RaidZError> {
-        let data = stripe_buf.data.as_ref().expect("Cannot write stripe without data");
+    async fn write_full_stripe(
+        &mut self,
+        stripe_buf: &StripeBuffer,
+        stripe_id: u64,
+    ) -> Result<(), RaidZError> {
+        let data = stripe_buf
+            .data
+            .as_ref()
+            .expect("Cannot write stripe without data");
 
         let mut shards = vec![vec![0u8; BLOCK_SIZE]; DISKS];
 
@@ -261,15 +285,19 @@ impl RaidZ {
             .into_iter()
             .zip(self.stripe.disks.iter_mut())
             .enumerate()
-            .map(|(disk_idx, (shard, disk))| {
-                async move {
-                    let block: [u8; BLOCK_SIZE] = shard
-                        .try_into()
-                        .map_err(|_| (disk_idx, DiskError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid data size"))) )?;
-                    match disk.write_block(stripe_id, &block).await {
-                        Ok(()) => Ok(disk_idx),
-                        Err(e) => Err((disk_idx, e))
-                    }
+            .map(|(disk_idx, (shard, disk))| async move {
+                let block: [u8; BLOCK_SIZE] = shard.try_into().map_err(|_| {
+                    (
+                        disk_idx,
+                        DiskError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid data size",
+                        )),
+                    )
+                })?;
+                match disk.write_block(stripe_id, &block).await {
+                    Ok(()) => Ok(disk_idx),
+                    Err(e) => Err((disk_idx, e)),
                 }
             });
 
@@ -284,7 +312,10 @@ impl RaidZ {
                     successes += 1;
                 }
                 Err((disk_idx, disk_error)) => {
-                    println!("WARN: Failed to write stripe {} to disk {}: {:?}", stripe_id, disk_idx, disk_error);
+                    println!(
+                        "WARN: Failed to write stripe {} to disk {}: {:?}",
+                        stripe_id, disk_idx, disk_error
+                    );
                     failures.push((disk_idx, disk_error));
                 }
             }
@@ -293,8 +324,12 @@ impl RaidZ {
         // We need at least DATA_SHARDS (3) successful writes to be able to reconstruct
         if successes >= DATA_SHARDS {
             if !failures.is_empty() {
-                println!("Stripe {} written with {} successes and {} failures (recoverable)", 
-                        stripe_id, successes, failures.len());
+                println!(
+                    "Stripe {} written with {} successes and {} failures (recoverable)",
+                    stripe_id,
+                    successes,
+                    failures.len()
+                );
             }
             Ok(())
         } else {

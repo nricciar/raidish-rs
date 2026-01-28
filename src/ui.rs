@@ -1,5 +1,8 @@
-use crate::fs::{FileSystem,UBERBLOCK_BLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
 use crate::disk::BlockDevice;
+use crate::fs::{
+    FileSystem, METASLAB_TABLE_START, SPACEMAP_LOG_BLOCKS_PER_METASLAB, SUPERBLOCK_LBA,
+    UBERBLOCK_BLOCK_COUNT, UBERBLOCK_START,
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
     Superblock,
@@ -7,7 +10,7 @@ enum BlockType {
     MetaslabHeader,
     SpaceMapLog,
     FileIndex,
-    InodeData,  // NEW: inode storage blocks
+    InodeData, // NEW: inode storage blocks
     FileData,
     Free,
 }
@@ -15,14 +18,14 @@ enum BlockType {
 impl BlockType {
     fn color(&self) -> &'static str {
         match self {
-            BlockType::Superblock => "\x1b[48;5;196m",      // Bright red background
-            BlockType::Uberblock => "\x1b[48;5;208m",       // Orange background
-            BlockType::MetaslabHeader => "\x1b[48;5;226m",  // Yellow background
-            BlockType::SpaceMapLog => "\x1b[48;5;220m",     // Gold background
-            BlockType::FileIndex => "\x1b[48;5;39m",        // Bright blue background
-            BlockType::InodeData => "\x1b[48;5;51m",        // Cyan background
-            BlockType::FileData => "\x1b[48;5;34m",         // Green background
-            BlockType::Free => "\x1b[48;5;240m",            // Dark gray background
+            BlockType::Superblock => "\x1b[48;5;196m", // Bright red background
+            BlockType::Uberblock => "\x1b[48;5;208m",  // Orange background
+            BlockType::MetaslabHeader => "\x1b[48;5;226m", // Yellow background
+            BlockType::SpaceMapLog => "\x1b[48;5;220m", // Gold background
+            BlockType::FileIndex => "\x1b[48;5;39m",   // Bright blue background
+            BlockType::InodeData => "\x1b[48;5;51m",   // Cyan background
+            BlockType::FileData => "\x1b[48;5;34m",    // Green background
+            BlockType::Free => "\x1b[48;5;240m",       // Dark gray background
         }
     }
 
@@ -69,7 +72,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let uber = self.uberblock().unwrap();
         let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
-        
+
         // Mark free blocks first (since they're the base state for data region)
         for ms in &self.metaslabs {
             for (&free_start, &free_len) in &ms.free_extents {
@@ -80,7 +83,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             }
         }
-        
+
         // Mark inode data blocks
         for inode_ref in self.file_index.files.values() {
             for extent in &inode_ref.inode_extent {
@@ -91,7 +94,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             }
         }
-        
+
         // Mark file data (requires reading inodes)
         for inode_ref in self.file_index.files.values() {
             if let Ok(inode) = self.read_inode(inode_ref).await {
@@ -104,7 +107,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             }
         }
-        
+
         // Mark file index
         for extent in &uber.file_index_extent {
             let start = extent.start() as usize;
@@ -113,33 +116,33 @@ impl<D: BlockDevice> FileSystem<D> {
                 block_map[i] = BlockType::FileIndex;
             }
         }
-        
+
         // Mark metadata regions (these override data allocations)
         let metaslab_headers_start = METASLAB_TABLE_START as usize;
         let metaslab_headers_end = metaslab_headers_start + superblock.metaslab_count as usize;
         for i in metaslab_headers_start..metaslab_headers_end.min(total_blocks) {
             block_map[i] = BlockType::MetaslabHeader;
         }
-        
+
         let spacemap_logs_start = metaslab_headers_end;
-        let spacemap_logs_end = spacemap_logs_start + 
-            (superblock.metaslab_count as usize * SPACEMAP_LOG_BLOCKS_PER_METASLAB as usize);
+        let spacemap_logs_end = spacemap_logs_start
+            + (superblock.metaslab_count as usize * SPACEMAP_LOG_BLOCKS_PER_METASLAB as usize);
         for i in spacemap_logs_start..spacemap_logs_end.min(total_blocks) {
             block_map[i] = BlockType::SpaceMapLog;
         }
-        
+
         // Mark uberblocks
         let uberblock_start = UBERBLOCK_START as usize;
         let uberblock_end = (UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT) as usize;
         for i in uberblock_start..uberblock_end.min(total_blocks) {
             block_map[i] = BlockType::Uberblock;
         }
-        
+
         // Mark superblock
         if SUPERBLOCK_LBA < total_blocks as u64 {
             block_map[SUPERBLOCK_LBA as usize] = BlockType::Superblock;
         }
-        
+
         block_map
     }
 
@@ -148,29 +151,37 @@ impl<D: BlockDevice> FileSystem<D> {
         let superblock = self.superblock().unwrap();
 
         const RESET: &str = "\x1b[0m";
-        
+
         let total_blocks = superblock.total_blocks;
         let (term_width, term_height) = Self::get_terminal_dimensions();
-        
+
         // Reserve space for labels and margins
         let available_width = term_width.saturating_sub(14);
-        
+
         // Reserve space for headers, legend, statistics, and footer
         let available_height = term_height.saturating_sub(20).max(10);
-        
+
         // Calculate total available characters in the grid
         let total_chars_available = available_width * available_height;
-        
+
         // Calculate how many blocks each character should represent
-        let blocks_per_char = ((total_blocks as f64) / (total_chars_available as f64)).ceil() as u64;
+        let blocks_per_char =
+            ((total_blocks as f64) / (total_chars_available as f64)).ceil() as u64;
         let blocks_per_char = blocks_per_char.max(1);
-        
+
         println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
         println!("║                          RAIDZ BLOCK USAGE MAP                             ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝");
         println!();
-        println!("Total Blocks: {}  |  Blocks per char: {}  |  Grid: {}x{} ({}x{} terminal)", 
-                 total_blocks, blocks_per_char, available_width, available_height, term_width, term_height);
+        println!(
+            "Total Blocks: {}  |  Blocks per char: {}  |  Grid: {}x{} ({}x{} terminal)",
+            total_blocks,
+            blocks_per_char,
+            available_width,
+            available_height,
+            term_width,
+            term_height
+        );
         println!();
 
         // Build the complete block map once
@@ -196,23 +207,24 @@ impl<D: BlockDevice> FileSystem<D> {
         ] {
             let count = counts.get(&block_type).copied().unwrap_or(0);
             let percentage = (count as f64 / total_blocks as f64) * 100.0;
-            println!("  {}{} {}{} - {:>6} blocks ({:>5.1}%)", 
-                     block_type.color(),
-                     block_type.symbol(),
-                     RESET,
-                     block_type.name(),
-                     count,
-                     percentage);
+            println!(
+                "  {}{} {}{} - {:>6} blocks ({:>5.1}%)",
+                block_type.color(),
+                block_type.symbol(),
+                RESET,
+                block_type.name(),
+                count,
+                percentage
+            );
         }
         println!();
 
         // Print the map
         println!("Block Map:");
         println!();
-        
-        
+
         let mut block_idx = 0u64;
-        
+
         while block_idx < total_blocks {
             // Print block number label
             print!("{:>10} │ ", block_idx);
@@ -225,26 +237,29 @@ impl<D: BlockDevice> FileSystem<D> {
                 // Sample blocks in this range to determine dominant type
                 let end_block = (block_idx + blocks_per_char).min(total_blocks);
                 let mut type_counts = std::collections::HashMap::new();
-                
+
                 for b in block_idx..end_block {
                     let bt = block_map[b as usize];
                     *type_counts.entry(bt).or_insert(0) += 1;
                 }
 
                 // Find the most common block type in this range
-                let dominant_type = type_counts.iter()
+                let dominant_type = type_counts
+                    .iter()
                     .max_by_key(|(_, count)| *count)
                     .map(|(bt, _)| *bt)
                     .unwrap_or(BlockType::Free);
 
-                print!("{}{}{}", 
-                       dominant_type.color(),
-                       dominant_type.symbol(),
-                       RESET);
-                
+                print!(
+                    "{}{}{}",
+                    dominant_type.color(),
+                    dominant_type.symbol(),
+                    RESET
+                );
+
                 block_idx += blocks_per_char;
             }
-            
+
             println!();
         }
 
@@ -254,8 +269,11 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Ok(orphaned) = self.find_orphaned_blocks().await {
             if !orphaned.is_empty() {
                 let total_orphaned: u64 = orphaned.iter().map(|(_, len)| len).sum();
-                println!("⚠️  WARNING: {} orphaned blocks detected in {} extents", 
-                         total_orphaned, orphaned.len());
+                println!(
+                    "⚠️  WARNING: {} orphaned blocks detected in {} extents",
+                    total_orphaned,
+                    orphaned.len()
+                );
                 if orphaned.len() <= 10 {
                     println!("   Orphaned extents:");
                     for (start, len) in &orphaned {
@@ -277,10 +295,14 @@ impl<D: BlockDevice> FileSystem<D> {
         for (i, ms) in self.metaslabs.iter().enumerate() {
             let total_blocks = ms.header.block_count;
             let free_blocks: u64 = ms.free_extents.values().sum();
-            println!("Metaslab {}: total_blocks={}, free_blocks={}, log_blocks={}/{}", 
-         i, total_blocks, free_blocks, 
-         ms.write_cursor - ms.header.spacemap_start,
-         SPACEMAP_LOG_BLOCKS_PER_METASLAB);
+            println!(
+                "Metaslab {}: total_blocks={}, free_blocks={}, log_blocks={}/{}",
+                i,
+                total_blocks,
+                free_blocks,
+                ms.write_cursor - ms.header.spacemap_start,
+                SPACEMAP_LOG_BLOCKS_PER_METASLAB
+            );
             let allocated_blocks = total_blocks - free_blocks;
             let utilization = (allocated_blocks as f64 / total_blocks as f64) * 100.0;
             let fragmentation = ms.free_extents.len();
@@ -289,14 +311,22 @@ impl<D: BlockDevice> FileSystem<D> {
             }
 
             println!("Metaslab #{}", i);
-            println!("  Range: {} - {}", ms.header.start_block, 
-                     ms.header.start_block + ms.header.block_count - 1);
+            println!(
+                "  Range: {} - {}",
+                ms.header.start_block,
+                ms.header.start_block + ms.header.block_count - 1
+            );
             println!("  Total: {} blocks", total_blocks);
             println!("  Used:  {} blocks ({:.1}%)", allocated_blocks, utilization);
-            println!("  Free:  {} blocks in {} extents", free_blocks, fragmentation);
-            println!("  Space map: {} / {} log blocks used", 
-                     ms.header.spacemap_blocks, SPACEMAP_LOG_BLOCKS_PER_METASLAB);
-            
+            println!(
+                "  Free:  {} blocks in {} extents",
+                free_blocks, fragmentation
+            );
+            println!(
+                "  Space map: {} / {} log blocks used",
+                ms.header.spacemap_blocks, SPACEMAP_LOG_BLOCKS_PER_METASLAB
+            );
+
             // Draw a simple bar chart
             let bar_width = 50;
             let filled = ((utilization / 100.0) * bar_width as f64) as usize;

@@ -1,27 +1,32 @@
 #![feature(async_drop)]
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
 use clap::{Parser, Subcommand};
-use std::{io::{self}, path::PathBuf, path::Path};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use serde::Deserialize;
+use std::sync::Arc;
+use std::{
+    io::{self},
+    path::Path,
+    path::PathBuf,
+};
+use tokio::sync::Mutex;
 
 mod api;
-mod fs;
 mod disk;
-mod raidz;
-mod ui;
-mod nbd;
-mod nvme;
-mod vblock;
-mod stripe;
+mod fs;
 mod inode;
 mod metaslab;
+mod nbd;
+mod nvme;
+mod raidz;
+mod stripe;
+mod ui;
+mod vblock;
 
-use fs::{FileSystem};
-use raidz::{RaidZ,DATA_SHARDS};
-use stripe::{Stripe};
+use fs::FileSystem;
+use raidz::{DATA_SHARDS, RaidZ};
+use stripe::Stripe;
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -50,51 +55,59 @@ enum Commands {
     Load,
     Nbd {
         name: String,
-        size: u64
+        size: u64,
     },
     Nvme {
-        name: String
+        name: String,
     },
     Block {
         name: String,
-        size: u64
+        size: u64,
     },
     Delete {
-        file: String
+        file: String,
     },
     Read {
-        file: String
+        file: String,
     },
     Inode {
         file: String,
     },
     Write {
-        file: String
+        file: String,
     },
     Listen {
         #[arg(short, long)]
         port: Option<u32>,
-    }
+    },
 }
 
 fn load_config(path: &str) -> io::Result<Config> {
     // Expand tilde to home directory
     let expanded_path = if path.starts_with("~/") {
-        let home = std::env::var("HOME")
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME environment variable not set"))?;
+        let home = std::env::var("HOME").map_err(|_| {
+            io::Error::new(io::ErrorKind::NotFound, "HOME environment variable not set")
+        })?;
         PathBuf::from(home).join(&path[2..])
     } else {
         PathBuf::from(path)
     };
 
     if !expanded_path.exists() {
-        eprintln!("Error: Config file does not exist: {}", expanded_path.display());
+        eprintln!(
+            "Error: Config file does not exist: {}",
+            expanded_path.display()
+        );
         std::process::exit(1);
     }
 
     let config_str = std::fs::read_to_string(&expanded_path)?;
-    let config: Config = serde_yaml::from_str(&config_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config: {}", e)))?;
+    let config: Config = serde_yaml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to parse config: {}", e),
+        )
+    })?;
 
     Ok(config)
 }
@@ -110,7 +123,9 @@ async fn main() -> io::Result<()> {
     }
 
     let disk_refs: Vec<&str> = config.disks.iter().map(|s| s.as_str()).collect();
-    let disk_array: [&str; 5] = disk_refs.as_slice().try_into()
+    let disk_array: [&str; 5] = disk_refs
+        .as_slice()
+        .try_into()
         .expect("Expected exactly 5 disks");
     let stripe = Stripe::new(disk_array, DATA_SHARDS).await;
     let raid = RaidZ::new(stripe).await;
@@ -118,59 +133,65 @@ async fn main() -> io::Result<()> {
     match cli.command {
         Commands::Nbd { name, size } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809).await.unwrap();
-        },
+            nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809)
+                .await
+                .unwrap();
+        }
         Commands::Nvme { name } => {
             let fs = FileSystem::load(raid).await.unwrap();
             let server = nvme::NvmeTcpServer::new(fs, name, 4420);
             server.run().await.unwrap();
-        },
+        }
         Commands::Block { name, size } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
-            fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32).await.unwrap();
-        },
+            fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+        }
         Commands::Map => {
             let fs = FileSystem::load(raid).await.unwrap();
             fs.display_block_map().await;
-        },
+        }
         Commands::Metaslab => {
             let fs = FileSystem::load(raid).await.unwrap();
             fs.display_metaslab_info();
-        },
-        Commands::Orphaned => { 
+        }
+        Commands::Orphaned => {
             let fs = FileSystem::load(raid).await.unwrap();
             let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
-        },
-        Commands::Read{ file } => {
+        }
+        Commands::Read { file } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
             let data = fs.read_file(&file).await.unwrap();
             std::fs::write("output.png", data)?;
-        },
+        }
         Commands::Inode { file } => {
             let fs = FileSystem::load(raid).await.unwrap();
             let inode_ref = fs.file_index.files.get(&file).unwrap();
             let inode = fs.read_inode(&inode_ref).await.unwrap();
             println!("inode: {:?}", inode);
-        },
+        }
         Commands::Write { file } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
             let file = Path::new(&file);
             let data = std::fs::read(file).unwrap();
-            fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data).await.unwrap();
-        },
+            fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data)
+                .await
+                .unwrap();
+        }
         Commands::Delete { file } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
             fs.delete(&file).await.unwrap();
-        },
+        }
         Commands::Format => {
             let fs = FileSystem::format(raid, 500_000).await.unwrap();
             println!("index: {:?}", fs.file_index);
-        },
+        }
         Commands::Load => {
             let fs = FileSystem::load(raid).await.unwrap();
             println!("index: {:?}", fs.file_index);
-        },
+        }
         Commands::Listen { port } => {
             let port = port.unwrap_or_else(|| 8881);
             raid.listen(port).await;

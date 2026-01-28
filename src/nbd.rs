@@ -1,9 +1,9 @@
+use crate::disk::BlockDevice;
+use crate::fs::FileSystem;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::fs::FileSystem;
-use crate::disk::BlockDevice;
 
 const NBD_INIT_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
 const NBD_OPTS_MAGIC: u64 = 0x49484156454F5054; // "IHAVEOPT"
@@ -44,14 +44,14 @@ where
 {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("NBD server listening on port {}", port);
-    
+
     loop {
         let (stream, addr) = listener.accept().await?;
         println!("Client connected from {}", addr);
-        
+
         let fs = fs.clone();
         let zvol_name = zvol_name.clone();
-        
+
         tokio::spawn(async move {
             if let Err(e) = handle_nbd_client(stream, fs, zvol_name, size).await {
                 eprintln!("Client error: {}", e);
@@ -72,77 +72,86 @@ where
     // Initial handshake
     stream.write_u64(NBD_INIT_MAGIC).await?;
     stream.write_u64(NBD_OPTS_MAGIC).await?;
-    stream.write_u16(NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES).await?;
-    
+    stream
+        .write_u16(NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES)
+        .await?;
+
     // Read client flags
     let client_flags = stream.read_u32().await?;
     let no_zeroes = (client_flags & (NBD_FLAG_NO_ZEROES as u32)) != 0;
-    
-    println!("Client flags: 0x{:x}, no_zeroes: {}", client_flags, no_zeroes);
-    
+
+    println!(
+        "Client flags: 0x{:x}, no_zeroes: {}",
+        client_flags, no_zeroes
+    );
+
     // Option haggling phase
     loop {
         let opts_magic = stream.read_u64().await?;
         if opts_magic != NBD_OPTS_MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bad options magic: 0x{:x}", opts_magic)
+                format!("Bad options magic: 0x{:x}", opts_magic),
             ));
         }
-        
+
         let option = stream.read_u32().await?;
         let length = stream.read_u32().await?;
-        
+
         let mut option_data = vec![0u8; length as usize];
         if length > 0 {
             stream.read_exact(&mut option_data).await?;
         }
-        
+
         println!("Received option: {}, length: {}", option, length);
-        
+
         match option {
             NBD_OPT_EXPORT_NAME => {
                 // Old-style export name (goes straight to transmission)
                 println!("Client requested export (old style)");
-                
+
                 // Send export size and flags
                 stream.write_u64(size).await?;
-                stream.write_u16(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH).await?;
-                
+                stream
+                    .write_u16(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH)
+                    .await?;
+
                 if !no_zeroes {
                     stream.write_all(&[0u8; 124]).await?;
                 }
-                
+
                 // Enter transmission phase
                 return transmission_phase(stream, fs, zvol_name, size).await;
             }
             NBD_OPT_GO => {
                 // New-style GO with info
                 println!("Client requested GO");
-                
+
                 // Send NBD_REP_INFO with export info
                 stream.write_u64(NBD_REP_MAGIC).await?;
                 stream.write_u32(option).await?;
                 stream.write_u32(NBD_REP_INFO).await?;
-                
+
                 // Info payload: type (u16) + data
                 let info_data = {
                     let mut buf = Vec::new();
                     buf.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
                     buf.extend_from_slice(&size.to_be_bytes());
-                    buf.extend_from_slice(&(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH).to_be_bytes());
+                    buf.extend_from_slice(
+                        &(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH).to_be_bytes(),
+                    );
                     buf
                 };
-                
+
                 stream.write_u32(info_data.len() as u32).await?;
                 stream.write_all(&info_data).await?;
-                
+
                 // Send NBD_REP_ACK
                 stream.write_u64(NBD_REP_MAGIC).await?;
                 stream.write_u32(option).await?;
                 stream.write_u32(NBD_REP_ACK).await?;
                 stream.write_u32(0).await?; // no additional data
-                
+
                 // Enter transmission phase
                 return transmission_phase(stream, fs, zvol_name, size).await;
             }
@@ -172,7 +181,7 @@ where
     D: BlockDevice + Send + Sync + 'static,
 {
     println!("Entering transmission phase, size: {}", size);
-    
+
     loop {
         let magic = match stream.read_u32().await {
             Ok(m) => m,
@@ -181,39 +190,42 @@ where
                 return Err(e);
             }
         };
-        
+
         if magic != NBD_REQUEST_MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Bad request magic: 0x{:x}", magic)
+                format!("Bad request magic: 0x{:x}", magic),
             ));
         }
-        
+
         let _flags = stream.read_u16().await?;
         let cmd = stream.read_u16().await?;
         let handle = stream.read_u64().await?;
         let offset = stream.read_u64().await?;
         let length = stream.read_u32().await?;
-        
-        println!("CMD: {}, offset: {}, length: {}, handle: {}", cmd, offset, length, handle);
-        
+
+        println!(
+            "CMD: {}, offset: {}, length: {}, handle: {}",
+            cmd, offset, length, handle
+        );
+
         match cmd {
             NBD_CMD_READ => {
                 println!("  -> Handling READ");
                 let mut buf = vec![0u8; length as usize];
-                
+
                 {
                     let mut fs = fs.lock().await;
                     let bytes_read = fs.block_read(&zvol_name, offset, &mut buf).await.unwrap();
                     println!("  -> Read {} bytes from filesystem", bytes_read);
-                    
+
                     if bytes_read != buf.len() {
                         println!("  -> WARNING: Short read: {} vs {}", bytes_read, buf.len());
                         // Fill rest with zeros
                         buf[bytes_read..].fill(0);
                     }
                 } // Drop fs lock before writing to stream
-                
+
                 println!("  -> Sending READ reply");
                 stream.write_u32(NBD_REPLY_MAGIC).await?;
                 stream.write_u32(0).await?; // error = 0
@@ -226,20 +238,24 @@ where
                 println!("  -> Handling WRITE");
                 let mut buf = vec![0u8; length as usize];
                 stream.read_exact(&mut buf).await?;
-                
+
                 let error = {
                     let mut fs = fs.lock().await;
                     let bytes_written = fs.block_write(&zvol_name, offset, &buf).await.unwrap();
                     println!("  -> Wrote {} bytes to filesystem", bytes_written);
-                    
+
                     if bytes_written != buf.len() {
-                        println!("  -> WARNING: Short write: {} vs {}", bytes_written, buf.len());
+                        println!(
+                            "  -> WARNING: Short write: {} vs {}",
+                            bytes_written,
+                            buf.len()
+                        );
                         5 // EIO
                     } else {
                         0
                     }
                 };
-                
+
                 println!("  -> Sending WRITE reply");
                 stream.write_u32(NBD_REPLY_MAGIC).await?;
                 stream.write_u32(error).await?;
