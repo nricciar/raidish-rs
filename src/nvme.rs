@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::fs::FileSystem;
+use crate::disk::BlockDevice;
 
 // NVMe-TCP PDU Types (from NVMe-TCP specification)
 const NVME_TCP_PDU_TYPE_IC_REQ: u8 = 0x00;
@@ -148,8 +149,11 @@ struct NvmeTcpC2HData {
     rsvd2: u32,
 }
 
-pub struct NvmeTcpServer {
-    fs: Arc<Mutex<FileSystem>>,
+pub struct NvmeTcpServer<D>
+where
+    D: BlockDevice + Send + Sync + 'static
+{
+    fs: Arc<Mutex<FileSystem<D>>>,
     device_name: String,
     port: u16,
 }
@@ -206,8 +210,11 @@ impl ControllerState {
 
 }
 
-impl NvmeTcpServer {
-    pub fn new(fs: FileSystem, device_name: String, port: u16) -> Self {
+impl<D: BlockDevice> NvmeTcpServer<D> {
+    pub fn new(fs: FileSystem<D>, device_name: String, port: u16) -> Self
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         NvmeTcpServer {
             fs: Arc::new(Mutex::new(fs)),
             device_name,
@@ -215,7 +222,10 @@ impl NvmeTcpServer {
         }
     }
 
-    pub async fn run(&self) -> std::io::Result<()> {
+    pub async fn run(&self) -> std::io::Result<()>
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
         println!("NVMe-TCP server listening on port {}", self.port);
 
@@ -240,10 +250,13 @@ impl NvmeTcpServer {
 
     async fn handle_connection(
         mut socket: TcpStream,
-        fs: Arc<Mutex<FileSystem>>,
+        fs: Arc<Mutex<FileSystem<D>>>,
         device_name: String,
         conn_id: usize,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<()>
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         // Get device size
         let device_size = {
             let fs_lock = fs.lock().await;
@@ -391,12 +404,15 @@ impl NvmeTcpServer {
     async fn handle_command(
         socket: &mut TcpStream,
         header: NvmeTcpPduHeader,
-        fs: &Arc<Mutex<FileSystem>>,
+        fs: &Arc<Mutex<FileSystem<D>>>,
         device_name: &str,
         device_size: u64,
         ctrl_state: &mut ControllerState,
         conn_id: usize,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<()>
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         let plen = header.plen as usize;
         let hlen = header.hlen as usize;
 
@@ -643,9 +659,12 @@ impl NvmeTcpServer {
     async fn handle_read(
         socket: &mut TcpStream,
         cmd: NvmeCommand,
-        fs: &Arc<Mutex<FileSystem>>,
+        fs: &Arc<Mutex<FileSystem<D>>>,
         device_name: &str,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<()>
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         let slba = u32::from_le(cmd.cdw10) as u64 | ((u32::from_le(cmd.cdw11) as u64) << 32);
         let nlb = (u32::from_le(cmd.cdw12) & 0xFFFF) + 1; // 0-based, so add 1
         
@@ -716,9 +735,12 @@ impl NvmeTcpServer {
     async fn handle_h2c_data(
         socket: &mut TcpStream,
         header: NvmeTcpPduHeader,
-        fs: &Arc<Mutex<FileSystem>>,
+        fs: &Arc<Mutex<FileSystem<D>>>,
         device_name: &str,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<()>
+    where
+        D: BlockDevice + Send + Sync + 'static, 
+    {
         // Read H2C data header (rest after common header)
         let mut h2c_buf = [0u8; 16];
         socket.read_exact(&mut h2c_buf).await?;

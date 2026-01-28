@@ -1,6 +1,5 @@
-use crate::fs::{FileSystem};
-use crate::raidz::{UBERBLOCK_BLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
-
+use crate::fs::{FileSystem,UBERBLOCK_BLOCK_COUNT,UBERBLOCK_START,SUPERBLOCK_LBA,METASLAB_TABLE_START,SPACEMAP_LOG_BLOCKS_PER_METASLAB};
+use crate::disk::BlockDevice;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
     Superblock,
@@ -54,7 +53,7 @@ impl BlockType {
     }
 }
 
-impl FileSystem {
+impl<D: BlockDevice> FileSystem<D> {
     /// Get terminal dimensions, defaulting to 80x24 if detection fails
     fn get_terminal_dimensions() -> (usize, usize) {
         if let Some((w, h)) = term_size::dimensions() {
@@ -66,7 +65,8 @@ impl FileSystem {
 
     /// Build a complete block type map efficiently (async version)
     async fn build_block_map(&self) -> Vec<BlockType> {
-        let superblock = self.dev.superblock().unwrap();
+        let superblock = self.superblock().unwrap();
+        let uber = self.uberblock().unwrap();
         let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
         
@@ -106,7 +106,7 @@ impl FileSystem {
         }
         
         // Mark file index
-        for extent in &self.current_file_index_extent {
+        for extent in &uber.file_index_extent {
             let start = extent.start() as usize;
             let end = (extent.start() + extent.len()) as usize;
             for i in start..end.min(total_blocks) {
@@ -145,7 +145,7 @@ impl FileSystem {
 
     /// Display a visual map of block usage (now async)
     pub async fn display_block_map(&self) {
-        let superblock = self.dev.superblock().unwrap();
+        let superblock = self.superblock().unwrap();
 
         const RESET: &str = "\x1b[0m";
         

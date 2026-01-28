@@ -1,11 +1,8 @@
-use crate::disk::{BLOCK_SIZE,FileId};
-use crate::raidz::{
-    BLOCK_PAYLOAD_SIZE,
-    Extent,
-};
-use crate::fs::{FileInode,FileSystem,FileSystemError,InodeType,InodeRef};
+use crate::disk::{BLOCK_SIZE,FileId,BlockDevice};
+use crate::fs::{FileSystem,FileSystemError,BLOCK_PAYLOAD_SIZE};
+use crate::inode::{FileInode,InodeType,InodeRef,Extent};
 
-impl FileSystem {
+impl<D: BlockDevice> FileSystem<D> {
     pub async fn create_block(&mut self, name: &str, size_bytes: u64, block_size: u32) -> Result<FileId, FileSystemError> {
         // Check if name already exists
         if self.file_index.files.contains_key(name) {
@@ -13,8 +10,7 @@ impl FileSystem {
         }
 
         let blocks_needed = Self::calculate_blocks_needed(size_bytes as usize);
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)
-            .expect("out of space for virtual block device");
+        let allocated_extents : Vec<Extent> = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
 
         println!("Created virtual block device '{}' with {} blocks: {:?}", name, blocks_needed, allocated_extents);
 
@@ -22,7 +18,7 @@ impl FileSystem {
         for extent in &allocated_extents {
             for i in 0..extent.len() {
                 let zeros = vec![0u8; BLOCK_PAYLOAD_SIZE];
-                self.dev.write_raw_block_checked_txg(extent.start() + i, &zeros)?;
+                self.write_raw_block_checked_txg(extent.start() + i, &zeros).await?;
             }
         }
 
@@ -106,7 +102,7 @@ impl FileSystem {
 
             println!("    -> About to call read_raw_block_checked({})", block_lba);
 
-            let (_txg, payload_len) = self.dev.read_raw_block_checked_into(
+            let (_txg, payload_len) = self.read_raw_block_checked_into(
                 block_lba, 
                 &mut block_buf
             ).await?;
@@ -164,15 +160,17 @@ impl FileSystem {
 
             if byte_offset == 0 && to_write == BLOCK_PAYLOAD_SIZE {
                 // Full block write
-                self.dev.write_raw_block_checked_txg(
+                self.write_raw_block_checked_txg(
                     block_lba,
                     &data[bytes_written..bytes_written + to_write],
-                )?;
+                ).await?;
             } else {
-                let (_txg, payload_len) = self.dev.read_raw_block_checked_into(
+                let (_txg, payload_len) = self.read_raw_block_checked_into(
                     block_lba, 
                     &mut block_buf
                 ).await?;
+                block_buf[payload_len..].fill(0);
+
                 // Ensure we have enough space for the write
                 let needed_len = byte_offset + to_write;
                 
@@ -187,15 +185,17 @@ impl FileSystem {
 
                 // Write back the modified payload (only up to what we need)
                 let final_len = needed_len.max(payload_len);
-                self.dev.write_raw_block_checked_txg(
+                self.write_raw_block_checked_txg(
                     block_lba, 
                     &block_buf[..final_len]
-                )?;
+                ).await?;
             }
 
             bytes_written += to_write;
             current_offset += to_write as u64;
         }
+
+        self.dev.flush().await?;
 
         Ok(bytes_written)
     }

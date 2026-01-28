@@ -15,9 +15,13 @@ mod ui;
 mod nbd;
 mod nvme;
 mod vblock;
+mod stripe;
+mod inode;
+mod metaslab;
 
 use fs::{FileSystem};
-use raidz::{RaidZ};
+use raidz::{RaidZ,DATA_SHARDS};
+use stripe::{Stripe};
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -108,7 +112,8 @@ async fn main() -> io::Result<()> {
     let disk_refs: Vec<&str> = config.disks.iter().map(|s| s.as_str()).collect();
     let disk_array: [&str; 5] = disk_refs.as_slice().try_into()
         .expect("Expected exactly 5 disks");
-    let raid = RaidZ::new(disk_array).await;
+    let stripe = Stripe::new(disk_array, DATA_SHARDS).await;
+    let raid = RaidZ::new(stripe).await;
 
     match cli.command {
         Commands::Nbd { name, size } => {

@@ -3,6 +3,7 @@ use tokio::net::TcpListener;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::fs::FileSystem;
+use crate::disk::BlockDevice;
 
 const NBD_INIT_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
 const NBD_OPTS_MAGIC: u64 = 0x49484156454F5054; // "IHAVEOPT"
@@ -32,12 +33,15 @@ const NBD_CMD_FLUSH: u16 = 3;
 const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
 const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
 
-pub async fn serve_nbd(
-    fs: Arc<Mutex<FileSystem>>,
+pub async fn serve_nbd<D>(
+    fs: Arc<Mutex<FileSystem<D>>>,
     zvol_name: String,
     size: u64,
     port: u16,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    D: BlockDevice + Send + Sync + 'static,
+{
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("NBD server listening on port {}", port);
     
@@ -56,12 +60,15 @@ pub async fn serve_nbd(
     }
 }
 
-pub async fn handle_nbd_client(
+pub async fn handle_nbd_client<D>(
     mut stream: tokio::net::TcpStream,
-    fs: Arc<Mutex<FileSystem>>,
+    fs: Arc<Mutex<FileSystem<D>>>,
     zvol_name: String,
     size: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    D: BlockDevice + Send + Sync + 'static,
+{
     // Initial handshake
     stream.write_u64(NBD_INIT_MAGIC).await?;
     stream.write_u64(NBD_OPTS_MAGIC).await?;
@@ -155,12 +162,15 @@ pub async fn handle_nbd_client(
     }
 }
 
-async fn transmission_phase(
+async fn transmission_phase<D>(
     mut stream: tokio::net::TcpStream,
-    fs: Arc<Mutex<FileSystem>>,
+    fs: Arc<Mutex<FileSystem<D>>>,
     zvol_name: String,
     size: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    D: BlockDevice + Send + Sync + 'static,
+{
     println!("Entering transmission phase, size: {}", size);
     
     loop {
@@ -241,9 +251,7 @@ async fn transmission_phase(
                 println!("  -> Handling FLUSH");
                 {
                     let mut fs = fs.lock().await;
-                    // Get the current file index extents to commit the txg
-                    let file_index_extents = fs.current_file_index_extent.clone();
-                    fs.dev.commit_txg(file_index_extents).await.unwrap();
+                    fs.sync().await.unwrap();
                 }
                 // Optionally call fs.sync() or similar
                 stream.write_u32(NBD_REPLY_MAGIC).await?;

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::fs::{File,OpenOptions};
 use url::ParseError;
+use std::fmt;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
@@ -19,7 +20,19 @@ pub enum DiskError {
     ReqwestError(reqwest::Error),
     TungsteniteError(tungstenite::error::Error),
     UnhealthyDisk,
-    InvalidUri(ParseError)
+    InvalidUri(ParseError),
+}
+
+impl fmt::Display for DiskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiskError::IoError(err) => write!(f, "I/O error: {}", err),
+            DiskError::ReqwestError(err) => write!(f, "HTTP request error: {}", err),
+            DiskError::TungsteniteError(err) => write!(f, "WebSocket error: {}", err),
+            DiskError::UnhealthyDisk => write!(f, "disk is unhealthy"),
+            DiskError::InvalidUri(err) => write!(f, "invalid URI: {}", err),
+        }
+    }
 }
 
 impl From<std::io::Error> for DiskError {
@@ -45,6 +58,14 @@ impl From<ParseError> for DiskError {
         DiskError::InvalidUri(error)
     }
 }
+
+#[async_trait::async_trait]
+pub trait BlockDevice: Send + Sync {
+    async fn flush(&mut self) -> Result<(), DiskError>;
+    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError>;
+    async fn write_block(&mut self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
+}
+
 
 #[derive(Debug)]
 enum DiskBackend {
@@ -120,8 +141,11 @@ impl Disk {
             Ok(Disk { backend: DiskBackend::Local(Arc::new(Mutex::new(file))) })
         }
     }
+}
 
-    pub async fn flush(&self) -> Result<(),DiskError> {
+#[async_trait]
+impl BlockDevice for Disk {
+    async fn flush(&mut self) -> Result<(),DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
@@ -171,7 +195,7 @@ impl Disk {
         Ok(())
     }
 
-    pub async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
@@ -251,7 +275,7 @@ impl Disk {
         Ok(())
     }
 
-    pub async fn write_block(&self, block: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_block(&mut self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;

@@ -1,15 +1,24 @@
 use serde::{Serialize, Deserialize};
 use std::collections::BTreeMap;
-use crate::disk::{BLOCK_SIZE,FileId,DiskError};
+use crate::inode::{InodeRef,FileInode,InodeType,Extent};
+use crate::disk::{BlockDevice,BLOCK_SIZE,FileId,DiskError,BlockId};
 use crate::raidz::{
-    RaidZ,
-    BLOCK_PAYLOAD_SIZE,
-    Extent,
+    DATA_SHARDS,
     RaidZError,
-    METASLAB_SIZE_BLOCKS,
-    METASLAB_TABLE_START,
-    SPACEMAP_LOG_BLOCKS_PER_METASLAB
 };
+use crate::metaslab::{MetaslabHeader,MetaslabState,SpaceMapEntry};
+
+pub const FS_ID: &str = "RAIDISHV10";
+pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
+pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
+pub const SUPERBLOCK_LBA: u64 = 0;
+pub const UBERBLOCK_START: u64 = 3;
+pub const UBERBLOCK_BLOCK_COUNT: u64 = 15;
+pub const UBERBLOCK_STRIPE_COUNT: u64 = UBERBLOCK_BLOCK_COUNT / 3; // needs to be a multiple of DATA_SHARDS
+pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
+pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
+pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT + 1; // TODO: + 1 to keep it stripe aligned
+pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
 
 #[derive(Debug)]
 pub enum FileSystemError {
@@ -18,7 +27,9 @@ pub enum FileSystemError {
     RaidZError(RaidZError),
     UnableToAllocateBlocks(u64),
     NotFormatted,
-    FileNotFound
+    FileNotFound,
+    ChecksumMismatch,
+    InvalidMagic,
 }
 
 impl From<bincode::Error> for FileSystemError {
@@ -40,102 +51,31 @@ impl From<RaidZError> for FileSystemError {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct MetaslabHeader {
-    pub start_block: u64,
-    pub block_count: u64,
-    pub spacemap_start: u64,
-    pub spacemap_blocks: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum SpaceMapEntry {
-    Invalid, // Zeros now map here
-    Alloc { start: u64, len: u64 },
-    Free  { start: u64, len: u64 },
-}
-
-#[derive(Debug)]
-pub struct MetaslabState {
-    pub header: MetaslabHeader,
-    pub header_block: u64,
-    pub free_extents: BTreeMap<u64, u64>,
-    pub write_cursor: u64, // next space map log block
-}
-
-#[derive(Debug,Serialize,Deserialize,Clone)]
-pub enum SparseExtent {
-    Allocated(Extent),
-    Sparse(u64)
+pub struct Superblock {
+    pub magic: String,
+    pub block_size: u32,
+    pub total_blocks: u64,
+    pub metaslab_count: u32,
+    pub metaslab_size_blocks: u64,
+    pub metaslab_table_start: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum InodeType {
-    File {
-        size_bytes: u64,
-        extents: Vec<Extent>,
-    },
-    Block {
-        size_bytes: u64,
-        block_size: u32,  // block size (e.g., 4KB, 8KB, 64KB)
-        extents: Vec<Extent>,
-    },
+pub struct Uberblock {
+    pub magic: u64,
+    pub version: u32,
+    pub txg: u64,              // transaction group
+    pub timestamp: u64,        // optional but useful
+    pub file_index_extent: Vec<Extent>,
 }
 
-impl InodeType {
-    pub fn size_bytes(&self) -> u64 {
-        match self {
-            InodeType::File { size_bytes, .. } => *size_bytes,
-            InodeType::Block { size_bytes, .. } => *size_bytes,
-        }
-    }
-
-    pub fn extents(&self) -> &[Extent] { //Vec<Extent> {
-        match self {
-            InodeType::File { extents, .. } => extents, //.clone(),
-            InodeType::Block { extents, size_bytes, block_size } => extents, /*{
-                extents.iter().filter_map(|value| {
-                    if let SparseExtent::Allocated(e) = value {
-                        Some(e.clone())
-                    } else {
-                        None
-                    }
-                }).collect()
-            }*/
-        }
-    }
-
-    pub fn is_block(&self) -> bool {
-        matches!(self, InodeType::Block { .. })
-    }
-
-    pub fn is_file(&self) -> bool {
-        matches!(self, InodeType::File { .. })
-    }
-
-    /*pub fn sparse_extents(&self) -> &[SparseExtent] {
-        match self {
-            InodeType::Block { extents, .. } => extents,
-            _ => panic!("Not a block device"),
-        }
-    }*/
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FileInode {
-    pub id: FileId,
-    pub inode_type: InodeType,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InodeRef {
-    pub file_id: FileId,
-    pub inode_extent: Vec<Extent>,  // Where the inode is stored on disk
-}
-
-impl InodeRef {
-    pub fn extents(&self) -> &[Extent] {
-        &self.inode_extent
-    }
+#[repr(C)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BlockHeader {
+    pub magic: u32,
+    pub txg: u64,
+    pub checksum: [u8; 32],
+    pub payload_len: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -144,126 +84,73 @@ pub struct FileIndex {
     pub files: BTreeMap<String, InodeRef>
 }
 
-#[derive(Debug)]
-pub struct FileSystem {
-    pub dev: RaidZ,
+pub struct FileSystem<D: BlockDevice> {
+    pub dev: D,
+    superblock: Option<Superblock>,
+    uberblock: Option<Uberblock>,
     pub metaslabs: Vec<MetaslabState>,
     pub file_index: FileIndex,
-    pub current_file_index_extent: Vec<Extent>,
 }
 
-impl FileSystem {
-    /// Delete a virtual block device or file
-    pub async fn delete(&mut self, name: &str) -> Result<(), FileSystemError> {
-        let inode_ref = match self.file_index.files.remove(name) {
-            Some(iref) => iref,
-            None => {
-                println!("'{}' does not exist", name);
-                return Ok(());
-            }
+impl<D: BlockDevice> FileSystem<D> {
+    pub fn superblock(&self) -> Option<&Superblock> {
+        self.superblock.as_ref()
+    }
+
+    pub fn uberblock(&self) -> Option<&Uberblock> {
+        self.uberblock.as_ref()
+    }
+
+    pub fn is_formatted(&self) -> bool {
+        self.superblock.is_some() && self.uberblock.is_some()
+    }
+
+    pub fn txg(&self) -> u64 {
+        if let Some(uber) = self.uberblock() {
+            uber.txg
+        } else {
+            0
+        }
+    }
+
+    /// Format file system
+    pub async fn format(dev: D, total_blocks: u64) -> Result<Self, FileSystemError> {
+        let mut fs = 
+            FileSystem {
+                dev: dev,
+                superblock: None,
+                uberblock: None,
+                metaslabs: Vec::new(),
+                file_index: FileIndex { next_file_id: 1, files: BTreeMap::new() },
+            };
+
+        // Zero out uberblock slots (TXG 0)
+        let zero_uber = Uberblock {
+            magic: 0,
+            version: 0,
+            txg: 0,
+            timestamp: 0,
+            file_index_extent: Vec::new(),
         };
-
-        // Read the inode to get its extents
-        let inode = self.read_inode(&inode_ref).await?;
-
-        // Free file data blocks
-        for extent in inode.inode_type.extents() {
-            self.free(extent.start(), extent.len())?;
+        fs.uberblock = Some(zero_uber.clone());
+        for slot in 0..UBERBLOCK_BLOCK_COUNT {
+            fs.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber).await?;
         }
 
-        // Free inode blocks
-        for extent in &inode_ref.inode_extent {
-            self.free(extent.start(), extent.len())?;
-        }
-
-        self.persist_file_index().await?;
-
-        Ok(())
-    }
-
-    /// Find all blocks that are allocated but not referenced by any live data
-    pub async fn find_orphaned_blocks(&self) -> Result<Vec<(u64, u64)>, FileSystemError> {
-        // Step 1: Build set of all blocks that SHOULD be allocated
-        let mut live_blocks = std::collections::HashSet::new();
-        
-        // Mark file data blocks AND inode blocks
-        for inode_ref in self.file_index.files.values() {
-            // Mark inode storage blocks
-            for extent in &inode_ref.inode_extent {
-                for i in 0..extent.len() {
-                    live_blocks.insert(extent.start() + i);
-                }
-            }
-            
-            // Read inode and mark its data blocks
-            let inode = self.read_inode(inode_ref).await?;
-            for extent in inode.inode_type.extents() {
-                for i in 0..extent.len() {
-                    live_blocks.insert(extent.start() + i);
-                }
-            }
-        }
-        
-        // Mark file index blocks
-        for extent in &self.current_file_index_extent {
-            for i in 0..extent.len() {
-                live_blocks.insert(extent.start() + i);
-            }
-        }
-        
-        // Step 2: Find blocks that are allocated but not live
-        let mut orphaned = Vec::new();
-        
-        for ms in &self.metaslabs {
-            let ms_start = ms.header.start_block;
-            let ms_end = ms_start + ms.header.block_count;
-            
-            // Find allocated ranges by inverting free_extents
-            let mut allocated_ranges = Vec::new();
-            let mut cursor = ms_start;
-            
-            for (&free_start, &free_len) in &ms.free_extents {
-                if cursor < free_start {
-                    allocated_ranges.push((cursor, free_start - cursor));
-                }
-                cursor = free_start + free_len;
-            }
-            if cursor < ms_end {
-                allocated_ranges.push((cursor, ms_end - cursor));
-            }
-            
-            // Check which allocated blocks aren't live
-            for (start, len) in allocated_ranges {
-                let mut orphan_start = None;
-                let mut orphan_len = 0;
-                
-                for i in 0..len {
-                    let block = start + i;
-                    if !live_blocks.contains(&block) {
-                        if orphan_start.is_none() {
-                            orphan_start = Some(block);
-                        }
-                        orphan_len += 1;
-                    } else {
-                        if let Some(os) = orphan_start {
-                            orphaned.push((os, orphan_len));
-                            orphan_start = None;
-                            orphan_len = 0;
-                        }
-                    }
-                }
-                
-                if let Some(os) = orphan_start {
-                    orphaned.push((os, orphan_len));
-                }
-            }
-        }
-        
-        Ok(orphaned)
-    }
-    
-    pub async fn format(mut dev: RaidZ, total_blocks: u64) -> Result<Self, FileSystemError> {
+        // Write superblock
         let metaslab_count = (total_blocks / METASLAB_SIZE_BLOCKS) as u32;
+        let superblock = Superblock {
+            magic: FS_ID.to_string(),
+            block_size: BLOCK_SIZE as u32,
+            total_blocks,
+            metaslab_count,
+            metaslab_size_blocks: METASLAB_SIZE_BLOCKS,
+            metaslab_table_start: METASLAB_TABLE_START,
+        };
+        for mirror_idx in 0..3 {
+            fs.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock).await?;
+        }
+        fs.superblock = Some(superblock);
 
         // Calculate metadata layout
         let metaslab_headers_start = METASLAB_TABLE_START;
@@ -286,10 +173,10 @@ impl FileSystem {
             };
 
             // Write metaslab header with checksum
-            dev.write_block_checked_txg(
+            fs.write_block_checked_txg(
                 METASLAB_TABLE_START + i as u64,
                 &header,
-            )?;
+            ).await?;
 
             let entry = SpaceMapEntry::Free {
                 start: start_block,
@@ -297,7 +184,7 @@ impl FileSystem {
             };
 
             // Write initial space map entry with checksum
-            dev.write_block_checked_txg(header.spacemap_start, &entry)?;
+            fs.write_block_checked_txg(header.spacemap_start, &entry).await?;
 
             let mut free_extents = BTreeMap::new();
             free_extents.insert(start_block, METASLAB_SIZE_BLOCKS);
@@ -310,277 +197,15 @@ impl FileSystem {
                 write_cursor
             });
         }
+        fs.metaslabs = metaslabs;
 
-        let mut fs = FileSystem {
-            dev,
-            metaslabs,
-            file_index: FileIndex {
-                next_file_id: 1,
-                files: BTreeMap::new(),
-            },
-            current_file_index_extent: Vec::new()
-        };
-
-        fs.dev.format(total_blocks)?;
+        // write root file index
         fs.persist_file_index().await?;
+
         Ok(fs)
     }
 
-    pub fn free(&mut self, start: u64, len: u64) -> Result<(), FileSystemError> {
-        println!("free called: start: {}, len: {}", start, len);
-        
-        for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
-            let ms_start = ms.header.start_block;
-            let ms_end = ms_start + ms.header.block_count;
-
-            if start >= ms_start && start < ms_end {
-                // Check if compaction needed
-                let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
-                let log_used = ms.write_cursor - ms.header.spacemap_start;
-                
-                if log_used >= log_capacity {
-                    drop(ms); // Release the immutable borrow
-                    self.compact_spacemap_log(ms_idx)?;
-                }
-                
-                return self.free_in_metaslab(ms_idx, start, len);
-            }
-        }
-        
-        Ok(())
-    }
-
-    fn free_in_metaslab(&mut self, ms_idx: usize, start: u64, len: u64) -> Result<(), FileSystemError> {
-        let ms = &mut self.metaslabs[ms_idx];
-        
-        println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
-        println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
-
-        // Check if this exact extent is already free
-        if let Some(&existing_len) = ms.free_extents.get(&start) {
-            if existing_len == len {
-                println!("WARNING: Attempted to free already-free extent {{{}:{}}}", start, len);
-                return Ok(());
-            }
-        }
-        
-        let mut new_start = start;
-        let mut new_len = len;
-
-        // Merge with preceding overlapping/adjacent free blocks
-        if let Some((&prev_start, &prev_len)) = ms.free_extents.range(..start).next_back() {
-            if prev_start + prev_len >= start {
-                new_start = prev_start;
-                new_len = (prev_start + prev_len).max(start + len) - new_start;
-                ms.free_extents.remove(&prev_start);
-            }
-        }
-
-        // Merge with following overlapping/adjacent free blocks
-        loop {
-            if let Some((&next_start, &next_len)) = ms.free_extents.range(new_start..).next() {
-                if next_start <= new_start + new_len {
-                    new_len = (next_start + next_len).max(new_start + new_len) - new_start;
-                    ms.free_extents.remove(&next_start);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        ms.free_extents.insert(new_start, new_len);
-
-        // Write the merged extent to space map log with current TXG
-        let entry = SpaceMapEntry::Free { start: new_start, len: new_len };
-        self.dev.write_metaslab_block_checked_txg(ms.write_cursor, &entry)?;
-        ms.write_cursor += 1;
-
-        ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-        self.dev.write_metaslab_block_checked_txg(ms.header_block, &ms.header)?;
-
-        println!("  -> After merge, inserting {{{}:{}}}", new_start, new_len);
-        
-        Ok(())
-    }
-
-    pub fn allocate_blocks_stripe_aligned(&mut self, blocks_needed: u64) -> Result<Vec<Extent>, FileSystemError> {
-        if blocks_needed == 0 { return Ok(Vec::new()); }
-        
-        // Round up to stripe boundary
-        let alignment = crate::raidz::DATA_SHARDS as u64;
-        let aligned_blocks = ((blocks_needed + alignment - 1) / alignment) * alignment;
-        
-        println!("allocate_blocks_stripe_aligned: requested {}, allocating {} (aligned to {} block stripes)", 
-                 blocks_needed, aligned_blocks, alignment);
-        
-        let mut allocated_extents = Vec::new();
-        let mut remaining = aligned_blocks;
-
-        for (ms_idx, ms) in self.metaslabs.iter_mut().enumerate() {
-            // skip this metaslab if log capacity is full
-            let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
-            let log_used = ms.write_cursor - ms.header.spacemap_start;
-            
-            if log_used >= log_capacity {
-                println!("  MS{}: Skipping - log at capacity ({}/{})", 
-                        ms_idx, log_used, log_capacity);
-                continue;
-            }
-
-            let ms_start = ms.header.start_block;
-            let ms_end = ms_start + ms.header.block_count;
-            
-            // Collect extents we've rejected to avoid infinite loop
-            let mut rejected_extents = Vec::new();
-            
-            while remaining > 0 {
-                // do not allocate anymore from this metaslab if it would
-                // overfill the log
-                let current_log_used = ms.write_cursor - ms.header.spacemap_start;
-                if current_log_used >= log_capacity {
-                    println!("  MS{}: Log filled during allocation sequence", ms_idx);
-                    break; 
-                }
-                // Skip extents we've already rejected
-                let found = ms.free_extents.iter()
-                    .map(|(&s, &l)| (s, l))
-                    .find(|(s, _)| !rejected_extents.iter().any(|(rs, _)| rs == s));
-                
-                if let Some((start, len)) = found {
-                    ms.free_extents.remove(&start);
-
-                    // Align start to stripe boundary
-                    let aligned_start = ((start + alignment - 1) / alignment) * alignment;
-                    let skip = aligned_start.saturating_sub(start);
-                    
-                    if skip >= len {
-                        // Extent too small/misaligned, reject it and try next
-                        rejected_extents.push((start, len));
-                        continue;
-                    }
-                    
-                    let usable_len = len - skip;
-                    let max_in_metaslab = ms_end.saturating_sub(aligned_start);
-                    let available = usable_len.min(max_in_metaslab);
-                    
-                    // Round down to stripe boundary
-                    let aligned_available = (available / alignment) * alignment;
-                    
-                    if aligned_available == 0 {
-                        // Extent too small after alignment, reject it
-                        rejected_extents.push((start, len));
-                        continue;
-                    }
-                    
-                    let take = aligned_available.min(remaining);
-                    
-                    println!("  MS{}: Allocating stripe-aligned extent {{{}: {}}} from {{{}: {}}}", 
-                             ms_idx, aligned_start, take, start, len);
-
-                    // Return skipped blocks before alignment
-                    if skip > 0 {
-                        ms.free_extents.insert(start, skip);
-                        println!("    -> Returned {} pre-alignment blocks to free pool", skip);
-                    }
-                    
-                    // Persist allocation
-                    let entry = SpaceMapEntry::Alloc { start: aligned_start, len: take };
-                    self.dev.write_block_checked_txg(ms.write_cursor, &entry)?;
-                    ms.write_cursor += 1;
-                    ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-                    self.dev.write_block_checked_txg(ms.header_block, &ms.header)?;
-
-                    // Return remainder after allocation
-                    let remainder = aligned_available - take;
-                    if remainder > 0 {
-                        ms.free_extents.insert(aligned_start + take, remainder);
-                        println!("    -> Returned {} post-allocation blocks to free pool", remainder);
-                    }
-
-                    let extent =
-                        if blocks_needed < 3 {
-                            Extent::Partial { start: aligned_start, len: take, used: blocks_needed }
-                        } else {
-                            Extent::Full { start: aligned_start, len: take }
-                        };
-
-                    allocated_extents.push(extent);
-                    remaining -= take;
-                } else {
-                    // No more suitable extents in this metaslab
-                    // Return rejected extents back to free pool
-                    for (start, len) in rejected_extents.drain(..) {
-                        ms.free_extents.insert(start, len);
-                    }
-                    break;
-                }
-            }
-            
-            // Return any remaining rejected extents
-            for (start, len) in rejected_extents.drain(..) {
-                if ms.free_extents.get(&start).is_none() {
-                    ms.free_extents.insert(start, len);
-                }
-            }
-            
-            if remaining == 0 { break; }
-        }
-
-        if remaining == 0 { 
-            Ok(allocated_extents) 
-        } else { 
-            // Rollback: return all allocated blocks
-            for extent in allocated_extents {
-                self.free(extent.start(), extent.len())?;
-            }
-            Err(FileSystemError::UnableToAllocateBlocks(remaining)) 
-        }
-    }
-
-    fn compact_spacemap_log(&mut self, ms_idx: usize) -> Result<(), FileSystemError> {
-        let ms = &mut self.metaslabs[ms_idx];
-        
-        println!("  COMPACTING spacemap log for metaslab {} (was at {}/{})", 
-                ms_idx, 
-                ms.write_cursor - ms.header.spacemap_start,
-                SPACEMAP_LOG_BLOCKS_PER_METASLAB);
-        
-        // Save current free extents
-        let free_extents = ms.free_extents.clone();
-        
-        // Reset cursor to start
-        ms.write_cursor = ms.header.spacemap_start;
-        
-        // Write compacted state - one Free entry per extent
-        for (&start, &len) in &free_extents {
-            let entry = SpaceMapEntry::Free { start, len };
-            self.dev.write_metaslab_block_checked_txg(ms.write_cursor, &entry)?;
-            ms.write_cursor += 1;
-            
-            // Safety check
-            if ms.write_cursor - ms.header.spacemap_start >= SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64 {
-                panic!("Metaslab {} still doesn't fit after compaction! Has {} free extents", 
-                    ms_idx, free_extents.len());
-            }
-        }
-        
-        ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
-        self.dev.write_metaslab_block_checked_txg(ms.header_block, &ms.header)?;
-        
-        println!("  Compacted to {}/{} entries", 
-                ms.write_cursor - ms.header.spacemap_start,
-                SPACEMAP_LOG_BLOCKS_PER_METASLAB);
-        
-        Ok(())
-    }
-
-    /// Calculate how many blocks are needed considering payload overhead
-    pub fn calculate_blocks_needed(data_len: usize) -> u64 {
-        ((data_len + BLOCK_PAYLOAD_SIZE - 1) / BLOCK_PAYLOAD_SIZE) as u64
-    }
-
+    /// Update root file index
     pub async fn persist_file_index(&mut self) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
         let data = bincode::serialize(&self.file_index).unwrap();
@@ -589,7 +214,7 @@ impl FileSystem {
         let blocks_needed = Self::calculate_blocks_needed(data.len());
 
         let allocated_extents = self
-            .allocate_blocks_stripe_aligned(blocks_needed)?;
+            .allocate_blocks_stripe_aligned(blocks_needed).await?;
 
         // Write index data using checksummed blocks
         let mut bytes_left = &data[..];
@@ -600,45 +225,62 @@ impl FileSystem {
                 if take > 0 {
                     let chunk = &bytes_left[..take];
                     // Write with current TXG + 1 (the new transaction)
-                    self.dev.write_block_checked_txg(extent.start() + i, &chunk)?;
+                    self.write_block_checked_txg(extent.start() + i, &chunk).await?;
                     bytes_left = &bytes_left[take..];
                 } else {
                     // Write empty block to maintain extent structure
                     let empty: &[u8] = &[];
-                    self.dev.write_block_checked_txg(extent.start() + i, &empty)?;
+                    self.write_block_checked_txg(extent.start() + i, &empty).await?;
                 }
             }
         }
 
-        self.dev.commit_txg(allocated_extents.clone()).await?;
+        let old_extents = self.uberblock()
+            .map(|ub| ub.file_index_extent.clone());
+
+        self.commit_txg(allocated_extents.clone()).await?;
 
         // Free old index blocks AFTER commit
-        let old_extents = std::mem::replace(&mut self.current_file_index_extent, allocated_extents);
-        for extent in old_extents {
-            self.free(extent.start(), extent.len())?;
+        if let Some(old_extents) = old_extents {
+            for extent in &old_extents {
+                self.free(extent.start(), extent.len()).await?;
+            }
         }
+
         Ok(())
     }
 
-    pub async fn load(dev: RaidZ) -> Result<Self, FileSystemError> {
+    /// Read file system headers and load root file index
+    pub async fn load(dev: D) -> Result<Self, FileSystemError> {
+        let mut fs = 
+            FileSystem {
+                dev: dev,
+                superblock: None,
+                uberblock: None,
+                metaslabs: Vec::new(),
+                file_index: FileIndex { next_file_id: 1, files: BTreeMap::new() },
+            };
+
+        fs.scan_uberblocks().await;
+
         let superblock =
-            dev.superblock().ok_or(FileSystemError::NotFormatted)?.clone();
+            fs.superblock().ok_or(FileSystemError::NotFormatted)?.clone();
         let uber =
-            dev.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
+            fs.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
 
         // Load metaslabs and replay space maps
         let mut metaslabs = Vec::new();
 
         for i in 0..superblock.metaslab_count {
             let (_, header) : (u64, MetaslabHeader) = 
-                dev.read_block_checked(superblock.metaslab_table_start + i as u64).await?;
+                fs.read_block_checked(superblock.metaslab_table_start + i as u64).await?;
             
             let mut free_extents = BTreeMap::new();
 
             // Replay spacemap log entries
             for b in 0..header.spacemap_blocks {
                 // Try to read the space map entry
-                let (_entry_txg, entry) = dev.read_block_checked::<SpaceMapEntry>(
+                let (_entry_txg, entry) = fs.read_block_checked::<SpaceMapEntry>(
                     header.spacemap_start + b as u64
                 ).await?;
                 // Process valid entries only
@@ -705,33 +347,31 @@ impl FileSystem {
                 write_cursor
             });
         }
+        fs.metaslabs = metaslabs;
 
         // Reconstruct file index from extents with validation
         let mut index_bytes = Vec::new();
         for extent in &uber.file_index_extent {
             for i in 0..extent.len() {
-                let (block_txg, chunk) = dev.read_block_checked::<Vec<u8>>(extent.start() + i).await?;
+                let (block_txg, chunk) = fs.read_block_checked::<Vec<u8>>(extent.start() + i).await?;
                 // Validate TXG matches or is from earlier transaction
-                if block_txg <= dev.txg() {
+                if block_txg <= uber.txg {
                     index_bytes.extend_from_slice(&chunk);
                 } else {
                     println!("WARNING: File index block has TXG {} > uberblock TXG {}", 
-                             block_txg, dev.txg());
+                             block_txg, uber.txg);
                 }
             }
         }
         
         let file_index: FileIndex = bincode::deserialize(&index_bytes)
             .expect("Failed to deserialize FileIndex");
+        fs.file_index = file_index;
 
-        Ok(FileSystem {
-            dev,
-            metaslabs,
-            file_index,
-            current_file_index_extent: uber.file_index_extent
-        })
+        Ok(fs)
     }
 
+    /// Read a files contents
     pub async fn read_file(&mut self, name: &str) -> Result<Vec<u8>, FileSystemError> {
         let inode_ref = self.file_index.files.get(name)
             .ok_or_else(|| FileSystemError::FileNotFound)?.clone();
@@ -748,7 +388,7 @@ impl FileSystem {
         let mut block_buf = [0u8; BLOCK_SIZE];
         for extent in inode.inode_type.extents() {
             for i in 0..extent.len() {
-                let (_, len) = self.dev.read_raw_block_checked_into(extent.start() + i, &mut block_buf).await?;
+                let (_, len) = self.read_raw_block_checked_into(extent.start() + i, &mut block_buf).await?;
                 let take = remaining.min(len as u64) as usize;
                 out.extend_from_slice(&block_buf[..take]);
                 remaining -= take as u64;
@@ -758,6 +398,7 @@ impl FileSystem {
         Ok(out)
     }
 
+    /// Write or overwrite a files contents
     pub async fn write_file(&mut self, name: &str, data: &[u8]) -> Result<FileId, FileSystemError> {
         let old_inode_ref = self.file_index.files.get(name).cloned();
 
@@ -772,7 +413,7 @@ impl FileSystem {
         // Calculate blocks needed accounting for header overhead
         let blocks_needed = Self::calculate_blocks_needed(data.len());
         
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)?;
+        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
         println!("allocated extents: {:?}", allocated_extents);
 
         // Write file data in chunks that fit in BLOCK_PAYLOAD_SIZE
@@ -782,14 +423,14 @@ impl FileSystem {
                 if current_offset >= data.len() { 
                     // Write empty block for unused allocated space
                     let empty: &[u8] = &[];
-                    self.dev.write_raw_block_checked_txg(extent.start() + i, &empty)?;
+                    self.write_raw_block_checked_txg(extent.start() + i, &empty).await?;
                     continue; 
                 }
                 
                 let take = (data.len() - current_offset).min(BLOCK_PAYLOAD_SIZE);
                 let chunk = &data[current_offset..current_offset + take];
                 
-                self.dev.write_raw_block_checked_txg(extent.start() + i, &chunk)?;
+                self.write_raw_block_checked_txg(extent.start() + i, &chunk).await?;
                 current_offset += take;
             }
         }
@@ -833,58 +474,223 @@ impl FileSystem {
             
             // Free old data blocks
             for extent in old_inode.inode_type.extents() { 
-                self.free(extent.start(), extent.len())?; 
+                self.free(extent.start(), extent.len()).await?; 
             }
             
             // Free old inode blocks
             for extent in &old_ref.inode_extent {
-                self.free(extent.start(), extent.len())?;
+                self.free(extent.start(), extent.len()).await?;
             }
         }
 
         Ok(file_id)
     }
 
-
-    pub async fn read_inode(&self, inode_ref: &InodeRef) -> Result<FileInode, FileSystemError> {
-        let mut inode_bytes = Vec::new();
-        
-        let mut block_buf = [0u8; BLOCK_SIZE];
-        for extent in inode_ref.extents() {
-            for i in 0..extent.len() {
-                let (_, _chunk) = self.dev.read_raw_block_checked_into(extent.start() + i, &mut block_buf).await?;
-                inode_bytes.extend_from_slice(&block_buf);
+    /// Delete a virtual block device or file
+    pub async fn delete(&mut self, name: &str) -> Result<(), FileSystemError> {
+        let inode_ref = match self.file_index.files.remove(name) {
+            Some(iref) => iref,
+            None => {
+                println!("'{}' does not exist", name);
+                return Ok(());
             }
+        };
+
+        // Read the inode to get its extents
+        let inode = self.read_inode(&inode_ref).await?;
+
+        // Free file data blocks
+        for extent in inode.inode_type.extents() {
+            self.free(extent.start(), extent.len()).await?;
         }
-        
-        let inode: FileInode = bincode::deserialize(&inode_bytes)?;
-        
-        Ok(inode)
+
+        // Free inode blocks
+        for extent in &inode_ref.inode_extent {
+            self.free(extent.start(), extent.len()).await?;
+        }
+
+        self.persist_file_index().await?;
+
+        Ok(())
     }
 
-    pub async fn write_inode(&mut self, inode: &FileInode) -> Result<Vec<Extent>, FileSystemError> {
-        let inode_data = bincode::serialize(inode).unwrap();
-        let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
+    pub async fn sync(&mut self) -> Result<(), FileSystemError> {
+        let uber = self.uberblock.as_ref().ok_or(RaidZError::NotFormatted)?;
+        self.commit_txg(uber.file_index_extent.clone()).await?;
+        Ok(())
+    }
+
+    async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> Result<u64, FileSystemError> {
+        let uber =
+            self.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
+        let txg = uber.txg;
+
+        self.dev.flush().await?;
+
+        let uberblock = Uberblock {
+            magic: UBERBLOCK_MAGIC,
+            version: 1,
+            txg,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            file_index_extent,
+        };
+
+        // Determine which stripe to use (rotating through UBERBLOCK_COUNT stripes)
+        let uberblock_stripe_idx = (txg % UBERBLOCK_STRIPE_COUNT) as u64;
+        let uberblock_stripe_id = (UBERBLOCK_START / DATA_SHARDS as u64) + uberblock_stripe_idx;
+
+        // Serialize and prepare the uberblock block
+        let payload = bincode::serialize(&uberblock)?;
+        assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
         
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed)?;
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(txg, &payload, &mut block_buf)?;
+
+        let base_lba = uberblock_stripe_id * DATA_SHARDS as u64;
+        for shard_idx in 0..DATA_SHARDS {
+            self.dev.write_block(base_lba + shard_idx as u64, &block_buf).await?;
+        }
+
+        // Flush again to ensure uberblock is durable
+        self.dev.flush().await?;
+
+        self.uberblock = Some(uberblock);
+
+        Ok(txg)
+    }
+
+    pub async fn write_raw_block_checked_txg(&mut self, lba: BlockId, data: &[u8]) -> Result<(), FileSystemError> {
+        let uber =
+            self.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
+
+        // Prepare the full block with header
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(uber.txg, data, &mut block_buf)?;
         
-        let mut bytes_left = &inode_data[..];
-        for extent in &allocated_extents {
-            for i in 0..extent.len() {
-                let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
-                
-                if take > 0 {
-                    let chunk = &bytes_left[..take];
-                    self.dev.write_raw_block_checked_txg(extent.start() + i, &chunk)?;
-                    bytes_left = &bytes_left[take..];
-                } else {
-                    let empty: &[u8] = &[];
-                    self.dev.write_raw_block_checked_txg(extent.start() + i, &empty)?;
+        self.dev.write_block(lba, &block_buf).await?;
+        Ok(())
+    }
+
+    pub async fn write_block_checked_txg<T: Serialize>(&mut self, lba: BlockId, value: &T) -> Result<(), FileSystemError> {
+        let uber =
+            self.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
+
+        let payload = bincode::serialize(value)?;
+        assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
+
+        // Prepare the full block with header
+        let mut block_buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(uber.txg, &payload, &mut block_buf)?;
+        
+        self.dev.write_block(lba, &block_buf).await?;
+        Ok(())
+    }
+
+    fn prepare_block_buffer(&self, txg: u64, data: &[u8], buf: &mut [u8; BLOCK_SIZE]) -> Result<(), FileSystemError> {
+        let checksum = *blake3::hash(data).as_bytes();
+        let header = BlockHeader {
+            magic: 0x52414944,
+            txg,
+            checksum,
+            payload_len: data.len() as u32,
+        };
+        buf.fill(0);
+        let header_bytes = bincode::serialize(&header)?;
+        buf[..header_bytes.len()].copy_from_slice(&header_bytes);
+        buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Returns the blocks raw payload excluding headers 
+    pub async fn read_raw_block_checked_into(
+        &self,
+        lba: BlockId,
+        buf: &mut [u8],
+    ) -> Result<(u64, usize), FileSystemError> {
+        assert!(buf.len() >= BLOCK_SIZE);
+
+        self.dev.read_block(lba, buf).await?;
+        
+        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
+
+        if header.magic != 0x52414944 {
+            return Err(FileSystemError::InvalidMagic)
+        }
+
+        let payload_len = header.payload_len as usize;
+        let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + header.payload_len as usize];
+
+        // Checksum verification
+        let checksum = *blake3::hash(payload).as_bytes();
+        if checksum != header.checksum {
+            return Err(FileSystemError::ChecksumMismatch);
+        }
+
+        buf.copy_within(BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len, 0);
+
+        Ok((header.txg, payload_len))
+    }
+
+    async fn scan_uberblocks(&mut self) -> Option<(u64, Uberblock)> {
+        // Load superblock (TXG 0 from format)
+        match self.read_block_checked::<Superblock>(SUPERBLOCK_LBA).await {
+            Ok((_, superblock)) => {
+                self.superblock = Some(superblock)
+            },
+            Err(e) => {
+                println!("WARNING! {:?}", e);
+            }
+        }
+
+        let mut best: Option<(u64, Uberblock)> = None;
+
+        for i in 0..UBERBLOCK_BLOCK_COUNT {
+            let lba = UBERBLOCK_START + i;
+            if let Ok((txg, ub)) = self.read_block_checked::<Uberblock>(lba).await {
+                if ub.magic != UBERBLOCK_MAGIC {
+                    continue;
+                }
+                match &best {
+                    None => {
+                        best = Some((txg, ub));
+                    }
+                    Some((best_txg, _)) if txg > *best_txg => {
+                        best = Some((txg, ub));
+                    }
+                    _ => {}
                 }
             }
         }
-        
-        Ok(allocated_extents)
+
+        // Initialize TXG state from the latest committed uberblock
+        if let Some((_txg, uberblock)) = best.clone() {
+            self.uberblock = Some(uberblock);
+        }
+
+        best
     }
 
+    /// Returns deserialized type from block
+    pub async fn read_block_checked<T: for<'a> Deserialize<'a>>(
+        &self,
+        lba: BlockId,
+    ) -> Result<(u64, T), FileSystemError> {
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        self.dev.read_block(lba, &mut buf).await?;
+
+        let header: BlockHeader =
+            bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
+
+        let payload_start = BLOCK_HEADER_SIZE;
+        let payload_end = payload_start + header.payload_len as usize;
+        let payload = &buf[payload_start..payload_end];
+
+        let checksum = *blake3::hash(payload).as_bytes();
+        if checksum != header.checksum {
+            return Err(FileSystemError::ChecksumMismatch);
+        }
+
+        let value = bincode::deserialize(payload)?;
+        Ok((header.txg, value))
+    }
 }

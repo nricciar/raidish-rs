@@ -8,7 +8,7 @@ use etcd_client::{Client, GetOptions, LockOptions};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::raidz::RaidZ;
-use crate::disk::BLOCK_SIZE;
+use crate::disk::{BLOCK_SIZE,BlockDevice};
 
 pub struct RaidZServer {
     raidz: Arc<Mutex<RaidZ>>,
@@ -71,7 +71,7 @@ async fn get_block(
     let raidz = server.raidz.lock().await;
     
     // Check if disk_index is valid
-    if disk_index >= raidz.disks.len() {
+    if disk_index >= raidz.stripe.disks.len() {
         return Err(Status::NotFound);
     }
     
@@ -81,7 +81,7 @@ async fn get_block(
     }
     
     let mut buf = vec![0u8; BLOCK_SIZE];
-    raidz.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
+    raidz.stripe.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
     
     Ok(buf)
 }
@@ -104,10 +104,10 @@ async fn put_block(
         return Err(Status::BadRequest);
     }
     
-    let raidz = server.raidz.lock().await;
+    let mut raidz = server.raidz.lock().await;
     
     // Check if disk_index is valid
-    if disk_index >= raidz.disks.len() {
+    if disk_index >= raidz.stripe.disks.len() {
         return Err(Status::NotFound);
     }
     
@@ -115,8 +115,9 @@ async fn put_block(
     if !raidz.is_local_disk(disk_index) {
         return Err(Status::BadRequest);
     }
-    
-    raidz.disks[disk_index].write_block(block_id, &bytes).await.unwrap();
+
+    let bytes = &bytes.as_slice().try_into().unwrap();
+    raidz.stripe.disks[disk_index].write_block(block_id, &bytes).await.unwrap();
     
     Ok(Status::Ok)
 }
@@ -140,7 +141,7 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
     }*/
     let raidz = server.raidz.lock().await;
     
-    let disk_info: Vec<_> = (0..raidz.disks.len())
+    let disk_info: Vec<_> = (0..raidz.stripe.disks.len())
         .map(|i| {
             serde_json::json!({
                 "index": i,
@@ -156,10 +157,10 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
 async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
-    let raidz = server.raidz.lock().await;
+    let mut raidz = server.raidz.lock().await;
     
     // Check if disk_index is valid
-    if disk_index >= raidz.disks.len() {
+    if disk_index >= raidz.stripe.disks.len() {
         return Status::NotFound;
     }
     
@@ -168,7 +169,7 @@ async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
         return Status::BadRequest;
     }
     
-    raidz.disks[disk_index].flush().await.unwrap();
+    raidz.stripe.disks[disk_index].flush().await.unwrap();
 
     Status::Ok
 }
@@ -214,10 +215,10 @@ async fn handle_ws_message(
         data[3..11].try_into().unwrap()
     );
     
-    let raidz_lock = raidz.lock().await;
+    let mut raidz_lock = raidz.lock().await;
     
     // Check disk validity
-    if disk_index >= raidz_lock.disks.len() {
+    if disk_index >= raidz_lock.stripe.disks.len() {
         return vec![1]; // Error - not found
     }
     
@@ -229,7 +230,7 @@ async fn handle_ws_message(
         // Read operation
         0 => {
             let mut buf = vec![0u8; BLOCK_SIZE];
-            raidz_lock.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
+            raidz_lock.stripe.disks[disk_index].read_block(block_id, &mut buf).await.unwrap();
             
             let mut response = vec![0]; // Success
             response.extend_from_slice(&buf);
@@ -241,14 +242,14 @@ async fn handle_ws_message(
                 return vec![2]; // Invalid request
             }
             
-            let block_data = &data[11..11+BLOCK_SIZE];
-            raidz_lock.disks[disk_index].write_block(block_id, block_data).await.unwrap();
+            let block_data = &data[11..11+BLOCK_SIZE].try_into().unwrap();
+            raidz_lock.stripe.disks[disk_index].write_block(block_id, &block_data).await.unwrap();
             
             vec![0] // Success
         }
         2 => {
-            println!("flush req for {:?}", raidz_lock.disks[disk_index]);
-            raidz_lock.disks[disk_index].flush().await.unwrap();
+            println!("flush req for {:?}", raidz_lock.stripe.disks[disk_index]);
+            raidz_lock.stripe.disks[disk_index].flush().await.unwrap();
             vec![0]
         }
         _ => vec![2], // Unknown operation
