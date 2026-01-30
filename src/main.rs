@@ -23,6 +23,7 @@ mod raidz;
 mod stripe;
 mod ui;
 mod vblock;
+mod websocket;
 
 use fs::FileSystem;
 use raidz::{DATA_SHARDS, RaidZ};

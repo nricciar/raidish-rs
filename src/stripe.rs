@@ -1,17 +1,18 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError};
 use futures::future::join_all;
+use std::sync::Arc;
 
 pub const DISKS: usize = 5;
 
 #[derive(Debug)]
 pub struct Stripe {
-    pub disks: Vec<Caddy>,
+    pub disks: Arc<Vec<Caddy>>,
     data_shards: usize,
 }
 
 impl Stripe {
     pub fn len(&self) -> usize {
-        DISKS
+        DISKS // TODO
     }
 
     pub fn data_shards(&self) -> usize {
@@ -19,11 +20,9 @@ impl Stripe {
     }
 
     pub async fn new(paths: [&str; DISKS], data_shards: usize) -> Self {
-        // Open all disks concurrently
         let disk_futures: Vec<_> = paths.iter().map(|path| Disk::open(path)).collect();
         let results = join_all(disk_futures).await;
 
-        // Convert each result into a Caddy
         let disks: Vec<Caddy> = results
             .into_iter()
             .zip(paths.iter())
@@ -33,23 +32,22 @@ impl Stripe {
             })
             .collect();
 
-        Stripe { disks, data_shards }
+        Stripe {
+            disks: Arc::new(disks),
+            data_shards,
+        }
     }
 }
 
 #[async_trait]
 impl BlockDevice for Stripe {
-    async fn flush(&mut self) -> Result<(), DiskError> {
-        let futures = self
-            .disks
-            .iter_mut()
-            .enumerate()
-            .map(|(i, disk)| async move {
-                match disk.flush().await {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err((i, e)),
-                }
-            });
+    async fn flush(&self) -> Result<(), DiskError> {
+        let futures = self.disks.iter().enumerate().map(|(i, disk)| async move {
+            match disk.flush().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err((i, e)),
+            }
+        });
         let results = futures::future::join_all(futures).await;
 
         let mut failures = Vec::new();
@@ -74,20 +72,14 @@ impl BlockDevice for Stripe {
         let stripe = lba as usize / self.data_shards;
         let data_index = lba as usize % self.data_shards;
 
-        match self.disks[data_index].read_block(stripe as u64, buf).await {
-            Ok(()) => return Ok(()),
-            Err(disk_error) => Err(disk_error),
-        }
+        self.disks[data_index].read_block(stripe as u64, buf).await
     }
 
-    async fn write_block(&mut self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+    async fn write_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         let stripe = lba as usize / self.data_shards;
         let data_index = lba as usize % self.data_shards;
 
-        match self.disks[data_index].write_block(stripe as u64, buf).await {
-            Ok(()) => return Ok(()),
-            Err(disk_error) => Err(disk_error),
-        }
+        self.disks[data_index].write_block(stripe as u64, buf).await
     }
 }
 
@@ -112,11 +104,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn write_block(
-        &mut self,
-        block: BlockId,
-        buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), DiskError> {
+    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(dev, e) => {
                 eprintln!("caddy: unable to write to unhealthy disk '{}': {}", dev, e);
@@ -129,7 +117,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn flush(&mut self) -> Result<(), DiskError> {
+    async fn flush(&self) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(dev, e) => {
                 eprintln!("caddy: unable to flush unhealthy disk '{}': {}", dev, e);

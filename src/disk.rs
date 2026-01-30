@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
@@ -13,6 +14,12 @@ use url::ParseError;
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
 pub type FileId = u64;
+
+thread_local! {
+    static WS_READ_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11));
+    static WS_WRITE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11 + BLOCK_SIZE));
+    static WS_FLUSH_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11));
+}
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -61,16 +68,12 @@ impl From<ParseError> for DiskError {
 
 #[async_trait::async_trait]
 pub trait BlockDevice: Send + Sync {
-    async fn flush(&mut self) -> Result<(), DiskError>;
+    async fn flush(&self) -> Result<(), DiskError>;
     async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError>;
-    async fn write_block(
-        &mut self,
-        block: BlockId,
-        buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), DiskError>;
+    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum DiskBackend {
     Local(Arc<Mutex<File>>),
     Remote {
@@ -84,7 +87,7 @@ enum DiskBackend {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Disk {
     backend: DiskBackend,
 }
@@ -155,7 +158,7 @@ impl Disk {
 
 #[async_trait]
 impl BlockDevice for Disk {
-    async fn flush(&mut self) -> Result<(), DiskError> {
+    async fn flush(&self) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
@@ -174,10 +177,14 @@ impl BlockDevice for Disk {
             }
             DiskBackend::WebSocket { disk_id, ws } => {
                 // Build read request: [op:1][disk_index:2][block_id:8]
-                let mut request = Vec::with_capacity(11);
-                request.push(2); // op=2 for flush
-                request.extend_from_slice(&disk_id.to_le_bytes());
-                request.extend_from_slice(&(0 as u64).to_le_bytes());
+                let request = WS_FLUSH_BUFFER.with(|buf| {
+                    let mut request = buf.borrow_mut();
+                    request.clear();
+                    request.push(2); // op=2 for flush
+                    request.extend_from_slice(&disk_id.to_le_bytes());
+                    request.extend_from_slice(&(0_u64).to_le_bytes());
+                    request.clone()
+                });
 
                 let mut ws_lock = ws.lock().await;
 
@@ -197,7 +204,9 @@ impl BlockDevice for Disk {
                         match status {
                             0 => (), // Success
                             1 => {
-                                return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into()));
+                                return Err(DiskError::IoError(
+                                    std::io::ErrorKind::NotFound.into(),
+                                ));
                             }
                             2 => {
                                 return Err(DiskError::IoError(
@@ -271,10 +280,14 @@ impl BlockDevice for Disk {
             }
             DiskBackend::WebSocket { disk_id, ws } => {
                 // Build read request: [op:1][disk_index:2][block_id:8]
-                let mut request = Vec::with_capacity(11);
-                request.push(0); // op=0 for read
-                request.extend_from_slice(&disk_id.to_le_bytes());
-                request.extend_from_slice(&block.to_le_bytes());
+                let request = WS_READ_BUFFER.with(|buf| {
+                    let mut request = buf.borrow_mut();
+                    request.clear();
+                    request.push(0); // op=0 for read
+                    request.extend_from_slice(&disk_id.to_le_bytes());
+                    request.extend_from_slice(&block.to_le_bytes());
+                    request.clone()
+                });
 
                 let mut ws_lock = ws.lock().await;
 
@@ -303,7 +316,9 @@ impl BlockDevice for Disk {
                                 }
                             }
                             1 => {
-                                return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into()));
+                                return Err(DiskError::IoError(
+                                    std::io::ErrorKind::NotFound.into(),
+                                ));
                             }
                             2 => {
                                 return Err(DiskError::IoError(
@@ -333,11 +348,7 @@ impl BlockDevice for Disk {
         Ok(())
     }
 
-    async fn write_block(
-        &mut self,
-        block: BlockId,
-        buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), DiskError> {
+    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
                 let mut file = file.lock().await;
@@ -362,11 +373,15 @@ impl BlockDevice for Disk {
             }
             DiskBackend::WebSocket { disk_id, ws } => {
                 // Build write request: [op:1][disk_index:2][block_id:8][data:4096]
-                let mut request = Vec::with_capacity(11 + BLOCK_SIZE);
-                request.push(1); // op=1 for write
-                request.extend_from_slice(&disk_id.to_le_bytes());
-                request.extend_from_slice(&block.to_le_bytes());
-                request.extend_from_slice(buf);
+                let request = WS_WRITE_BUFFER.with(|buffer| {
+                    let mut request = buffer.borrow_mut();
+                    request.clear();
+                    request.push(1); // op=1 for write
+                    request.extend_from_slice(&disk_id.to_le_bytes());
+                    request.extend_from_slice(&block.to_le_bytes());
+                    request.extend_from_slice(buf);
+                    request.clone()
+                });
 
                 let mut ws_lock = ws.lock().await;
 
@@ -386,7 +401,9 @@ impl BlockDevice for Disk {
                         match status {
                             0 => {} // Success
                             1 => {
-                                return Err(DiskError::IoError(std::io::ErrorKind::NotFound.into()));
+                                return Err(DiskError::IoError(
+                                    std::io::ErrorKind::NotFound.into(),
+                                ));
                             }
                             2 => {
                                 return Err(DiskError::IoError(
