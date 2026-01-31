@@ -6,6 +6,7 @@ use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use crossbeam_queue::ArrayQueue;
 
 pub const DATA_SHARDS: usize = 3;
 pub const PARITY_SHARDS: usize = 2;
@@ -53,7 +54,7 @@ impl From<reed_solomon_simd::Error> for RaidZError {
 pub struct RaidZ {
     pub stripe: Stripe,
     writes: Arc<DashMap<u64, Arc<Mutex<StripeBuffer>>>>,
-    stripe_pool: Arc<Mutex<Vec<Box<[u8; BLOCK_SIZE * DATA_SHARDS]>>>>,
+    stripe_pool: Arc<ArrayQueue<Box<[u8; BLOCK_SIZE * DATA_SHARDS]>>>,
 }
 
 #[async_trait]
@@ -111,8 +112,7 @@ impl BlockDevice for RaidZ {
                 .unwrap();
 
             if let Some(buffer) = stripe_buf.take_buffer() {
-                let mut pool = self.stripe_pool.lock().await;
-                pool.push(buffer);
+                let _ = self.stripe_pool.push(buffer);
             }
 
             drop(stripe_buf);
@@ -162,8 +162,7 @@ impl BlockDevice for RaidZ {
             stripe_ref.value().clone()
         } else {
             let buffer = {
-                let mut pool = self.stripe_pool.lock().await;
-                pool.pop()
+                self.stripe_pool.pop()
             };
 
             let new_stripe = Arc::new(Mutex::new(
@@ -182,8 +181,8 @@ impl BlockDevice for RaidZ {
                         let mut guard =
                             new_stripe.try_lock().expect("Exclusive ownership expected");
                         if let Some(buf) = guard.take_buffer() {
-                            let mut pool = self.stripe_pool.lock().await;
-                            pool.push(buf);
+                            //let mut pool = self.stripe_pool.lock().await;
+                            let _ = self.stripe_pool.push(buf);
                         }
                     }
                     o.get().clone()
@@ -210,18 +209,16 @@ impl RaidZ {
         RaidZ {
             stripe,
             writes: Arc::new(DashMap::new()),
-            stripe_pool: Arc::new(Mutex::new(Vec::new())),
+            stripe_pool: Arc::new(ArrayQueue::new(100)),
         }
     }
 
     pub async fn with_pool_size(mut self, pool_size: usize) -> Self {
-        self.stripe_pool.lock().await.reserve(pool_size);
+        let pool = Arc::new(ArrayQueue::new(pool_size));
         for _ in 0..pool_size {
-            self.stripe_pool
-                .lock()
-                .await
-                .push(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
+            let _ = pool.push(Box::new([0u8; BLOCK_SIZE * DATA_SHARDS]));
         }
+        self.stripe_pool = pool;
         self
     }
 

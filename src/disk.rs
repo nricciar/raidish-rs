@@ -1,6 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
@@ -14,12 +13,6 @@ use url::ParseError;
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
 pub type FileId = u64;
-
-thread_local! {
-    static WS_READ_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11));
-    static WS_WRITE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11 + BLOCK_SIZE));
-    static WS_FLUSH_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(11));
-}
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -176,15 +169,8 @@ impl BlockDevice for Disk {
                 }
             }
             DiskBackend::WebSocket { disk_id, ws } => {
-                // Build read request: [op:1][disk_index:2][block_id:8]
-                let request = WS_FLUSH_BUFFER.with(|buf| {
-                    let mut request = buf.borrow_mut();
-                    request.clear();
-                    request.push(2); // op=2 for flush
-                    request.extend_from_slice(&disk_id.to_le_bytes());
-                    request.extend_from_slice(&(0_u64).to_le_bytes());
-                    request.clone()
-                });
+                // Build flush request: [op:2][disk_index:2][00000000]
+                let request = build_ws_request(2, *disk_id, 0, None);
 
                 let mut ws_lock = ws.lock().await;
 
@@ -279,15 +265,8 @@ impl BlockDevice for Disk {
                 }
             }
             DiskBackend::WebSocket { disk_id, ws } => {
-                // Build read request: [op:1][disk_index:2][block_id:8]
-                let request = WS_READ_BUFFER.with(|buf| {
-                    let mut request = buf.borrow_mut();
-                    request.clear();
-                    request.push(0); // op=0 for read
-                    request.extend_from_slice(&disk_id.to_le_bytes());
-                    request.extend_from_slice(&block.to_le_bytes());
-                    request.clone()
-                });
+                // Build read request: [op:0][disk_index:2][block_id:8]
+                let request = build_ws_request(0, *disk_id, block, None);
 
                 let mut ws_lock = ws.lock().await;
 
@@ -373,15 +352,7 @@ impl BlockDevice for Disk {
             }
             DiskBackend::WebSocket { disk_id, ws } => {
                 // Build write request: [op:1][disk_index:2][block_id:8][data:4096]
-                let request = WS_WRITE_BUFFER.with(|buffer| {
-                    let mut request = buffer.borrow_mut();
-                    request.clear();
-                    request.push(1); // op=1 for write
-                    request.extend_from_slice(&disk_id.to_le_bytes());
-                    request.extend_from_slice(&block.to_le_bytes());
-                    request.extend_from_slice(buf);
-                    request.clone()
-                });
+                let request = build_ws_request(1, *disk_id, block, Some(buf));
 
                 let mut ws_lock = ws.lock().await;
 
@@ -432,4 +403,20 @@ impl BlockDevice for Disk {
         }
         Ok(())
     }
+}
+
+#[inline]
+fn build_ws_request(op: u8, disk_id: u16, block_id: u64, data: Option<&[u8]>) -> Vec<u8> {
+    let capacity = 11 + data.map(|d| d.len()).unwrap_or(0);
+    let mut request = Vec::with_capacity(capacity);
+    
+    request.push(op);
+    request.extend_from_slice(&disk_id.to_le_bytes());
+    request.extend_from_slice(&block_id.to_le_bytes());
+    
+    if let Some(data) = data {
+        request.extend_from_slice(data);
+    }
+    
+    request
 }

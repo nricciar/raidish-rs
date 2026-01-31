@@ -12,7 +12,7 @@ pub struct Stripe {
 
 impl Stripe {
     pub fn len(&self) -> usize {
-        DISKS // TODO
+        self.disks.len()
     }
 
     pub fn data_shards(&self) -> usize {
