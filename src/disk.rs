@@ -409,14 +409,14 @@ impl BlockDevice for Disk {
 fn build_ws_request(op: u8, disk_id: u16, block_id: u64, data: Option<&[u8]>) -> Vec<u8> {
     let capacity = 11 + data.map(|d| d.len()).unwrap_or(0);
     let mut request = Vec::with_capacity(capacity);
-    
+
     request.push(op);
     request.extend_from_slice(&disk_id.to_le_bytes());
     request.extend_from_slice(&block_id.to_le_bytes());
-    
+
     if let Some(data) = data {
         request.extend_from_slice(data);
     }
-    
+
     request
 }

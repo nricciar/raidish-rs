@@ -31,9 +31,9 @@ cargo run -- --config remote-config.yaml map
 // load filesystem and display root file index
 load
 // write file to root file index
-write path/to/file
+write path/to/file path/to/dest
 // read file from file index
-read file
+read path/to/file
 // display orphaned blocks (if any)
 orphaned
 // create a virtual block device
@@ -72,5 +72,5 @@ sudo nbd-client -d /dev/nbd0
 ## TODO
 
 * virtual block devices (partially implemented)
-* directories
+* permissions
 * snapshots

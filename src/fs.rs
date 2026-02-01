@@ -1,9 +1,11 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
-use crate::inode::{Extent, FileInode, InodeRef, InodeType};
+use crate::inode::{Extent, FileIndex, FileInode, InodeRef, InodeType, Permissions};
 use crate::metaslab::{MetaslabHeader, MetaslabState, SpaceMapEntry};
 use crate::raidz::{DATA_SHARDS, RaidZError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
 
 pub const FS_ID: &str = "RAIDISHV10";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
@@ -27,6 +29,29 @@ pub enum FileSystemError {
     FileNotFound,
     ChecksumMismatch,
     InvalidMagic,
+    DirectoryNotFound,
+    NotADirectory,
+    NotAFile,
+}
+
+impl fmt::Display for FileSystemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileSystemError::SerializationError(err) => write!(f, "Serialization error: {}", err),
+            FileSystemError::DiskError(err) => write!(f, "Disk error: {}", err),
+            FileSystemError::RaidZError(err) => write!(f, "RaidZ error: {}", err),
+            FileSystemError::UnableToAllocateBlocks(count) => {
+                write!(f, "Unable to allocate {} blocks", count)
+            }
+            FileSystemError::NotFormatted => write!(f, "Not formatted"),
+            FileSystemError::FileNotFound => write!(f, "File not found"),
+            FileSystemError::ChecksumMismatch => write!(f, "Checksum mismatch"),
+            FileSystemError::InvalidMagic => write!(f, "Invalid magic"),
+            FileSystemError::DirectoryNotFound => write!(f, "Directory not found"),
+            FileSystemError::NotADirectory => write!(f, "Not a directory"),
+            FileSystemError::NotAFile => write!(f, "Not a file"),
+        }
+    }
 }
 
 impl From<bincode::Error> for FileSystemError {
@@ -75,12 +100,6 @@ pub struct BlockHeader {
     pub payload_len: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FileIndex {
-    pub next_file_id: FileId,
-    pub files: BTreeMap<String, InodeRef>,
-}
-
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Option<Superblock>,
@@ -96,18 +115,6 @@ impl<D: BlockDevice> FileSystem<D> {
 
     pub fn uberblock(&self) -> Option<&Uberblock> {
         self.uberblock.as_ref()
-    }
-
-    pub fn is_formatted(&self) -> bool {
-        self.superblock.is_some() && self.uberblock.is_some()
-    }
-
-    pub fn txg(&self) -> u64 {
-        if let Some(uber) = self.uberblock() {
-            uber.txg
-        } else {
-            0
-        }
     }
 
     /// Format file system
@@ -201,13 +208,13 @@ impl<D: BlockDevice> FileSystem<D> {
         fs.metaslabs = metaslabs;
 
         // write root file index
-        fs.persist_file_index().await?;
+        fs.persist_root_index().await?;
 
         Ok(fs)
     }
 
     /// Update root file index
-    pub async fn persist_file_index(&mut self) -> Result<(), FileSystemError> {
+    pub async fn persist_root_index(&mut self) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
         let data = bincode::serialize(&self.file_index).unwrap();
 
@@ -399,18 +406,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Read a files contents
-    pub async fn read_file(&mut self, name: &str) -> Result<Vec<u8>, FileSystemError> {
-        let inode_ref = self
-            .file_index
-            .files
-            .get(name)
-            .ok_or_else(|| FileSystemError::FileNotFound)?
-            .clone();
+    pub async fn read_file(&mut self, path: &Path) -> Result<Vec<u8>, FileSystemError> {
+        let inode_ref = self.get_file_at_path(path).await?;
 
         let inode = self.read_inode(&inode_ref).await?;
 
         if !inode.inode_type.is_file() {
-            panic!("'{}' is not a regular file", name);
+            panic!("'{}' is not a regular file", path.display());
         }
 
         let mut out = Vec::with_capacity(inode.inode_type.size_bytes() as usize);
@@ -431,15 +433,107 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(out)
     }
 
+    /// List directory contents
+    pub async fn ls(&self, path: &Path) -> Result<FileIndex, FileSystemError> {
+        let (index, _) = self.get_directory_at_path(path).await?;
+        Ok(index)
+    }
+
+    pub async fn mkdir(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
+        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+
+        if let Some(ref inode_ref) = old_inode_ref {
+            let old_inode = self.read_inode(inode_ref).await?;
+            if !old_inode.inode_type.is_directory() {
+                panic!("'{}' is not a directory", path.display());
+            }
+            Ok(old_inode.id)
+        } else {
+            let dir = FileIndex {
+                next_file_id: 1,
+                files: BTreeMap::new(),
+            };
+            let data = bincode::serialize(&dir).unwrap();
+
+            // Account for block header overhead when calculating space needed
+            let blocks_needed = Self::calculate_blocks_needed(data.len());
+
+            let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
+
+            // Write index data using checksummed blocks
+            let mut bytes_left = &data[..];
+            for extent in &allocated_extents {
+                for i in 0..extent.len() {
+                    let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
+
+                    if take > 0 {
+                        let chunk = &bytes_left[..take];
+                        // Write with current TXG + 1 (the new transaction)
+                        self.write_raw_block_checked_txg(extent.start() + i, &chunk)
+                            .await?;
+                        bytes_left = &bytes_left[take..];
+                    } else {
+                        // Write empty block to maintain extent structure
+                        let empty: &[u8] = &[];
+                        self.write_raw_block_checked_txg(extent.start() + i, &empty)
+                            .await?;
+                    }
+                }
+            }
+
+            // Create or update file ID
+            let file_id = old_inode_ref
+                .as_ref()
+                .map(|r| r.file_id)
+                .unwrap_or(parent.next_file_id);
+
+            if old_inode_ref.is_none() {
+                parent.next_file_id += 1;
+            }
+
+            // Create new inode
+            let new_inode = FileInode {
+                id: file_id,
+                inode_type: InodeType::Directory {
+                    extents: allocated_extents,
+                },
+            };
+
+            // Write inode and get its extent
+            let extents = self.write_inode(&new_inode).await?;
+
+            // Update file index with new inode reference
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(FileSystemError::FileNotFound)?;
+            parent.files.insert(
+                filename.to_string(),
+                InodeRef {
+                    file_id,
+                    extents,
+                    permissions: Permissions::default(),
+                },
+            );
+
+            self.persist_directory_changes(path, parent).await?;
+            Ok(new_inode.id)
+        }
+    }
+
     /// Write or overwrite a files contents
-    pub async fn write_file(&mut self, name: &str, data: &[u8]) -> Result<FileId, FileSystemError> {
-        let old_inode_ref = self.file_index.files.get(name).cloned();
+    pub async fn write_file(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+    ) -> Result<FileId, FileSystemError> {
+        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         // If exists, ensure it's a file not a virtual block device
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
             if !old_inode.inode_type.is_file() {
-                panic!("'{}' is a block device, not a file", name);
+                return Err(FileSystemError::NotAFile);
             }
         }
 
@@ -474,10 +568,10 @@ impl<D: BlockDevice> FileSystem<D> {
         let file_id = old_inode_ref
             .as_ref()
             .map(|r| r.file_id)
-            .unwrap_or(self.file_index.next_file_id);
+            .unwrap_or(parent.next_file_id);
 
         if old_inode_ref.is_none() {
-            self.file_index.next_file_id += 1;
+            parent.next_file_id += 1;
         }
 
         // Create new inode
@@ -490,18 +584,23 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         // Write inode and get its extent
-        let inode_extent = self.write_inode(&new_inode).await?;
+        let extents = self.write_inode(&new_inode).await?;
 
         // Update file index with new inode reference
-        self.file_index.files.insert(
-            name.to_string(),
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(FileSystemError::FileNotFound)?;
+        parent.files.insert(
+            filename.to_string(),
             InodeRef {
                 file_id,
-                inode_extent,
+                extents,
+                permissions: Permissions::default(),
             },
         );
 
-        self.persist_file_index().await?;
+        self.persist_directory_changes(path, parent).await?;
 
         // Free old inode and data blocks
         if let Some(old_ref) = old_inode_ref {
@@ -513,7 +612,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
 
             // Free old inode blocks
-            for extent in &old_ref.inode_extent {
+            for extent in &old_ref.extents {
                 self.free(extent.start(), extent.len()).await?;
             }
         }
@@ -522,31 +621,34 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Delete a virtual block device or file
-    pub async fn delete(&mut self, name: &str) -> Result<(), FileSystemError> {
-        let inode_ref = match self.file_index.files.remove(name) {
-            Some(iref) => iref,
-            None => {
-                println!("'{}' does not exist", name);
-                return Ok(());
-            }
+    pub async fn delete(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
+        let (mut parent, inode_ref_opt) = self.get_maybe_inode_ref_at_path(path).await?;
+
+        let inode_ref = match inode_ref_opt {
+            Some(ref inode_ref) => inode_ref,
+            None => return Err(FileSystemError::FileNotFound),
         };
 
-        // Read the inode to get its extents
         let inode = self.read_inode(&inode_ref).await?;
 
-        // Free file data blocks
         for extent in inode.inode_type.extents() {
             self.free(extent.start(), extent.len()).await?;
         }
 
-        // Free inode blocks
-        for extent in &inode_ref.inode_extent {
+        for extent in &inode_ref.extents {
             self.free(extent.start(), extent.len()).await?;
         }
 
-        self.persist_file_index().await?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(FileSystemError::FileNotFound)?;
 
-        Ok(())
+        parent.files.remove(filename);
+
+        self.persist_directory_changes(path, parent).await?;
+
+        Ok(inode.id)
     }
 
     pub async fn sync(&mut self) -> Result<(), FileSystemError> {

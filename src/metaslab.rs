@@ -261,17 +261,9 @@ impl<D: BlockDevice> FileSystem<D> {
                         );
                     }
 
-                    let extent = if blocks_needed < 3 {
-                        Extent::Partial {
-                            start: aligned_start,
-                            len: take,
-                            used: blocks_needed,
-                        }
-                    } else {
-                        Extent::Full {
-                            start: aligned_start,
-                            len: take,
-                        }
+                    let extent = Extent {
+                        start: aligned_start,
+                        len: take,
                     };
 
                     allocated_extents.push(extent);
@@ -396,7 +388,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // Mark file data blocks AND inode blocks
         for inode_ref in self.file_index.files.values() {
             // Mark inode storage blocks
-            for extent in &inode_ref.inode_extent {
+            for extent in &inode_ref.extents {
                 for i in 0..extent.len() {
                     live_blocks.insert(extent.start() + i);
                 }

@@ -1,6 +1,6 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError};
-use crate::inode::{Extent, FileInode, InodeRef, InodeType};
+use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions};
 
 impl<D: BlockDevice> FileSystem<D> {
     pub async fn create_block(
@@ -45,18 +45,19 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         // Write inode and get its extent
-        let inode_extent = self.write_inode(&inode).await?;
+        let extents = self.write_inode(&inode).await?;
 
         // Update file index with new inode reference
         self.file_index.files.insert(
             name.to_string(),
             InodeRef {
                 file_id,
-                inode_extent,
+                extents,
+                permissions: Permissions::default(),
             },
         );
 
-        self.persist_file_index().await?;
+        self.persist_root_index().await?;
 
         Ok(file_id)
     }

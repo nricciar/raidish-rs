@@ -1,12 +1,12 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError};
 use crate::stripe::{DISKS, Stripe};
+use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crossbeam_queue::ArrayQueue;
 
 pub const DATA_SHARDS: usize = 3;
 pub const PARITY_SHARDS: usize = 2;
@@ -161,9 +161,7 @@ impl BlockDevice for RaidZ {
         let stripe = if let Some(stripe_ref) = self.writes.get(&stripe_id) {
             stripe_ref.value().clone()
         } else {
-            let buffer = {
-                self.stripe_pool.pop()
-            };
+            let buffer = { self.stripe_pool.pop() };
 
             let new_stripe = Arc::new(Mutex::new(
                 buffer
@@ -181,7 +179,6 @@ impl BlockDevice for RaidZ {
                         let mut guard =
                             new_stripe.try_lock().expect("Exclusive ownership expected");
                         if let Some(buf) = guard.take_buffer() {
-                            //let mut pool = self.stripe_pool.lock().await;
                             let _ = self.stripe_pool.push(buf);
                         }
                     }

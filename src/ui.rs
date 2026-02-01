@@ -86,7 +86,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Mark inode data blocks
         for inode_ref in self.file_index.files.values() {
-            for extent in &inode_ref.inode_extent {
+            for extent in &inode_ref.extents {
                 let start = extent.start() as usize;
                 let end = (extent.start() + extent.len()) as usize;
                 for i in start..end.min(total_blocks) {

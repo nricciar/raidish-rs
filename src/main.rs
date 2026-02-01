@@ -1,15 +1,10 @@
-#![feature(async_drop)]
 #[macro_use]
 extern crate rocket;
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::sync::Arc;
-use std::{
-    io::{self},
-    path::Path,
-    path::PathBuf,
-};
+use std::{path::Path, path::PathBuf};
 use tokio::sync::Mutex;
 
 mod api;
@@ -66,16 +61,23 @@ enum Commands {
         size: u64,
     },
     Delete {
-        file: String,
+        path: String,
     },
     Read {
-        file: String,
+        path: String,
     },
     Inode {
         file: String,
     },
     Write {
-        file: String,
+        source: String,
+        dest: String,
+    },
+    Mkdir {
+        path: String,
+    },
+    Ls {
+        path: String,
     },
     Listen {
         #[arg(short, long)]
@@ -83,11 +85,14 @@ enum Commands {
     },
 }
 
-fn load_config(path: &str) -> io::Result<Config> {
+fn load_config(path: &str) -> std::io::Result<Config> {
     // Expand tilde to home directory
     let expanded_path = if path.starts_with("~/") {
         let home = std::env::var("HOME").map_err(|_| {
-            io::Error::new(io::ErrorKind::NotFound, "HOME environment variable not set")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "HOME environment variable not set",
+            )
         })?;
         PathBuf::from(home).join(&path[2..])
     } else {
@@ -104,8 +109,8 @@ fn load_config(path: &str) -> io::Result<Config> {
 
     let config_str = std::fs::read_to_string(&expanded_path)?;
     let config: Config = serde_yaml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             format!("Failed to parse config: {}", e),
         )
     })?;
@@ -114,7 +119,7 @@ fn load_config(path: &str) -> io::Result<Config> {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
 
@@ -162,9 +167,9 @@ async fn main() -> io::Result<()> {
             let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
         }
-        Commands::Read { file } => {
+        Commands::Read { path } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
-            let data = fs.read_file(&file).await.unwrap();
+            let data = fs.read_file(&Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
         Commands::Inode { file } => {
@@ -173,17 +178,27 @@ async fn main() -> io::Result<()> {
             let inode = fs.read_inode(&inode_ref).await.unwrap();
             println!("inode: {:?}", inode);
         }
-        Commands::Write { file } => {
+        Commands::Write { source, dest } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
-            let file = Path::new(&file);
+            let file = Path::new(&source);
             let data = std::fs::read(file).unwrap();
-            fs.write_file(file.file_name().unwrap().to_str().unwrap(), &data)
-                .await
-                .unwrap();
+            fs.write_file(&Path::new(&dest), &data).await.unwrap();
+            fs.sync().await.unwrap();
         }
-        Commands::Delete { file } => {
+        Commands::Mkdir { path } => {
             let mut fs = FileSystem::load(raid).await.unwrap();
-            fs.delete(&file).await.unwrap();
+            fs.mkdir(&Path::new(&path)).await.unwrap();
+            fs.sync().await.unwrap();
+        }
+        Commands::Ls { path } => {
+            let fs = FileSystem::load(raid).await.unwrap();
+            let ls = fs.ls(&Path::new(&path)).await.unwrap();
+            println!("ls: {:?}", &ls);
+        }
+        Commands::Delete { path } => {
+            let mut fs = FileSystem::load(raid).await.unwrap();
+            fs.delete(&Path::new(&path)).await.unwrap();
+            fs.sync().await.unwrap();
         }
         Commands::Format => {
             let fs = FileSystem::format(raid, 500_000).await.unwrap();

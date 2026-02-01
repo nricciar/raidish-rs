@@ -2,7 +2,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::raidz::RaidZ;
 use crate::stripe::Caddy;
 use crate::websocket::{WsOp, WsRequest, WsResponseBuilder, WsStatus};
-use etcd_client::{Client, GetOptions, LockOptions};
+//use etcd_client::{Client, GetOptions, LockOptions};
 use rocket::data::{Data, ToByteUnit};
 use rocket::figment::util::map;
 use rocket::futures::{SinkExt, StreamExt};
@@ -233,7 +233,7 @@ async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Result<Vec<u
     }
 }
 
-async fn keepalive(mut client: Client, lease_id: i64) {
+/*async fn keepalive(mut client: Client, lease_id: i64) {
     let (mut ka, _ks) = client.lease_keep_alive(lease_id).await.unwrap();
 
     while ka.keep_alive().await.is_ok() {
@@ -270,4 +270,4 @@ async fn register_node(
         .await?;
 
     Ok(())
-}
+}*/
