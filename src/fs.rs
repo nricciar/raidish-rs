@@ -406,7 +406,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Read a files contents
-    pub async fn read_file(&mut self, path: &Path) -> Result<Vec<u8>, FileSystemError> {
+    pub async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileSystemError> {
         let inode_ref = self.get_file_at_path(path).await?;
 
         let inode = self.read_inode(&inode_ref).await?;
@@ -849,3 +849,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok((header.txg, value))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/fs_tests.rs"]
+mod tests;

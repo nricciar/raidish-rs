@@ -420,3 +420,7 @@ fn build_ws_request(op: u8, disk_id: u16, block_id: u64, data: Option<&[u8]>) ->
 
     request
 }
+
+#[cfg(test)]
+#[path = "tests/disk_tests.rs"]
+mod tests;

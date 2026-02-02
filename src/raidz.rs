@@ -464,3 +464,7 @@ impl StripeBuffer {
         self.data.take()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/raidz_tests.rs"]
+mod tests;
