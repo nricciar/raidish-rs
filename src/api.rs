@@ -1,4 +1,5 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::fs::{FileSystem, FileSystemError};
 use crate::raidz::RaidZ;
 use crate::stripe::Caddy;
 use crate::websocket::{WsOp, WsRequest, WsResponseBuilder, WsStatus};
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use ws::WebSocket;
 
 pub struct RaidZServer {
-    raidz: RaidZ,
+    fs: FileSystem<RaidZ>,
 }
 
 impl RaidZ {
@@ -37,7 +38,9 @@ impl RaidZ {
 
         tokio::spawn(elect_leader(etcd_cli.clone(), lease_id, self.id.to_string()));*/
 
-        let server = RaidZServer { raidz: self };
+        let server = RaidZServer {
+            fs: FileSystem::load(self).await.unwrap(),
+        };
 
         rocket::build()
             .manage(server)
@@ -47,7 +50,14 @@ impl RaidZ {
             )))
             .mount(
                 "/",
-                routes![get_block, put_block, list_disks, flush_disks, ws_endpoint],
+                routes![
+                    get_block,
+                    put_block,
+                    list_disks,
+                    flush_disks,
+                    read_file,
+                    ws_endpoint
+                ],
             )
             .launch()
             .await
@@ -64,17 +74,17 @@ async fn get_block(
     server: &State<RaidZServer>,
 ) -> Result<Vec<u8>, Status> {
     // Check if disk_index is valid
-    if disk_index >= server.raidz.stripe.disks.len() {
+    if disk_index >= server.fs.dev.stripe.disks.len() {
         return Err(Status::NotFound);
     }
 
     // Check if this is a local disk (not remote)
-    if !server.raidz.is_local_disk(disk_index) {
+    if !server.fs.dev.is_local_disk(disk_index) {
         return Err(Status::BadRequest);
     }
 
     let mut buf = vec![0u8; BLOCK_SIZE];
-    server.raidz.stripe.disks[disk_index]
+    server.fs.dev.stripe.disks[disk_index]
         .read_block(block_id, &mut buf)
         .await
         .unwrap();
@@ -102,17 +112,17 @@ async fn put_block(
     }
 
     // Check if disk_index is valid
-    if disk_index >= server.raidz.stripe.disks.len() {
+    if disk_index >= server.fs.dev.stripe.disks.len() {
         return Err(Status::NotFound);
     }
 
     // Check if this is a local disk (not remote)
-    if !server.raidz.is_local_disk(disk_index) {
+    if !server.fs.dev.is_local_disk(disk_index) {
         return Err(Status::BadRequest);
     }
 
     let bytes = &bytes.as_slice().try_into().unwrap();
-    server.raidz.stripe.disks[disk_index]
+    server.fs.dev.stripe.disks[disk_index]
         .write_block(block_id, &bytes)
         .await
         .unwrap();
@@ -138,12 +148,12 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
         println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
     }*/
 
-    let disk_info: Vec<_> = (0..server.raidz.stripe.disks.len())
+    let disk_info: Vec<_> = (0..server.fs.dev.stripe.disks.len())
         .map(|i| {
             serde_json::json!({
                 "index": i,
-                "is_local": server.raidz.is_local_disk(i),
-                "servable": server.raidz.is_local_disk(i)
+                "is_local": server.fs.dev.is_local_disk(i),
+                "servable": server.fs.dev.is_local_disk(i)
             })
         })
         .collect();
@@ -155,18 +165,40 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
 #[post("/api/v1/disks/<disk_index>/flush")]
 async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
     // Check if disk_index is valid
-    if disk_index >= server.raidz.stripe.disks.len() {
+    if disk_index >= server.fs.dev.stripe.disks.len() {
         return Status::NotFound;
     }
 
     // Check if this is a local disk (not remote)
-    if !server.raidz.is_local_disk(disk_index) {
+    if !server.fs.dev.is_local_disk(disk_index) {
         return Status::BadRequest;
     }
 
-    server.raidz.stripe.disks[disk_index].flush().await.unwrap();
+    server.fs.dev.stripe.disks[disk_index]
+        .flush()
+        .await
+        .unwrap();
 
     Status::Ok
+}
+
+#[get("/api/v1/files/<path..>")]
+async fn read_file(
+    path: std::path::PathBuf,
+    server: &State<RaidZServer>,
+) -> Result<Vec<u8>, Status> {
+    // Read the file from the filesystem
+    match server.fs.read_file(path.as_path()).await {
+        Ok(data) => Ok(data),
+        Err(err) => match err {
+            FileSystemError::FileNotFound => Err(Status::NotFound),
+            FileSystemError::NotAFile => Err(Status::BadRequest),
+            _ => {
+                eprintln!("Error reading file '{}': {}", path.display(), err);
+                Err(Status::InternalServerError)
+            }
+        },
+    }
 }
 
 /// WebSocket endpoint for efficient block I/O
@@ -177,7 +209,7 @@ async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
 ///     status=0: success, status=1: error (not found/not local), status=2: invalid request
 #[get("/ws")]
 async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<'static> {
-    let disks = server.raidz.stripe.disks.clone();
+    let disks = server.fs.dev.stripe.disks.clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
@@ -271,3 +303,7 @@ async fn register_node(
 
     Ok(())
 }*/
+
+#[cfg(test)]
+#[path = "tests/api_tests.rs"]
+mod tests;
