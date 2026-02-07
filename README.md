@@ -7,13 +7,14 @@ a distributed raidz2 like filesystem proof of concept
 step 1) run a server with our disks
 
 ```
+make setup-etcd-cluster
 mkdir disks/
 fallocate -l 1G disks/disk1
 fallocate -l 1G disks/disk2
 fallocate -l 1G disks/disk3
 fallocate -l 1G disks/disk4
 fallocate -l 1G disks/disk5
-cargo run -- --config example-config.yaml listen
+cargo run -- --config example-config.yaml listen node-1
 ```
 
 ## Usage

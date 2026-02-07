@@ -30,17 +30,49 @@ pub struct MetaslabState {
 }
 
 impl<D: BlockDevice> FileSystem<D> {
-    pub async fn free(&mut self, start: u64, len: u64) -> Result<(), FileSystemError> {
+    pub(crate) fn consume_blocks_from_pool(
+        pool: &mut Vec<Extent>,
+        blocks_needed: usize,
+    ) -> Vec<Extent> {
+        let mut allocated = Vec::new();
+        let mut remaining = blocks_needed as u64;
+
+        while remaining > 0 && !pool.is_empty() {
+            if pool[0].len <= remaining {
+                // Take the whole extent
+                let extent = pool.remove(0);
+                remaining -= extent.len;
+                allocated.push(extent);
+            } else {
+                // Take part of the extent
+                allocated.push(Extent {
+                    start: pool[0].start,
+                    len: remaining,
+                });
+                pool[0].start += remaining;
+                pool[0].len -= remaining;
+                remaining = 0;
+            }
+        }
+
+        allocated
+    }
+
+    pub(crate) async fn free(&self, start: u64, len: u64) -> Result<(), FileSystemError> {
         println!("free called: start: {}, len: {}", start, len);
 
         for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
-            let ms_start = ms.header.start_block;
-            let ms_end = ms_start + ms.header.block_count;
+            let (ms_start, ms_end, log_used) = {
+                let ms = ms.read().await;
+                let ms_start = ms.header.start_block;
+                let ms_end = ms_start + ms.header.block_count;
+                let log_used = ms.write_cursor - ms.header.spacemap_start;
+                (ms_start, ms_end, log_used)
+            };
 
             if start >= ms_start && start < ms_end {
                 // Check if compaction needed
                 let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
-                let log_used = ms.write_cursor - ms.header.spacemap_start;
 
                 if log_used >= log_capacity {
                     self.compact_spacemap_log(ms_idx).await?;
@@ -54,27 +86,30 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     async fn free_in_metaslab(
-        &mut self,
+        &self,
         ms_idx: usize,
         start: u64,
         len: u64,
     ) -> Result<(), FileSystemError> {
         let (write_cursor, header_block, header, entry) = {
-            let ms = &mut self.metaslabs[ms_idx];
+            {
+                let ms = &mut self.metaslabs[ms_idx].read().await;
+                println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
+                println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
 
-            println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
-            println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
-
-            // Check if this exact extent is already free
-            if let Some(&existing_len) = ms.free_extents.get(&start) {
-                if existing_len == len {
-                    println!(
-                        "WARNING: Attempted to free already-free extent {{{}:{}}}",
-                        start, len
-                    );
-                    return Ok(());
+                // Check if this exact extent is already free
+                if let Some(&existing_len) = ms.free_extents.get(&start) {
+                    if existing_len == len {
+                        println!(
+                            "WARNING: Attempted to free already-free extent {{{}:{}}}",
+                            start, len
+                        );
+                        return Ok(());
+                    }
                 }
             }
+
+            let ms = &mut self.metaslabs[ms_idx].write().await;
 
             let mut new_start = start;
             let mut new_len = len;
@@ -124,8 +159,8 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    pub async fn allocate_blocks_stripe_aligned(
-        &mut self,
+    pub(crate) async fn allocate_blocks_stripe_aligned(
+        &self,
         blocks_needed: u64,
     ) -> Result<Vec<Extent>, FileSystemError> {
         if blocks_needed == 0 {
@@ -148,7 +183,7 @@ impl<D: BlockDevice> FileSystem<D> {
         while ms_idx < self.metaslabs.len() && remaining > 0 {
             // skip this metaslab if log capacity is full
             let (log_capacity, log_used) = {
-                let ms = &self.metaslabs[ms_idx];
+                let ms = &self.metaslabs[ms_idx].read().await;
                 let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
                 let log_used = ms.write_cursor - ms.header.spacemap_start;
                 (log_capacity, log_used)
@@ -170,7 +205,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 // do not allocate anymore from this metaslab if it would
                 // overfill the log
                 let current_log_used = {
-                    let ms = &self.metaslabs[ms_idx];
+                    let ms = &self.metaslabs[ms_idx].read().await;
                     ms.write_cursor - ms.header.spacemap_start
                 };
                 if current_log_used >= log_capacity {
@@ -180,7 +215,9 @@ impl<D: BlockDevice> FileSystem<D> {
                 // Skip extents we've already rejected
                 let found = {
                     let ms = &self.metaslabs[ms_idx];
-                    ms.free_extents
+                    ms.read()
+                        .await
+                        .free_extents
                         .iter()
                         .map(|(&s, &l)| (s, l))
                         .find(|(s, _)| !rejected_extents.iter().any(|(rs, _)| rs == s))
@@ -188,7 +225,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
                 if let Some((start, len)) = found {
                     let ms_end = {
-                        let ms = &mut self.metaslabs[ms_idx];
+                        let ms = &mut self.metaslabs[ms_idx].write().await;
                         ms.free_extents.remove(&start);
                         ms.header.start_block + ms.header.block_count
                     };
@@ -227,14 +264,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
                     // Return skipped blocks before alignment
                     if skip > 0 {
-                        let ms = &mut self.metaslabs[ms_idx];
-                        ms.free_extents.insert(start, skip);
+                        let ms = &self.metaslabs[ms_idx];
+                        ms.write().await.free_extents.insert(start, skip);
                         println!("    -> Returned {} pre-alignment blocks to free pool", skip);
                     }
 
                     // Persist allocation
                     let (write_cursor, header_block, header, entry) = {
-                        let ms = &mut self.metaslabs[ms_idx];
+                        let ms = &mut self.metaslabs[ms_idx].write().await;
                         let entry = SpaceMapEntry::Alloc {
                             start: aligned_start,
                             len: take,
@@ -253,8 +290,11 @@ impl<D: BlockDevice> FileSystem<D> {
                     //let remainder = aligned_available - take;
                     let remainder = (len - skip) - take;
                     if remainder > 0 {
-                        let ms = &mut self.metaslabs[ms_idx];
-                        ms.free_extents.insert(aligned_start + take, remainder);
+                        let ms = &self.metaslabs[ms_idx];
+                        ms.write()
+                            .await
+                            .free_extents
+                            .insert(aligned_start + take, remainder);
                         println!(
                             "    -> Returned {} post-allocation blocks to free pool",
                             remainder
@@ -271,9 +311,9 @@ impl<D: BlockDevice> FileSystem<D> {
                 } else {
                     // No more suitable extents in this metaslab
                     // Return rejected extents back to free pool
-                    let ms = &mut self.metaslabs[ms_idx];
+                    let ms = &self.metaslabs[ms_idx];
                     for (start, len) in rejected_extents.drain(..) {
-                        ms.free_extents.insert(start, len);
+                        ms.write().await.free_extents.insert(start, len);
                     }
                 }
 
@@ -285,10 +325,10 @@ impl<D: BlockDevice> FileSystem<D> {
 
             // Return any remaining rejected extents
             {
-                let ms = &mut self.metaslabs[ms_idx];
+                let ms = &self.metaslabs[ms_idx];
                 for (start, len) in rejected_extents.drain(..) {
-                    if ms.free_extents.get(&start).is_none() {
-                        ms.free_extents.insert(start, len);
+                    if ms.read().await.free_extents.get(&start).is_none() {
+                        ms.write().await.free_extents.insert(start, len);
                     }
                 }
             }
@@ -309,9 +349,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    async fn compact_spacemap_log(&mut self, ms_idx: usize) -> Result<(), FileSystemError> {
+    async fn compact_spacemap_log(&self, ms_idx: usize) -> Result<(), FileSystemError> {
         let (free_extents, spacemap_start) = {
-            let ms = &mut self.metaslabs[ms_idx];
+            let ms = &mut self.metaslabs[ms_idx].write().await;
 
             println!(
                 "  COMPACTING spacemap log for metaslab {} (was at {}/{})",
@@ -329,7 +369,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // Write compacted state - one Free entry per extent
         for (&start, &len) in &free_extents {
             let (write_cursor, entry) = {
-                let ms = &mut self.metaslabs[ms_idx];
+                let ms = &mut self.metaslabs[ms_idx].write().await;
                 let entry = SpaceMapEntry::Free { start, len };
                 let write_cursor = ms.write_cursor;
                 ms.write_cursor += 1;
@@ -352,7 +392,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         let (header_block, header) = {
-            let ms = &mut self.metaslabs[ms_idx];
+            let ms = &mut self.metaslabs[ms_idx].write().await;
             ms.header.spacemap_blocks = (ms.write_cursor - ms.header.spacemap_start) as u32;
             (ms.header_block, ms.header.clone())
         };
@@ -360,7 +400,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.write_block_checked_txg(header_block, &header).await?;
 
         let write_cursor = {
-            let ms = &self.metaslabs[ms_idx];
+            let ms = &self.metaslabs[ms_idx].read().await;
             ms.write_cursor
         };
 
@@ -374,7 +414,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Calculate how many blocks are needed considering payload overhead
-    pub fn calculate_blocks_needed(data_len: usize) -> u64 {
+    pub(crate) fn calculate_blocks_needed(data_len: usize) -> u64 {
         ((data_len + BLOCK_PAYLOAD_SIZE - 1) / BLOCK_PAYLOAD_SIZE) as u64
     }
 
@@ -413,7 +453,8 @@ impl<D: BlockDevice> FileSystem<D> {
         // Step 2: Find blocks that are allocated but not live
         let mut orphaned = Vec::new();
 
-        for ms in &self.metaslabs {
+        for ms in self.metaslabs.iter() {
+            let ms = ms.read().await;
             let ms_start = ms.header.start_block;
             let ms_end = ms_start + ms.header.block_count;
 
@@ -461,3 +502,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(orphaned)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/metaslab_tests.rs"]
+mod tests;

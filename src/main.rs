@@ -20,6 +20,7 @@ mod ui;
 mod vblock;
 mod websocket;
 
+use api::EtcdConfig;
 use fs::FileSystem;
 use raidz::{DATA_SHARDS, RaidZ};
 use stripe::Stripe;
@@ -27,6 +28,7 @@ use stripe::Stripe;
 #[derive(Deserialize, Debug)]
 struct Config {
     disks: Vec<String>,
+    etcd_config: Option<EtcdConfig>,
 }
 
 #[derive(Parser)]
@@ -82,6 +84,8 @@ enum Commands {
     Listen {
         #[arg(short, long)]
         port: Option<u32>,
+
+        id: String,
     },
 }
 
@@ -160,7 +164,7 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Metaslab => {
             let fs = FileSystem::load(raid).await.unwrap();
-            fs.display_metaslab_info();
+            fs.display_metaslab_info().await;
         }
         Commands::Orphaned => {
             let fs = FileSystem::load(raid).await.unwrap();
@@ -168,7 +172,7 @@ async fn main() -> std::io::Result<()> {
             println!("orphans: {:?}", orphans);
         }
         Commands::Read { path } => {
-            let mut fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load(raid).await.unwrap();
             let data = fs.read_file(&Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
@@ -208,9 +212,9 @@ async fn main() -> std::io::Result<()> {
             let fs = FileSystem::load(raid).await.unwrap();
             println!("index: {:?}", fs.file_index);
         }
-        Commands::Listen { port } => {
+        Commands::Listen { port, id } => {
             let port = port.unwrap_or_else(|| 8881);
-            raid.listen(port).await;
+            raid.listen(port, config.etcd_config, &id).await;
         }
     }
     Ok(())

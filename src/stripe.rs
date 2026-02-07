@@ -19,6 +19,10 @@ impl Stripe {
         self.data_shards
     }
 
+    pub fn is_local(&self, index: usize) -> bool {
+        self.disks[index].is_local()
+    }
+
     pub async fn new(paths: [&str; DISKS], data_shards: usize) -> Self {
         let disk_futures: Vec<_> = paths.iter().map(|path| Disk::open(path)).collect();
         let results = join_all(disk_futures).await;

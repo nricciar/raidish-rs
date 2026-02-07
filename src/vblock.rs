@@ -45,7 +45,7 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         // Write inode and get its extent
-        let extents = self.write_inode(&inode).await?;
+        let extents = self.write_inode(&inode, None).await?;
 
         // Update file index with new inode reference
         self.file_index.files.insert(
@@ -57,7 +57,7 @@ impl<D: BlockDevice> FileSystem<D> {
             },
         );
 
-        self.persist_root_index().await?;
+        self.persist_root_index(None).await?;
 
         Ok(file_id)
     }

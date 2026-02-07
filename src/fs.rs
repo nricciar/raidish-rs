@@ -1,11 +1,13 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
-use crate::inode::{Extent, FileIndex, FileInode, InodeRef, InodeType, Permissions};
+use crate::inode::{Extent, FileIndex, FileInode, InodeType};
 use crate::metaslab::{MetaslabHeader, MetaslabState, SpaceMapEntry};
 use crate::raidz::{DATA_SHARDS, RaidZError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 
 pub const FS_ID: &str = "RAIDISHV10";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
@@ -104,7 +106,7 @@ pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Option<Superblock>,
     uberblock: Option<Uberblock>,
-    pub metaslabs: Vec<MetaslabState>,
+    pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
     pub file_index: FileIndex,
 }
 
@@ -123,7 +125,7 @@ impl<D: BlockDevice> FileSystem<D> {
             dev: dev,
             superblock: None,
             uberblock: None,
-            metaslabs: Vec::new(),
+            metaslabs: Arc::new(Vec::new()),
             file_index: FileIndex {
                 next_file_id: 1,
                 files: BTreeMap::new(),
@@ -198,34 +200,45 @@ impl<D: BlockDevice> FileSystem<D> {
             free_extents.insert(start_block, METASLAB_SIZE_BLOCKS);
 
             let write_cursor = header.spacemap_start + 1;
-            metaslabs.push(MetaslabState {
+            metaslabs.push(Arc::new(RwLock::new(MetaslabState {
                 header,
                 header_block: METASLAB_TABLE_START + i as u64,
                 free_extents,
                 write_cursor,
-            });
+            })));
         }
-        fs.metaslabs = metaslabs;
+        fs.metaslabs = Arc::new(metaslabs);
 
         // write root file index
-        fs.persist_root_index().await?;
+        fs.persist_root_index(None).await?;
 
         Ok(fs)
     }
 
     /// Update root file index
-    pub async fn persist_root_index(&mut self) -> Result<(), FileSystemError> {
+    pub async fn persist_root_index(
+        &mut self,
+        extent_pool: Option<&mut Vec<Extent>>,
+    ) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
         let data = bincode::serialize(&self.file_index).unwrap();
 
         // Account for block header overhead when calculating space needed
         let blocks_needed = Self::calculate_blocks_needed(data.len());
 
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
+        let allocated_extents = match extent_pool {
+            Some(pool) => {
+                //Self::consume_blocks_from_pool(pool, blocks_needed as usize)
+                pool // we use all thats left
+            }
+            None => &mut self.allocate_blocks_stripe_aligned(blocks_needed).await?,
+        };
+
+        let commit_txg_extents = allocated_extents.clone();
 
         // Write index data using checksummed blocks
         let mut bytes_left = &data[..];
-        for extent in &allocated_extents {
+        for extent in allocated_extents {
             for i in 0..extent.len() {
                 let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
 
@@ -240,13 +253,17 @@ impl<D: BlockDevice> FileSystem<D> {
                     let empty: &[u8] = &[];
                     self.write_block_checked_txg(extent.start() + i, &empty)
                         .await?;
+                    eprintln!(
+                        "WARNING! Wasted block '{}' assigned to file index",
+                        extent.start() + i
+                    )
                 }
             }
         }
 
         let old_extents = self.uberblock().map(|ub| ub.file_index_extent.clone());
 
-        self.commit_txg(allocated_extents.clone()).await?;
+        self.commit_txg(commit_txg_extents).await?;
 
         // Free old index blocks AFTER commit
         if let Some(old_extents) = old_extents {
@@ -264,7 +281,7 @@ impl<D: BlockDevice> FileSystem<D> {
             dev: dev,
             superblock: None,
             uberblock: None,
-            metaslabs: Vec::new(),
+            metaslabs: Arc::new(Vec::new()),
             file_index: FileIndex {
                 next_file_id: 1,
                 files: BTreeMap::new(),
@@ -277,7 +294,10 @@ impl<D: BlockDevice> FileSystem<D> {
             .superblock()
             .ok_or(FileSystemError::NotFormatted)?
             .clone();
-        let uber = fs.uberblock().ok_or(FileSystemError::NotFormatted)?.clone();
+        let uber = match fs.uberblock() {
+            Some(uber) => uber.clone(),
+            None => return Ok(fs),
+        };
 
         // Load metaslabs and replay space maps
         let mut metaslabs = Vec::new();
@@ -371,14 +391,14 @@ impl<D: BlockDevice> FileSystem<D> {
             }
 
             let write_cursor = header.spacemap_start + header.spacemap_blocks as u64;
-            metaslabs.push(MetaslabState {
+            metaslabs.push(Arc::new(RwLock::new(MetaslabState {
                 header,
                 header_block: superblock.metaslab_table_start + i as u64,
                 free_extents,
                 write_cursor,
-            });
+            })));
         }
-        fs.metaslabs = metaslabs;
+        fs.metaslabs = Arc::new(metaslabs);
 
         // Reconstruct file index from extents with validation
         let mut index_bytes = Vec::new();
@@ -440,7 +460,8 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn mkdir(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let (mut parent, old_inode_ref, path_blocks) =
+            self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
@@ -499,25 +520,17 @@ impl<D: BlockDevice> FileSystem<D> {
                 },
             };
 
-            // Write inode and get its extent
-            let extents = self.write_inode(&new_inode).await?;
+            let inode_data = bincode::serialize(&new_inode).unwrap();
+            let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
-            // Update file index with new inode reference
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or(FileSystemError::FileNotFound)?;
-            parent.files.insert(
-                filename.to_string(),
-                InodeRef {
-                    file_id,
-                    extents,
-                    permissions: Permissions::default(),
-                },
-            );
+            let mut extent_pool = self
+                .allocate_blocks_stripe_aligned(path_blocks as u64 + blocks_needed)
+                .await?;
 
-            self.persist_directory_changes(path, parent).await?;
-            Ok(new_inode.id)
+            self.persist_directory_changes(path, parent, Some(new_inode), Some(&mut extent_pool))
+                .await?;
+
+            Ok(file_id)
         }
     }
 
@@ -527,7 +540,8 @@ impl<D: BlockDevice> FileSystem<D> {
         path: &Path,
         data: &[u8],
     ) -> Result<FileId, FileSystemError> {
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let (mut parent, old_inode_ref, path_blocks) =
+            self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
         // If exists, ensure it's a file not a virtual block device
         if let Some(ref inode_ref) = old_inode_ref {
@@ -583,24 +597,15 @@ impl<D: BlockDevice> FileSystem<D> {
             },
         };
 
-        // Write inode and get its extent
-        let extents = self.write_inode(&new_inode).await?;
+        let inode_data = bincode::serialize(&new_inode).unwrap();
+        let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
-        // Update file index with new inode reference
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(FileSystemError::FileNotFound)?;
-        parent.files.insert(
-            filename.to_string(),
-            InodeRef {
-                file_id,
-                extents,
-                permissions: Permissions::default(),
-            },
-        );
+        let mut extent_pool = self
+            .allocate_blocks_stripe_aligned(path_blocks as u64 + blocks_needed)
+            .await?;
 
-        self.persist_directory_changes(path, parent).await?;
+        self.persist_directory_changes(path, parent, Some(new_inode), Some(&mut extent_pool))
+            .await?;
 
         // Free old inode and data blocks
         if let Some(old_ref) = old_inode_ref {
@@ -622,7 +627,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Delete a virtual block device or file
     pub async fn delete(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
-        let (mut parent, inode_ref_opt) = self.get_maybe_inode_ref_at_path(path).await?;
+        let (mut parent, inode_ref_opt, path_blocks) =
+            self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
         let inode_ref = match inode_ref_opt {
             Some(ref inode_ref) => inode_ref,
@@ -646,7 +652,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
         parent.files.remove(filename);
 
-        self.persist_directory_changes(path, parent).await?;
+        let mut extent_pool = self
+            .allocate_blocks_stripe_aligned(path_blocks as u64)
+            .await?;
+
+        self.persist_directory_changes(path, parent, None, Some(&mut extent_pool))
+            .await?;
 
         Ok(inode.id)
     }
@@ -701,7 +712,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn write_raw_block_checked_txg(
-        &mut self,
+        &self,
         lba: BlockId,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
@@ -719,7 +730,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn write_block_checked_txg<T: Serialize>(
-        &mut self,
+        &self,
         lba: BlockId,
         value: &T,
     ) -> Result<(), FileSystemError> {

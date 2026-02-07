@@ -18,11 +18,11 @@ serde_yaml = "0.9"
 
 rocket = { version = "0.5.1", features = ["json","uuid"] }
 ws = { package = "rocket_ws", version = "0.1.1" }
+etcd-client = "0.16"
 
 clap = { version = "4.5", features = ["derive","color"] }
 url = "2.5.8"
 reqwest = "0.13.1"
-#etcd-client = "0.16"
 bincode = "1"
 blake3 = "1.8.3"
 chrono = "0.4.43"

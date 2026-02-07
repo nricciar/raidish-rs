@@ -154,11 +154,18 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(inode)
     }
 
-    pub async fn write_inode(&mut self, inode: &FileInode) -> Result<Vec<Extent>, FileSystemError> {
+    pub async fn write_inode(
+        &mut self,
+        inode: &FileInode,
+        extent_pool: Option<&mut Vec<Extent>>,
+    ) -> Result<Vec<Extent>, FileSystemError> {
         let inode_data = bincode::serialize(inode).unwrap();
         let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
+        let allocated_extents = match extent_pool {
+            Some(pool) => Self::consume_blocks_from_pool(pool, blocks_needed as usize),
+            None => self.allocate_blocks_stripe_aligned(blocks_needed).await?,
+        };
 
         let mut bytes_left = &inode_data[..];
         for extent in &allocated_extents {
@@ -228,6 +235,58 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok((current_index, current_inode_ref))
     }
 
+    pub(crate) async fn get_directory_at_path_with_count(
+        &self,
+        path: &Path,
+    ) -> Result<(FileIndex, Option<InodeRef>, usize), FileSystemError> {
+        let components = Self::path_components(path);
+
+        let mut total_blocks = 0;
+
+        if components.is_empty() {
+            // Count root index
+            let root_data = bincode::serialize(&self.file_index)?;
+            total_blocks += Self::calculate_blocks_needed(root_data.len());
+            return Ok((self.file_index.clone(), None, total_blocks as usize));
+        }
+
+        let mut current_index = self.file_index.clone();
+        let mut current_inode_ref = None;
+
+        for component in &components {
+            let inode_ref = current_index
+                .files
+                .get(component)
+                .ok_or(FileSystemError::DirectoryNotFound)?
+                .clone();
+
+            let inode = self.read_inode(&inode_ref).await?;
+
+            if !inode.inode_type.is_directory() {
+                return Err(FileSystemError::NotADirectory);
+            }
+
+            let dir_index = self.read_file_index(&inode.inode_type).await?;
+
+            // Count blocks for this directory's FileIndex
+            let index_data = bincode::serialize(&dir_index)?;
+            total_blocks += Self::calculate_blocks_needed(index_data.len());
+
+            // Count blocks for this directory's FileInode
+            let inode_data = bincode::serialize(&inode)?;
+            total_blocks += Self::calculate_blocks_needed(inode_data.len());
+
+            current_index = dir_index;
+            current_inode_ref = Some(inode_ref);
+        }
+
+        // Count root index
+        let root_data = bincode::serialize(&self.file_index)?;
+        total_blocks += Self::calculate_blocks_needed(root_data.len());
+
+        Ok((current_index, current_inode_ref, total_blocks as usize))
+    }
+
     /// Navigate to a file at path and return its InodeRef
     pub async fn get_file_at_path(&self, path: &Path) -> Result<InodeRef, FileSystemError> {
         let components = Self::path_components(path);
@@ -262,10 +321,10 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(inode_ref)
     }
 
-    pub async fn get_maybe_inode_ref_at_path(
+    pub(crate) async fn get_maybe_inode_ref_at_path_with_count(
         &self,
         path: &Path,
-    ) -> Result<(FileIndex, Option<InodeRef>), FileSystemError> {
+    ) -> Result<(FileIndex, Option<InodeRef>, usize), FileSystemError> {
         let components = Self::path_components(path);
 
         if components.is_empty() {
@@ -279,13 +338,14 @@ impl<D: BlockDevice> FileSystem<D> {
             components[..components.len() - 1].iter().collect()
         };
 
-        let (parent_index, _) = self.get_directory_at_path(&parent_path).await?;
+        let (parent_index, _, total_blocks) =
+            self.get_directory_at_path_with_count(&parent_path).await?;
 
         // Get the file from parent directory
         let file_name = &components[components.len() - 1];
         let inode_ref = parent_index.files.get(file_name).map(|i| i.clone());
 
-        Ok((parent_index, inode_ref))
+        Ok((parent_index, inode_ref, total_blocks))
     }
 
     /// Persist directory changes using copy-on-write from the target directory back to root.
@@ -293,14 +353,41 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn persist_directory_changes(
         &mut self,
         file_path: &Path,
-        updated_index: FileIndex,
+        mut updated_index: FileIndex,
+        updated_inode: Option<FileInode>,
+        mut extent_pool: Option<&mut Vec<Extent>>,
     ) -> Result<(), FileSystemError> {
+        match updated_inode {
+            Some(updated_inode) => {
+                // Write inode and get its extent
+                let extents = self
+                    .write_inode(&updated_inode, extent_pool.as_mut().map(|p| &mut **p))
+                    .await?;
+
+                // Update file index with new inode reference
+                let filename = file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(FileSystemError::FileNotFound)?;
+                updated_index.files.insert(
+                    filename.to_string(),
+                    InodeRef {
+                        file_id: updated_inode.id,
+                        extents,
+                        permissions: Permissions::default(),
+                    },
+                );
+            }
+            _ => (),
+        }
+
         let components = Self::path_components(file_path);
 
         // If we're in the root directory, just persist the file index
         if components.len() <= 1 {
             self.file_index = updated_index;
-            self.persist_root_index().await?;
+            self.persist_root_index(extent_pool.as_mut().map(|p| &mut **p))
+                .await?;
             return Ok(());
         }
 
@@ -312,7 +399,10 @@ impl<D: BlockDevice> FileSystem<D> {
             // Step 1: Write the FileIndex to disk
             let index_data = bincode::serialize(&current_index)?;
             let blocks_needed = Self::calculate_blocks_needed(index_data.len());
-            let index_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
+            let index_extents = match extent_pool.as_mut() {
+                Some(pool) => Self::consume_blocks_from_pool(pool, blocks_needed as usize),
+                None => self.allocate_blocks_stripe_aligned(blocks_needed).await?,
+            };
 
             let mut bytes_left = &index_data[..];
             for extent in &index_extents {
@@ -364,7 +454,9 @@ impl<D: BlockDevice> FileSystem<D> {
             };
 
             // Step 4: Write the FileInode to disk
-            let inode_extents = self.write_inode(&new_inode).await?;
+            let inode_extents = self
+                .write_inode(&new_inode, extent_pool.as_mut().map(|p| &mut **p))
+                .await?;
 
             // Step 5: Update the parent's reference to this directory
             if depth == 0 {
@@ -391,7 +483,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
 
                 // Persist root index
-                self.persist_root_index().await?;
+                self.persist_root_index(extent_pool.as_mut().map(|p| &mut **p))
+                    .await?;
             } else {
                 let parent_path: std::path::PathBuf = dir_components[..depth].iter().collect();
                 let (mut parent_index, _) = self.get_directory_at_path(&parent_path).await?;

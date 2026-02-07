@@ -3,43 +3,51 @@ use crate::fs::{FileSystem, FileSystemError};
 use crate::raidz::RaidZ;
 use crate::stripe::Caddy;
 use crate::websocket::{WsOp, WsRequest, WsResponseBuilder, WsStatus};
-//use etcd_client::{Client, GetOptions, LockOptions};
+use etcd_client::{Client, GetOptions, LockOptions};
 use rocket::data::{Data, ToByteUnit};
 use rocket::figment::util::map;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
 use rocket::{State, get, put};
+use serde::Deserialize;
 use std::sync::Arc;
 use ws::WebSocket;
 
+#[derive(Deserialize, Debug)]
+pub struct EtcdConfig {
+    pub enable: bool,
+    pub etcd_nodes: Vec<String>,
+}
+
 pub struct RaidZServer {
     fs: FileSystem<RaidZ>,
+    etcd_client: Option<Client>,
 }
 
 impl RaidZ {
     /// Start an HTTP/WebSocket server that exposes all local disks in this RaidZ array
     /// Only local disks are exposed - remote disks are skipped
-    pub async fn listen(self, port: u32) {
-        /*let mut etcd_cli = Client::connect(
-            ["http://127.0.0.1:12379","http://127.0.0.1:22379","http://127.0.0.1:32379"],
-            None
-        ).await.unwrap();
-        self.etcd_client = Some(etcd_cli.clone());
+    pub async fn listen(self, port: u32, etcd_config: Option<EtcdConfig>, id: &str) {
+        let etcd_client = match etcd_config {
+            Some(etcd_config) if etcd_config.enable => {
+                let mut etcd_cli = Client::connect(etcd_config.etcd_nodes, None).await.unwrap();
 
-        // register us with etcd
-        let lease_id = etcd_cli.lease_grant(10, None).await.unwrap().id();
-        tokio::spawn(keepalive(etcd_cli.clone(), lease_id));
+                // register us with etcd
+                let lease_id = etcd_cli.lease_grant(10, None).await.unwrap().id();
+                tokio::spawn(keepalive(etcd_cli.clone(), lease_id));
 
-        register_node(
-            &mut etcd_cli,
-            &self.id,
-            lease_id
-        ).await.unwrap();
+                register_node(&mut etcd_cli, id, lease_id).await.unwrap();
 
-        tokio::spawn(elect_leader(etcd_cli.clone(), lease_id, self.id.to_string()));*/
+                tokio::spawn(elect_leader(etcd_cli.clone(), lease_id, id.to_string()));
+
+                Some(etcd_cli)
+            }
+            _ => None,
+        };
 
         let server = RaidZServer {
             fs: FileSystem::load(self).await.unwrap(),
+            etcd_client,
         };
 
         rocket::build()
@@ -133,20 +141,27 @@ async fn put_block(
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
 #[get("/api/v1/disks")]
 async fn list_disks(server: &State<RaidZServer>) -> String {
-    /*let resp = node.etcd_client.clone().unwrap().leader("/myapp/nodes/leader").await.unwrap();
+    let resp = server
+        .etcd_client
+        .clone()
+        .unwrap()
+        .leader("/myapp/nodes/leader")
+        .await
+        .unwrap();
     let kv = resp.kv().unwrap();
     println!("key is {:?}", kv.key_str());
     println!("value is {:?}", kv.value_str());
 
-    let resp = node.etcd_client.clone().unwrap()
-        .get(
-            "/myapp/nodes/",
-            Some(GetOptions::new().with_prefix())
-        )
-        .await.unwrap();
+    let resp = server
+        .etcd_client
+        .clone()
+        .unwrap()
+        .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
+        .await
+        .unwrap();
     for kv in resp.kvs() {
         println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
-    }*/
+    }
 
     let disk_info: Vec<_> = (0..server.fs.dev.stripe.disks.len())
         .map(|i| {
@@ -265,7 +280,7 @@ async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Result<Vec<u
     }
 }
 
-/*async fn keepalive(mut client: Client, lease_id: i64) {
+async fn keepalive(mut client: Client, lease_id: i64) {
     let (mut ka, _ks) = client.lease_keep_alive(lease_id).await.unwrap();
 
     while ka.keep_alive().await.is_ok() {
@@ -302,7 +317,7 @@ async fn register_node(
         .await?;
 
     Ok(())
-}*/
+}
 
 #[cfg(test)]
 #[path = "tests/api_tests.rs"]

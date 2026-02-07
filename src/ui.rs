@@ -74,7 +74,8 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
 
         // Mark free blocks first (since they're the base state for data region)
-        for ms in &self.metaslabs {
+        for ms in self.metaslabs.iter() {
+            let ms = ms.read().await;
             for (&free_start, &free_len) in &ms.free_extents {
                 let start = free_start as usize;
                 let end = (free_start + free_len) as usize;
@@ -287,12 +288,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Display detailed metaslab information
-    pub fn display_metaslab_info(&self) {
+    pub async fn display_metaslab_info(&self) {
         println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
         println!("║                         METASLAB INFORMATION                               ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
         for (i, ms) in self.metaslabs.iter().enumerate() {
+            let ms = ms.read().await;
             let total_blocks = ms.header.block_count;
             let free_blocks: u64 = ms.free_extents.values().sum();
             println!(
