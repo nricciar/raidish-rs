@@ -178,7 +178,7 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Inode { file } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            let inode_ref = fs.file_index.files.get(&file).unwrap();
+            let inode_ref = fs.file_index.read().await.files.get(&file).unwrap().clone();
             let inode = fs.read_inode(&inode_ref).await.unwrap();
             println!("inode: {:?}", inode);
         }

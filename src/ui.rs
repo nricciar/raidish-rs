@@ -68,8 +68,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Build a complete block type map efficiently (async version)
     async fn build_block_map(&self) -> Vec<BlockType> {
-        let superblock = self.superblock().unwrap();
-        let uber = self.uberblock().unwrap();
+        let superblock = self.superblock().await.unwrap();
+        let uber = self.uberblock().await.unwrap();
         let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
 
@@ -86,7 +86,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         // Mark inode data blocks
-        for inode_ref in self.file_index.files.values() {
+        for inode_ref in self.file_index.read().await.files.values() {
             for extent in &inode_ref.extents {
                 let start = extent.start() as usize;
                 let end = (extent.start() + extent.len()) as usize;
@@ -97,7 +97,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         // Mark file data (requires reading inodes)
-        for inode_ref in self.file_index.files.values() {
+        for inode_ref in self.file_index.read().await.files.values() {
             if let Ok(inode) = self.read_inode(inode_ref).await {
                 for extent in inode.inode_type.extents() {
                     let start = extent.start() as usize;
@@ -149,7 +149,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Display a visual map of block usage (now async)
     pub async fn display_block_map(&self) {
-        let superblock = self.superblock().unwrap();
+        let superblock = self.superblock().await.unwrap();
 
         const RESET: &str = "\x1b[0m";
 

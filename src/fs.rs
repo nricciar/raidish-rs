@@ -104,32 +104,32 @@ pub struct BlockHeader {
 
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
-    superblock: Option<Superblock>,
-    uberblock: Option<Uberblock>,
+    superblock: Arc<RwLock<Option<Superblock>>>,
+    uberblock: Arc<Mutex<Option<Uberblock>>>,
     pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
-    pub file_index: FileIndex,
+    pub(crate) file_index: Arc<RwLock<FileIndex>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
-    pub fn superblock(&self) -> Option<&Superblock> {
-        self.superblock.as_ref()
+    pub async fn superblock(&self) -> Option<Superblock> {
+        self.superblock.read().await.clone()
     }
 
-    pub fn uberblock(&self) -> Option<&Uberblock> {
-        self.uberblock.as_ref()
+    pub async fn uberblock(&self) -> Option<Uberblock> {
+        self.uberblock.lock().await.clone()
     }
 
     /// Format file system
     pub async fn format(dev: D, total_blocks: u64) -> Result<Self, FileSystemError> {
         let mut fs = FileSystem {
             dev: dev,
-            superblock: None,
-            uberblock: None,
+            superblock: Arc::new(RwLock::new(None)),
+            uberblock: Arc::new(Mutex::new(None)),
             metaslabs: Arc::new(Vec::new()),
-            file_index: FileIndex {
+            file_index: Arc::new(RwLock::new(FileIndex {
                 next_file_id: 1,
                 files: BTreeMap::new(),
-            },
+            })),
         };
 
         // Zero out uberblock slots (TXG 0)
@@ -140,7 +140,7 @@ impl<D: BlockDevice> FileSystem<D> {
             timestamp: 0,
             file_index_extent: Vec::new(),
         };
-        fs.uberblock = Some(zero_uber.clone());
+        fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         for slot in 0..UBERBLOCK_BLOCK_COUNT {
             fs.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber)
                 .await?;
@@ -160,7 +160,7 @@ impl<D: BlockDevice> FileSystem<D> {
             fs.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock)
                 .await?;
         }
-        fs.superblock = Some(superblock);
+        fs.superblock = Arc::new(RwLock::new(Some(superblock)));
 
         // Calculate metadata layout
         let metaslab_headers_start = METASLAB_TABLE_START;
@@ -216,12 +216,16 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Update root file index
-    pub async fn persist_root_index(
-        &mut self,
+    pub(crate) async fn persist_root_index(
+        &self,
         extent_pool: Option<&mut Vec<Extent>>,
     ) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
-        let data = bincode::serialize(&self.file_index).unwrap();
+        let data = 
+            {
+                let index= self.file_index.read().await;
+                bincode::serialize(&*index).unwrap()
+            };
 
         // Account for block header overhead when calculating space needed
         let blocks_needed = Self::calculate_blocks_needed(data.len());
@@ -261,7 +265,10 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        let old_extents = self.uberblock().map(|ub| ub.file_index_extent.clone());
+        let old_extents = self
+            .uberblock()
+            .await
+            .map(|ub| ub.file_index_extent.clone());
 
         self.commit_txg(commit_txg_extents).await?;
 
@@ -279,23 +286,20 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn load(dev: D) -> Result<Self, FileSystemError> {
         let mut fs = FileSystem {
             dev: dev,
-            superblock: None,
-            uberblock: None,
+            superblock: Arc::new(RwLock::new(None)),
+            uberblock: Arc::new(Mutex::new(None)),
             metaslabs: Arc::new(Vec::new()),
-            file_index: FileIndex {
+            file_index: Arc::new(RwLock::new(FileIndex {
                 next_file_id: 1,
                 files: BTreeMap::new(),
-            },
+            })),
         };
 
         fs.scan_uberblocks().await;
 
-        let superblock = fs
-            .superblock()
-            .ok_or(FileSystemError::NotFormatted)?
-            .clone();
-        let uber = match fs.uberblock() {
-            Some(uber) => uber.clone(),
+        let superblock = fs.superblock().await.ok_or(FileSystemError::NotFormatted)?;
+        let uber = match fs.uberblock().await {
+            Some(uber) => uber,
             None => return Ok(fs),
         };
 
@@ -420,7 +424,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let file_index: FileIndex =
             bincode::deserialize(&index_bytes).expect("Failed to deserialize FileIndex");
-        fs.file_index = file_index;
+        fs.file_index = Arc::new(RwLock::new(file_index));
 
         Ok(fs)
     }
@@ -459,7 +463,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(index)
     }
 
-    pub async fn mkdir(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
+    pub async fn mkdir(&self, path: &Path) -> Result<FileId, FileSystemError> {
         let (mut parent, old_inode_ref, path_blocks) =
             self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
@@ -536,7 +540,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write or overwrite a files contents
     pub async fn write_file(
-        &mut self,
+        &self,
         path: &Path,
         data: &[u8],
     ) -> Result<FileId, FileSystemError> {
@@ -626,7 +630,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Delete a virtual block device or file
-    pub async fn delete(&mut self, path: &Path) -> Result<FileId, FileSystemError> {
+    pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
         let (mut parent, inode_ref_opt, path_blocks) =
             self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
@@ -662,17 +666,17 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(inode.id)
     }
 
-    pub async fn sync(&mut self) -> Result<(), FileSystemError> {
-        let uber = self.uberblock.as_ref().ok_or(RaidZError::NotFormatted)?;
+    pub async fn sync(&self) -> Result<(), FileSystemError> {
+        let uber = self.uberblock().await.ok_or(RaidZError::NotFormatted)?;
         self.commit_txg(uber.file_index_extent.clone()).await?;
         Ok(())
     }
 
-    async fn commit_txg(&mut self, file_index_extent: Vec<Extent>) -> Result<u64, FileSystemError> {
+    async fn commit_txg(&self, file_index_extent: Vec<Extent>) -> Result<u64, FileSystemError> {
         let uber = self
             .uberblock()
-            .ok_or(FileSystemError::NotFormatted)?
-            .clone();
+            .await
+            .ok_or(FileSystemError::NotFormatted)?;
         let txg = uber.txg;
 
         self.dev.flush().await?;
@@ -706,20 +710,20 @@ impl<D: BlockDevice> FileSystem<D> {
         // Flush again to ensure uberblock is durable
         self.dev.flush().await?;
 
-        self.uberblock = Some(uberblock);
+        *self.uberblock.lock().await = Some(uberblock);
 
         Ok(txg)
     }
 
-    pub async fn write_raw_block_checked_txg(
+    pub(crate) async fn write_raw_block_checked_txg(
         &self,
         lba: BlockId,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
         let uber = self
             .uberblock()
-            .ok_or(FileSystemError::NotFormatted)?
-            .clone();
+            .await
+            .ok_or(FileSystemError::NotFormatted)?;
 
         // Prepare the full block with header
         let mut block_buf = [0u8; BLOCK_SIZE];
@@ -729,15 +733,15 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    pub async fn write_block_checked_txg<T: Serialize>(
+    pub(crate) async fn write_block_checked_txg<T: Serialize>(
         &self,
         lba: BlockId,
         value: &T,
     ) -> Result<(), FileSystemError> {
         let uber = self
             .uberblock()
-            .ok_or(FileSystemError::NotFormatted)?
-            .clone();
+            .await
+            .ok_or(FileSystemError::NotFormatted)?;
 
         let payload = bincode::serialize(value)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
@@ -771,7 +775,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Returns the blocks raw payload excluding headers
-    pub async fn read_raw_block_checked_into(
+    pub(crate) async fn read_raw_block_checked_into(
         &self,
         lba: BlockId,
         buf: &mut [u8],
@@ -800,10 +804,10 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok((header.txg, payload_len))
     }
 
-    async fn scan_uberblocks(&mut self) -> Option<(u64, Uberblock)> {
+    async fn scan_uberblocks(&self) -> Option<(u64, Uberblock)> {
         // Load superblock (TXG 0 from format)
         match self.read_block_checked::<Superblock>(SUPERBLOCK_LBA).await {
-            Ok((_, superblock)) => self.superblock = Some(superblock),
+            Ok((_, superblock)) => *self.superblock.write().await = Some(superblock),
             Err(e) => {
                 println!("WARNING! {:?}", e);
             }
@@ -831,14 +835,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Initialize TXG state from the latest committed uberblock
         if let Some((_txg, uberblock)) = best.clone() {
-            self.uberblock = Some(uberblock);
+            *self.uberblock.lock().await = Some(uberblock);
         }
 
         best
     }
 
     /// Returns deserialized type from block
-    pub async fn read_block_checked<T: for<'a> Deserialize<'a>>(
+    pub(crate) async fn read_block_checked<T: for<'a> Deserialize<'a>>(
         &self,
         lba: BlockId,
     ) -> Result<(u64, T), FileSystemError> {

@@ -3,6 +3,8 @@ use crate::fs::{BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{RwLock};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileIndex {
@@ -155,7 +157,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn write_inode(
-        &mut self,
+        &self,
         inode: &FileInode,
         extent_pool: Option<&mut Vec<Extent>>,
     ) -> Result<Vec<Extent>, FileSystemError> {
@@ -209,10 +211,10 @@ impl<D: BlockDevice> FileSystem<D> {
         let components = Self::path_components(path);
 
         if components.is_empty() {
-            return Ok((self.file_index.clone(), None));
+            return Ok((self.file_index.read().await.clone(), None));
         }
 
-        let mut current_index = self.file_index.clone();
+        let mut current_index = self.file_index.read().await.clone();
         let mut current_inode_ref = None;
 
         for component in &components {
@@ -245,12 +247,13 @@ impl<D: BlockDevice> FileSystem<D> {
 
         if components.is_empty() {
             // Count root index
-            let root_data = bincode::serialize(&self.file_index)?;
+            let index = self.file_index.read().await;
+            let root_data = bincode::serialize(&*index)?;
             total_blocks += Self::calculate_blocks_needed(root_data.len());
-            return Ok((self.file_index.clone(), None, total_blocks as usize));
+            return Ok((index.clone(), None, total_blocks as usize));
         }
 
-        let mut current_index = self.file_index.clone();
+        let mut current_index = self.file_index.read().await.clone();
         let mut current_inode_ref = None;
 
         for component in &components {
@@ -281,7 +284,8 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         // Count root index
-        let root_data = bincode::serialize(&self.file_index)?;
+        let index = self.file_index.read().await;
+        let root_data = bincode::serialize(&*index)?;
         total_blocks += Self::calculate_blocks_needed(root_data.len());
 
         Ok((current_index, current_inode_ref, total_blocks as usize))
@@ -351,7 +355,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Persist directory changes using copy-on-write from the target directory back to root.
     /// This updates the parent directory's index and propagates changes up the directory tree.
     pub async fn persist_directory_changes(
-        &mut self,
+        &self,
         file_path: &Path,
         mut updated_index: FileIndex,
         updated_inode: Option<FileInode>,
@@ -385,7 +389,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // If we're in the root directory, just persist the file index
         if components.len() <= 1 {
-            self.file_index = updated_index;
+            *self.file_index.write().await = updated_index;
             self.persist_root_index(extent_pool.as_mut().map(|p| &mut **p))
                 .await?;
             return Ok(());
@@ -426,6 +430,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let dir_name = &dir_components[0];
                 let old_ref = self
                     .file_index
+                    .read().await
                     .files
                     .get(dir_name)
                     .cloned()
@@ -462,7 +467,7 @@ impl<D: BlockDevice> FileSystem<D> {
             if depth == 0 {
                 let dir_name = &dir_components[0];
 
-                self.file_index.files.insert(
+                self.file_index.write().await.files.insert(
                     dir_name.to_string(),
                     InodeRef {
                         file_id: dir_file_id,

@@ -4,13 +4,13 @@ use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions};
 
 impl<D: BlockDevice> FileSystem<D> {
     pub async fn create_block(
-        &mut self,
+        &self,
         name: &str,
         size_bytes: u64,
         block_size: u32,
     ) -> Result<FileId, FileSystemError> {
         // Check if name already exists
-        if self.file_index.files.contains_key(name) {
+        if self.file_index.read().await.files.contains_key(name) {
             panic!("File or block device '{}' already exists", name);
         }
 
@@ -32,8 +32,13 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        let file_id = self.file_index.next_file_id;
-        self.file_index.next_file_id += 1;
+        let file_id = 
+            {
+                let mut index = self.file_index.write().await;
+                let file_id = index.next_file_id;
+                index.next_file_id += 1;
+                file_id
+            };
 
         let inode = FileInode {
             id: file_id,
@@ -48,7 +53,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let extents = self.write_inode(&inode, None).await?;
 
         // Update file index with new inode reference
-        self.file_index.files.insert(
+        self.file_index.write().await.files.insert(
             name.to_string(),
             InodeRef {
                 file_id,
@@ -64,7 +69,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read data from a virtual block device at a specific byte offset
     pub async fn block_read(
-        &mut self,
+        &self,
         name: &str,
         offset: u64,
         buf: &mut [u8],
@@ -78,6 +83,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let inode_ref = self
             .file_index
+            .read().await
             .files
             .get(name)
             .ok_or_else(|| FileSystemError::FileNotFound)?
@@ -156,13 +162,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write data to a virtual block device at a specific byte offset
     pub async fn block_write(
-        &mut self,
+        &self,
         name: &str,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, FileSystemError> {
         let inode_ref = self
             .file_index
+            .read().await
             .files
             .get(name)
             .ok_or_else(|| FileSystemError::FileNotFound)?

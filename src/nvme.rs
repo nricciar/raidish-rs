@@ -262,12 +262,12 @@ impl<D: BlockDevice> NvmeTcpServer<D> {
         // Get device size
         let device_size = {
             let fs_lock = fs.lock().await;
-            let inode_ref = fs_lock.file_index.files.get(&device_name).ok_or_else(|| {
+            let inode_ref = fs_lock.file_index.read().await.files.get(&device_name).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("Device '{}' not found", device_name),
                 )
-            })?;
+            })?.clone();
 
             let inode = fs_lock.read_inode(&inode_ref).await.unwrap();
 
