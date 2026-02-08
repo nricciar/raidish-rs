@@ -92,7 +92,7 @@ impl<D: BlockDevice> FileSystem<D> {
         len: u64,
     ) -> Result<(), FileSystemError> {
         let mut ms = self.metaslabs[ms_idx].write().await;
-        
+
         println!("  -> Block {} belongs to metaslab {}", start, ms_idx);
         println!("  -> Before merge, free_extents: {:?}", ms.free_extents);
 
@@ -146,7 +146,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let header_block = ms.header_block;
         let header = ms.header.clone();
-        
+
         drop(ms);
 
         self.write_block_checked_txg(write_cursor, &entry).await?;
@@ -177,19 +177,18 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut ms_idx = 0;
 
         while ms_idx < self.metaslabs.len() && remaining > 0 {
-            let (log_used, log_capacity) = 
-                {
-                    let ms = self.metaslabs[ms_idx].read().await;
-                    let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
-                    let log_used = ms.write_cursor - ms.header.spacemap_start;
-                    (log_used, log_capacity)
-                };
+            let (log_used, log_capacity) = {
+                let ms = self.metaslabs[ms_idx].read().await;
+                let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
+                let log_used = ms.write_cursor - ms.header.spacemap_start;
+                (log_used, log_capacity)
+            };
 
             if log_used >= log_capacity {
                 println!(
-                        "  MS{}: Skipping - log at capacity ({}/{})",
-                        ms_idx, log_used, log_capacity
-                    );
+                    "  MS{}: Skipping - log at capacity ({}/{})",
+                    ms_idx, log_used, log_capacity
+                );
                 ms_idx += 1;
                 continue;
             }
@@ -198,7 +197,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let log_capacity = SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64;
             let mut rejected_extents = Vec::new();
             let mut io_batch = Vec::new();
-            
+
             while remaining > 0 {
                 let current_log_used = ms.write_cursor - ms.header.spacemap_start;
                 if current_log_used >= log_capacity {
@@ -207,13 +206,15 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
 
                 // Find suitable extent (direct access, no lock needed)
-                let found = ms.free_extents.iter()
+                let found = ms
+                    .free_extents
+                    .iter()
                     .map(|(&s, &l)| (s, l))
                     .find(|(s, _)| !rejected_extents.iter().any(|(rs, _)| rs == s));
 
                 if let Some((start, len)) = found {
                     let ms_end = ms.header.start_block + ms.header.block_count;
-                    
+
                     // Remove from free pool
                     ms.free_extents.remove(&start);
 
@@ -274,7 +275,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
                     // Add to batch for I/O (will execute after lock release)
                     io_batch.push((write_cursor, ms.header_block, ms.header.clone(), entry));
-                    
+
                     allocated_extents.push(Extent {
                         start: aligned_start,
                         len: take,
@@ -290,7 +291,7 @@ impl<D: BlockDevice> FileSystem<D> {
             for (start, len) in rejected_extents {
                 ms.free_extents.insert(start, len);
             }
-            
+
             // Release write lock before I/O
             drop(ms);
 
@@ -302,7 +303,7 @@ impl<D: BlockDevice> FileSystem<D> {
             if remaining == 0 {
                 break;
             }
-            
+
             ms_idx += 1;
         }
 
@@ -328,12 +329,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 SPACEMAP_LOG_BLOCKS_PER_METASLAB
             );
 
-            let free_extents_vec: Vec<(u64, u64)> = ms.free_extents.iter()
+            let free_extents_vec: Vec<(u64, u64)> = ms
+                .free_extents
+                .iter()
                 .map(|(&start, &len)| (start, len))
                 .collect();
-            
+
             ms.write_cursor = ms.header.spacemap_start;
-            
+
             (free_extents_vec, ms.header.spacemap_start)
         };
 
@@ -341,15 +344,17 @@ impl<D: BlockDevice> FileSystem<D> {
         for (start, len) in &free_extents_vec {
             let (write_cursor, entry) = {
                 let mut ms = self.metaslabs[ms_idx].write().await;
-                let entry = SpaceMapEntry::Free { 
-                    start: *start, 
-                    len: *len 
+                let entry = SpaceMapEntry::Free {
+                    start: *start,
+                    len: *len,
                 };
                 let write_cursor = ms.write_cursor;
                 ms.write_cursor += 1;
 
                 // Safety check
-                if ms.write_cursor - ms.header.spacemap_start >= SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64 {
+                if ms.write_cursor - ms.header.spacemap_start
+                    >= SPACEMAP_LOG_BLOCKS_PER_METASLAB as u64
+                {
                     panic!(
                         "Metaslab {} still doesn't fit after compaction! Has {} free extents",
                         ms_idx,

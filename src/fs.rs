@@ -221,11 +221,10 @@ impl<D: BlockDevice> FileSystem<D> {
         extent_pool: Option<&mut Vec<Extent>>,
     ) -> Result<(), FileSystemError> {
         println!("persist_file_index called");
-        let data = 
-            {
-                let index= self.file_index.read().await;
-                bincode::serialize(&*index).unwrap()
-            };
+        let data = {
+            let index = self.file_index.read().await;
+            bincode::serialize(&*index)?
+        };
 
         // Account for block header overhead when calculating space needed
         let blocks_needed = Self::calculate_blocks_needed(data.len());
@@ -422,8 +421,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        let file_index: FileIndex =
-            bincode::deserialize(&index_bytes).expect("Failed to deserialize FileIndex");
+        let file_index: FileIndex = bincode::deserialize(&index_bytes)?;
         fs.file_index = Arc::new(RwLock::new(file_index));
 
         Ok(fs)
@@ -436,7 +434,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let inode = self.read_inode(&inode_ref).await?;
 
         if !inode.inode_type.is_file() {
-            panic!("'{}' is not a regular file", path.display());
+            return Err(FileSystemError::NotAFile);
         }
 
         let mut out = Vec::with_capacity(inode.inode_type.size_bytes() as usize);
@@ -470,7 +468,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
             if !old_inode.inode_type.is_directory() {
-                panic!("'{}' is not a directory", path.display());
+                return Err(FileSystemError::NotADirectory);
             }
             Ok(old_inode.id)
         } else {
@@ -478,7 +476,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 next_file_id: 1,
                 files: BTreeMap::new(),
             };
-            let data = bincode::serialize(&dir).unwrap();
+            let data = bincode::serialize(&dir)?;
 
             // Account for block header overhead when calculating space needed
             let blocks_needed = Self::calculate_blocks_needed(data.len());
@@ -524,7 +522,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 },
             };
 
-            let inode_data = bincode::serialize(&new_inode).unwrap();
+            let inode_data = bincode::serialize(&new_inode)?;
             let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
             let mut extent_pool = self
@@ -539,11 +537,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Write or overwrite a files contents
-    pub async fn write_file(
-        &self,
-        path: &Path,
-        data: &[u8],
-    ) -> Result<FileId, FileSystemError> {
+    pub async fn write_file(&self, path: &Path, data: &[u8]) -> Result<FileId, FileSystemError> {
         let (mut parent, old_inode_ref, path_blocks) =
             self.get_maybe_inode_ref_at_path_with_count(path).await?;
 
@@ -601,7 +595,7 @@ impl<D: BlockDevice> FileSystem<D> {
             },
         };
 
-        let inode_data = bincode::serialize(&new_inode).unwrap();
+        let inode_data = bincode::serialize(&new_inode)?;
         let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
         let mut extent_pool = self

@@ -3,8 +3,6 @@ use crate::fs::{BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::{RwLock};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileIndex {
@@ -161,7 +159,7 @@ impl<D: BlockDevice> FileSystem<D> {
         inode: &FileInode,
         extent_pool: Option<&mut Vec<Extent>>,
     ) -> Result<Vec<Extent>, FileSystemError> {
-        let inode_data = bincode::serialize(inode).unwrap();
+        let inode_data = bincode::serialize(inode)?;
         let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
 
         let allocated_extents = match extent_pool {
@@ -318,8 +316,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Verify it's actually a file (not a directory)
         let inode = self.read_inode(&inode_ref).await?;
-        if inode.inode_type.is_directory() {
-            return Err(FileSystemError::NotADirectory);
+        if !inode.inode_type.is_file() {
+            return Err(FileSystemError::NotAFile);
         }
 
         Ok(inode_ref)
@@ -430,7 +428,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 let dir_name = &dir_components[0];
                 let old_ref = self
                     .file_index
-                    .read().await
+                    .read()
+                    .await
                     .files
                     .get(dir_name)
                     .cloned()

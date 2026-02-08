@@ -73,7 +73,7 @@ async fn create_test_fs() -> (FileSystem<RaidZ>, Vec<NamedTempFile>) {
 
 #[tokio::test]
 async fn test_multiple_files_in_directory() {
-    let (mut fs, _temp_files) = create_test_fs().await;
+    let (fs, _temp_files) = create_test_fs().await;
 
     // Create a directory
     fs.mkdir(Path::new("/files")).await.unwrap();
@@ -96,7 +96,7 @@ async fn test_multiple_files_in_directory() {
 
 #[tokio::test]
 async fn test_nested_directory_creation() {
-    let (mut fs, _temp_files) = create_test_fs().await;
+    let (fs, _temp_files) = create_test_fs().await;
 
     // Create nested directories one at a time
     let paths = vec!["/level1", "/level1/level2", "/level1/level2/level3"];

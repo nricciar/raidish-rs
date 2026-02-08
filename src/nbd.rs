@@ -215,7 +215,7 @@ where
                 let mut buf = vec![0u8; length as usize];
 
                 {
-                    let mut fs = fs.lock().await;
+                    let fs = fs.lock().await;
                     let bytes_read = fs.block_read(&zvol_name, offset, &mut buf).await.unwrap();
                     println!("  -> Read {} bytes from filesystem", bytes_read);
 
@@ -240,7 +240,7 @@ where
                 stream.read_exact(&mut buf).await?;
 
                 let error = {
-                    let mut fs = fs.lock().await;
+                    let fs = fs.lock().await;
                     let bytes_written = fs.block_write(&zvol_name, offset, &buf).await.unwrap();
                     println!("  -> Wrote {} bytes to filesystem", bytes_written);
 
@@ -266,7 +266,7 @@ where
             NBD_CMD_FLUSH => {
                 println!("  -> Handling FLUSH");
                 {
-                    let mut fs = fs.lock().await;
+                    let fs = fs.lock().await;
                     fs.sync().await.unwrap();
                 }
                 // Optionally call fs.sync() or similar

@@ -32,13 +32,12 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        let file_id = 
-            {
-                let mut index = self.file_index.write().await;
-                let file_id = index.next_file_id;
-                index.next_file_id += 1;
-                file_id
-            };
+        let file_id = {
+            let mut index = self.file_index.write().await;
+            let file_id = index.next_file_id;
+            index.next_file_id += 1;
+            file_id
+        };
 
         let inode = FileInode {
             id: file_id,
@@ -83,7 +82,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let inode_ref = self
             .file_index
-            .read().await
+            .read()
+            .await
             .files
             .get(name)
             .ok_or_else(|| FileSystemError::FileNotFound)?
@@ -169,7 +169,8 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<usize, FileSystemError> {
         let inode_ref = self
             .file_index
-            .read().await
+            .read()
+            .await
             .files
             .get(name)
             .ok_or_else(|| FileSystemError::FileNotFound)?

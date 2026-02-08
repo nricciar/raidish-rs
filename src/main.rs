@@ -153,7 +153,7 @@ async fn main() -> std::io::Result<()> {
             server.run().await.unwrap();
         }
         Commands::Block { name, size } => {
-            let mut fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load(raid).await.unwrap();
             fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32)
                 .await
                 .unwrap();
@@ -183,14 +183,14 @@ async fn main() -> std::io::Result<()> {
             println!("inode: {:?}", inode);
         }
         Commands::Write { source, dest } => {
-            let mut fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load(raid).await.unwrap();
             let file = Path::new(&source);
             let data = std::fs::read(file).unwrap();
             fs.write_file(&Path::new(&dest), &data).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Mkdir { path } => {
-            let mut fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load(raid).await.unwrap();
             fs.mkdir(&Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
@@ -200,7 +200,7 @@ async fn main() -> std::io::Result<()> {
             println!("ls: {:?}", &ls);
         }
         Commands::Delete { path } => {
-            let mut fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load(raid).await.unwrap();
             fs.delete(&Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }

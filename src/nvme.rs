@@ -262,12 +262,19 @@ impl<D: BlockDevice> NvmeTcpServer<D> {
         // Get device size
         let device_size = {
             let fs_lock = fs.lock().await;
-            let inode_ref = fs_lock.file_index.read().await.files.get(&device_name).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Device '{}' not found", device_name),
-                )
-            })?.clone();
+            let inode_ref = fs_lock
+                .file_index
+                .read()
+                .await
+                .files
+                .get(&device_name)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Device '{}' not found", device_name),
+                    )
+                })?
+                .clone();
 
             let inode = fs_lock.read_inode(&inode_ref).await.unwrap();
 
@@ -709,7 +716,7 @@ impl<D: BlockDevice> NvmeTcpServer<D> {
         let mut buffer = vec![0u8; length as usize];
 
         {
-            let mut fs_lock = fs.lock().await;
+            let fs_lock = fs.lock().await;
             let bytes_read = fs_lock
                 .block_read(device_name, offset, &mut buffer)
                 .await
@@ -796,7 +803,7 @@ impl<D: BlockDevice> NvmeTcpServer<D> {
         let offset = (datao as u64 / block_size) * block_size;
 
         {
-            let mut fs_lock = fs.lock().await;
+            let fs_lock = fs.lock().await;
             fs_lock
                 .block_write(device_name, offset, &data)
                 .await
@@ -1015,7 +1022,7 @@ impl<D: BlockDevice> NvmeTcpServer<D> {
         status: u16,
         result: u64,
     ) -> std::io::Result<()> {
-        let mut rsp = NvmeTcpRsp {
+        let rsp = NvmeTcpRsp {
             header: NvmeTcpPduHeader {
                 pdu_type: NVME_TCP_PDU_TYPE_RSP,
                 flags: 0,
