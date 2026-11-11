@@ -14,7 +14,13 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+
+/// Most blocks fetched by one coalesced read of physically adjacent records.
+pub const COALESCE_MAX_BLOCKS: u64 = 256;
+/// Coalesced reads in flight at once.
+const READ_CONCURRENCY: usize = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlockPtr {
@@ -43,6 +49,26 @@ impl BlockPtr {
     pub fn data_blocks(&self) -> u64 {
         (self.lsize as u64).div_ceil(BLOCK_SIZE as u64)
     }
+}
+
+/// Split `ptrs` into runs of records that are physically adjacent (each
+/// starts where the previous one's allocation ends), so each run can be
+/// fetched with one read of at most `COALESCE_MAX_BLOCKS` blocks.
+pub fn coalesce_groups(ptrs: &[BlockPtr]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < ptrs.len() {
+        let mut j = i + 1;
+        while j < ptrs.len()
+            && ptrs[j].lba == ptrs[j - 1].lba + ptrs[j - 1].asize as u64
+            && ptrs[j].lba + ptrs[j].data_blocks() - ptrs[i].lba <= COALESCE_MAX_BLOCKS
+        {
+            j += 1;
+        }
+        groups.push(i..j);
+        i = j;
+    }
+    groups
 }
 
 /// Logical size of an object.
@@ -114,6 +140,35 @@ impl<D: BlockDevice> FileSystem<D> {
         })
     }
 
+    /// Write `records` back to back at `start`, each in `record_blocks`
+    /// (stripe aligned) blocks, with a single device write. The space must
+    /// already be allocated; returns one pointer per record.
+    pub(crate) async fn write_records_at(
+        &self,
+        start: u64,
+        record_blocks: u64,
+        records: &[&[u8]],
+    ) -> Result<Vec<BlockPtr>, FileSystemError> {
+        debug_assert_eq!(record_blocks, self.align_blocks(record_blocks));
+        let txg = self.open_txg().await?;
+        let stride = record_blocks as usize * BLOCK_SIZE;
+        let mut buf = vec![0u8; stride * records.len()];
+        let mut ptrs = Vec::with_capacity(records.len());
+        for (i, data) in records.iter().enumerate() {
+            assert!(data.len() <= stride, "record larger than its slot");
+            buf[i * stride..i * stride + data.len()].copy_from_slice(data);
+            ptrs.push(BlockPtr {
+                lba: start + i as u64 * record_blocks,
+                asize: record_blocks as u32,
+                lsize: data.len() as u32,
+                birth_txg: txg,
+                checksum: *blake3::hash(data).as_bytes(),
+            });
+        }
+        self.dev.write_blocks(start, &buf).await?;
+        Ok(ptrs)
+    }
+
     async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
         let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
@@ -125,8 +180,53 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Read and verify a whole object.
     pub(crate) async fn read_object(&self, ptrs: &[BlockPtr]) -> Result<Vec<u8>, FileSystemError> {
         let mut out = Vec::with_capacity(object_size(ptrs) as usize);
-        for ptr in ptrs {
-            out.extend_from_slice(&self.read_record(ptr).await?);
+        for data in self.read_records(ptrs).await? {
+            out.extend_from_slice(&data);
+        }
+        Ok(out)
+    }
+
+    /// Read and verify several records, in order. Records that sit back to
+    /// back on disk are fetched with one device read (up to
+    /// `COALESCE_MAX_BLOCKS`); any record of such a read that fails its
+    /// checksum is re-read on its own through the self-healing path.
+    pub(crate) async fn read_records(
+        &self,
+        ptrs: &[BlockPtr],
+    ) -> Result<Vec<Vec<u8>>, FileSystemError> {
+        let groups = coalesce_groups(ptrs);
+        let reads = groups.into_iter().map(|g| self.read_group(&ptrs[g]));
+        let results: Vec<_> = stream::iter(reads)
+            .buffered(READ_CONCURRENCY)
+            .collect()
+            .await;
+        let mut out = Vec::with_capacity(ptrs.len());
+        for r in results {
+            out.extend(r?);
+        }
+        Ok(out)
+    }
+
+    async fn read_group(&self, ptrs: &[BlockPtr]) -> Result<Vec<Vec<u8>>, FileSystemError> {
+        if ptrs.len() == 1 {
+            return Ok(vec![self.read_record(&ptrs[0]).await?]);
+        }
+        let first = ptrs[0].lba;
+        let last = &ptrs[ptrs.len() - 1];
+        let span = last.lba + last.data_blocks() - first;
+        let mut raw = vec![0u8; span as usize * BLOCK_SIZE];
+        let read_ok = self.dev.read_blocks(first, &mut raw).await.is_ok();
+        let mut out = Vec::with_capacity(ptrs.len());
+        for p in ptrs {
+            if read_ok {
+                let at = (p.lba - first) as usize * BLOCK_SIZE;
+                let data = &raw[at..at + p.lsize as usize];
+                if *blake3::hash(data).as_bytes() == p.checksum {
+                    out.push(data.to_vec());
+                    continue;
+                }
+            }
+            out.push(self.read_record(p).await?);
         }
         Ok(out)
     }

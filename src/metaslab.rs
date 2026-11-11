@@ -16,8 +16,9 @@
 //! slot.
 //!
 //! Frees are deferred for `TXG_DEFER_SIZE` TXGs before the space becomes
-//! allocatable again, so the previous few uberblocks never reference blocks
-//! that have since been overwritten.
+//! allocatable again, so the previous uberblocks in the ring never reference
+//! blocks that have since been overwritten (every one of them is a safe
+//! rewind target, see `fs::Rewind`).
 
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{
@@ -26,8 +27,9 @@ use crate::fs::{
 use crate::inode::Extent;
 use std::collections::{BTreeMap, VecDeque};
 
-/// Number of TXGs a freed block waits before it can be reallocated.
-pub const TXG_DEFER_SIZE: u64 = 2;
+/// Number of TXGs a freed block waits before it can be reallocated: one
+/// less than the uberblock ring, so every older uberblock stays intact.
+pub const TXG_DEFER_SIZE: u64 = crate::fs::UBERBLOCK_SLOTS - 1;
 /// Number of space map slots per metaslab (A/B).
 pub const SPACEMAP_SLOTS: u64 = 2;
 /// Bounds on metaslab size, in blocks (rounded down to the pool's alignment).
@@ -216,12 +218,90 @@ impl MetaslabState {
         map.insert(new_start, new_end - new_start);
     }
 
-    /// Carve out exactly `want` (stripe-aligned) contiguous blocks.
-    fn take_aligned_exact(&mut self, want: u64) -> Option<Extent> {
-        let (s, l, aligned) = self.free_extents.iter().find_map(|(&s, &l)| {
-            let aligned = align_up(s, self.align);
-            (aligned + want <= s + l).then_some((s, l, aligned))
-        })?;
+    /// Remove `[start, start + len)` from a free map, splitting extents.
+    pub(crate) fn remove_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
+        let end = start + len;
+        let hit: Vec<(u64, u64)> = map
+            .range(..end)
+            .rev()
+            .take_while(|(s, l)| *s + *l > start)
+            .map(|(&s, &l)| (s, l))
+            .collect();
+        for (s, l) in hit {
+            map.remove(&s);
+            if s < start {
+                map.insert(s, start - s);
+            }
+            if s + l > end {
+                map.insert(end, s + l - end);
+            }
+        }
+    }
+
+    /// Remove `[start, start + len)` from a list of extents, splitting them.
+    fn remove_from_extents(list: &mut Vec<Extent>, start: u64, len: u64) {
+        let end = start + len;
+        let mut out = Vec::with_capacity(list.len());
+        for e in list.drain(..) {
+            let e_end = e.start + e.len;
+            if e_end <= start || e.start >= end {
+                out.push(e);
+                continue;
+            }
+            if e.start < start {
+                out.push(Extent {
+                    start: e.start,
+                    len: start - e.start,
+                });
+            }
+            if e_end > end {
+                out.push(Extent {
+                    start: end,
+                    len: e_end - end,
+                });
+            }
+        }
+        *list = out;
+    }
+
+    /// Mark `[start, start + len)` allocated, whatever state it was in (free,
+    /// freeing or deferred). Used by repair when live data is found in space
+    /// the map considers released.
+    pub(crate) fn mark_allocated(&mut self, start: u64, len: u64) {
+        Self::remove_range(&mut self.free_extents, start, len);
+        Self::remove_from_extents(&mut self.freeing, start, len);
+        for (_, v) in self.deferred.iter_mut() {
+            Self::remove_from_extents(v, start, len);
+        }
+        self.deferred.retain(|(_, v)| !v.is_empty());
+        self.dirty = true;
+    }
+
+    /// Every released extent (free, freeing or deferred), merged.
+    pub(crate) fn released_map(&self) -> BTreeMap<u64, u64> {
+        let mut released = BTreeMap::new();
+        for (s, l) in self.released_extents() {
+            Self::insert_free(&mut released, s, l);
+        }
+        released
+    }
+
+    /// Carve out exactly `want` (stripe-aligned) contiguous blocks, from the
+    /// first free extent that fits at or after block `from`.
+    fn take_aligned_exact(&mut self, want: u64, from: u64) -> Option<Extent> {
+        let align = self.align;
+        let containing = self
+            .free_extents
+            .range(..=from)
+            .next_back()
+            .filter(|(s, l)| *s + *l > from);
+        let (s, l, aligned) = containing
+            .into_iter()
+            .chain(self.free_extents.range(from + 1..))
+            .find_map(|(&s, &l)| {
+                let aligned = align_up(s.max(from), align);
+                (aligned + want <= s + l).then_some((s, l, aligned))
+            })?;
         self.free_extents.remove(&s);
         if aligned > s {
             self.free_extents.insert(s, aligned - s);
@@ -453,9 +533,29 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Allocate one contiguous, stripe-aligned extent of `blocks` (rounded up
     /// to whole stripes).
     pub(crate) async fn allocate_contiguous(&self, blocks: u64) -> Result<Extent, FileSystemError> {
+        self.allocate_run(blocks, None).await
+    }
+
+    /// Allocate one contiguous, stripe-aligned extent of `blocks`, preferably
+    /// at or just after block `hint` (so related records end up next to each
+    /// other), else first fit.
+    pub(crate) async fn allocate_run(
+        &self,
+        blocks: u64,
+        hint: Option<u64>,
+    ) -> Result<Extent, FileSystemError> {
         let want = align_up(blocks, self.layout.align);
+        if let Some(h) = hint
+            && let Some(idx) = self.layout.metaslab_for_block(h)
+            && let Some(extent) = self.metaslabs[idx]
+                .write()
+                .await
+                .take_aligned_exact(want, h)
+        {
+            return Ok(extent);
+        }
         for ms in self.metaslabs.iter() {
-            if let Some(extent) = ms.write().await.take_aligned_exact(want) {
+            if let Some(extent) = ms.write().await.take_aligned_exact(want, 0) {
                 return Ok(extent);
             }
         }
@@ -471,6 +571,12 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         let mut remaining = align_up(blocks_needed, self.layout.align);
+        // Whole object in one piece if it fits anywhere; split only if not.
+        if remaining <= self.layout.metaslab_size_blocks
+            && let Ok(extent) = self.allocate_run(remaining, None).await
+        {
+            return Ok(vec![extent]);
+        }
         let mut allocated: Vec<(usize, Extent)> = Vec::new();
 
         for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
@@ -591,11 +697,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Load every metaslab from the newest valid slot not newer than `uber_txg`.
+    /// Also returns the metaslabs that had no valid slot (loaded as full).
     pub(crate) async fn load_metaslabs(
         &self,
         uber_txg: u64,
-    ) -> Result<Vec<MetaslabState>, FileSystemError> {
+    ) -> Result<(Vec<MetaslabState>, Vec<usize>), FileSystemError> {
         let mut out = Vec::with_capacity(self.layout.metaslab_count as usize);
+        let mut missing = Vec::new();
 
         for ms_idx in 0..self.layout.metaslab_count as usize {
             let start = self.layout.metaslab_start(ms_idx);
@@ -633,6 +741,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         "WARNING: metaslab {} has no valid space map slot; treating as full",
                         ms_idx
                     );
+                    missing.push(ms_idx);
                     let mut st = MetaslabState::new_empty(start, count, self.layout.align);
                     st.free_extents.clear();
                     st.dirty = false;
@@ -642,7 +751,7 @@ impl<D: BlockDevice> FileSystem<D> {
             out.push(state);
         }
 
-        Ok(out)
+        Ok((out, missing))
     }
 
     /// Read a slot: valid at TXG `t` only if every block is a good label
@@ -727,82 +836,6 @@ impl<D: BlockDevice> FileSystem<D> {
             return Some((t, bytes));
         }
         None
-    }
-
-    /// Find all blocks that are allocated but not referenced by any live data
-    pub async fn find_orphaned_blocks(&self) -> Result<Vec<(u64, u64)>, FileSystemError> {
-        let mut live_blocks = std::collections::HashSet::new();
-        let mut mark = |extent: &Extent| {
-            for i in 0..extent.len() {
-                live_blocks.insert(extent.start() + i);
-            }
-        };
-
-        // Walk the whole tree, not just the root directory.
-        let mut pending = vec![self.file_index.read().await.clone()];
-        while let Some(index) = pending.pop() {
-            for inode_ref in index.files.values() {
-                for extent in inode_ref.inode_extents() {
-                    mark(&extent);
-                }
-                let inode = self.read_inode(inode_ref).await?;
-                for extent in self.content_extents(&inode.inode_type).await? {
-                    mark(&extent);
-                }
-                if inode.inode_type.is_directory() {
-                    pending.push(self.read_file_index(&inode.inode_type).await?);
-                }
-            }
-        }
-
-        for ptr in self.root_ptr.lock().await.iter() {
-            mark(&ptr.extent());
-        }
-
-        let mut orphaned = Vec::new();
-
-        for ms in self.metaslabs.iter() {
-            let ms = ms.read().await;
-            let ms_end = ms.start_block + ms.block_count;
-
-            // Everything not free, freeing or deferred is allocated.
-            let mut released = BTreeMap::new();
-            for (s, l) in ms.released_extents() {
-                MetaslabState::insert_free(&mut released, s, l);
-            }
-
-            let mut allocated_ranges = Vec::new();
-            let mut cursor = ms.start_block;
-            for (&s, &l) in &released {
-                if cursor < s {
-                    allocated_ranges.push((cursor, s - cursor));
-                }
-                cursor = s + l;
-            }
-            if cursor < ms_end {
-                allocated_ranges.push((cursor, ms_end - cursor));
-            }
-
-            for (start, len) in allocated_ranges {
-                let mut orphan_start = None;
-                let mut orphan_len = 0;
-
-                for block in start..start + len {
-                    if !live_blocks.contains(&block) {
-                        orphan_start.get_or_insert(block);
-                        orphan_len += 1;
-                    } else if let Some(os) = orphan_start.take() {
-                        orphaned.push((os, orphan_len));
-                        orphan_len = 0;
-                    }
-                }
-                if let Some(os) = orphan_start {
-                    orphaned.push((os, orphan_len));
-                }
-            }
-        }
-
-        Ok(orphaned)
     }
 }
 

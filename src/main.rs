@@ -11,6 +11,7 @@ mod config;
 mod disk;
 mod disks;
 mod fs;
+mod fsck;
 mod inode;
 mod metaslab;
 mod mirror;
@@ -42,6 +43,15 @@ struct Cli {
 
     #[arg(short, long, global = true, default_value = "~/.raidish.yaml")]
     config: String,
+
+    /// Open the newest committed state whose whole tree verifies, discarding
+    /// newer (damaged) TXGs. Writable commands commit the rewind.
+    #[arg(long, global = true, conflicts_with = "txg")]
+    rewind: bool,
+
+    /// Open the committed state of exactly this TXG (see `status`).
+    #[arg(long, global = true)]
+    txg: Option<u64>,
 
     #[command(subcommand)]
     command: Commands,
@@ -99,6 +109,35 @@ enum Commands {
     },
     /// Rebuild what degraded disks missed (only blocks written since).
     Resilver,
+    /// Check the space maps against the tree: leaked blocks, blocks in use
+    /// that the maps call free, cross-links, unreadable metadata.
+    Fsck {
+        /// Free leaked blocks and re-allocate in-use blocks marked free.
+        #[arg(long)]
+        repair: bool,
+        /// Discard the space maps and rebuild them from the tree.
+        #[arg(long)]
+        rebuild_spacemaps: bool,
+        /// Rebuild even if part of the tree is unreadable (frees whatever
+        /// only the unreadable part referenced).
+        #[arg(long, requires = "rebuild_spacemaps")]
+        force: bool,
+    },
+    /// Copy everything still readable to a local directory (volumes as
+    /// sparse .img files); damaged records are zero-filled and reported.
+    Salvage {
+        dest: String,
+    },
+    /// Rewrite a volume so its records are contiguous on disk.
+    Defrag {
+        name: String,
+        /// Records rewritten per commit.
+        #[arg(long, default_value_t = 2048)]
+        batch: usize,
+        /// Only report how fragmented the volume is.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show disk health: online, label, degraded since which TXG.
     Status,
     Listen {
@@ -144,6 +183,19 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
     if let Some(u) = fs.uberblock().await {
         println!("pool at TXG {}", u.txg);
     }
+    let ring: Vec<String> = fs
+        .uberblock_ring()
+        .await
+        .iter()
+        .map(|u| {
+            let when = chrono::DateTime::from_timestamp_millis(u.timestamp as i64)
+                .map_or("?".to_string(), |t| {
+                    t.format("%Y-%m-%d %H:%M:%S").to_string()
+                });
+            format!("TXG {} ({})", u.txg, when)
+        })
+        .collect();
+    println!("rewind targets: {}", ring.join(", "));
     let Some(pool) = fs.dev.pool() else {
         return;
     };
@@ -200,6 +252,15 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+async fn open_fs<D: BlockDevice>(dev: D, read_only: bool, rewind: fs::Rewind) -> FileSystem<D> {
+    let opened = match (rewind, read_only) {
+        (fs::Rewind::None, false) => FileSystem::load(dev).await,
+        (fs::Rewind::None, true) => FileSystem::load_readonly(dev).await,
+        _ => FileSystem::load_with(dev, fs::LoadOptions { read_only, rewind }).await,
+    };
+    opened.unwrap_or_else(|e| fail(format!("cannot open pool: {}", e)))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
@@ -226,25 +287,30 @@ async fn main() -> std::io::Result<()> {
     let Some(spec) = spec else {
         fail("no pool topology configured (set `pool` in the config)");
     };
+    let rewind = match (cli.rewind, cli.txg) {
+        (_, Some(t)) => fs::Rewind::Txg(t),
+        (true, None) => fs::Rewind::Auto,
+        (false, None) => fs::Rewind::None,
+    };
     let raid = spec.open(opts).await;
 
     match cli.command {
         Commands::Nbd { name, size: _ } => {
-            let fs = Arc::new(FileSystem::load(raid).await.unwrap());
+            let fs = Arc::new(open_fs(raid, false, rewind).await);
             scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
             nbd::serve_nbd(fs, name, 10809).await.unwrap();
         }
         Commands::Nvme { name } => {
-            let fs = Arc::new(FileSystem::load(raid).await.unwrap());
+            let fs = Arc::new(open_fs(raid, false, rewind).await);
             scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
             let server = nvme::NvmeTcpServer::new(fs, name, 4420).await.unwrap();
             server.run().await.unwrap();
         }
         Commands::Scrub { dry_run } => {
             let fs = if dry_run {
-                FileSystem::load_readonly(raid).await.unwrap()
+                open_fs(raid, true, rewind).await
             } else {
-                FileSystem::load(raid).await.unwrap()
+                open_fs(raid, false, rewind).await
             };
             let report = fs.scrub(!dry_run).await.unwrap();
             println!("{}", report);
@@ -253,7 +319,7 @@ async fn main() -> std::io::Result<()> {
             }
         }
         Commands::Resilver => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = open_fs(raid, false, rewind).await;
             if !fs.needs_resilver() {
                 println!("no online disk needs a resilver");
                 print_status(&fs).await;
@@ -266,58 +332,105 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
         }
+        Commands::Fsck {
+            repair,
+            rebuild_spacemaps,
+            force,
+        } => {
+            let fs = open_fs(raid, !(repair || rebuild_spacemaps), rewind).await;
+            if rebuild_spacemaps {
+                let report = fs
+                    .rebuild_spacemaps(force)
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                println!("{}", report);
+            }
+            let report = fs.fsck(repair).await.unwrap_or_else(|e| fail(e));
+            println!("{}", report);
+            if !report.is_clean() {
+                std::process::exit(2);
+            }
+        }
+        Commands::Salvage { dest } => {
+            // A damaged root shouldn't stop a salvage: fall back to the
+            // newest TXG whose root directory still reads.
+            let rewind = match rewind {
+                fs::Rewind::None => fs::Rewind::Readable,
+                r => r,
+            };
+            let fs = open_fs(raid, true, rewind).await;
+            let report = fs
+                .salvage(Path::new(&dest))
+                .await
+                .unwrap_or_else(|e| fail(e));
+            println!("{}", report);
+            if !report.is_complete() {
+                std::process::exit(2);
+            }
+        }
+        Commands::Defrag { name, batch, check } => {
+            let fs = open_fs(raid, check, rewind).await;
+            if check {
+                let frag = fs.fragmentation(&name).await.unwrap_or_else(|e| fail(e));
+                println!("{}", frag);
+                return Ok(());
+            }
+            let (before, after) = fs.defrag(&name, batch).await.unwrap_or_else(|e| fail(e));
+            println!("before: {}", before);
+            println!("after:  {}", after);
+        }
         Commands::Status => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             print_status(&fs).await;
         }
         Commands::Block { name, size } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = open_fs(raid, false, rewind).await;
             let vbs = fs.default_volblocksize();
             fs.create_block(&name, size, vbs).await.unwrap();
         }
         Commands::Map => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             fs.display_block_map().await;
         }
         Commands::Metaslab => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             fs.display_metaslab_info().await;
         }
         Commands::Orphaned => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
         }
         Commands::Read { path } => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             let data = fs.read_file(&Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
         Commands::Inode { file } => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             let inode_ref = fs.file_index.read().await.files.get(&file).unwrap().clone();
             let inode = fs.read_inode(&inode_ref).await.unwrap();
             println!("inode: {:?}", inode);
         }
         Commands::Write { source, dest } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = open_fs(raid, false, rewind).await;
             let file = Path::new(&source);
             let data = std::fs::read(file).unwrap();
             fs.write_file(&Path::new(&dest), &data).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Mkdir { path } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = open_fs(raid, false, rewind).await;
             fs.mkdir(&Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Ls { path } => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             let ls = fs.ls(&Path::new(&path)).await.unwrap();
             println!("ls: {:?}", &ls);
         }
         Commands::Delete { path } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = open_fs(raid, false, rewind).await;
             fs.delete(&Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
@@ -340,7 +453,7 @@ async fn main() -> std::io::Result<()> {
             );
         }
         Commands::Load => {
-            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            let fs = open_fs(raid, true, rewind).await;
             println!("index: {:?}", fs.file_index);
         }
         Commands::Listen { .. } => unreachable!(),

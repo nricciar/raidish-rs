@@ -103,12 +103,20 @@ status
 scrub [--dry-run]
 // rebuild only what degraded disks missed while they were away
 resilver
+// check space maps against the tree (leaks, in-use blocks marked free, cross-links)
+fsck [--repair] [--rebuild-spacemaps [--force]]
+// copy everything still readable to a local directory
+salvage path/to/dir
+// lay a volume's records out contiguously (--check: only report)
+defrag name [--batch N] [--check]
 // serve this node's disks (port 8881)
 listen [--port N] id
 ```
 
-`load`, `read`, `ls`, `inode`, `map`, `metaslab`, `orphaned`, `status` and `scrub --dry-run`
-open the pool read-only, so they're safe to run against a pool that another process is serving.
+Every command takes `--rewind` or `--txg N` to open an older committed state (see below).
+
+`load`, `read`, `ls`, `inode`, `map`, `metaslab`, `orphaned`, `status`, `scrub --dry-run`,
+`fsck` (without `--repair`), `salvage` and `defrag --check` open the pool read-only, so they're safe to run against a pool that another process is serving.
 
 ## Disk failures, resilver and scrub
 
@@ -134,6 +142,52 @@ degraded disk is back in sync once the scrub passes.
 
 Scrub and resilver are safe while the pool is in use. They do hold back reuse
 of freed space until they finish, and they stop if the pool gets close to full.
+
+## Recovery
+
+`fsck` walks the whole tree and compares what it references with the space
+maps. It reports *leaks* (allocated, referenced by nothing), *referenced-but-free*
+blocks (live data the allocator could hand out again), *cross-links* (two
+pointers to the same blocks) and unreadable metadata. `fsck --repair`
+re-allocates live space and frees leaks. Leaks are left alone if part of the
+tree couldn't be read, because then it isn't known what that part references.
+`fsck` holds the commit lock while it runs, so writers wait.
+
+`fsck --rebuild-spacemaps` throws the space maps away and derives them from
+the tree. Use it when a space map is lost: the metaslab loads as full, and a
+warning at import says so. It refuses if part of the tree is unreadable,
+unless you pass `--force`.
+
+The uberblock ring keeps the last 5 committed TXGs, and freed space isn't
+reused for 4 TXGs, so each of them is a complete, intact tree. To go back:
+
+* `--rewind` opens the newest TXG whose whole tree (metadata and data)
+  verifies.
+* `--txg N` opens exactly TXG `N`. `status` lists the TXGs you can rewind to.
+
+A writable command commits the rewind. It rebuilds the space maps from the
+chosen tree, which frees what the discarded TXGs wrote, and it commits with a
+TXG newer than any in the ring, so the discarded TXGs are gone for good.
+Read-only commands (`ls`, `read`, `salvage`, ...) only look at the older state.
+
+`salvage dir` copies every file it can read into `dir`, and each volume as a
+sparse `<name>.img`. Records that fail their checksum are zero-filled, and it
+reports each damaged item with the byte ranges that were lost. If the newest
+root directory is unreadable, it falls back to the newest TXG whose root still
+reads.
+
+## Fragmentation
+
+When a volume commits, each stretch of consecutive dirty records gets a single
+contiguous allocation, placed right after the record before it where there's
+room. Files are allocated in one piece if any free extent fits them. Reads
+fetch records that sit back to back on disk with one device read (up to 1 MiB),
+and verify each record's checksum on its own.
+
+Random overwrites still scatter a volume over time. `defrag name` rewrites it
+in index order, one commit per batch, and skips batches that are already
+contiguous. `defrag --check` prints how fragmented a volume is. While it runs,
+a defrag needs free space for about two batches.
 
 ## Virtual Block Devices
 
@@ -249,10 +303,6 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 ## TODO
 
 * pool exclusivity (writer lease) and multi-node allocation via metaslab leases
-* fsck `--repair` (leaks, referenced-but-free blocks), rewind import to an older
-  uberblock, rebuilding space maps from the tree, `salvage` of readable data
-* fragmentation: contiguous allocation of sequential records, coalesced
-  multi-record reads, `defrag` for volumes
 * intent log (ZIL) for low-latency fsync
 * snapshots and clones
 * permissions

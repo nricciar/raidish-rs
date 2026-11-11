@@ -134,6 +134,28 @@ pub struct Superblock {
     pub topology: Option<Topology>,
 }
 
+/// Which committed state to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rewind {
+    /// The newest valid uberblock (normal import).
+    #[default]
+    None,
+    /// The newest uberblock whose whole tree (metadata and data) reads back
+    /// with good checksums.
+    Auto,
+    /// The newest uberblock whose root directory reads (data may be damaged;
+    /// for salvage).
+    Readable,
+    /// The uberblock of exactly this TXG.
+    Txg(u64),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    pub read_only: bool,
+    pub rewind: Rewind,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Uberblock {
     pub magic: u64,
@@ -394,21 +416,35 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read file system headers and load root file index
     pub async fn load(dev: D) -> Result<Self, FileSystemError> {
-        Self::load_inner(dev, false).await
+        Self::load_with(dev, LoadOptions::default()).await
     }
 
     /// Open without ever writing to the device (inspection tools, or reading
     /// a pool another process is serving). Damaged blocks are still healed in
     /// memory for the caller, just not repaired on disk.
     pub async fn load_readonly(dev: D) -> Result<Self, FileSystemError> {
-        Self::load_inner(dev, true).await
+        Self::load_with(
+            dev,
+            LoadOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
-    async fn load_inner(dev: D, read_only: bool) -> Result<Self, FileSystemError> {
+    /// Open the pool, possibly at an older committed state (`opts.rewind`).
+    ///
+    /// Rewinding to an uberblock older than the newest one, when writable,
+    /// rebuilds the space maps from the chosen tree (which frees whatever the
+    /// abandoned TXGs wrote) and commits right away with a TXG newer than any
+    /// in the ring, so the abandoned uberblocks can never win a later import.
+    pub async fn load_with(dev: D, opts: LoadOptions) -> Result<Self, FileSystemError> {
         let mut fs = Self::empty(dev);
-        fs.read_only = read_only;
+        fs.read_only = opts.read_only;
 
-        fs.scan_uberblocks().await;
+        fs.read_superblock().await;
+        let ring = fs.read_uberblock_ring().await;
 
         let superblock = fs.superblock().await.ok_or(FileSystemError::NotFormatted)?;
         if superblock.magic != FS_ID {
@@ -432,18 +468,74 @@ impl<D: BlockDevice> FileSystem<D> {
                 pool.topology.summary()
             )));
         }
-        let uber = match fs.uberblock().await {
-            Some(uber) => uber,
-            None => return Ok(fs),
+        let Some(newest) = ring.first().cloned() else {
+            return Ok(fs);
         };
-
         fs.layout = MetaslabLayout::from_superblock(&superblock);
-        let mut degraded = uber.degraded;
+
+        let uber = match opts.rewind {
+            Rewind::None => newest.clone(),
+            Rewind::Txg(t) => ring.iter().find(|u| u.txg == t).cloned().ok_or_else(|| {
+                FileSystemError::InvalidArgument(format!(
+                    "no valid uberblock for TXG {} (have: {:?})",
+                    t,
+                    ring.iter().map(|u| u.txg).collect::<Vec<_>>()
+                ))
+            })?,
+            Rewind::Auto => fs.first_intact(&ring).await?,
+            Rewind::Readable => {
+                let mut pick = None;
+                for u in &ring {
+                    if fs.read_value::<FileIndex>(&u.root).await.is_ok() {
+                        pick = Some(u.clone());
+                        break;
+                    }
+                    eprintln!("rewind: TXG {}: root directory unreadable", u.txg);
+                }
+                pick.ok_or_else(|| {
+                    FileSystemError::InvalidArgument("no uberblock with a readable root".into())
+                })?
+            }
+        };
+        let rewound = uber.txg < newest.txg;
+        if rewound {
+            eprintln!(
+                "rewind: opening TXG {} (newest is TXG {}; {} newer TXG(s) discarded)",
+                uber.txg,
+                newest.txg,
+                ring.iter().filter(|u| u.txg > uber.txg).count()
+            );
+        }
+        // A rewound pool's next TXG must be newer than everything in the
+        // ring; it keeps the chosen tree.
+        *fs.uberblock.lock().await = Some(Uberblock {
+            txg: newest.txg,
+            ..uber.clone()
+        });
+
+        // Conservative: a disk degraded in any newer TXG stays degraded.
+        let mut degraded = uber.degraded.clone();
+        for u in ring.iter().filter(|u| u.txg > uber.txg) {
+            for (d, since) in u.degraded.iter().enumerate() {
+                if d < degraded.len()
+                    && let Some(s) = since
+                {
+                    degraded[d] = Some(degraded[d].map_or(*s, |t| t.min(*s)));
+                }
+            }
+        }
         degraded.resize(fs.disk_count(), None);
         *fs.degraded.lock().unwrap() = degraded;
         *fs.miss_seen.lock().unwrap() = fs.miss_counts();
         fs.adopt_disks().await;
-        let metaslabs = fs.load_metaslabs(uber.txg).await?;
+        let (metaslabs, missing) = fs.load_metaslabs(uber.txg).await?;
+        if !missing.is_empty() && !(rewound && !fs.read_only) {
+            eprintln!(
+                "WARNING: {} metaslab(s) without a valid space map are treated as full; \
+                 run `fsck --rebuild-spacemaps` to recover the space",
+                missing.len()
+            );
+        }
         fs.metaslabs = Arc::new(
             metaslabs
                 .into_iter()
@@ -462,7 +554,48 @@ impl<D: BlockDevice> FileSystem<D> {
         fs.file_index = Arc::new(RwLock::new(file_index));
         fs.root_ptr = Arc::new(Mutex::new(uber.root.clone()));
 
+        if rewound && !fs.read_only {
+            let older: Vec<Vec<BlockPtr>> = ring
+                .iter()
+                .filter(|u| u.txg < uber.txg)
+                .map(|u| u.root.clone())
+                .collect();
+            let _tx = fs.begin_tx().await;
+            let report = fs.rebuild_spacemaps_locked(&older, true).await?;
+            eprintln!("rewind: {}", report);
+            let txg = fs.commit_locked().await?;
+            eprintln!("rewind: committed as TXG {}", txg);
+        }
+
         Ok(fs)
+    }
+
+    /// The newest uberblock of `ring` whose whole tree verifies.
+    async fn first_intact(&self, ring: &[Uberblock]) -> Result<Uberblock, FileSystemError> {
+        for u in ring {
+            if u.root.iter().any(|p| p.birth_txg > u.txg) {
+                eprintln!("rewind: TXG {}: root newer than its uberblock", u.txg);
+                continue;
+            }
+            let walk = self.verify_tree(&u.root).await;
+            if walk.errors.is_empty() {
+                return Ok(u.clone());
+            }
+            eprintln!(
+                "rewind: TXG {} has {} damaged record(s), e.g. {}",
+                u.txg,
+                walk.errors.len(),
+                walk.errors[0]
+            );
+        }
+        Err(FileSystemError::InvalidArgument(
+            "rewind: no uberblock in the ring has an intact tree".into(),
+        ))
+    }
+
+    /// Every valid uberblock in the ring, newest first (one per TXG).
+    pub async fn uberblock_ring(&self) -> Vec<Uberblock> {
+        self.read_uberblock_ring().await
     }
 
     /// Read a files contents
@@ -876,7 +1009,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    async fn scan_uberblocks(&self) -> Option<(u64, Uberblock)> {
+    async fn read_superblock(&self) {
         // The superblock is written to several mirrors; use the first good one.
         for mirror in 0..self.header.superblock_blocks {
             match self
@@ -890,33 +1023,24 @@ impl<D: BlockDevice> FileSystem<D> {
                 Err(e) => eprintln!("superblock mirror {}: {:?}", mirror, e),
             }
         }
+    }
 
-        let mut best: Option<(u64, Uberblock)> = None;
-
+    /// Every valid uberblock version found in the ring, newest first.
+    async fn read_uberblock_ring(&self) -> Vec<Uberblock> {
+        let mut found: Vec<Uberblock> = Vec::new();
         for i in 0..self.header.uberblock_blocks() {
             let lba = self.header.uberblock_start + i;
             for (txg, ub) in self.read_label_versions::<Uberblock>(lba).await {
-                if ub.magic != UBERBLOCK_MAGIC {
+                if ub.magic != UBERBLOCK_MAGIC || ub.txg != txg {
                     continue;
                 }
-                match &best {
-                    None => {
-                        best = Some((txg, ub));
-                    }
-                    Some((best_txg, _)) if txg > *best_txg => {
-                        best = Some((txg, ub));
-                    }
-                    _ => {}
+                if !found.iter().any(|u| u.txg == txg) {
+                    found.push(ub);
                 }
             }
         }
-
-        // Initialize TXG state from the latest committed uberblock
-        if let Some((_txg, uberblock)) = best.clone() {
-            *self.uberblock.lock().await = Some(uberblock);
-        }
-
-        best
+        found.sort_by_key(|u| std::cmp::Reverse(u.txg));
+        found
     }
 
     /// Every valid version of label block `lba`: as normally read, and as
