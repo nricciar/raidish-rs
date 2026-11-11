@@ -1,0 +1,180 @@
+#!/bin/bash
+# raidish-nvme-test: the only privileged operations needed to test the raidish
+# NVMe/TCP target through the kernel's nvme-tcp initiator. Meant for a single
+# NOPASSWD sudo rule, so it must be INSTALLED ROOT-OWNED (not run from the
+# repo, which your user can write to):
+#
+#   sudo install -o root -g root -m 0755 hack/raidish-nvme-test /usr/local/sbin/
+#
+# SAFETY: NVMe device names are assigned dynamically and this machine's system
+# disk is NVMe. No command accepts a device path. The test namespace is
+# resolved from sysfs and only accepted if ALL of these hold:
+#   - its subsystem NQN is exactly $NQN
+#   - every controller path to it is transport "tcp" to $ADDR:$PORT
+#   - its model string starts with "RAIDISH"
+#   - it is the only namespace matching the above
+# Anything else aborts before touching a device.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+NQN=nqn.2024-01.com.raidish:nvme:vdisk0
+HOSTNQN=nqn.2024-01.com.raidish:host:test
+HOSTID=5b5d1c3e-7a3a-4b8e-9c55-7261696469f1
+ADDR=127.0.0.1
+PORT=4420
+MNT=/mnt/raidish-nvme
+# Untrusted image contents: never honour setuid bits or device nodes.
+MOUNT_OPTS=nosuid,nodev,noexec
+
+die() { echo "raidish-nvme-test: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must be run via sudo"
+OWNER_UID=${SUDO_UID:?must be run via sudo}
+OWNER_GID=${SUDO_GID:?must be run via sudo}
+
+# Is controller directory $1 a TCP path to our target?
+ctrl_is_ours() {
+    local c=$1
+    [[ $(cat "$c/transport" 2>/dev/null) == tcp ]] || return 1
+    [[ $(cat "$c/subsysnqn" 2>/dev/null) == "$NQN" ]] || return 1
+    local a
+    a=$(cat "$c/address" 2>/dev/null) || return 1
+    [[ ,$a, == *,traddr=$ADDR,* && ,$a, == *,trsvcid=$PORT,* ]] || return 1
+}
+
+# Print the block device of our namespace, or nothing. Dies if ambiguous.
+find_dev() {
+    local found=() d name parent ctrls c ok
+    for d in /sys/block/nvme*; do
+        [[ -e $d ]] || continue
+        name=${d##*/}
+        [[ $name =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        parent=$(dirname "$(readlink -f "$d")")
+        [[ $(cat "$parent/subsysnqn" 2>/dev/null) == "$NQN" ]] || continue
+        [[ $(cat "$parent/model" 2>/dev/null) == RAIDISH* ]] || continue
+        # Parent is a controller (single path) or a subsystem (multipath head).
+        if [[ -e $parent/transport ]]; then
+            ctrls=("$parent")
+        else
+            ctrls=()
+            for c in "$parent"/nvme[0-9]*; do
+                [[ -e $c/transport ]] && ctrls+=("$(readlink -f "$c")")
+            done
+        fi
+        ok=$(( ${#ctrls[@]} > 0 ))
+        for c in "${ctrls[@]}"; do ctrl_is_ours "$c" || ok=0; done
+        (( ok )) && found+=("/dev/$name")
+    done
+    (( ${#found[@]} <= 1 )) || die "refusing: ${#found[@]} namespaces match ${found[*]}"
+    [[ ${#found[@]} -eq 1 ]] && echo "${found[0]}"
+    return 0
+}
+
+need_dev() {
+    DEV=$(find_dev)
+    [[ -n $DEV ]] || die "no raidish namespace connected"
+    [[ -b $DEV ]] || die "$DEV is not a block device"
+    ls "/sys/block/${DEV#/dev/}" | grep -q "^${DEV#/dev/}p[0-9]" && die "refusing: $DEV has partitions"
+    local elsewhere
+    elsewhere=$(findmnt -rn -S "$DEV" -o TARGET | grep -vxF "$MNT" || true)
+    [[ -z $elsewhere ]] || die "refusing: $DEV is mounted at $elsewhere"
+}
+
+mounted() { findmnt -rn "$MNT" >/dev/null 2>&1; }
+need_unmounted() { ! mounted || die "$MNT is mounted"; }
+
+usage() {
+    cat >&2 <<EOF
+usage: sudo raidish-nvme-test <command> [arg]
+  connect [queues]  nvme connect tcp://$ADDR:$PORT $NQN (I/O queues 1-8, default 1)
+  disconnect        unmount if needed, then nvme disconnect $NQN
+  dev               print the resolved namespace device (safety checks applied)
+  mkfs              mkfs.ext4 on the namespace (must not be mounted)
+  mount             mount on $MNT ($MOUNT_OPTS), root dir owned by you
+  umount            unmount $MNT
+  fsck              read-only e2fsck -f -n (must not be mounted)
+  fstrim            discard unused blocks of the filesystem on $MNT
+  dropcaches        flush the namespace's buffers and drop the page cache
+  status            connection, controller state and mount state
+  dmesg [lines]     last nvme-related kernel log lines (1-500, default 50)
+EOF
+    exit 2
+}
+
+cmd=${1:-}
+case "$cmd" in
+connect)
+    queues=${2:-1}
+    [[ $queues =~ ^[1-8]$ ]] || die "queues must be 1-8"
+    [[ -z $(find_dev) ]] || die "already connected"
+    modprobe nvme-tcp
+    # Short loss timeout: if the target dies while iterating, the kernel
+    # gives up after 5s instead of retrying for minutes.
+    nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" \
+        --hostnqn="$HOSTNQN" --hostid="$HOSTID" \
+        --nr-io-queues="$queues" --ctrl-loss-tmo=5 --reconnect-delay=1 \
+        --keep-alive-tmo=5
+    for _ in $(seq 1 50); do [[ -n $(find_dev) ]] && break; sleep 0.1; done
+    DEV=$(find_dev)
+    [[ -n $DEV ]] && echo "connected: $DEV" || die "connected, but no namespace appeared (see: dmesg)"
+    ;;
+disconnect)
+    if mounted; then umount "$MNT"; fi
+    nvme disconnect -n "$NQN"
+    ;;
+dev)
+    need_dev
+    echo "$DEV"
+    ;;
+mkfs)
+    need_dev
+    need_unmounted
+    mkfs.ext4 -F -q "$DEV"
+    ;;
+mount)
+    need_dev
+    need_unmounted
+    mkdir -p "$MNT"
+    mount -t ext4 -o "$MOUNT_OPTS" "$DEV" "$MNT"
+    chown "$OWNER_UID:$OWNER_GID" "$MNT"
+    ;;
+umount)
+    mounted || die "$MNT is not mounted"
+    umount "$MNT"
+    ;;
+fsck)
+    need_dev
+    need_unmounted
+    e2fsck -f -n "$DEV"
+    ;;
+fstrim)
+    mounted || die "$MNT is not mounted"
+    need_dev
+    fstrim -v "$MNT"
+    ;;
+dropcaches)
+    sync
+    DEV=$(find_dev)
+    if [[ -n $DEV ]]; then blockdev --flushbufs "$DEV"; fi
+    echo 3 >/proc/sys/vm/drop_caches
+    ;;
+status)
+    DEV=$(find_dev)
+    if [[ -n $DEV ]]; then echo "namespace: $DEV"; else echo "namespace: not connected"; fi
+    for c in /sys/class/nvme/nvme*; do
+        [[ -e $c ]] || continue
+        c=$(readlink -f "$c")
+        ctrl_is_ours "$c" && echo "controller ${c##*/}: state=$(cat "$c/state") queues=$(cat "$c/queue_count" 2>/dev/null || echo ?)"
+    done
+    if mounted; then findmnt -n "$MNT"; else echo "$MNT: not mounted"; fi
+    ;;
+dmesg)
+    lines=${2:-50}
+    [[ $lines =~ ^[0-9]{1,3}$ && $lines -ge 1 && $lines -le 500 ]] || die "lines must be 1-500"
+    dmesg --ctime | grep -iE 'nvme|nvmet' | tail -n "$lines"
+    ;;
+*)
+    usage
+    ;;
+esac

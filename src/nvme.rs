@@ -1,1070 +1,940 @@
-// FIXME: this code does not really work yet, but you can almost connect to it :)
-// nvme_tcp.rs - NVMe-TCP Protocol Implementation
+//! NVMe over TCP target exporting one copy-on-write volume as namespace 1.
+//!
+//! Each TCP connection is one queue pair. The first capsule on it must be a
+//! Fabrics Connect, which decides whether it is the admin queue (qid 0, which
+//! creates a controller) or an I/O queue (qid > 0, which joins one). Admin and
+//! I/O opcodes overlap, so commands are always dispatched by queue type.
+//!
+//! Commands run concurrently; each reply (C2H data PDUs + response capsule) is
+//! written in one piece under the writer lock. Host-to-controller data arrives
+//! either in-capsule (up to `INLINE_DATA_SIZE`) or after we send an R2T.
+//!
+//! Writes complete once they are in the volume's dirty records (the
+//! controller advertises a volatile write cache), and FLUSH commits a TXG.
+//! Set `RAIDISH_NVME_TRACE=1` to log every command.
+
 use crate::disk::BlockDevice;
 use crate::fs::FileSystem;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
 
-// NVMe-TCP PDU Types (from NVMe-TCP specification)
-const NVME_TCP_PDU_TYPE_IC_REQ: u8 = 0x00;
-const NVME_TCP_PDU_TYPE_IC_RESP: u8 = 0x01;
-const NVME_TCP_PDU_TYPE_H2C_TERM: u8 = 0x02;
-const NVME_TCP_PDU_TYPE_C2H_TERM: u8 = 0x03;
-const NVME_TCP_PDU_TYPE_CMD: u8 = 0x04;
-const NVME_TCP_PDU_TYPE_RSP: u8 = 0x05;
-const NVME_TCP_PDU_TYPE_H2C_DATA: u8 = 0x06;
-const NVME_TCP_PDU_TYPE_C2H_DATA: u8 = 0x07;
-const NVME_TCP_PDU_TYPE_R2T: u8 = 0x09;
+pub const SUBSYS_NQN: &str = "nqn.2024-01.com.raidish:nvme:vdisk0";
+pub const LBA_SIZE: u64 = 4096;
+const LBA_SHIFT: u8 = 12;
 
-// NVMe Admin & I/O Opcodes
-const NVME_ADMIN_IDENTIFY: u8 = 0x06;
-const NVME_ADMIN_GET_LOG_PAGE: u8 = 0x02;
-const NVME_ADMIN_SET_FEATURES: u8 = 0x09;
-const NVME_ADMIN_GET_FEATURES: u8 = 0x0A;
-const NVME_ADMIN_CREATE_IO_SQ: u8 = 0x01;
-const NVME_ADMIN_CREATE_IO_CQ: u8 = 0x05;
-const NVME_ADMIN_KEEP_ALIVE: u8 = 0x18;
-const NVME_IO_WRITE: u8 = 0x01;
-const NVME_IO_READ: u8 = 0x02;
-const NVME_IO_FLUSH: u8 = 0x00;
+// PDU types and flags.
+const PDU_IC_REQ: u8 = 0x00;
+const PDU_IC_RESP: u8 = 0x01;
+const PDU_H2C_TERM: u8 = 0x02;
+const PDU_CMD: u8 = 0x04;
+const PDU_RSP: u8 = 0x05;
+const PDU_H2C_DATA: u8 = 0x06;
+const PDU_C2H_DATA: u8 = 0x07;
+const PDU_R2T: u8 = 0x09;
+const PDU_FLAG_HDGST: u8 = 0x01;
+const PDU_FLAG_DDGST: u8 = 0x02;
+const PDU_FLAG_LAST: u8 = 0x04;
 
-// Fabric/Discovery specific
-const NVME_FABRICS_COMMAND: u8 = 0x7f;
-const NVME_FABRICS_TYPE_PROPERTY_SET: u8 = 0x00;
-const NVME_FABRICS_TYPE_CONNECT: u8 = 0x01;
-const NVME_FABRICS_TYPE_PROPERTY_GET: u8 = 0x04;
+/// Largest H2C data PDU we accept.
+pub const MAX_H2C_DATA: u32 = 128 * 1024;
+/// In-capsule data the host may send (writes up to this skip the R2T).
+pub const INLINE_DATA_SIZE: usize = 8192;
+/// Max data transfer: 2^MDTS * 4 KiB = 1 MiB.
+const MDTS: u8 = 8;
+pub const MAX_TRANSFER: usize = (1 << MDTS) * LBA_SIZE as usize;
+const MAX_PDU: usize = MAX_TRANSFER + 8192;
+const C2H_CHUNK: usize = 128 * 1024;
+/// Entries per queue (CAP.MQES + 1).
+pub const QUEUE_ENTRIES: u16 = 128;
+pub const MAX_IO_QUEUES: u16 = 8;
 
-// NVMe Status Codes
-const NVME_SC_SUCCESS: u16 = 0x00;
-const NVME_SC_INVALID_OPCODE: u16 = 0x01;
-const NVME_SC_INVALID_FIELD: u16 = 0x02;
-const NVME_SC_INTERNAL: u16 = 0xFF;
+// Admin opcodes.
+const ADM_GET_LOG_PAGE: u8 = 0x02;
+const ADM_IDENTIFY: u8 = 0x06;
+const ADM_ABORT: u8 = 0x08;
+const ADM_SET_FEATURES: u8 = 0x09;
+const ADM_GET_FEATURES: u8 = 0x0a;
+const ADM_ASYNC_EVENT: u8 = 0x0c;
+const ADM_KEEP_ALIVE: u8 = 0x18;
+const OPC_FABRICS: u8 = 0x7f;
+// I/O opcodes.
+const IO_FLUSH: u8 = 0x00;
+const IO_WRITE: u8 = 0x01;
+const IO_READ: u8 = 0x02;
+const IO_WRITE_ZEROES: u8 = 0x08;
+const IO_DSM: u8 = 0x09;
+// Fabrics command types.
+const FCT_PROP_SET: u8 = 0x00;
+const FCT_CONNECT: u8 = 0x01;
+const FCT_PROP_GET: u8 = 0x04;
+// Properties.
+const PROP_CAP: u32 = 0x00;
+const PROP_VS: u32 = 0x08;
+const PROP_CC: u32 = 0x14;
+const PROP_CSTS: u32 = 0x1c;
+const NVME_VERSION: u32 = 0x0001_0400; // 1.4
 
-// Common header for all PDUs
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpPduHeader {
-    pdu_type: u8,
-    flags: u8,
-    hlen: u8,
-    pdo: u8,
-    plen: u32,
+// Status codes (generic command status unless noted).
+const SC_INVALID_OPCODE: u16 = 0x01;
+const SC_INVALID_FIELD: u16 = 0x02;
+const SC_DATA_XFER_ERROR: u16 = 0x04;
+const SC_INTERNAL: u16 = 0x06;
+const SC_INVALID_NS: u16 = 0x0b;
+const SC_CMD_SEQ_ERROR: u16 = 0x0c;
+const SC_LBA_RANGE: u16 = 0x80;
+const SC_CAPACITY_EXCEEDED: u16 = 0x81;
+const SCT_GENERIC: u16 = 0;
+const SCT_FABRICS: u16 = 1;
+const SC_CONNECT_INVALID_PARAM: u16 = 0x82;
+
+static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("RAIDISH_NVME_TRACE").is_some());
+
+macro_rules! trace {
+    ($($arg:tt)*) => { if *TRACE { eprintln!($($arg)*); } };
 }
 
-// Initialize Connection Request
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpIcReq {
-    header: NvmeTcpPduHeader,
-    pfv: u16,
-    hpda: u8,
-    digest: u8,
-    maxr2t: u32,
-    rsvd: [u8; 112],
+fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+}
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn le64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+fn put(b: &mut [u8], at: usize, v: &[u8]) {
+    b[at..at + v.len()].copy_from_slice(v);
+}
+/// Space-padded ASCII field.
+fn put_str(b: &mut [u8], at: usize, len: usize, s: &str) {
+    let field = &mut b[at..at + len];
+    field.fill(b' ');
+    let n = s.len().min(len);
+    field[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+fn cstr(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
-// Initialize Connection Response
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpIcResp {
-    header: NvmeTcpPduHeader,
-    pfv: u16,
-    cpda: u8,
-    digest: u8,
-    maxh2cdata: u32,
-    rsvd: [u8; 112],
+/// A 64-byte submission queue entry.
+#[derive(Clone)]
+struct Sqe([u8; 64]);
+
+impl Sqe {
+    fn opcode(&self) -> u8 {
+        self.0[0]
+    }
+    fn cid(&self) -> u16 {
+        le16(&self.0, 2)
+    }
+    fn nsid(&self) -> u32 {
+        le32(&self.0, 4)
+    }
+    fn fctype(&self) -> u8 {
+        self.0[4]
+    }
+    fn cdw(&self, n: usize) -> u32 {
+        le32(&self.0, 40 + (n - 10) * 4)
+    }
+    /// Length of the (single) SGL data block descriptor.
+    fn data_len(&self) -> usize {
+        le32(&self.0, 32) as usize
+    }
+    /// Data-transfer direction from the opcode (fabrics: from fctype).
+    fn host_to_ctrl(&self) -> bool {
+        let dir = if self.opcode() == OPC_FABRICS {
+            self.fctype()
+        } else {
+            self.opcode()
+        };
+        dir & 0x1 != 0
+    }
+    fn slba(&self) -> u64 {
+        self.cdw(10) as u64 | (self.cdw(11) as u64) << 32
+    }
+    fn nlb(&self) -> u64 {
+        (self.cdw(12) & 0xffff) as u64 + 1
+    }
 }
 
-// NVMe Command (simplified)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpCmd {
-    header: NvmeTcpPduHeader,
-    cmd: NvmeCommand,
-}
-
-// NVMe Response
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpRsp {
-    header: NvmeTcpPduHeader,
-    cqe: NvmeCompletion,
-}
-
-// NVMe Command structure (64 bytes)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeCommand {
-    opcode: u8,
-    flags: u8,
-    cid: u16,
-    nsid: u32,
-    cdw2: u32,
-    cdw3: u32,
-    mptr: u64,
-    dptr: [u64; 2], // Data pointer
-    cdw10: u32,
-    cdw11: u32,
-    cdw12: u32,
-    cdw13: u32,
-    cdw14: u32,
-    cdw15: u32,
-}
-
-// NVMe Completion Queue Entry (16 bytes)
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeCompletion {
-    result: u32,
-    rsvd: u32,
-    sqhd: u16,
-    sqid: u16,
-    cid: u16,
+/// What a command produces: completion fields plus optional C2H data.
+struct Completion {
     status: u16,
+    dw0: u32,
+    dw1: u32,
+    data: Option<Vec<u8>>,
 }
 
-// H2C (Host to Controller) Data PDU
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpH2CData {
-    header: NvmeTcpPduHeader,
-    cccid: u16,
-    ttag: u16,
-    datao: u32,
-    datal: u32,
-    rsvd: u32,
+impl Completion {
+    fn ok() -> Self {
+        Completion {
+            status: 0,
+            dw0: 0,
+            dw1: 0,
+            data: None,
+        }
+    }
+    fn with_dw0(dw0: u32) -> Self {
+        Completion { dw0, ..Self::ok() }
+    }
+    fn with_data(data: Vec<u8>) -> Self {
+        Completion {
+            data: Some(data),
+            ..Self::ok()
+        }
+    }
+    fn err(sct: u16, sc: u16) -> Self {
+        Completion {
+            // DNR: retrying won't help for any error we return.
+            status: (sc << 1) | (sct << 9) | (1 << 15),
+            ..Self::ok()
+        }
+    }
+    fn generic(sc: u16) -> Self {
+        Self::err(SCT_GENERIC, sc)
+    }
 }
 
-// C2H (Controller to Host) Data PDU
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct NvmeTcpC2HData {
-    header: NvmeTcpPduHeader,
-    cccid: u16,
-    rsvd: u16,
-    datao: u32,
-    datal: u32,
-    rsvd2: u32,
+struct CtrlRegs {
+    cc: u32,
+    csts: u32,
+    io_queues: u16,
+    kato: u32,
 }
 
-pub struct NvmeTcpServer<D>
-where
-    D: BlockDevice + Send + Sync + 'static,
-{
-    fs: Arc<Mutex<FileSystem<D>>>,
-    device_name: String,
+struct Controller {
+    cntlid: u16,
+    regs: Mutex<CtrlRegs>,
+}
+
+#[derive(Clone)]
+struct QueueInfo {
+    qid: u16,
+    /// 0-based queue size from Connect.
+    sqsize: u16,
+    ctrl: Arc<Controller>,
+}
+
+struct Target<D: BlockDevice> {
+    fs: Arc<FileSystem<D>>,
+    volume: String,
+    nsze: u64,
+    uuid: [u8; 16],
+    ctrls: Mutex<HashMap<u16, Arc<Controller>>>,
+    next_cntlid: AtomicU16,
+}
+
+struct Conn<D: BlockDevice> {
+    target: Arc<Target<D>>,
+    writer: AsyncMutex<OwnedWriteHalf>,
+    queue: Mutex<Option<QueueInfo>>,
+    sqhd: AtomicU32,
+    /// PDU data offset for C2H data, honouring the host's HPDA.
+    c2h_pdo: usize,
+    peer: String,
+}
+
+pub struct NvmeTcpServer<D: BlockDevice> {
+    target: Arc<Target<D>>,
     port: u16,
 }
 
-struct ControllerState {
-    cc: u32,         // Controller Configuration
-    csts: u32,       // Controller Status
-    connected: bool, // Track if we've completed connection
-    reset_in_progress: bool,
-}
-
-impl ControllerState {
-    fn new() -> Self {
-        ControllerState {
-            //cc: 0x460001, // Enabled (EN bit set) with reasonable defaults
-            cc: 0,
-            csts: 0, // Ready (RDY bit set) - ALWAYS READY
-            connected: false,
-            reset_in_progress: false,
-        }
+impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
+    pub async fn new(
+        fs: Arc<FileSystem<D>>,
+        volume: String,
+        port: u16,
+    ) -> Result<Self, crate::fs::FileSystemError> {
+        let size = fs.open_volume(&volume).await?.size_bytes;
+        let uuid: [u8; 16] = blake3::hash(format!("raidish-ns:{}", volume).as_bytes()).as_bytes()
+            [..16]
+            .try_into()
+            .unwrap();
+        Ok(NvmeTcpServer {
+            target: Arc::new(Target {
+                fs,
+                volume,
+                nsze: size / LBA_SIZE,
+                uuid,
+                ctrls: Mutex::new(HashMap::new()),
+                next_cntlid: AtomicU16::new(1),
+            }),
+            port,
+        })
     }
 
-    fn set_cc(&mut self, value: u32) {
-        let old_en = self.cc & 0x1;
-        let new_en = value & 0x1;
+    pub async fn run(&self) -> std::io::Result<()> {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
+        self.serve(listener).await
+    }
 
+    pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         println!(
-            "    set_cc: old_en={}, new_en={}, connected={}",
-            old_en, new_en, self.connected
+            "NVMe/TCP target {} on {} (volume '{}', {} x {} byte LBAs)",
+            SUBSYS_NQN,
+            listener.local_addr()?,
+            self.target.volume,
+            self.target.nsze,
+            LBA_SIZE
         );
 
-        self.cc = value;
-
-        if !self.connected {
-            // Pre-connection: normal enable/disable behavior
-            if new_en == 1 {
-                self.csts = 0x1; // Set RDY bit
-            } else {
-                self.csts = 0x0; // Clear RDY bit
+        // Background TXG sync, as for NBD.
+        let fs = self.target.fs.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::nbd::SYNC_INTERVAL);
+            loop {
+                tick.tick().await;
+                if fs.has_dirty_volumes()
+                    && let Err(e) = fs.sync().await
+                {
+                    eprintln!("nvme: background sync failed: {}", e);
+                }
             }
-        } else {
-            // Post-connection (NVMe-oF): controller stays ready
-            // According to NVMe-oF spec, writes to CC.EN don't affect readiness
-            // The controller is ready as long as the fabric connection is active
-            println!("    NVMe-oF mode: Keeping CSTS.RDY=1 (controller stays ready over fabric)");
-            self.csts = 0x1;
-
-            // If the kernel writes CC.EN=0, it's probably checking reset behavior
-            // But we don't actually disable - we just acknowledge the write
-            if new_en == 0 {
-                println!("    Note: CC.EN=0 written, but controller remains ready in NVMe-oF");
-            }
-        }
-
-        println!("    Final CC=0x{:x}, CSTS=0x{:x}", self.cc, self.csts);
-    }
-}
-
-impl<D: BlockDevice> NvmeTcpServer<D> {
-    pub fn new(fs: FileSystem<D>, device_name: String, port: u16) -> Self
-    where
-        D: BlockDevice + Send + Sync + 'static,
-    {
-        NvmeTcpServer {
-            fs: Arc::new(Mutex::new(fs)),
-            device_name,
-            port,
-        }
-    }
-
-    pub async fn run(&self) -> std::io::Result<()>
-    where
-        D: BlockDevice + Send + Sync + 'static,
-    {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
-        println!("NVMe-TCP server listening on port {}", self.port);
-
-        let conn_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        });
 
         loop {
-            let (socket, addr) = listener.accept().await?;
-            let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            println!("[Conn {}] New connection from {}", conn_id, addr);
-
-            let fs = Arc::clone(&self.fs);
-            let device_name = self.device_name.clone();
-
+            let (stream, addr) = listener.accept().await?;
+            let target = self.target.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(socket, fs, device_name, conn_id).await {
-                    eprintln!("[Conn {}] Connection error: {}", conn_id, e);
+                if let Err(e) = handle_connection(target, stream, addr.to_string()).await {
+                    eprintln!("nvme: {}: {}", addr, e);
                 }
-                println!("[Conn {}] Connection closed", conn_id);
             });
         }
     }
+}
 
-    async fn handle_connection(
-        mut socket: TcpStream,
-        fs: Arc<Mutex<FileSystem<D>>>,
-        device_name: String,
-        conn_id: usize,
-    ) -> std::io::Result<()>
-    where
-        D: BlockDevice + Send + Sync + 'static,
+fn invalid(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Read one whole PDU (common header included).
+async fn read_pdu(rd: &mut OwnedReadHalf) -> std::io::Result<Vec<u8>> {
+    let mut hdr = [0u8; 8];
+    rd.read_exact(&mut hdr).await?;
+    let plen = le32(&hdr, 4) as usize;
+    let hlen = hdr[2] as usize;
+    if !(8..=MAX_PDU).contains(&plen) || !(8..=plen).contains(&hlen) {
+        return Err(invalid(format!(
+            "bad PDU type {} hlen {} plen {}",
+            hdr[0], hlen, plen
+        )));
+    }
+    let mut pdu = vec![0u8; plen];
+    pdu[..8].copy_from_slice(&hdr);
+    rd.read_exact(&mut pdu[8..]).await?;
+    Ok(pdu)
+}
+
+/// Data carried by a capsule or H2C data PDU.
+fn pdu_data(pdu: &[u8]) -> std::io::Result<&[u8]> {
+    let pdo = pdu[3] as usize;
+    if pdu[1] & (PDU_FLAG_HDGST | PDU_FLAG_DDGST) != 0 {
+        return Err(invalid("digests were not negotiated"));
+    }
+    if pdo == 0 || pdo >= pdu.len() {
+        return Ok(&[]);
+    }
+    Ok(&pdu[pdo..])
+}
+
+struct PendingWrite {
+    sqe: Sqe,
+    buf: Vec<u8>,
+    received: usize,
+}
+
+async fn handle_connection<D: BlockDevice + Send + Sync + 'static>(
+    target: Arc<Target<D>>,
+    stream: TcpStream,
+    peer: String,
+) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    let (mut rd, mut wr) = stream.into_split();
+
+    // Connection initialisation.
+    let ic = read_pdu(&mut rd).await?;
+    if ic[0] != PDU_IC_REQ || ic.len() != 128 {
+        return Err(invalid("expected ICReq"));
+    }
+    let hpda = ic[10] as usize;
+    let mut resp = [0u8; 128];
+    resp[0] = PDU_IC_RESP;
+    resp[2] = 128;
+    put(&mut resp, 4, &128u32.to_le_bytes());
+    // pfv 0, cpda 0, no digests.
+    put(&mut resp, 12, &MAX_H2C_DATA.to_le_bytes());
+    wr.write_all(&resp).await?;
+    trace!(
+        "nvme: {}: ICReq hpda={} dgst={:#x} maxr2t={}",
+        peer,
+        hpda,
+        ic[11],
+        le32(&ic, 12)
+    );
+
+    let align = (hpda + 1) * 4;
+    let conn = Arc::new(Conn {
+        target,
+        writer: AsyncMutex::new(wr),
+        queue: Mutex::new(None),
+        sqhd: AtomicU32::new(0),
+        c2h_pdo: 24usize.div_ceil(align) * align,
+        peer,
+    });
+
+    let result = connection_loop(&conn, &mut rd).await;
+
+    // An admin queue going away tears down its controller.
+    if let Some(q) = conn.queue.lock().unwrap().as_ref()
+        && q.qid == 0
     {
-        // Get device size
-        let device_size = {
-            let fs_lock = fs.lock().await;
-            let inode_ref = fs_lock
-                .file_index
-                .read()
-                .await
-                .files
-                .get(&device_name)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Device '{}' not found", device_name),
-                    )
-                })?
-                .clone();
+        conn.target.ctrls.lock().unwrap().remove(&q.ctrl.cntlid);
+        trace!("nvme: {}: controller {} removed", conn.peer, q.ctrl.cntlid);
+    }
+    result
+}
 
-            let inode = fs_lock.read_inode(&inode_ref).await.unwrap();
+async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
+    conn: &Arc<Conn<D>>,
+    rd: &mut OwnedReadHalf,
+) -> std::io::Result<()> {
+    let mut pending: HashMap<u16, PendingWrite> = HashMap::new();
+    let mut tasks = JoinSet::new();
 
-            inode.inode_type.size_bytes()
-        };
-
-        // Connection initialization
-        Self::perform_connection_init(&mut socket).await?;
-
-        println!(
-            "[Conn {}] NVMe-TCP connection initialized for device '{}' ({} bytes)",
-            conn_id, device_name, device_size
-        );
-
-        // Controller state
-        let mut ctrl_state = ControllerState::new();
-
-        // Main command processing loop
-        loop {
-            // Add a timeout to detect hung connections
-            let read_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                Self::read_pdu_header(&mut socket),
-            )
-            .await;
-
-            match read_result {
-                Ok(Ok(header)) => {
-                    let pdu_type = header.pdu_type;
-                    println!("[Conn {}] PDU type 0x{:02x}", conn_id, pdu_type);
-
-                    match pdu_type {
-                        NVME_TCP_PDU_TYPE_CMD => {
-                            Self::handle_command(
-                                &mut socket,
-                                header,
-                                &fs,
-                                &device_name,
-                                device_size,
-                                &mut ctrl_state,
-                                conn_id,
-                            )
-                            .await?;
-                        }
-                        NVME_TCP_PDU_TYPE_H2C_DATA => {
-                            Self::handle_h2c_data(&mut socket, header, &fs, &device_name).await?;
-                        }
-                        NVME_TCP_PDU_TYPE_H2C_TERM => {
-                            println!("Received termination request from host");
-                            break;
-                        }
-                        _ => {
-                            eprintln!("Unsupported PDU type: 0x{:02x}", header.pdu_type);
-                            // Try to skip the rest of the PDU to stay in sync
-                            let skip_bytes = header.plen.saturating_sub(8) as usize;
-                            if skip_bytes > 0 {
-                                let mut skip_buf = vec![0u8; skip_bytes];
-                                socket.read_exact(&mut skip_buf).await?;
-                                println!("Skipped {} bytes to resync", skip_bytes);
-                            }
-                        }
-                    }
-                }
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    println!("[Conn {}] Connection closed by client", conn_id);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[Conn {}] Error reading PDU: {}", conn_id, e);
-                    return Err(e);
-                }
-                Err(_) => {
-                    println!(
-                        "[Conn {}] Timeout waiting for PDU - client appears idle",
-                        conn_id
-                    );
-                    break;
-                }
-            }
+    let result = loop {
+        while let Some(r) = tasks.try_join_next() {
+            r.map_err(std::io::Error::other)??;
         }
 
-        Ok(())
-    }
-
-    async fn perform_connection_init(socket: &mut TcpStream) -> std::io::Result<()> {
-        // Read IC Request
-        let mut ic_req_buf = vec![0u8; std::mem::size_of::<NvmeTcpIcReq>()];
-        socket.read_exact(&mut ic_req_buf).await?;
-
-        let ic_req = unsafe { std::ptr::read(ic_req_buf.as_ptr() as *const NvmeTcpIcReq) };
-
-        println!(
-            "Received IC Request: pfv={}, hpda={}",
-            u16::from_le(ic_req.pfv),
-            ic_req.hpda
-        );
-
-        // Send IC Response
-        let ic_resp = NvmeTcpIcResp {
-            header: NvmeTcpPduHeader {
-                pdu_type: NVME_TCP_PDU_TYPE_IC_RESP,
-                flags: 0,
-                hlen: std::mem::size_of::<NvmeTcpIcResp>() as u8,
-                pdo: 0,
-                plen: (std::mem::size_of::<NvmeTcpIcResp>() as u32).to_le(),
-            },
-            pfv: 0u16.to_le(),                   // Protocol version 0
-            cpda: 0,                             // Controller PDU Data Alignment
-            digest: 0,                           // No digest support
-            maxh2cdata: (128 * 1024u32).to_le(), // 128KB max transfer
-            rsvd: [0; 112],
+        let pdu = match read_pdu(rd).await {
+            Ok(pdu) => pdu,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+            Err(e) => break Err(e),
         };
 
-        let ic_resp_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ic_resp as *const _ as *const u8,
-                std::mem::size_of::<NvmeTcpIcResp>(),
-            )
-        };
-
-        socket.write_all(ic_resp_bytes).await?;
-        socket.flush().await?;
-
-        println!("Sent IC Response");
-        Ok(())
-    }
-
-    async fn read_pdu_header(socket: &mut TcpStream) -> std::io::Result<NvmeTcpPduHeader> {
-        let mut header_buf = [0u8; 8];
-        socket.read_exact(&mut header_buf).await?;
-
-        let header = NvmeTcpPduHeader {
-            pdu_type: header_buf[0],
-            flags: header_buf[1],
-            hlen: header_buf[2],
-            pdo: header_buf[3],
-            plen: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
-        };
-
-        // Copy fields to avoid packed struct reference issues
-        let pdu_type = header.pdu_type;
-        let flags = header.flags;
-        let hlen = header.hlen;
-        let pdo = header.pdo;
-        let plen = header.plen;
-
-        println!(
-            "Read PDU header: type=0x{:02x}, flags=0x{:02x}, hlen={}, pdo={}, plen={}",
-            pdu_type, flags, hlen, pdo, plen
-        );
-
-        Ok(header)
-    }
-
-    async fn handle_command(
-        socket: &mut TcpStream,
-        header: NvmeTcpPduHeader,
-        fs: &Arc<Mutex<FileSystem<D>>>,
-        device_name: &str,
-        device_size: u64,
-        ctrl_state: &mut ControllerState,
-        conn_id: usize,
-    ) -> std::io::Result<()>
-    where
-        D: BlockDevice + Send + Sync + 'static,
-    {
-        let plen = header.plen as usize;
-        let hlen = header.hlen as usize;
-
-        // 1. Read the 64-byte NVMe command first so we have the opcode
-        let mut cmd_buf = [0u8; 64];
-        socket.read_exact(&mut cmd_buf).await?;
-        let cmd = unsafe { std::ptr::read(cmd_buf.as_ptr() as *const NvmeCommand) };
-
-        let opcode = cmd.opcode;
-        let cid = u16::from_le(cmd.cid);
-
-        // 2. Consume any remaining PDU data (like the 1024-byte Connect data)
-        // plen (total) - 8 (header) - 64 (command) = extra data
-        let consumed_so_far = 8 + 64;
-        let remaining = plen.saturating_sub(consumed_so_far);
-
-        if remaining > 0 {
-            let mut extra_data = vec![0u8; remaining];
-            socket.read_exact(&mut extra_data).await?;
-            println!(
-                "[Conn {}] Consumed {} bytes of extra PDU data",
-                conn_id, remaining
-            );
-        }
-
-        let nsid = u32::from_le(cmd.nsid);
-
-        println!(
-            "[Conn {}] Received command: opcode=0x{:02x}, cid={}, nsid={}",
-            conn_id, opcode, cid, nsid
-        );
-
-        match cmd.opcode {
-            NVME_ADMIN_IDENTIFY => {
-                Self::handle_identify(socket, cmd, device_size).await?;
-            }
-            NVME_IO_READ => {
-                Self::handle_read(socket, cmd, fs, device_name).await?;
-            }
-            NVME_IO_WRITE => {
-                Self::handle_write_cmd(socket, cmd).await?;
-            }
-            NVME_IO_FLUSH => {
-                Self::send_completion(socket, cmd.cid, NVME_SC_SUCCESS, 0).await?;
-            }
-            NVME_FABRICS_COMMAND => {
-                Self::handle_fabrics_command(socket, cmd, ctrl_state).await?;
-            }
-            NVME_ADMIN_GET_LOG_PAGE => {
-                Self::handle_get_log_page(socket, cmd).await?;
-            }
-            NVME_ADMIN_SET_FEATURES | NVME_ADMIN_GET_FEATURES => {
-                // Minimal implementation - just acknowledge
-                Self::send_completion(socket, cmd.cid, NVME_SC_SUCCESS, 0).await?;
-            }
-            NVME_ADMIN_CREATE_IO_SQ | NVME_ADMIN_CREATE_IO_CQ | NVME_ADMIN_KEEP_ALIVE => {
-                // Queue management - acknowledge for now
-                Self::send_completion(socket, cmd.cid, NVME_SC_SUCCESS, 0).await?;
-            }
-            _ => {
-                println!("Unsupported opcode: 0x{:02x}", cmd.opcode);
-                Self::send_completion(socket, cmd.cid, NVME_SC_INVALID_OPCODE, 0).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_identify(
-        socket: &mut TcpStream,
-        cmd: NvmeCommand,
-        device_size: u64,
-    ) -> std::io::Result<()> {
-        let mut identify_data = vec![0u8; 4096];
-        let cns = u32::from_le(cmd.cdw10) & 0xFF;
-
-        match cns {
-            0x01 => {
-                // Identify Controller
-                println!("    Identify Controller (CNS=0x01)");
-
-                // VID (PCI Vendor ID) at offset 0-1
-                identify_data[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
-
-                // SSVID (PCI Subsystem Vendor ID) at offset 2-3
-                identify_data[2..4].copy_from_slice(&0x1234u16.to_le_bytes());
-
-                // Serial Number (SN) at offset 4-23 (20 bytes, ASCII)
-                identify_data[4..24].copy_from_slice(b"RAIDISHV10          ");
-
-                // Model Number (MN) at offset 24-63 (40 bytes, ASCII)
-                identify_data[24..64].copy_from_slice(b"RAIDISH NVMe-TCP Virtual Device         ");
-
-                // Firmware Revision (FR) at offset 64-71 (8 bytes, ASCII)
-                identify_data[64..72].copy_from_slice(b"1.0     ");
-
-                // Recommended Arbitration Burst (RAB) at offset 72
-                identify_data[72] = 0;
-
-                // IEEE OUI at offset 73-75
-                identify_data[73..76].copy_from_slice(&[0x00, 0x00, 0x00]);
-
-                // Controller Multi-Path I/O (CMIC) at offset 76
-                identify_data[76] = 0;
-
-                // Maximum Data Transfer Size (MDTS) at offset 77
-                identify_data[77] = 5; // 2^5 = 32 pages = 128KB
-
-                // Controller ID (CNTLID) at offset 78-79
-                identify_data[78..80].copy_from_slice(&1u16.to_le_bytes());
-
-                // Version (VER) at offset 80-83 - NVMe 1.4
-                identify_data[80..84].copy_from_slice(&0x00010400u32.to_le_bytes());
-
-                // RTD3 Resume Latency (RTD3R) at offset 84-87
-                identify_data[84..88].copy_from_slice(&0u32.to_le_bytes());
-
-                // RTD3 Entry Latency (RTD3E) at offset 88-91
-                identify_data[88..92].copy_from_slice(&0u32.to_le_bytes());
-
-                // Optional Asynchronous Events Supported (OAES) at offset 92-95
-                identify_data[92..96].copy_from_slice(&0x00000200u32.to_le_bytes());
-
-                // Optional Admin Command Support (OACS) at offset 256-257
-                identify_data[256..258].copy_from_slice(&0x0004u16.to_le_bytes());
-
-                // Abort Command Limit (ACL) at offset 258
-                identify_data[258] = 3; // Support up to 4 aborts
-
-                // Asynchronous Event Request Limit (AERL) at offset 259
-                identify_data[259] = 3; // Support up to 4 async events
-
-                // Firmware Updates (FRMW) at offset 260
-                identify_data[260] = 0x01; // First slot is read-only
-
-                // Log Page Attributes (LPA) at offset 261
-                identify_data[261] = 0;
-
-                // Error Log Page Entries (ELPE) at offset 262
-                identify_data[262] = 3; // 4 entries (0-based)
-
-                // Number of Power States (NPSS) at offset 263
-                identify_data[263] = 0; // 1 power state (0-based)
-
-                // Keep Alive Support (KAS) at offset 320-321
-                // Units are 100 milliseconds. 30 seconds = 300 * 100ms
-                identify_data[320..322].copy_from_slice(&300u16.to_le_bytes());
-
-                // Submission Queue Entry Size (SQES) at offset 512
-                identify_data[512] = 0x66; // Min=6, Max=6 (64 bytes)
-
-                // Completion Queue Entry Size (CQES) at offset 513
-                identify_data[513] = 0x44; // Min=4, Max=4 (16 bytes)
-
-                // Number of Namespaces (NN) at offset 516-519
-                identify_data[516..520].copy_from_slice(&1u32.to_le_bytes());
-
-                // Subsystem NQN (SUBNQN) at offset 768-1023 (256 bytes)
-                let subnqn = b"nqn.2024-01.com.raidish:nvme:vdisk0";
-                let subnqn_len = subnqn.len().min(256);
-                identify_data[768..768 + subnqn_len].copy_from_slice(&subnqn[..subnqn_len]);
-
-                // NVMe over Fabrics specific attributes
-                // IOCCSZ at offset 2052-2055 (4 bytes)
-                identify_data[2052..2056].copy_from_slice(&4u32.to_le_bytes());
-
-                // IORCSZ at offset 2056-2059 (4 bytes)
-                identify_data[2056..2060].copy_from_slice(&1u32.to_le_bytes());
-
-                // ICDOFF at offset 2060-2061 (2 bytes)
-                identify_data[2060..2062].copy_from_slice(&0u16.to_le_bytes());
-
-                // FCATT at offset 2062 (1 byte)
-                identify_data[2062] = 0x01;
-
-                // MSDBD at offset 2063 (1 byte)
-                identify_data[2063] = 0;
-
-                println!("    -> CNTLID: 1");
-                println!(
-                    "    -> SUBNQN: {}",
-                    String::from_utf8_lossy(&subnqn[..subnqn_len])
-                );
-                println!("    -> KAS: 300 (30 seconds)");
-                println!("    -> IOCCSZ: 4, IORCSZ: 1");
-            }
-            0x00 | 0x11 => {
-                // Identify Namespace (0x00) or Active NSID List (0x11)
-                println!("    Identify Namespace (CNS=0x{:02x})", cns);
-
-                if cns == 0x11 {
-                    // Active NSID list - just return namespace 1
-                    identify_data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        match pdu[0] {
+            PDU_CMD => {
+                if pdu.len() < 72 {
+                    break Err(invalid("short command capsule"));
+                }
+                let sqe = Sqe(pdu[8..72].try_into().unwrap());
+                let inline = pdu_data(&pdu)?;
+                let need = if sqe.host_to_ctrl() {
+                    sqe.data_len()
                 } else {
-                    // Namespace 1 details
-                    let block_size = 4096u64;
-                    let nsze = device_size / block_size;
-
-                    // NSZE (Namespace Size) at offset 0-7
-                    identify_data[0..8].copy_from_slice(&nsze.to_le_bytes());
-
-                    // NCAP (Namespace Capacity) at offset 8-15
-                    identify_data[8..16].copy_from_slice(&nsze.to_le_bytes());
-
-                    // NUSE (Namespace Utilization) at offset 16-23
-                    identify_data[16..24].copy_from_slice(&nsze.to_le_bytes());
-
-                    // NLBAF (Number of LBA Formats) at offset 25
-                    identify_data[25] = 0; // 1 format (0-based)
-
-                    // FLBAS (Formatted LBA Size) at offset 26
-                    identify_data[26] = 0; // Format 0 is current
-
-                    // LBA Format 0 at offset 128-131
-                    // LBADS (LBA Data Size) = 12 (2^12 = 4096 bytes)
-                    identify_data[128] = 12;
-                }
-            }
-            _ => {
-                println!("    Warning: Unhandled Identify CNS 0x{:02x}", cns);
-            }
-        }
-
-        let hlen = std::mem::size_of::<NvmeTcpC2HData>();
-        let c2h_header = NvmeTcpC2HData {
-            header: NvmeTcpPduHeader {
-                pdu_type: NVME_TCP_PDU_TYPE_C2H_DATA,
-                flags: 0x01, // DATA_LAST
-                hlen: hlen as u8,
-                pdo: hlen as u8,
-                plen: (hlen as u32 + 4096).to_le(),
-            },
-            cccid: cmd.cid,
-            rsvd: 0,
-            datao: 0,
-            datal: 4096u32.to_le(),
-            rsvd2: 0,
-        };
-
-        let c2h_bytes =
-            unsafe { std::slice::from_raw_parts(&c2h_header as *const _ as *const u8, hlen) };
-
-        socket.write_all(c2h_bytes).await?;
-        socket.write_all(&identify_data).await?;
-        socket.flush().await?;
-
-        Self::send_completion(socket, u16::from_le(cmd.cid), NVME_SC_SUCCESS, 0u64).await?;
-
-        Ok(())
-    }
-
-    async fn handle_read(
-        socket: &mut TcpStream,
-        cmd: NvmeCommand,
-        fs: &Arc<Mutex<FileSystem<D>>>,
-        device_name: &str,
-    ) -> std::io::Result<()>
-    where
-        D: BlockDevice + Send + Sync + 'static,
-    {
-        let slba = u32::from_le(cmd.cdw10) as u64 | ((u32::from_le(cmd.cdw11) as u64) << 32);
-        let nlb = (u32::from_le(cmd.cdw12) & 0xFFFF) + 1; // 0-based, so add 1
-
-        let block_size = 4096u64;
-        let offset = slba * block_size;
-        let length = nlb as u64 * block_size;
-
-        println!(
-            "Read: slba={}, nlb={}, offset={}, length={}",
-            slba, nlb, offset, length
-        );
-
-        let mut buffer = vec![0u8; length as usize];
-
-        {
-            let fs_lock = fs.lock().await;
-            let bytes_read = fs_lock
-                .block_read(device_name, offset, &mut buffer)
-                .await
-                .unwrap();
-
-            if bytes_read < length as usize {
-                buffer.truncate(bytes_read);
-            }
-        }
-
-        // Send C2H Data PDU
-        let c2h_header = NvmeTcpC2HData {
-            header: NvmeTcpPduHeader {
-                pdu_type: NVME_TCP_PDU_TYPE_C2H_DATA,
-                flags: 0x01, // Last PDU
-                hlen: std::mem::size_of::<NvmeTcpC2HData>() as u8,
-                pdo: 0,
-                plen: (std::mem::size_of::<NvmeTcpC2HData>() as u32 + buffer.len() as u32).to_le(),
-            },
-            cccid: cmd.cid,
-            rsvd: 0,
-            datao: 0,
-            datal: (buffer.len() as u32).to_le(),
-            rsvd2: 0,
-        };
-
-        let c2h_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &c2h_header as *const _ as *const u8,
-                std::mem::size_of::<NvmeTcpC2HData>(),
-            )
-        };
-
-        socket.write_all(c2h_bytes).await?;
-        socket.write_all(&buffer).await?;
-        socket.flush().await?;
-
-        // Send completion
-        Self::send_completion(socket, cmd.cid, NVME_SC_SUCCESS, 0).await?;
-
-        Ok(())
-    }
-
-    async fn handle_write_cmd(socket: &mut TcpStream, cmd: NvmeCommand) -> std::io::Result<()> {
-        // For writes, we just acknowledge the command and wait for H2C data
-        // The actual write will be handled in handle_h2c_data
-
-        // We could send an R2T (Ready to Transfer) here, but most implementations
-        // just wait for the H2C data to arrive
-
-        println!("Write command queued, waiting for data...");
-        Ok(())
-    }
-
-    async fn handle_h2c_data(
-        socket: &mut TcpStream,
-        header: NvmeTcpPduHeader,
-        fs: &Arc<Mutex<FileSystem<D>>>,
-        device_name: &str,
-    ) -> std::io::Result<()>
-    where
-        D: BlockDevice + Send + Sync + 'static,
-    {
-        // Read H2C data header (rest after common header)
-        let mut h2c_buf = [0u8; 16];
-        socket.read_exact(&mut h2c_buf).await?;
-
-        let cccid = u16::from_le_bytes([h2c_buf[0], h2c_buf[1]]);
-        let datao = u32::from_le_bytes([h2c_buf[4], h2c_buf[5], h2c_buf[6], h2c_buf[7]]);
-        let datal = u32::from_le_bytes([h2c_buf[8], h2c_buf[9], h2c_buf[10], h2c_buf[11]]);
-
-        println!(
-            "H2C Data: cccid={}, datao={}, datal={}",
-            cccid, datao, datal
-        );
-
-        // Read the actual data
-        let mut data = vec![0u8; datal as usize];
-        socket.read_exact(&mut data).await?;
-
-        // We need to track the write command context
-        // For simplicity, assume offset is datao (this is a simplification)
-        let block_size = 4096u64;
-        let offset = (datao as u64 / block_size) * block_size;
-
-        {
-            let fs_lock = fs.lock().await;
-            fs_lock
-                .block_write(device_name, offset, &data)
-                .await
-                .unwrap();
-        }
-
-        // Send completion for the write
-        Self::send_completion(socket, cccid, NVME_SC_SUCCESS, 0).await?;
-
-        Ok(())
-    }
-
-    async fn handle_fabrics_command(
-        socket: &mut TcpStream,
-        cmd: NvmeCommand,
-        ctrl_state: &mut ControllerState,
-    ) -> std::io::Result<()> {
-        // NVMe Fabrics Command structure:
-        // Byte 0: opcode (0x7F)
-        // Byte 1: flags
-        // Bytes 2-3: cid
-        // Byte 4: fctype ← THIS IS THE KEY!
-        // Bytes 5-7: reserved (rest of what would be nsid in regular commands)
-        // Bytes 8-11: cdw2
-        // ...
-
-        // For Fabrics commands, fctype is at byte 4, which is the LOW byte of the nsid field
-        let fctype = (u32::from_le(cmd.nsid) & 0xFF) as u8;
-        let cdw10 = u32::from_le(cmd.cdw10);
-        let cdw11 = u32::from_le(cmd.cdw11);
-        // Note: For Fabrics commands, the normal nsid field contains fctype in byte 4
-        // We already extracted it above, so we don't use nsid for anything else
-
-        println!(
-            "    Fabrics: fctype=0x{:02x}, cdw10=0x{:08x}, cdw11=0x{:08x}",
-            fctype, cdw10, cdw11
-        );
-
-        match fctype {
-            0x00 => {
-                // PROPERTY SET
-                let offset = cdw11 & 0xFFFFFF;
-                let attrib = (cdw11 >> 24) & 0xFF;
-                let value = u64::from_le(cmd.dptr[0]);
-
-                println!(
-                    "    Property Set: offset=0x{:02x}, value=0x{:x}",
-                    offset, value
-                );
-
-                match offset {
-                    0x14 => {
-                        // CC - Controller Configuration (writable)
-                        ctrl_state.set_cc(value as u32);
-                        Self::send_completion(socket, u16::from_le(cmd.cid), 0, 0).await?;
-                    }
-                    0x1C | 0x00 | 0x08 => {
-                        // CSTS, CAP, VS - all read-only
-                        println!("    ERROR: Write to read-only register 0x{:02x}", offset);
-                        Self::send_completion(
-                            socket,
-                            u16::from_le(cmd.cid),
-                            NVME_SC_INVALID_FIELD,
-                            0,
-                        )
-                        .await?;
-                    }
-                    _ => {
-                        println!(
-                            "    WARNING: Write to unknown offset 0x{:02x}, accepting",
-                            offset
-                        );
-                        Self::send_completion(socket, u16::from_le(cmd.cid), 0, 0).await?;
-                    }
-                }
-            }
-
-            0x04 => {
-                // PROPERTY GET
-                let offset = cdw11 & 0xFFFFFF;
-                let attrib = (cdw11 >> 24) & 0xFF;
-
-                let value: u64 = match offset {
-                    0x00 => 0x00000001000203FFu64,  // CAP (64-bit)
-                    0x08 => 0x00010400u64,          // VS (32-bit, 1.4.0)
-                    0x14 => ctrl_state.cc as u64,   // CC (32-bit)
-                    0x1C => ctrl_state.csts as u64, // CSTS (32-bit)
-                    _ => {
-                        println!(
-                            "    Property Get: unknown offset 0x{:02x}, returning 0",
-                            offset
-                        );
-                        0
-                    }
+                    0
                 };
 
-                println!(
-                    "    Property Get: offset=0x{:02x}, returning 0x{:x}",
-                    offset, value
-                );
-                Self::send_completion(socket, u16::from_le(cmd.cid), 0, value).await?;
-            }
-
-            0x01 => {
-                // CONNECT
-                let recfmt = (cdw10 & 0xFFFF) as u16;
-                let qid = (cdw10 >> 16) as u16;
-
-                println!("    Fabrics Connect: RECFMT={}, QID={}", recfmt, qid);
-
-                // Validate RECFMT (must be 0 for NVMe-oF 1.x)
-                if recfmt != 0 {
-                    println!("    ERROR: Invalid RECFMT={}, expected 0", recfmt);
-                    Self::send_completion(socket, u16::from_le(cmd.cid), NVME_SC_INVALID_FIELD, 0)
-                        .await?;
-                    return Ok(());
-                }
-
-                if qid == 0 {
-                    // Admin queue connection
-                    println!("    Admin queue (QID 0) connecting");
-                    // After successful admin queue connection, controller should be enabled and ready
-                    // This is different from PCIe NVMe where the host must explicitly enable via CC.EN
-                    ctrl_state.cc = 0x00460001; // EN=1, plus reasonable defaults
-                    ctrl_state.csts = 0x00000001; // RDY=1 (controller is ready)
-                    ctrl_state.connected = true;
-
-                    println!(
-                        "    Controller now ENABLED and READY (CC=0x{:x}, CSTS=0x{:x})",
-                        ctrl_state.cc, ctrl_state.csts
+                if need > MAX_TRANSFER {
+                    send_completion(conn, sqe.cid(), Completion::generic(SC_INVALID_FIELD)).await?;
+                } else if need > 0 && inline.is_empty() {
+                    // Ask the host for the data; the command runs once it's all here.
+                    let ttag = sqe.cid();
+                    if pending.contains_key(&ttag) {
+                        break Err(invalid(format!("duplicate outstanding cid {}", ttag)));
+                    }
+                    send_r2t(conn, sqe.cid(), ttag, 0, need as u32).await?;
+                    pending.insert(
+                        ttag,
+                        PendingWrite {
+                            sqe,
+                            buf: vec![0u8; need],
+                            received: 0,
+                        },
                     );
-
-                    // Return Controller ID = 1 for admin queue
-                    Self::send_completion(socket, u16::from_le(cmd.cid), 0, 0x0001).await?;
+                } else if need > 0 && inline.len() != need {
+                    send_completion(conn, sqe.cid(), Completion::generic(SC_DATA_XFER_ERROR))
+                        .await?;
                 } else {
-                    // I/O queue connection
-                    println!("    I/O queue (QID {}) connecting", qid);
-                    // Return 0xFFFF for I/O queues
-                    Self::send_completion(socket, u16::from_le(cmd.cid), 0, 0xFFFF).await?;
+                    let (conn, data) = (conn.clone(), inline.to_vec());
+                    tasks.spawn(async move { execute(&conn, sqe, data).await });
                 }
             }
+            PDU_H2C_DATA => {
+                let ttag = le16(&pdu, 10);
+                let datao = le32(&pdu, 12) as usize;
+                let datal = le32(&pdu, 16) as usize;
+                let data = pdu_data(&pdu)?;
+                let Some(p) = pending.get_mut(&ttag) else {
+                    break Err(invalid(format!("H2C data for unknown ttag {}", ttag)));
+                };
+                if data.len() != datal
+                    || datao + datal > p.buf.len()
+                    || datal > MAX_H2C_DATA as usize
+                {
+                    break Err(invalid("H2C data out of range"));
+                }
+                p.buf[datao..datao + datal].copy_from_slice(data);
+                p.received += datal;
+                if p.received >= p.buf.len() {
+                    let p = pending.remove(&ttag).unwrap();
+                    let conn = conn.clone();
+                    tasks.spawn(async move { execute(&conn, p.sqe, p.buf).await });
+                }
+            }
+            PDU_H2C_TERM => {
+                trace!(
+                    "nvme: {}: host terminated connection (fes {:#x})",
+                    conn.peer,
+                    le16(&pdu, 8)
+                );
+                break Ok(());
+            }
+            other => break Err(invalid(format!("unexpected PDU type {:#x}", other))),
+        }
+    };
 
-            0x05 => {
-                // AUTHENTICATION SEND
-                println!("    Authentication Send (not implemented)");
-                Self::send_completion(socket, u16::from_le(cmd.cid), NVME_SC_INVALID_OPCODE, 0)
-                    .await?;
+    // Let in-flight commands finish (their replies may fail if the socket is gone).
+    while let Some(r) = tasks.join_next().await {
+        let _ = r;
+    }
+    result
+}
+
+async fn send_r2t<D: BlockDevice>(
+    conn: &Conn<D>,
+    cid: u16,
+    ttag: u16,
+    offset: u32,
+    len: u32,
+) -> std::io::Result<()> {
+    let mut pdu = [0u8; 24];
+    pdu[0] = PDU_R2T;
+    pdu[2] = 24;
+    put(&mut pdu, 4, &24u32.to_le_bytes());
+    put(&mut pdu, 8, &cid.to_le_bytes());
+    put(&mut pdu, 10, &ttag.to_le_bytes());
+    put(&mut pdu, 12, &offset.to_le_bytes());
+    put(&mut pdu, 16, &len.to_le_bytes());
+    conn.writer.lock().await.write_all(&pdu).await
+}
+
+/// Write any C2H data followed by the response capsule, in one piece.
+async fn send_completion<D: BlockDevice>(
+    conn: &Conn<D>,
+    cid: u16,
+    c: Completion,
+) -> std::io::Result<()> {
+    let mut out = Vec::new();
+    if let Some(data) = &c.data {
+        let chunks = data.chunks(C2H_CHUNK).count();
+        for (i, chunk) in data.chunks(C2H_CHUNK).enumerate() {
+            let pdo = conn.c2h_pdo;
+            let start = out.len();
+            out.resize(start + pdo, 0);
+            let h = &mut out[start..];
+            h[0] = PDU_C2H_DATA;
+            h[1] = if i + 1 == chunks { PDU_FLAG_LAST } else { 0 };
+            h[2] = 24;
+            h[3] = pdo as u8;
+            put(h, 4, &((pdo + chunk.len()) as u32).to_le_bytes());
+            put(h, 8, &cid.to_le_bytes());
+            put(h, 12, &((i * C2H_CHUNK) as u32).to_le_bytes());
+            put(h, 16, &(chunk.len() as u32).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+
+    let (sqid, sqsize) = match conn.queue.lock().unwrap().as_ref() {
+        Some(q) => (q.qid, q.sqsize as u32 + 1),
+        None => (0, QUEUE_ENTRIES as u32),
+    };
+    let sqhd = (conn.sqhd.fetch_add(1, Ordering::Relaxed) + 1) % sqsize;
+
+    let start = out.len();
+    out.resize(start + 24, 0);
+    let r = &mut out[start..];
+    r[0] = PDU_RSP;
+    r[2] = 24;
+    put(r, 4, &24u32.to_le_bytes());
+    put(r, 8, &c.dw0.to_le_bytes());
+    put(r, 12, &c.dw1.to_le_bytes());
+    put(r, 16, &(sqhd as u16).to_le_bytes());
+    put(r, 18, &sqid.to_le_bytes());
+    put(r, 20, &cid.to_le_bytes());
+    put(r, 22, &c.status.to_le_bytes());
+
+    conn.writer.lock().await.write_all(&out).await
+}
+
+async fn execute<D: BlockDevice + Send + Sync + 'static>(
+    conn: &Conn<D>,
+    sqe: Sqe,
+    data: Vec<u8>,
+) -> std::io::Result<()> {
+    let queue = conn.queue.lock().unwrap().clone();
+    let completion = if sqe.opcode() == OPC_FABRICS {
+        fabrics(conn, &queue, &sqe, &data)
+    } else {
+        match &queue {
+            None => Some(Completion::generic(SC_CMD_SEQ_ERROR)),
+            Some(q) if q.qid == 0 => admin(conn, q, &sqe, &data),
+            Some(_) => Some(io(conn, &sqe, &data).await),
+        }
+    };
+
+    let Some(c) = completion else {
+        // Async Event Requests stay outstanding until there is an event.
+        return Ok(());
+    };
+    trace!(
+        "nvme: {} q{} cid={} opc={:#04x} cdw10={:#x}{} -> status {:#06x}",
+        conn.peer,
+        queue.as_ref().map_or(-1, |q| q.qid as i32),
+        sqe.cid(),
+        sqe.opcode(),
+        sqe.cdw(10),
+        if sqe.opcode() == OPC_FABRICS {
+            format!(" fctype={:#04x}", sqe.fctype())
+        } else {
+            String::new()
+        },
+        c.status
+    );
+    send_completion(conn, sqe.cid(), c).await
+}
+
+fn fabrics<D: BlockDevice>(
+    conn: &Conn<D>,
+    queue: &Option<QueueInfo>,
+    sqe: &Sqe,
+    data: &[u8],
+) -> Option<Completion> {
+    let target = &conn.target;
+    Some(match sqe.fctype() {
+        FCT_CONNECT => {
+            if queue.is_some() {
+                return Some(Completion::generic(SC_CMD_SEQ_ERROR));
+            }
+            if data.len() < 1024 {
+                return Some(Completion::generic(SC_INVALID_FIELD));
+            }
+            let qid = le16(&sqe.0, 42);
+            let sqsize = le16(&sqe.0, 44);
+            let kato = le32(&sqe.0, 48);
+            let cntlid = le16(data, 16);
+            let subnqn = cstr(&data[256..512]);
+            let hostnqn = cstr(&data[512..768]);
+            trace!(
+                "nvme: {}: connect qid={} sqsize={} cntlid={:#x} subnqn={} hostnqn={}",
+                conn.peer, qid, sqsize, cntlid, subnqn, hostnqn
+            );
+
+            // Invalid-parameter responses say which field: bit 16 = in data, bits 15:0 = offset.
+            let bad = |in_data: bool, offset: u32| Completion {
+                dw0: ((in_data as u32) << 16) | offset,
+                ..Completion::err(SCT_FABRICS, SC_CONNECT_INVALID_PARAM)
+            };
+            if subnqn != SUBSYS_NQN {
+                return Some(bad(true, 256));
+            }
+            if sqsize == 0 || sqsize >= QUEUE_ENTRIES {
+                return Some(bad(false, 44));
             }
 
-            0x06 => {
-                // AUTHENTICATION RECV
-                println!("    Authentication Recv (not implemented)");
-                Self::send_completion(socket, u16::from_le(cmd.cid), NVME_SC_INVALID_OPCODE, 0)
-                    .await?;
-            }
+            let ctrl = if qid == 0 {
+                if cntlid != 0xffff && cntlid != 0xfffe {
+                    return Some(bad(true, 16));
+                }
+                let id = target.next_cntlid.fetch_add(1, Ordering::Relaxed);
+                let ctrl = Arc::new(Controller {
+                    cntlid: id,
+                    regs: Mutex::new(CtrlRegs {
+                        cc: 0,
+                        csts: 0,
+                        io_queues: 0,
+                        kato,
+                    }),
+                });
+                target.ctrls.lock().unwrap().insert(id, ctrl.clone());
+                ctrl
+            } else {
+                let Some(ctrl) = target.ctrls.lock().unwrap().get(&cntlid).cloned() else {
+                    return Some(bad(true, 16));
+                };
+                let regs = ctrl.regs.lock().unwrap();
+                if regs.csts & 1 == 0 || qid > regs.io_queues.max(1) {
+                    drop(regs);
+                    return Some(bad(false, 42));
+                }
+                drop(regs);
+                ctrl
+            };
 
-            _ => {
-                println!("    ERROR: Unknown Fabrics fctype=0x{:02x}", fctype);
-                Self::send_completion(socket, u16::from_le(cmd.cid), NVME_SC_INVALID_OPCODE, 0)
-                    .await?;
+            let cntlid = ctrl.cntlid;
+            *conn.queue.lock().unwrap() = Some(QueueInfo { qid, sqsize, ctrl });
+            conn.sqhd.store(0, Ordering::Relaxed);
+            Completion::with_dw0(cntlid as u32)
+        }
+        FCT_PROP_GET | FCT_PROP_SET => {
+            let Some(q) = queue.as_ref().filter(|q| q.qid == 0) else {
+                return Some(Completion::generic(SC_CMD_SEQ_ERROR));
+            };
+            let offset = le32(&sqe.0, 44);
+            let mut regs = q.ctrl.regs.lock().unwrap();
+            if sqe.fctype() == FCT_PROP_GET {
+                let value: u64 = match offset {
+                    PROP_CAP => {
+                        (QUEUE_ENTRIES as u64 - 1) // MQES
+                            | 1 << 16 // CQR
+                            | 30 << 24 // TO: 15 s
+                            | 1 << 37 // CSS: NVM command set
+                    }
+                    PROP_VS => NVME_VERSION as u64,
+                    PROP_CC => regs.cc as u64,
+                    PROP_CSTS => regs.csts as u64,
+                    _ => return Some(Completion::generic(SC_INVALID_FIELD)),
+                };
+                Completion {
+                    dw0: value as u32,
+                    dw1: (value >> 32) as u32,
+                    ..Completion::ok()
+                }
+            } else {
+                if offset != PROP_CC {
+                    return Some(Completion::generic(SC_INVALID_FIELD));
+                }
+                let cc = le32(&sqe.0, 48);
+                let was_enabled = regs.cc & 1 != 0;
+                if cc & 1 != 0 && !was_enabled {
+                    regs.csts = 1; // RDY, shutdown status cleared
+                } else if cc & 1 == 0 {
+                    regs.csts &= !1;
+                }
+                if (cc >> 14) & 0x3 != 0 {
+                    // Shutdown requested: nothing to drain beyond a commit,
+                    // which the host follows with FLUSH anyway. Report complete.
+                    regs.csts = (regs.csts & !0xc) | (0x2 << 2);
+                }
+                regs.cc = cc;
+                trace!(
+                    "nvme: {}: CC={:#x} CSTS={:#x}",
+                    conn.peer, regs.cc, regs.csts
+                );
+                Completion::ok()
             }
         }
+        _ => Completion::generic(SC_INVALID_OPCODE),
+    })
+}
 
-        Ok(())
+fn admin<D: BlockDevice>(
+    conn: &Conn<D>,
+    q: &QueueInfo,
+    sqe: &Sqe,
+    _data: &[u8],
+) -> Option<Completion> {
+    let target = &conn.target;
+    Some(match sqe.opcode() {
+        ADM_IDENTIFY => {
+            let cns = sqe.cdw(10) & 0xff;
+            let nsid = sqe.nsid();
+            let page = match cns {
+                0x00 if nsid == 1 => identify_ns(target),
+                0x00 => return Some(Completion::generic(SC_INVALID_NS)),
+                0x01 => identify_ctrl(target, q.ctrl.cntlid),
+                0x02 => {
+                    let mut list = vec![0u8; 4096];
+                    if nsid < 1 {
+                        put(&mut list, 0, &1u32.to_le_bytes());
+                    }
+                    list
+                }
+                0x03 if nsid == 1 => {
+                    let mut list = vec![0u8; 4096];
+                    list[0] = 0x03; // NIDT: UUID
+                    list[1] = 16;
+                    put(&mut list, 4, &target.uuid);
+                    list
+                }
+                _ => return Some(Completion::generic(SC_INVALID_FIELD)),
+            };
+            Completion::with_data(page)
+        }
+        ADM_GET_LOG_PAGE => {
+            let lid = sqe.cdw(10) & 0xff;
+            let numd = ((sqe.cdw(10) >> 16) | ((sqe.cdw(11) & 0xffff) << 16)) as usize + 1;
+            let len = (numd * 4).min(sqe.data_len());
+            match lid {
+                // Error information, SMART / health, firmware slots: all empty.
+                0x01..=0x03 => Completion::with_data(vec![0u8; len]),
+                _ => Completion::generic(SC_INVALID_FIELD),
+            }
+        }
+        ADM_SET_FEATURES | ADM_GET_FEATURES => {
+            let fid = sqe.cdw(10) & 0xff;
+            let set = sqe.opcode() == ADM_SET_FEATURES;
+            let mut regs = q.ctrl.regs.lock().unwrap();
+            match fid {
+                0x07 => {
+                    // Number of queues (0-based in both directions).
+                    if set {
+                        let nsqr = (sqe.cdw(11) & 0xffff) as u16 + 1;
+                        let ncqr = (sqe.cdw(11) >> 16) as u16 + 1;
+                        regs.io_queues = nsqr.min(ncqr).min(MAX_IO_QUEUES);
+                    }
+                    let n = regs.io_queues.max(1) as u32 - 1;
+                    Completion::with_dw0(n << 16 | n)
+                }
+                0x06 => Completion::with_dw0(1), // volatile write cache: enabled
+                0x0b => Completion::ok(),        // async event configuration
+                0x0f => {
+                    if set {
+                        regs.kato = sqe.cdw(11);
+                    }
+                    Completion::with_dw0(regs.kato)
+                }
+                _ => Completion::generic(SC_INVALID_FIELD),
+            }
+        }
+        ADM_ASYNC_EVENT => return None,
+        ADM_KEEP_ALIVE => Completion::ok(),
+        ADM_ABORT => Completion::with_dw0(1), // command not aborted
+        _ => Completion::generic(SC_INVALID_OPCODE),
+    })
+}
+
+async fn io<D: BlockDevice + Send + Sync + 'static>(
+    conn: &Conn<D>,
+    sqe: &Sqe,
+    data: &[u8],
+) -> Completion {
+    let target = &conn.target;
+    if sqe.nsid() != 1 {
+        return Completion::generic(SC_INVALID_NS);
     }
+    let fs = &target.fs;
+    let name = &target.volume;
 
-    async fn handle_get_log_page(socket: &mut TcpStream, cmd: NvmeCommand) -> std::io::Result<()> {
-        let lid = (u32::from_le(cmd.cdw10) & 0xFF) as u8;
-        let numdl = (u32::from_le(cmd.cdw10) >> 16) & 0xFFFF;
-        let numdu = u32::from_le(cmd.cdw11) & 0xFFFF;
-        let len = (((numdu as u32) << 16) | numdl) + 1;
-        let byte_len = (len * 4) as usize;
+    let range = |slba: u64, nlb: u64| -> Option<(u64, usize)> {
+        let end = slba.checked_add(nlb)?;
+        (end <= target.nsze).then_some((slba * LBA_SIZE, (nlb * LBA_SIZE) as usize))
+    };
+    let fail = |what: &str, e: crate::fs::FileSystemError| {
+        eprintln!("nvme: {} {} failed: {}", what, sqe.cid(), e);
+        match e {
+            crate::fs::FileSystemError::UnableToAllocateBlocks(_) => {
+                Completion::generic(SC_CAPACITY_EXCEEDED)
+            }
+            _ => Completion::generic(SC_INTERNAL),
+        }
+    };
 
-        println!("Get Log Page: lid=0x{:02x}, len={} bytes", lid, byte_len);
-
-        // Return empty/zeroed log pages for now
-        let log_data = vec![0u8; byte_len];
-
-        // Send C2H Data PDU
-        let c2h_header = NvmeTcpC2HData {
-            header: NvmeTcpPduHeader {
-                pdu_type: NVME_TCP_PDU_TYPE_C2H_DATA,
-                flags: 0x01, // Last PDU
-                hlen: std::mem::size_of::<NvmeTcpC2HData>() as u8,
-                pdo: 0,
-                plen: (std::mem::size_of::<NvmeTcpC2HData>() as u32 + log_data.len() as u32)
-                    .to_le(),
-            },
-            cccid: cmd.cid,
-            rsvd: 0,
-            datao: 0,
-            datal: (log_data.len() as u32).to_le(),
-            rsvd2: 0,
-        };
-
-        let c2h_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &c2h_header as *const _ as *const u8,
-                std::mem::size_of::<NvmeTcpC2HData>(),
-            )
-        };
-
-        socket.write_all(c2h_bytes).await?;
-        socket.write_all(&log_data).await?;
-        socket.flush().await?;
-
-        // Send completion
-        Self::send_completion(socket, cmd.cid, NVME_SC_SUCCESS, 0).await?;
-
-        Ok(())
+    match sqe.opcode() {
+        IO_READ | IO_WRITE | IO_WRITE_ZEROES => {
+            let Some((offset, len)) = range(sqe.slba(), sqe.nlb()) else {
+                return Completion::generic(SC_LBA_RANGE);
+            };
+            match sqe.opcode() {
+                IO_READ => {
+                    if len > MAX_TRANSFER || len > sqe.data_len() {
+                        return Completion::generic(SC_INVALID_FIELD);
+                    }
+                    let mut buf = vec![0u8; len];
+                    match fs.block_read(name, offset, &mut buf).await {
+                        Ok(_) => Completion::with_data(buf),
+                        Err(e) => fail("read", e),
+                    }
+                }
+                IO_WRITE => {
+                    if data.len() != len {
+                        return Completion::generic(SC_DATA_XFER_ERROR);
+                    }
+                    match fs.block_write(name, offset, data).await {
+                        Ok(_) => Completion::ok(),
+                        Err(e) => fail("write", e),
+                    }
+                }
+                _ => match fs.block_zero(name, offset, len).await {
+                    Ok(_) => Completion::ok(),
+                    Err(e) => fail("write zeroes", e),
+                },
+            }
+        }
+        IO_FLUSH => match fs.sync().await {
+            Ok(()) => Completion::ok(),
+            Err(e) => fail("flush", e),
+        },
+        IO_DSM => {
+            let ranges = (sqe.cdw(10) & 0xff) as usize + 1;
+            let deallocate = sqe.cdw(11) & (1 << 2) != 0;
+            if data.len() < ranges * 16 {
+                return Completion::generic(SC_DATA_XFER_ERROR);
+            }
+            if deallocate {
+                for r in data.chunks(16).take(ranges) {
+                    let nlb = le32(r, 4) as u64;
+                    if nlb == 0 {
+                        continue;
+                    }
+                    let Some((offset, len)) = range(le64(r, 8), nlb) else {
+                        return Completion::generic(SC_LBA_RANGE);
+                    };
+                    if let Err(e) = fs.block_zero(name, offset, len).await {
+                        return fail("deallocate", e);
+                    }
+                }
+            }
+            Completion::ok()
+        }
+        _ => Completion::generic(SC_INVALID_OPCODE),
     }
+}
 
-    async fn send_completion(
-        socket: &mut TcpStream,
-        cid: u16,
-        status: u16,
-        result: u64,
-    ) -> std::io::Result<()> {
-        let rsp = NvmeTcpRsp {
-            header: NvmeTcpPduHeader {
-                pdu_type: NVME_TCP_PDU_TYPE_RSP,
-                flags: 0,
-                hlen: 24, // Standard size for Response PDU header
-                pdo: 0,
-                plen: 24u32.to_le(), // Total PDU length is exactly 24 bytes
-            },
-            cqe: NvmeCompletion {
-                result: (result as u32).to_le(),
-                rsvd: ((result >> 32) as u32).to_le(),
-                sqhd: 0,
-                sqid: 0,
-                cid: cid.to_le(),
-                status: (status << 1).to_le(),
-            },
-        };
+fn identify_ctrl<D: BlockDevice>(target: &Target<D>, cntlid: u16) -> Vec<u8> {
+    let mut id = vec![0u8; 4096];
+    put_str(&mut id, 4, 20, &format!("RAIDISH-{}", target.volume)); // SN
+    put_str(&mut id, 24, 40, "RAIDISH NVMe-TCP Volume"); // MN
+    put_str(&mut id, 64, 8, env!("CARGO_PKG_VERSION")); // FR
+    id[77] = MDTS;
+    put(&mut id, 78, &cntlid.to_le_bytes());
+    put(&mut id, 80, &NVME_VERSION.to_le_bytes());
+    id[111] = 1; // CNTRLTYPE: I/O controller
+    id[258] = 3; // ACL (0-based)
+    id[259] = 3; // AERL (0-based)
+    id[260] = 0x01; // FRMW: slot 1 read-only
+    put(&mut id, 320, &100u16.to_le_bytes()); // KAS: 10 s granularity units of 100 ms
+    id[512] = 0x66; // SQES: 64 bytes
+    id[513] = 0x44; // CQES: 16 bytes
+    put(&mut id, 514, &QUEUE_ENTRIES.to_le_bytes()); // MAXCMD
+    put(&mut id, 516, &1u32.to_le_bytes()); // NN
+    put(&mut id, 520, &((1u16 << 2) | (1 << 3)).to_le_bytes()); // ONCS: DSM, Write Zeroes
+    id[525] = 0x01; // VWC present
+    put(&mut id, 536, &((1u32 << 0) | (1 << 20)).to_le_bytes()); // SGLS: SGLs, offsets
+    put(&mut id, 768, SUBSYS_NQN.as_bytes()); // SUBNQN (NUL padded)
+    // Fabrics: in-capsule size in 16-byte units, response size, no ICDOFF.
+    put(
+        &mut id,
+        1792,
+        &(((64 + INLINE_DATA_SIZE) / 16) as u32).to_le_bytes(),
+    ); // IOCCSZ
+    put(&mut id, 1796, &1u32.to_le_bytes()); // IORCSZ
+    id[1803] = 1; // MSDBD
+    id
+}
 
-        let rsp_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &rsp as *const _ as *const u8,
-                24, // Ensure we send exactly 24 bytes
-            )
-        };
-
-        socket.write_all(rsp_bytes).await?;
-        socket.flush().await?;
-        println!(
-            "    Sent completion: CID={}, Status=0x{:x}, Result=0x{:x}",
-            cid, status, result
-        );
-        Ok(())
-    }
+fn identify_ns<D: BlockDevice>(target: &Target<D>) -> Vec<u8> {
+    let mut id = vec![0u8; 4096];
+    put(&mut id, 0, &target.nsze.to_le_bytes()); // NSZE
+    put(&mut id, 8, &target.nsze.to_le_bytes()); // NCAP
+    put(&mut id, 16, &target.nsze.to_le_bytes()); // NUSE
+    id[24] = 0x01; // NSFEAT: thin provisioned
+    id[25] = 0; // NLBAF (0-based): one format
+    id[26] = 0; // FLBAS: format 0
+    id[33] = 0x09; // DLFEAT: deallocated reads zeros, Write Zeroes may deallocate
+    put(&mut id, 104, &target.uuid); // NGUID
+    put(&mut id, 128, &((LBA_SHIFT as u32) << 16).to_le_bytes()); // LBAF0: 4 KiB, no metadata
+    id
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_structure_sizes() {
-        assert_eq!(std::mem::size_of::<NvmeTcpPduHeader>(), 8);
-        assert_eq!(std::mem::size_of::<NvmeCommand>(), 64);
-        assert_eq!(std::mem::size_of::<NvmeCompletion>(), 16);
-    }
-}
+#[path = "tests/nvme_tests.rs"]
+mod tests;
