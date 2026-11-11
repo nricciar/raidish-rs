@@ -21,6 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          apt-get install protobuf-compiler
+
       - name: Install Rust toolchain + targets
         uses: dtolnay/rust-toolchain@stable
         with:
