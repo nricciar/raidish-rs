@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install protobuf-compiler
 
       - name: Install Rust toolchain + targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
 
