@@ -173,6 +173,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 size_bytes, volblocksize, VOLBLOCK_ALIGN, MAX_VOLBLOCKSIZE
             )));
         }
+        let _tx = self.begin_tx().await;
         if self.file_index.read().await.files.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);
         }
@@ -203,7 +204,7 @@ impl<D: BlockDevice> FileSystem<D> {
         );
 
         self.persist_root_index().await?;
-        self.commit_txg().await?;
+        self.commit_locked().await?;
         Ok(file_id)
     }
 

@@ -20,7 +20,9 @@
 //! that have since been overwritten.
 
 use crate::disk::{BLOCK_SIZE, BlockDevice};
-use crate::fs::{BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock};
+use crate::fs::{
+    BLOCK_HEADER_SIZE as BLOCK_HEADER, BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock,
+};
 use crate::inode::Extent;
 use crate::raidz::DATA_SHARDS;
 use std::collections::{BTreeMap, VecDeque};
@@ -371,6 +373,9 @@ impl MetaslabState {
     }
 }
 
+/// Per slot block: every (txg, payload, rebuilt-from-parity block) seen.
+type SlotVersions = Vec<Vec<(u64, Vec<u8>, Option<[u8; BLOCK_SIZE]>)>>;
+
 /// Bookkeeping for a metaslab whose slot was written during a TXG sync.
 pub(crate) struct SyncedMetaslab {
     ms_idx: usize,
@@ -569,7 +574,9 @@ impl<D: BlockDevice> FileSystem<D> {
 
             let mut best: Option<(u64, u64, Vec<u8>)> = None;
             for slot in 0..SPACEMAP_SLOTS {
-                if let Some((txg, bytes)) = self.read_slot(self.layout.slot_lba(ms_idx, slot)).await
+                if let Some((txg, bytes)) = self
+                    .read_slot(self.layout.slot_lba(ms_idx, slot), uber_txg)
+                    .await
                     && txg <= uber_txg
                     && best.as_ref().is_none_or(|(t, _, _)| txg > *t)
                 {
@@ -604,26 +611,88 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(out)
     }
 
-    /// Read a slot; valid only if every block checksums and shares one TXG.
-    async fn read_slot(&self, lba: u64) -> Option<(u64, Vec<u8>)> {
-        let mut bytes = Vec::new();
-        let mut slot_txg = None;
-        let mut buf = [0u8; BLOCK_SIZE];
-
+    /// Read a slot: valid at TXG `t` only if every block is a good label
+    /// from TXG `t`. A disk that missed writes while it was away returns
+    /// stale but well-formed blocks, so blocks that disagree are also rebuilt
+    /// from parity, and the slot is taken at the newest TXG (no newer than
+    /// `max_txg`) that every block can reach. Healed blocks are repaired.
+    async fn read_slot(&self, lba: u64, max_txg: u64) -> Option<(u64, Vec<u8>)> {
+        // versions[b]: every (txg, payload, came-from-parity) seen for block b.
+        let mut versions: SlotVersions = Vec::new();
         for b in 0..self.layout.spacemap_slot_blocks {
-            let (txg, len) = self
-                .read_raw_block_checked_into(lba + b, &mut buf)
-                .await
-                .ok()?;
-            match slot_txg {
-                None => slot_txg = Some(txg),
-                Some(t) if t != txg => return None,
-                _ => {}
+            let mut v = Vec::new();
+            let mut buf = [0u8; BLOCK_SIZE];
+            if self.dev.read_block(lba + b, &mut buf).await.is_ok()
+                && let Ok((txg, len)) = crate::fs::parse_label(&buf)
+            {
+                v.push((txg, buf[BLOCK_HEADER..BLOCK_HEADER + len].to_vec(), None));
             }
-            bytes.extend_from_slice(&buf[..len]);
+            versions.push(v);
         }
 
-        slot_txg.map(|t| (t, bytes))
+        let consistent = |versions: &SlotVersions| {
+            let first = versions.first()?.first()?.0;
+            versions
+                .iter()
+                .all(|v| v.len() == 1 && v[0].0 == first)
+                .then_some(first)
+        };
+        if let Some(t) = consistent(&versions)
+            && t <= max_txg
+        {
+            return Some((
+                t,
+                versions.into_iter().flat_map(|v| v[0].1.clone()).collect(),
+            ));
+        }
+
+        // Disagreement: add every rebuild of every block as an alternative.
+        for (b, v) in versions.iter_mut().enumerate() {
+            if let Ok(c) = self.dev.reconstruct_candidates(lba + b as u64).await {
+                for rebuilt in c.rebuilt.into_iter().flatten() {
+                    if let Ok((txg, len)) = crate::fs::parse_label(&rebuilt)
+                        && !v.iter().any(|(t, _, _)| *t == txg)
+                    {
+                        let block: [u8; BLOCK_SIZE] = rebuilt[..].try_into().ok()?;
+                        v.push((
+                            txg,
+                            rebuilt[BLOCK_HEADER..BLOCK_HEADER + len].to_vec(),
+                            Some(block),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut txgs: Vec<u64> = versions
+            .iter()
+            .flat_map(|v| v.iter().map(|(t, _, _)| *t))
+            .filter(|&t| t <= max_txg)
+            .collect();
+        txgs.sort_unstable();
+        txgs.dedup();
+        for &t in txgs.iter().rev() {
+            let picks: Option<Vec<_>> = versions
+                .iter()
+                .map(|v| v.iter().find(|(txg, _, _)| *txg == t))
+                .collect();
+            let Some(picks) = picks else { continue };
+            let mut bytes = Vec::new();
+            for (b, (_, payload, healed)) in picks.into_iter().enumerate() {
+                if let Some(block) = healed {
+                    eprintln!(
+                        "space map: block {} was stale; rebuilt from parity",
+                        lba + b as u64
+                    );
+                    if !self.read_only {
+                        let _ = self.dev.repair_block(lba + b as u64, block).await;
+                    }
+                }
+                bytes.extend_from_slice(payload);
+            }
+            return Some((t, bytes));
+        }
+        None
     }
 
     /// Find all blocks that are allocated but not referenced by any live data

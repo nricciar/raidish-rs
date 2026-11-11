@@ -116,6 +116,23 @@ pub struct BlockHeader {
     pub payload_len: u32,
 }
 
+/// Validate a self-describing label block in place; returns (txg, payload length).
+pub(crate) fn parse_label(buf: &[u8]) -> Result<(u64, usize), FileSystemError> {
+    let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
+    if header.magic != 0x52414944 {
+        return Err(FileSystemError::InvalidMagic);
+    }
+    let payload_len = header.payload_len as usize;
+    if BLOCK_HEADER_SIZE + payload_len > buf.len() {
+        return Err(FileSystemError::ChecksumMismatch);
+    }
+    let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len];
+    if *blake3::hash(payload).as_bytes() != header.checksum {
+        return Err(FileSystemError::ChecksumMismatch);
+    }
+    Ok((header.txg, payload_len))
+}
+
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Arc<RwLock<Option<Superblock>>>,
@@ -133,6 +150,9 @@ pub struct FileSystem<D: BlockDevice> {
     /// Lets concurrent `sync` calls share one commit (group commit).
     commits_started: Arc<AtomicU64>,
     commits_done: Arc<AtomicU64>,
+    /// Opened for inspection: never writes (no commits, no self-heal repairs),
+    /// so it is safe to point at a pool another process is serving.
+    pub(crate) read_only: bool,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -149,6 +169,7 @@ impl<D: BlockDevice> FileSystem<D> {
             commit_lock: Arc::new(Mutex::new(())),
             commits_started: Arc::new(AtomicU64::new(0)),
             commits_done: Arc::new(AtomicU64::new(0)),
+            read_only: false,
         }
     }
 
@@ -235,7 +256,19 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read file system headers and load root file index
     pub async fn load(dev: D) -> Result<Self, FileSystemError> {
+        Self::load_inner(dev, false).await
+    }
+
+    /// Open without ever writing to the device (inspection tools, or reading
+    /// a pool another process is serving). Damaged blocks are still healed in
+    /// memory for the caller, just not repaired on disk.
+    pub async fn load_readonly(dev: D) -> Result<Self, FileSystemError> {
+        Self::load_inner(dev, true).await
+    }
+
+    async fn load_inner(dev: D, read_only: bool) -> Result<Self, FileSystemError> {
         let mut fs = Self::empty(dev);
+        fs.read_only = read_only;
 
         fs.scan_uberblocks().await;
 
@@ -293,6 +326,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn mkdir(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        let _tx = self.begin_tx().await;
         let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         if let Some(ref inode_ref) = old_inode_ref {
@@ -314,13 +348,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
         self.persist_directory_changes(path, parent, Some(new_inode))
             .await?;
-        self.commit_txg().await?;
+        self.commit_locked().await?;
 
         Ok(file_id)
     }
 
     /// Write or overwrite a files contents
     pub async fn write_file(&self, path: &Path, data: &[u8]) -> Result<FileId, FileSystemError> {
+        let _tx = self.begin_tx().await;
         let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         // If exists, ensure it's a file not a directory or virtual block device
@@ -357,13 +392,14 @@ impl<D: BlockDevice> FileSystem<D> {
             self.free_inode(&old_ref).await?;
         }
 
-        self.commit_txg().await?;
+        self.commit_locked().await?;
 
         Ok(file_id)
     }
 
     /// Delete a virtual block device or file
     pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        let _tx = self.begin_tx().await;
         let (mut parent, inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
         let inode_ref = inode_ref.ok_or(FileSystemError::FileNotFound)?;
 
@@ -382,7 +418,7 @@ impl<D: BlockDevice> FileSystem<D> {
         parent.files.remove(filename);
 
         self.persist_directory_changes(path, parent, None).await?;
-        self.commit_txg().await?;
+        self.commit_locked().await?;
 
         Ok(inode.id)
     }
@@ -416,7 +452,19 @@ impl<D: BlockDevice> FileSystem<D> {
         self.commit_locked().await
     }
 
-    async fn commit_locked(&self) -> Result<u64, FileSystemError> {
+    /// Start a metadata transaction: excludes commits (and other metadata
+    /// operations) until dropped, so no commit can capture a half-done
+    /// operation. Finish with `commit_locked` while holding it.
+    pub(crate) async fn begin_tx(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.commit_lock.lock().await
+    }
+
+    pub(crate) async fn commit_locked(&self) -> Result<u64, FileSystemError> {
+        if self.read_only {
+            return Err(FileSystemError::InvalidArgument(
+                "pool opened read-only".into(),
+            ));
+        }
         let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
 
         let txg = self.open_txg().await?;
@@ -534,42 +582,18 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    /// Returns the blocks raw payload excluding headers
-    pub(crate) async fn read_raw_block_checked_into(
-        &self,
-        lba: BlockId,
-        buf: &mut [u8],
-    ) -> Result<(u64, usize), FileSystemError> {
-        assert!(buf.len() >= BLOCK_SIZE);
-
-        self.dev.read_block(lba, buf).await?;
-
-        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
-
-        if header.magic != 0x52414944 {
-            return Err(FileSystemError::InvalidMagic);
-        }
-
-        let payload_len = header.payload_len as usize;
-        let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + header.payload_len as usize];
-
-        // Checksum verification
-        let checksum = *blake3::hash(payload).as_bytes();
-        if checksum != header.checksum {
-            return Err(FileSystemError::ChecksumMismatch);
-        }
-
-        buf.copy_within(BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len, 0);
-
-        Ok((header.txg, payload_len))
-    }
-
     async fn scan_uberblocks(&self) -> Option<(u64, Uberblock)> {
-        // Load superblock (TXG 0 from format)
-        match self.read_block_checked::<Superblock>(SUPERBLOCK_LBA).await {
-            Ok((_, superblock)) => *self.superblock.write().await = Some(superblock),
-            Err(e) => {
-                println!("WARNING! {:?}", e);
+        // The superblock is written to three mirrors; use the first good one.
+        for mirror in 0..3 {
+            match self
+                .read_block_checked::<Superblock>(SUPERBLOCK_LBA + mirror)
+                .await
+            {
+                Ok((_, superblock)) => {
+                    *self.superblock.write().await = Some(superblock);
+                    break;
+                }
+                Err(e) => eprintln!("superblock mirror {}: {:?}", mirror, e),
             }
         }
 
@@ -628,3 +652,7 @@ impl<D: BlockDevice> FileSystem<D> {
 #[cfg(test)]
 #[path = "tests/fs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/crash_tests.rs"]
+mod crash_tests;

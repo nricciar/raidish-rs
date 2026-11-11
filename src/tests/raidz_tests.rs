@@ -302,11 +302,15 @@ async fn full_stripe_writes_have_valid_parity() {
     raidz.write_blocks(60, &data).await.unwrap();
     raidz.flush().await.unwrap();
 
-    // Each data block must be reconstructible (and verifiable) from the others.
+    // Every way of rebuilding each data block from the other disks must
+    // agree with what was written (i.e. parity is consistent).
     for i in 0..12u64 {
-        let mut rebuilt = vec![0u8; BLOCK_SIZE];
-        raidz.reconstruct_block(60 + i, &mut rebuilt).await.unwrap();
+        let c = raidz.reconstruct_candidates(60 + i).await.unwrap();
         let at = i as usize * BLOCK_SIZE;
-        assert_eq!(rebuilt, data[at..at + BLOCK_SIZE], "block {}", 60 + i);
+        let rebuilt: Vec<_> = c.rebuilt.iter().flatten().collect();
+        assert_eq!(rebuilt.len(), DISKS - 1, "block {}", 60 + i);
+        for r in rebuilt {
+            assert_eq!(&r[..], &data[at..at + BLOCK_SIZE], "block {}", 60 + i);
+        }
     }
 }

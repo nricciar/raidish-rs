@@ -96,7 +96,16 @@ impl BlockDevice for RaidZ {
                     let disk = &self.stripe.disks[i];
                     read_tasks.push(async move {
                         let mut buf = [0u8; BLOCK_SIZE];
-                        disk.read_block(stripe_id, &mut buf).await.map(|_| (i, buf))
+                        // A missing disk shouldn't block the write: rebuild
+                        // the shard from the rest of the stripe instead.
+                        if disk.read_block(stripe_id, &mut buf).await.is_err() {
+                            self.reconstruct_from_stripe(stripe_id, i, &mut buf)
+                                .await
+                                .map_err(|e| {
+                                    DiskError::IoError(std::io::Error::other(format!("{}", e)))
+                                })?;
+                        }
+                        Ok::<_, DiskError>((i, buf))
                     });
                 }
 
@@ -110,10 +119,11 @@ impl BlockDevice for RaidZ {
                 }
             }
 
-            // Now stripe is complete, write it
+            // Now stripe is complete, write it. On failure the stripe stays
+            // buffered, so a later flush retries it.
             self.write_full_stripe(&stripe_buf, stripe_id)
                 .await
-                .unwrap();
+                .map_err(|e| DiskError::IoError(std::io::Error::other(format!("{}", e))))?;
 
             if let Some(buffer) = stripe_buf.take_buffer() {
                 let _ = self.stripe_pool.push(buffer);
@@ -123,7 +133,14 @@ impl BlockDevice for RaidZ {
             self.writes.remove(&stripe_id);
         }
 
-        self.stripe.flush().await?;
+        // Like stripe writes, flushing tolerates up to PARITY_SHARDS failed
+        // disks: the data is still recoverable from the rest.
+        let flushes = self.stripe.disks.iter().map(|d| d.flush());
+        let results = futures::future::join_all(flushes).await;
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        if failures > PARITY_SHARDS {
+            return results.into_iter().find(Result::is_err).unwrap();
+        }
 
         Ok(())
     }
@@ -275,17 +292,58 @@ impl BlockDevice for RaidZ {
         Ok(())
     }
 
-    async fn reconstruct_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn reconstruct_candidates(
+        &self,
+        lba: BlockId,
+    ) -> Result<crate::disk::Candidates, DiskError> {
         let stripe_id = lba / DATA_SHARDS as u64;
-        let data_index = (lba % DATA_SHARDS as u64) as usize;
-        self.reconstruct_verified(stripe_id, data_index, buf)
-            .await
-            .map_err(|e| {
-                DiskError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{}", e),
-                ))
-            })
+        let target = (lba % DATA_SHARDS as u64) as usize;
+        let reads = (0..DISKS).filter(|&i| i != target).map(|i| async move {
+            let mut buf = [0u8; BLOCK_SIZE];
+            self.stripe.disks[i]
+                .read_block(stripe_id, &mut buf)
+                .await
+                .map(|_| (i, buf))
+        });
+        let mut shards = [[0u8; BLOCK_SIZE]; DISKS];
+        let mut present = [false; DISKS];
+        for (i, buf) in futures::future::join_all(reads).await.into_iter().flatten() {
+            shards[i] = buf;
+            present[i] = true;
+        }
+
+        let mut out = vec![None; DISKS];
+        for (exclude, slot) in out.iter_mut().enumerate() {
+            if exclude == target {
+                continue;
+            }
+            let mut using = present;
+            using[exclude] = false;
+            if using.iter().filter(|&&p| p).count() < DATA_SHARDS {
+                continue;
+            }
+            // Exactly DATA_SHARDS inputs, so the decoder can't mix in a bad one.
+            let mut kept = 0;
+            for u in using.iter_mut() {
+                if *u {
+                    kept += 1;
+                    if kept > DATA_SHARDS {
+                        *u = false;
+                    }
+                }
+            }
+            let mut rebuilt = [0u8; BLOCK_SIZE];
+            if self
+                .reconstruct_shard(&mut shards.clone(), &using, target, &mut rebuilt)
+                .is_ok()
+            {
+                *slot = Some(rebuilt.to_vec());
+            }
+        }
+        Ok(crate::disk::Candidates {
+            disk: target,
+            rebuilt: out,
+        })
     }
 
     async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
@@ -436,57 +494,6 @@ impl RaidZ {
         } else {
             Err(RaidZError::IncompleteStripe(first_stripe))
         }
-    }
-
-    /// Rebuild data shard `target` from the rest of the stripe and only
-    /// return it if the stripe is self-consistent: the shard is rebuilt with
-    /// the first parity, then the stripe is re-encoded and checked against the
-    /// second. A stripe with another bad shard fails instead of yielding a
-    /// plausible-looking wrong block. If a disk can't be read there is nothing
-    /// to cross-check against, so fall back to a plain reconstruction.
-    async fn reconstruct_verified(
-        &self,
-        stripe_id: u64,
-        target: usize,
-        output: &mut [u8],
-    ) -> Result<(), RaidZError> {
-        let reads = (0..DISKS).filter(|&i| i != target).map(|i| async move {
-            let mut buf = [0u8; BLOCK_SIZE];
-            self.stripe.disks[i]
-                .read_block(stripe_id, &mut buf)
-                .await
-                .map(|_| (i, buf))
-        });
-
-        let mut shards = [[0u8; BLOCK_SIZE]; DISKS];
-        let mut present = [false; DISKS];
-        for (i, buf) in futures::future::join_all(reads).await.into_iter().flatten() {
-            shards[i] = buf;
-            present[i] = true;
-        }
-        if present.iter().filter(|&&p| p).count() < DISKS - 1 {
-            return self
-                .reconstruct_from_stripe(stripe_id, target, output)
-                .await;
-        }
-
-        let spare = DATA_SHARDS + 1;
-        let mut using = present;
-        using[spare] = false;
-        let mut rebuilt = [0u8; BLOCK_SIZE];
-        self.reconstruct_shard(&mut shards, &using, target, &mut rebuilt)?;
-
-        let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
-        for (i, shard) in shards.iter().enumerate().take(DATA_SHARDS) {
-            encoder.add_original_shard(if i == target { &rebuilt } else { shard })?;
-        }
-        let encoded = encoder.encode()?;
-        if encoded.recovery(1) != Some(&shards[spare][..]) {
-            return Err(RaidZError::InconsistentStripe(stripe_id));
-        }
-
-        output[..BLOCK_SIZE].copy_from_slice(&rebuilt);
-        Ok(())
     }
 
     fn reconstruct_shard(

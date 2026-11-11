@@ -170,25 +170,25 @@ async fn main() -> std::io::Result<()> {
                 .unwrap();
         }
         Commands::Map => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             fs.display_block_map().await;
         }
         Commands::Metaslab => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             fs.display_metaslab_info().await;
         }
         Commands::Orphaned => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
         }
         Commands::Read { path } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             let data = fs.read_file(&Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
         Commands::Inode { file } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             let inode_ref = fs.file_index.read().await.files.get(&file).unwrap().clone();
             let inode = fs.read_inode(&inode_ref).await.unwrap();
             println!("inode: {:?}", inode);
@@ -206,7 +206,7 @@ async fn main() -> std::io::Result<()> {
             fs.sync().await.unwrap();
         }
         Commands::Ls { path } => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             let ls = fs.ls(&Path::new(&path)).await.unwrap();
             println!("ls: {:?}", &ls);
         }
@@ -234,7 +234,7 @@ async fn main() -> std::io::Result<()> {
             );
         }
         Commands::Load => {
-            let fs = FileSystem::load(raid).await.unwrap();
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
             println!("index: {:?}", fs.file_index);
         }
         Commands::Listen { port, id } => {

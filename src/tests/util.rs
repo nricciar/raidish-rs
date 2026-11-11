@@ -84,3 +84,122 @@ impl TestPool {
         f.sync_all().unwrap();
     }
 }
+
+/// Wraps a device and fails writes on demand, to exercise error paths.
+/// `fail_after(n)`: the next `n` write calls succeed, every later one fails.
+pub struct FaultyDev<D> {
+    inner: D,
+    remaining: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+#[derive(Clone)]
+pub struct FaultSwitch(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+impl FaultSwitch {
+    pub fn fail_after(&self, writes: i64) {
+        self.0.store(writes, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn heal(&self) {
+        self.0.store(-1, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn remaining(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Has an injected failure been hit (i.e. has the "crash" happened)?
+    pub fn tripped(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+}
+
+impl<D> FaultyDev<D> {
+    pub fn new(inner: D) -> (Self, FaultSwitch) {
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        (
+            FaultyDev {
+                inner,
+                remaining: remaining.clone(),
+            },
+            FaultSwitch(remaining),
+        )
+    }
+
+    fn check(&self) -> Result<(), crate::disk::DiskError> {
+        use std::sync::atomic::Ordering;
+        let r = self.remaining.load(Ordering::SeqCst);
+        if r < 0 {
+            return Ok(());
+        }
+        if r == 0 {
+            return Err(crate::disk::DiskError::IoError(std::io::Error::other(
+                "injected write failure",
+            )));
+        }
+        self.remaining.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
+    async fn flush(&self) -> Result<(), crate::disk::DiskError> {
+        self.inner.flush().await
+    }
+    async fn read_block(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+        self.inner.read_block(b, buf).await
+    }
+    async fn read_blocks(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+        self.inner.read_blocks(b, buf).await
+    }
+    async fn write_block(
+        &self,
+        b: u64,
+        buf: &[u8; crate::disk::BLOCK_SIZE],
+    ) -> Result<(), crate::disk::DiskError> {
+        self.check()?;
+        self.inner.write_block(b, buf).await
+    }
+    async fn write_blocks(&self, b: u64, buf: &[u8]) -> Result<(), crate::disk::DiskError> {
+        self.check()?;
+        self.inner.write_blocks(b, buf).await
+    }
+    async fn reconstruct_candidates(
+        &self,
+        b: u64,
+    ) -> Result<crate::disk::Candidates, crate::disk::DiskError> {
+        self.inner.reconstruct_candidates(b).await
+    }
+    async fn repair_block(
+        &self,
+        b: u64,
+        buf: &[u8; crate::disk::BLOCK_SIZE],
+    ) -> Result<(), crate::disk::DiskError> {
+        self.inner.repair_block(b, buf).await
+    }
+}
+
+impl TestPool {
+    pub async fn format_faulty(&self) -> (FileSystem<FaultyDev<RaidZ>>, FaultSwitch) {
+        let (dev, switch) = FaultyDev::new(self.dev().await);
+        (FileSystem::format(dev, TOTAL_BLOCKS).await.unwrap(), switch)
+    }
+}
+
+impl TestPool {
+    /// Open the pool with the given disks unavailable (as if unplugged).
+    pub async fn dev_without(&self, missing: &[usize]) -> RaidZ {
+        let p: Vec<String> = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if missing.contains(&i) {
+                    "/nonexistent-raidish-test/disk".to_string()
+                } else {
+                    p.to_str().unwrap().to_string()
+                }
+            })
+            .collect();
+        let stripe = Stripe::new([&p[0], &p[1], &p[2], &p[3], &p[4]], DATA_SHARDS).await;
+        RaidZ::new(stripe).await
+    }
+}

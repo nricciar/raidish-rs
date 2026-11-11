@@ -144,7 +144,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let n = ptr.data_blocks();
         let mut raw = vec![0u8; n as usize * BLOCK_SIZE];
         self.dev.read_blocks(ptr.lba, &mut raw).await?;
-        let mut blocks: Vec<Vec<u8>> = raw.chunks(BLOCK_SIZE).map(|b| b.to_vec()).collect();
+        let blocks: Vec<Vec<u8>> = raw.chunks(BLOCK_SIZE).map(|b| b.to_vec()).collect();
 
         let lsize = ptr.lsize as usize;
         let assemble = |blocks: &[Vec<u8>]| -> Vec<u8> {
@@ -158,49 +158,76 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(data);
         }
 
-        // Rebuild every block from the other disks (a block we can't rebuild
-        // keeps what we read).
+        // Rebuild every block several ways (see `Candidates`), then test
+        // hypotheses about which disks are bad; the record checksum decides.
         let rebuilds = (0..n).map(|i| async move {
-            let mut block = vec![0u8; BLOCK_SIZE];
-            match self.dev.reconstruct_block(ptr.lba + i, &mut block).await {
-                Ok(()) => Some(block),
-                Err(_) => None,
-            }
+            self.dev
+                .reconstruct_candidates(ptr.lba + i)
+                .await
+                .unwrap_or_default()
         });
-        let rebuilt: Vec<Option<Vec<u8>>> = futures::future::join_all(rebuilds).await;
+        let cands: Vec<crate::disk::Candidates> = futures::future::join_all(rebuilds).await;
+        let disks = cands.iter().map(|c| c.rebuilt.len()).max().unwrap_or(0);
 
-        // First assume a single bad block, then that every differing block is bad.
-        let mut candidates: Vec<Vec<usize>> = (0..n as usize)
-            .filter(|&i| rebuilt[i].as_ref().is_some_and(|r| *r != blocks[i]))
-            .map(|i| vec![i])
-            .collect();
-        let all: Vec<usize> = candidates.iter().map(|c| c[0]).collect();
-        if all.len() > 1 {
-            candidates.push(all);
+        // Hypotheses: every single disk and every pair of disks is bad (two
+        // is all the parity can cover). Under a hypothesis, each block on a
+        // bad disk is rebuilt without the bad disks; other blocks stay as read.
+        let mut hypotheses: Vec<Vec<usize>> = (0..disks).map(|d| vec![d]).collect();
+        for a in 0..disks {
+            for b in a + 1..disks {
+                hypotheses.push(vec![a, b]);
+            }
+        }
+        let mut trials: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
+        'hypothesis: for bad in &hypotheses {
+            let mut fix = Vec::new();
+            for (i, c) in cands.iter().enumerate() {
+                if c.rebuilt.is_empty() || !bad.contains(&c.disk) {
+                    continue;
+                }
+                // Rebuild without the *other* bad disk; if this is the only
+                // one, any rebuild will do (they agree when the rest is good).
+                let other = bad.iter().find(|&&d| d != c.disk);
+                let rebuilt = match other {
+                    Some(&d) => c.rebuilt.get(d).cloned().flatten(),
+                    None => c.rebuilt.iter().flatten().next().cloned(),
+                };
+                let Some(rebuilt) = rebuilt else {
+                    continue 'hypothesis;
+                };
+                if rebuilt != blocks[i] {
+                    fix.push((i, rebuilt));
+                }
+            }
+            if !fix.is_empty() && !trials.contains(&fix) {
+                trials.push(fix);
+            }
         }
 
-        for bad in candidates {
+        for fix in trials {
             let mut trial = blocks.clone();
-            for &i in &bad {
-                trial[i] = rebuilt[i].clone().unwrap();
+            for (i, b) in &fix {
+                trial[*i] = b.clone();
             }
             let data = assemble(&trial);
             if *blake3::hash(&data).as_bytes() != ptr.checksum {
                 continue;
             }
-            for &i in &bad {
-                let lba = ptr.lba + i as u64;
+            for (i, b) in &fix {
+                let lba = ptr.lba + *i as u64;
                 eprintln!(
                     "self-heal: block {} failed its checksum; rebuilt from parity",
                     lba
                 );
-                let fixed: &[u8; BLOCK_SIZE] = trial[i].as_slice().try_into().unwrap();
+                let fixed: &[u8; BLOCK_SIZE] = b.as_slice().try_into().unwrap();
+                if self.read_only {
+                    continue;
+                }
                 if let Err(e) = self.dev.repair_block(lba, fixed).await {
                     eprintln!("self-heal: unable to repair block {}: {}", lba, e);
                 }
             }
-            blocks = trial;
-            return Ok(assemble(&blocks));
+            return Ok(data);
         }
 
         Err(FileSystemError::ChecksumMismatch)

@@ -60,7 +60,9 @@ impl RaidZ {
         // Serving blocks doesn't need a formatted pool (that's how a remote
         // client formats it in the first place).
         let disks = self.stripe.disks.clone();
-        let fs = match FileSystem::load(self).await {
+        // Read-only: this process only serves raw blocks; the pool's writer is
+        // whoever formats/serves it remotely.
+        let fs = match FileSystem::load_readonly(self).await {
             Ok(fs) => Some(fs),
             Err(e) => {
                 println!("serving raw disks only ({})", e);

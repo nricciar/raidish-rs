@@ -506,3 +506,47 @@ fn record_cache_is_bounded() {
     // Same lba, newer birth TXG: a different entry, never a stale hit.
     assert!(c.get((n as u64 - 1, 2)).is_none());
 }
+
+/// A sync that fails after caching new indirect blocks hands their space
+/// back, and the retry (same TXG, so same birth_txg) reuses those LBAs for
+/// different contents. That is safe only because every indirect written
+/// re-inserts its cache entry; this guards that invariant.
+#[tokio::test]
+async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
+    let pool = TestPool::new().await;
+    let (fs, faults) = pool.format_faulty().await;
+    fs.create_block("vol", 64 * MB, VOLBLOCK_ALIGN)
+        .await
+        .unwrap();
+    let vbs = VOLBLOCK_ALIGN as usize;
+
+    // Two levels: record 600 needs an L1 indirect and the root indirect.
+    assert_eq!(fs.open_volume("vol").await.unwrap().levels, 2);
+    let rec = 600u64;
+    fs.block_write("vol", rec * vbs as u64, &pattern(vbs, 1))
+        .await
+        .unwrap();
+    // Sync writes: the data record, then L1 (cached), then the root -> fail it.
+    faults.fail_after(2);
+    assert!(fs.sync().await.is_err());
+    faults.heal();
+
+    // Change the record so the retry's L1 has different contents.
+    let second = pattern(vbs, 2);
+    fs.block_write("vol", rec * vbs as u64, &second)
+        .await
+        .unwrap();
+    fs.sync().await.unwrap();
+
+    assert!(read_any(&fs, rec * vbs as u64, vbs).await == second);
+}
+
+async fn read_any<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+    fs: &FileSystem<D>,
+    offset: u64,
+    len: usize,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    fs.block_read("vol", offset, &mut buf).await.unwrap();
+    buf
+}

@@ -99,9 +99,10 @@ pub trait BlockDevice: Send + Sync {
         Ok(())
     }
 
-    /// Rebuild a block from redundancy *without* reading its primary copy.
-    /// Used when a block reads fine but fails its checksum.
-    async fn reconstruct_block(&self, _block: BlockId, _buf: &mut [u8]) -> Result<(), DiskError> {
+    /// Alternative rebuilds of a block, for a caller with an end-to-end
+    /// checksum that has to work out which disks are wrong (e.g. a disk that
+    /// came back stale after an outage, plus a corrupt one).
+    async fn reconstruct_candidates(&self, _block: BlockId) -> Result<Candidates, DiskError> {
         Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
     }
 
@@ -113,6 +114,14 @@ pub trait BlockDevice: Send + Sync {
     ) -> Result<(), DiskError> {
         Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
     }
+}
+
+/// Rebuilds of one block. `rebuilt[d]` is the block reconstructed without
+/// its own disk (`disk`) and without disk `d`; None if not possible.
+#[derive(Debug, Clone, Default)]
+pub struct Candidates {
+    pub disk: usize,
+    pub rebuilt: Vec<Option<Vec<u8>>>,
 }
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
