@@ -1,0 +1,99 @@
+#!/bin/bash
+# raidish-nbd-test: the only privileged operations needed to test raidish
+# volumes through the kernel NBD client. Meant to be run via a single
+# NOPASSWD sudo rule, so it must be INSTALLED ROOT-OWNED (not run from the
+# repo, which your user can write to):
+#
+#   sudo install -o root -g root -m 0755 hack/raidish-nbd-test /usr/local/sbin/
+#
+# Everything is fixed: one device, one mountpoint, localhost only. The NBD
+# server itself (raidish nbd ...) runs unprivileged as your user.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+DEV=/dev/nbd15
+MNT=/mnt/raidish-test
+HOST=127.0.0.1
+PORT=10809
+# Untrusted image contents: never honour setuid bits or device nodes.
+MOUNT_OPTS=nosuid,nodev,noexec
+
+die() { echo "raidish-nbd-test: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must be run via sudo"
+OWNER_UID=${SUDO_UID:?must be run via sudo}
+OWNER_GID=${SUDO_GID:?must be run via sudo}
+
+connected() { nbd-client -c "$DEV" >/dev/null 2>&1; }
+mounted() { findmnt -rn "$MNT" >/dev/null 2>&1; }
+need_connected() { connected || die "$DEV is not connected"; }
+need_unmounted() { ! mounted || die "$MNT is mounted"; }
+
+usage() {
+    cat >&2 <<EOF
+usage: sudo raidish-nbd-test <command> [export]
+  connect [name]  attach $DEV to nbd://$HOST:$PORT (export name: [A-Za-z0-9_-], default vol0)
+  disconnect      detach $DEV (unmounts first if needed)
+  mkfs            mkfs.ext4 on $DEV (must not be mounted)
+  mount           mount $DEV on $MNT ($MOUNT_OPTS), root dir owned by you
+  umount          unmount $MNT
+  fsck            read-only e2fsck -f -n of $DEV (must not be mounted)
+  fstrim          discard unused blocks of the filesystem mounted on $MNT
+  dropcaches      flush $DEV buffers and drop the page cache
+  status          show connection and mount state
+EOF
+    exit 2
+}
+
+cmd=${1:-}
+case "$cmd" in
+connect)
+    name=${2:-vol0}
+    [[ $name =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "bad export name"
+    connected && die "$DEV is already connected"
+    modprobe nbd
+    nbd-client -N "$name" -b 4096 "$HOST" "$PORT" "$DEV"
+    ;;
+disconnect)
+    if mounted; then umount "$MNT"; fi
+    nbd-client -d "$DEV"
+    ;;
+mkfs)
+    need_connected
+    need_unmounted
+    mkfs.ext4 -F -q "$DEV"
+    ;;
+mount)
+    need_connected
+    need_unmounted
+    mkdir -p "$MNT"
+    mount -t ext4 -o "$MOUNT_OPTS" "$DEV" "$MNT"
+    chown "$OWNER_UID:$OWNER_GID" "$MNT"
+    ;;
+umount)
+    mounted || die "$MNT is not mounted"
+    umount "$MNT"
+    ;;
+fsck)
+    need_connected
+    need_unmounted
+    e2fsck -f -n "$DEV"
+    ;;
+fstrim)
+    mounted || die "$MNT is not mounted"
+    fstrim -v "$MNT"
+    ;;
+dropcaches)
+    sync
+    if connected; then blockdev --flushbufs "$DEV"; fi
+    echo 3 >/proc/sys/vm/drop_caches
+    ;;
+status)
+    if connected; then echo "$DEV: connected"; else echo "$DEV: disconnected"; fi
+    if mounted; then findmnt -n "$MNT"; else echo "$MNT: not mounted"; fi
+    ;;
+*)
+    usage
+    ;;
+esac

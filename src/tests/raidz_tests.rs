@@ -247,3 +247,66 @@ async fn test_random_access_pattern() {
         );
     }
 }
+
+fn pattern(blocks: usize, seed: u8) -> Vec<u8> {
+    (0..blocks * BLOCK_SIZE)
+        .map(|i| ((i / 7) as u8).wrapping_add(seed))
+        .collect()
+}
+
+#[tokio::test]
+async fn range_io_round_trips_at_every_alignment() {
+    let (raidz, _t) = create_test_raidz().await;
+    // Every (start % 3, len % 3) combination, plus multi-stripe spans.
+    let mut lba = 300;
+    for start_off in 0..3u64 {
+        for blocks in [1usize, 2, 3, 4, 5, 6, 7, 31] {
+            let start = lba + start_off;
+            let data = pattern(blocks, (start + blocks as u64) as u8);
+            raidz.write_blocks(start, &data).await.unwrap();
+            let mut got = vec![0u8; data.len()];
+            raidz.read_blocks(start, &mut got).await.unwrap();
+            assert_eq!(got, data, "before flush: start {} blocks {}", start, blocks);
+
+            raidz.flush().await.unwrap();
+            let mut got = vec![0u8; data.len()];
+            raidz.read_blocks(start, &mut got).await.unwrap();
+            assert_eq!(got, data, "after flush: start {} blocks {}", start, blocks);
+            lba += 60;
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_stripe_write_supersedes_buffered_partial() {
+    let (raidz, _t) = create_test_raidz().await;
+    // Buffer a partial write to stripe 10, then overwrite the whole stripe.
+    let stale = pattern(1, 1);
+    raidz
+        .write_block(30, stale.as_slice().try_into().unwrap())
+        .await
+        .unwrap();
+    let fresh = pattern(3, 2);
+    raidz.write_blocks(30, &fresh).await.unwrap();
+    raidz.flush().await.unwrap();
+
+    let mut got = vec![0u8; fresh.len()];
+    raidz.read_blocks(30, &mut got).await.unwrap();
+    assert_eq!(got, fresh);
+}
+
+#[tokio::test]
+async fn full_stripe_writes_have_valid_parity() {
+    let (raidz, _t) = create_test_raidz().await;
+    let data = pattern(12, 5);
+    raidz.write_blocks(60, &data).await.unwrap();
+    raidz.flush().await.unwrap();
+
+    // Each data block must be reconstructible (and verifiable) from the others.
+    for i in 0..12u64 {
+        let mut rebuilt = vec![0u8; BLOCK_SIZE];
+        raidz.reconstruct_block(60 + i, &mut rebuilt).await.unwrap();
+        let at = i as usize * BLOCK_SIZE;
+        assert_eq!(rebuilt, data[at..at + BLOCK_SIZE], "block {}", 60 + i);
+    }
+}

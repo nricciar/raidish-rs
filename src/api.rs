@@ -2,7 +2,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::raidz::RaidZ;
 use crate::stripe::Caddy;
-use crate::websocket::{WsOp, WsRequest, WsResponseBuilder, WsStatus};
+use crate::websocket::{WsOp, WsRequest, WsStatus, encode_response};
 use etcd_client::{Client, GetOptions, LockOptions};
 use rocket::data::{Data, ToByteUnit};
 use rocket::figment::util::map;
@@ -20,8 +20,20 @@ pub struct EtcdConfig {
 }
 
 pub struct RaidZServer {
-    fs: FileSystem<RaidZ>,
+    disks: Arc<Vec<Caddy>>,
+    /// Only present if the local disks hold a formatted pool.
+    fs: Option<FileSystem<RaidZ>>,
     etcd_client: Option<Client>,
+}
+
+impl RaidZServer {
+    fn local_disk(&self, disk_index: usize) -> Result<&Caddy, Status> {
+        let disk = self.disks.get(disk_index).ok_or(Status::NotFound)?;
+        if !disk.is_local() {
+            return Err(Status::BadRequest);
+        }
+        Ok(disk)
+    }
 }
 
 impl RaidZ {
@@ -45,8 +57,19 @@ impl RaidZ {
             _ => None,
         };
 
+        // Serving blocks doesn't need a formatted pool (that's how a remote
+        // client formats it in the first place).
+        let disks = self.stripe.disks.clone();
+        let fs = match FileSystem::load(self).await {
+            Ok(fs) => Some(fs),
+            Err(e) => {
+                println!("serving raw disks only ({})", e);
+                None
+            }
+        };
         let server = RaidZServer {
-            fs: FileSystem::load(self).await.unwrap(),
+            disks,
+            fs,
             etcd_client,
         };
 
@@ -81,18 +104,9 @@ async fn get_block(
     block_id: u64,
     server: &State<RaidZServer>,
 ) -> Result<Vec<u8>, Status> {
-    // Check if disk_index is valid
-    if disk_index >= server.fs.dev.stripe.disks.len() {
-        return Err(Status::NotFound);
-    }
-
-    // Check if this is a local disk (not remote)
-    if !server.fs.dev.is_local_disk(disk_index) {
-        return Err(Status::BadRequest);
-    }
-
     let mut buf = vec![0u8; BLOCK_SIZE];
-    server.fs.dev.stripe.disks[disk_index]
+    server
+        .local_disk(disk_index)?
         .read_block(block_id, &mut buf)
         .await
         .unwrap();
@@ -119,19 +133,10 @@ async fn put_block(
         return Err(Status::BadRequest);
     }
 
-    // Check if disk_index is valid
-    if disk_index >= server.fs.dev.stripe.disks.len() {
-        return Err(Status::NotFound);
-    }
-
-    // Check if this is a local disk (not remote)
-    if !server.fs.dev.is_local_disk(disk_index) {
-        return Err(Status::BadRequest);
-    }
-
     let bytes = &bytes.as_slice().try_into().unwrap();
-    server.fs.dev.stripe.disks[disk_index]
-        .write_block(block_id, &bytes)
+    server
+        .local_disk(disk_index)?
+        .write_block(block_id, bytes)
         .await
         .unwrap();
 
@@ -163,12 +168,12 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
         println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
     }
 
-    let disk_info: Vec<_> = (0..server.fs.dev.stripe.disks.len())
+    let disk_info: Vec<_> = (0..server.disks.len())
         .map(|i| {
             serde_json::json!({
                 "index": i,
-                "is_local": server.fs.dev.is_local_disk(i),
-                "servable": server.fs.dev.is_local_disk(i)
+                "is_local": server.disks[i].is_local(),
+                "servable": server.disks[i].is_local()
             })
         })
         .collect();
@@ -179,22 +184,13 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
 async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
-    // Check if disk_index is valid
-    if disk_index >= server.fs.dev.stripe.disks.len() {
-        return Status::NotFound;
+    match server.local_disk(disk_index) {
+        Ok(disk) => match disk.flush().await {
+            Ok(()) => Status::Ok,
+            Err(_) => Status::InternalServerError,
+        },
+        Err(status) => status,
     }
-
-    // Check if this is a local disk (not remote)
-    if !server.fs.dev.is_local_disk(disk_index) {
-        return Status::BadRequest;
-    }
-
-    server.fs.dev.stripe.disks[disk_index]
-        .flush()
-        .await
-        .unwrap();
-
-    Status::Ok
 }
 
 #[get("/api/v1/files/<path..>")]
@@ -202,8 +198,8 @@ async fn read_file(
     path: std::path::PathBuf,
     server: &State<RaidZServer>,
 ) -> Result<Vec<u8>, Status> {
-    // Read the file from the filesystem
-    match server.fs.read_file(path.as_path()).await {
+    let fs = server.fs.as_ref().ok_or(Status::ServiceUnavailable)?;
+    match fs.read_file(path.as_path()).await {
         Ok(data) => Ok(data),
         Err(err) => match err {
             FileSystemError::FileNotFound => Err(Status::NotFound),
@@ -216,67 +212,91 @@ async fn read_file(
     }
 }
 
-/// WebSocket endpoint for efficient block I/O
-/// Message format (binary):
-///   Request:  [op:1][disk_index:2][block_id:8][data:0/4096]
-///     op=0: read, op=1: write
-///   Response: [status:1][data:0/4096]
-///     status=0: success, status=1: error (not found/not local), status=2: invalid request
+/// WebSocket endpoint for block I/O (protocol in `crate::websocket`).
+///
+/// Requests are handled concurrently and answered as they complete, so a
+/// client can keep many requests in flight on one connection.
 #[get("/ws")]
 async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<'static> {
-    let disks = server.fs.dev.stripe.disks.clone();
+    let disks = server.disks.clone();
 
-    ws.channel(move |mut stream| {
+    ws.channel(move |stream| {
         Box::pin(async move {
-            while let Some(message) = stream.next().await {
-                if let Ok(ws::Message::Binary(data)) = message {
-                    let response = match handle_ws_message(&data, &disks).await {
-                        Ok(resp) => resp,
-                        Err(err) => WsResponseBuilder::error(err),
-                    };
-                    let _ = stream.send(ws::Message::Binary(response)).await;
+            let (mut sink, mut source) = stream.split();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+            let writer = tokio::spawn(async move {
+                while let Some(response) = rx.recv().await {
+                    if sink.send(ws::Message::Binary(response)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            while let Some(message) = source.next().await {
+                match message {
+                    Ok(ws::Message::Binary(data)) => {
+                        let (disks, tx) = (disks.clone(), tx.clone());
+                        tokio::spawn(async move {
+                            let _ = tx.send(handle_ws_message(&data, &disks).await);
+                        });
+                    }
+                    Ok(ws::Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
                 }
             }
+
+            drop(tx);
+            let _ = writer.await;
             Ok(())
         })
     })
 }
 
-async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Result<Vec<u8>, WsStatus> {
-    let request = WsRequest::parse(data)?;
+async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
+    let Some(request) = WsRequest::parse(data) else {
+        return encode_response(WsStatus::InvalidRequest, 0, &[]);
+    };
+    let id = request.id();
+    match serve_request(&request, disks).await {
+        Ok(payload) => encode_response(WsStatus::Success, id, &payload),
+        Err(status) => encode_response(status, id, &[]),
+    }
+}
 
-    let op = request.op()?;
-
+async fn serve_request(
+    request: &WsRequest<'_>,
+    disks: &Arc<Vec<Caddy>>,
+) -> Result<Vec<u8>, WsStatus> {
+    let op = request.op().ok_or(WsStatus::InvalidRequest)?;
     let disk_index = request.disk_index() as usize;
-    let block_id = request.block_id();
+    let block = request.block_id();
+    let count = request.count();
 
-    // Validate disk access
-    if disk_index >= disks.len() || !disks[disk_index].is_local() {
-        return Err(WsStatus::ErrorNotFound);
+    let disk = disks
+        .get(disk_index)
+        .filter(|d| d.is_local())
+        .ok_or(WsStatus::ErrorNotFound)?;
+    if count > crate::websocket::WS_MAX_BLOCKS {
+        return Err(WsStatus::InvalidRequest);
     }
 
     match op {
         WsOp::Read => {
-            let mut buffer = [0u8; BLOCK_SIZE];
-            disks[disk_index].read_block(block_id, &mut buffer).await?;
-            Ok(WsResponseBuilder::with_data(&buffer))
+            let mut buffer = vec![0u8; count as usize * BLOCK_SIZE];
+            disk.read_blocks(block, &mut buffer).await?;
+            Ok(buffer)
         }
         WsOp::Write => {
-            let write_data = request.write_data().ok_or(WsStatus::InvalidRequest)?;
-
-            let block_array: &[u8; BLOCK_SIZE] = match write_data.try_into() {
-                Ok(arr) => arr,
-                Err(_) => return Err(WsStatus::InvalidRequest),
-            };
-
-            disks[disk_index].write_block(block_id, block_array).await?;
-
-            Ok(WsResponseBuilder::success())
+            let data = request.write_data().ok_or(WsStatus::InvalidRequest)?;
+            disk.write_blocks(block, data).await?;
+            Ok(Vec::new())
         }
         WsOp::Flush => {
-            disks[disk_index].flush().await?;
-            Ok(WsResponseBuilder::success())
+            disk.flush().await?;
+            Ok(Vec::new())
         }
+        WsOp::Info => Ok(disk.capacity_blocks().await?.to_le_bytes().to_vec()),
     }
 }
 

@@ -5,9 +5,9 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::{path::Path, path::PathBuf};
-use tokio::sync::Mutex;
 
 mod api;
+mod blkptr;
 mod disk;
 mod fs;
 mod inode;
@@ -17,10 +17,15 @@ mod nvme;
 mod raidz;
 mod stripe;
 mod ui;
-mod vblock;
+mod volume;
 mod websocket;
 
+#[cfg(test)]
+#[path = "tests/util.rs"]
+mod test_util;
+
 use api::EtcdConfig;
+use disk::BlockDevice;
 use fs::FileSystem;
 use raidz::{DATA_SHARDS, RaidZ};
 use stripe::Stripe;
@@ -49,11 +54,17 @@ enum Commands {
     Map,
     Metaslab,
     Orphaned,
-    Format,
+    /// Format the pool. Size defaults to the disks' capacity.
+    Format {
+        /// Override the pool size in 4 KiB blocks (e.g. for HTTP-only disks).
+        #[arg(long)]
+        blocks: Option<u64>,
+    },
     Load,
     Nbd {
         name: String,
-        size: u64,
+        /// Ignored; the size comes from the volume. Kept for compatibility.
+        size: Option<u64>,
     },
     Nvme {
         name: String,
@@ -141,20 +152,20 @@ async fn main() -> std::io::Result<()> {
     let raid = RaidZ::new(stripe).await;
 
     match cli.command {
-        Commands::Nbd { name, size } => {
+        Commands::Nbd { name, size: _ } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            nbd::serve_nbd(Arc::new(Mutex::new(fs)), name, size, 10809)
-                .await
-                .unwrap();
+            nbd::serve_nbd(Arc::new(fs), name, 10809).await.unwrap();
         }
         Commands::Nvme { name } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            let server = nvme::NvmeTcpServer::new(fs, name, 4420);
+            let server = nvme::NvmeTcpServer::new(Arc::new(fs), name, 4420)
+                .await
+                .unwrap();
             server.run().await.unwrap();
         }
         Commands::Block { name, size } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            fs.create_block(&name, size, crate::disk::BLOCK_SIZE as u32)
+            fs.create_block(&name, size, volume::DEFAULT_VOLBLOCKSIZE)
                 .await
                 .unwrap();
         }
@@ -204,9 +215,23 @@ async fn main() -> std::io::Result<()> {
             fs.delete(&Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
-        Commands::Format => {
-            let fs = FileSystem::format(raid, 500_000).await.unwrap();
-            println!("index: {:?}", fs.file_index);
+        Commands::Format { blocks } => {
+            let blocks = match blocks {
+                Some(b) => b,
+                None => raid.capacity_blocks().await.unwrap_or_else(|e| {
+                    eprintln!("cannot determine disk capacity ({}); pass --blocks", e);
+                    std::process::exit(1);
+                }),
+            };
+            let fs = FileSystem::format(raid, blocks).await.unwrap();
+            let sb = fs.superblock().await.unwrap();
+            println!(
+                "formatted {} blocks ({:.1} GiB usable): {} metaslabs of {} blocks",
+                blocks,
+                (sb.metaslab_count * sb.metaslab_size_blocks) as f64 * 4096.0 / (1u64 << 30) as f64,
+                sb.metaslab_count,
+                sb.metaslab_size_blocks
+            );
         }
         Commands::Load => {
             let fs = FileSystem::load(raid).await.unwrap();

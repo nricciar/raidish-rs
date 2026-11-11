@@ -1,13 +1,17 @@
+use crate::websocket::{WS_MAX_BLOCKS, WsOp, WsStatus, decode_response, encode_request};
+use dashmap::DashMap;
+use futures::future::try_join_all;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use std::fmt;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tungstenite::Message;
+use tungstenite::{Bytes, Message};
 use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
@@ -59,16 +63,168 @@ impl From<ParseError> for DiskError {
     }
 }
 
+impl From<tokio::task::JoinError> for DiskError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        DiskError::IoError(std::io::Error::other(error))
+    }
+}
+
 #[async_trait::async_trait]
 pub trait BlockDevice: Send + Sync {
     async fn flush(&self) -> Result<(), DiskError>;
     async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError>;
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
+
+    /// Usable capacity in blocks.
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
+    }
+
+    /// Read `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
+    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+            self.read_block(start + i as u64, chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
+    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
+            self.write_block(start + i as u64, chunk.try_into().unwrap())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild a block from redundancy *without* reading its primary copy.
+    /// Used when a block reads fine but fails its checksum.
+    async fn reconstruct_block(&self, _block: BlockId, _buf: &mut [u8]) -> Result<(), DiskError> {
+        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
+    }
+
+    /// Overwrite the primary copy of a block with known-good data.
+    async fn repair_block(
+        &self,
+        _block: BlockId,
+        _buf: &[u8; BLOCK_SIZE],
+    ) -> Result<(), DiskError> {
+        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
+    }
+}
+
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type Pending = DashMap<u64, oneshot::Sender<(u8, Bytes)>>;
+
+/// A multiplexed websocket connection: many requests may be in flight; a
+/// reader task routes each response to its caller by request id.
+pub struct WsConn {
+    sink: Mutex<WsSink>,
+    pending: Arc<Pending>,
+    next_id: AtomicU64,
+    closed: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for WsConn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsConn")
+            .field("in_flight", &self.pending.len())
+            .finish()
+    }
+}
+
+impl WsConn {
+    async fn connect(url: &str) -> Result<Arc<Self>, DiskError> {
+        let (ws, _) = connect_async(url).await?;
+        let (sink, mut stream) = ws.split();
+        let pending: Arc<Pending> = Arc::new(DashMap::new());
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let (p, c) = (pending.clone(), closed.clone());
+        tokio::spawn(async move {
+            while let Some(msg) = stream.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => match decode_response(&data) {
+                        Some((status, id)) => {
+                            if let Some((_, tx)) = p.remove(&id) {
+                                let _ = tx.send((
+                                    status,
+                                    data.slice(crate::websocket::WS_RESPONSE_HEADER_LEN..),
+                                ));
+                            }
+                        }
+                        None => eprintln!("websocket: malformed response"),
+                    },
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            // Fail everything still waiting.
+            c.store(true, Ordering::SeqCst);
+            p.clear();
+        });
+
+        Ok(Arc::new(WsConn {
+            sink: Mutex::new(sink),
+            pending,
+            next_id: AtomicU64::new(1),
+            closed,
+        }))
+    }
+
+    async fn request(
+        &self,
+        op: WsOp,
+        disk_id: u16,
+        block: u64,
+        count: u32,
+        data: Option<&[u8]>,
+    ) -> Result<Bytes, DiskError> {
+        let closed = || DiskError::TungsteniteError(tungstenite::error::Error::ConnectionClosed);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(id, tx);
+        if self.closed.load(Ordering::SeqCst) {
+            self.pending.remove(&id);
+            return Err(closed());
+        }
+
+        let msg = encode_request(op, disk_id, block, count, id, data);
+        if let Err(e) = self
+            .sink
+            .lock()
+            .await
+            .send(Message::Binary(msg.into()))
+            .await
+        {
+            self.pending.remove(&id);
+            return Err(e.into());
+        }
+
+        let (status, payload) = rx.await.map_err(|_| closed())?;
+        match WsStatus::try_from(status) {
+            Ok(WsStatus::Success) => Ok(payload),
+            Ok(WsStatus::ErrorNotFound) => {
+                Err(DiskError::IoError(std::io::ErrorKind::NotFound.into()))
+            }
+            Ok(WsStatus::InvalidRequest) => {
+                Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into()))
+            }
+            Err(_) => Err(DiskError::IoError(std::io::Error::other(format!(
+                "websocket: unknown status {}",
+                status
+            )))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 enum DiskBackend {
-    Local(Arc<Mutex<File>>),
+    /// Positional I/O (pread/pwrite) on a blocking thread; no shared cursor,
+    /// so concurrent requests don't serialize on a lock.
+    Local(Arc<std::fs::File>),
     Remote {
         base_url: String,
         disk_id: String,
@@ -76,7 +232,7 @@ enum DiskBackend {
     },
     WebSocket {
         disk_id: u16,
-        ws: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+        conn: Arc<WsConn>,
     },
 }
 
@@ -92,7 +248,6 @@ impl Disk {
 
     pub async fn open(path: &str) -> Result<Self, DiskError> {
         if path.starts_with("http://") || path.starts_with("https://") {
-            // Try WebSocket connection first
             let url = url::Url::parse(path)?;
             let scheme = if path.starts_with("https://") {
                 "wss"
@@ -101,26 +256,19 @@ impl Disk {
             };
             let host = url.host_str().ok_or(ParseError::EmptyHost)?;
             let port = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
-
-            // Construct WebSocket URL
             let ws_url = format!("{}://{}{}/ws", scheme, host, port);
 
             let parts: Vec<&str> = path.rsplitn(2, '/').collect();
-            let disk_id = parts[0].to_string();
-            let base_url = parts[1].to_string();
             let disk_id_str = parts[0];
+            let base_url = parts[1].to_string();
 
-            // Try to establish WebSocket connection
-            if let Ok((ws_stream, _)) = connect_async(&ws_url).await {
-                // Parse disk_id as u16
-                if let Ok(disk_id) = disk_id_str.parse::<u16>() {
-                    return Ok(Disk {
-                        backend: DiskBackend::WebSocket {
-                            disk_id,
-                            ws: Arc::new(Mutex::new(ws_stream)),
-                        },
-                    });
-                }
+            // Prefer the websocket transport; fall back to plain HTTP.
+            if let Ok(disk_id) = disk_id_str.parse::<u16>()
+                && let Ok(conn) = WsConn::connect(&ws_url).await
+            {
+                return Ok(Disk {
+                    backend: DiskBackend::WebSocket { disk_id, conn },
+                });
             }
 
             let client = Client::builder()
@@ -130,23 +278,43 @@ impl Disk {
             Ok(Disk {
                 backend: DiskBackend::Remote {
                     base_url,
-                    disk_id,
+                    disk_id: disk_id_str.to_string(),
                     client,
                 },
             })
         } else {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                //.custom_flags(libc::O_DIRECT | libc::O_SYNC) // On Linux
-                .open(path)
-                .await?;
+            let path = path.to_string();
+            let file = tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+            })
+            .await??;
             Ok(Disk {
-                backend: DiskBackend::Local(Arc::new(Mutex::new(file))),
+                backend: DiskBackend::Local(Arc::new(file)),
             })
         }
     }
+}
+
+/// pread that zero-fills past end of file.
+fn read_at_zero_fill(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => {
+                buf[done..].fill(0);
+                break;
+            }
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -154,8 +322,8 @@ impl BlockDevice for Disk {
     async fn flush(&self) -> Result<(), DiskError> {
         match &self.backend {
             DiskBackend::Local(file) => {
-                let mut file = file.lock().await;
-                file.flush().await?;
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || file.sync_data()).await??;
             }
             DiskBackend::Remote {
                 base_url,
@@ -163,60 +331,10 @@ impl BlockDevice for Disk {
                 client,
             } => {
                 let url = format!("{}/{}/flush", base_url, disk_id);
-                match client.post(&url).send().await {
-                    Ok(_response) => (),
-                    Err(e) => return Err(DiskError::ReqwestError(e)),
-                }
+                client.post(&url).send().await?;
             }
-            DiskBackend::WebSocket { disk_id, ws } => {
-                // Build flush request: [op:2][disk_index:2][00000000]
-                let request = build_ws_request(2, *disk_id, 0, None);
-
-                let mut ws_lock = ws.lock().await;
-
-                // Send request
-                ws_lock.send(Message::Binary(request.into())).await?;
-
-                // Receive response
-                match ws_lock.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.is_empty() {
-                            return Err(DiskError::IoError(
-                                std::io::ErrorKind::UnexpectedEof.into(),
-                            ));
-                        }
-
-                        let status = data[0];
-                        match status {
-                            0 => (), // Success
-                            1 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::NotFound.into(),
-                                ));
-                            }
-                            2 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::InvalidInput.into(),
-                                ));
-                            }
-                            _ => {
-                                return Err(DiskError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("WebSocket read error: unknown status {}", status),
-                                )));
-                            }
-                        }
-                    }
-                    Some(Ok(_)) => {
-                        return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()));
-                    }
-                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
-                    None => {
-                        return Err(DiskError::TungsteniteError(
-                            tungstenite::error::Error::ConnectionClosed,
-                        ));
-                    }
-                }
+            DiskBackend::WebSocket { disk_id, conn } => {
+                conn.request(WsOp::Flush, *disk_id, 0, 0, None).await?;
             }
         }
         Ok(())
@@ -224,117 +342,34 @@ impl BlockDevice for Disk {
 
     async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
         match &self.backend {
-            DiskBackend::Local(file) => {
-                let mut file = file.lock().await;
-                file.seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
-                    .await?;
-                match file.read_exact(buf).await {
-                    Ok(_) => {}
-                    // TODO: is this actually a good idea?
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        buf.fill(0);
-                    }
-                    Err(e) => return Err(DiskError::IoError(e)),
-                }
-            }
             DiskBackend::Remote {
                 base_url,
                 disk_id,
                 client,
             } => {
                 let url = format!("{}/{}/blocks/{}", base_url, disk_id, block);
-                match client.get(&url).send().await {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            let bytes = response.bytes().await?;
-                            if bytes.len() == BLOCK_SIZE {
-                                buf.copy_from_slice(&bytes);
-                            } else if bytes.is_empty() {
-                                buf.fill(0);
-                            } else {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::InvalidData.into(),
-                                ));
-                            }
-                        } else {
-                            // Treat errors as empty blocks
-                            buf.fill(0);
-                        }
-                    }
-                    Err(e) => return Err(DiskError::ReqwestError(e)),
-                }
-            }
-            DiskBackend::WebSocket { disk_id, ws } => {
-                // Build read request: [op:0][disk_index:2][block_id:8]
-                let request = build_ws_request(0, *disk_id, block, None);
-
-                let mut ws_lock = ws.lock().await;
-
-                // Send request
-                ws_lock.send(Message::Binary(request.into())).await?;
-
-                // Receive response
-                match ws_lock.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.is_empty() {
-                            return Err(DiskError::IoError(
-                                std::io::ErrorKind::UnexpectedEof.into(),
-                            ));
-                        }
-
-                        let status = data[0];
-                        match status {
-                            0 => {
-                                // Success
-                                if data.len() == 1 + BLOCK_SIZE {
-                                    buf.copy_from_slice(&data[1..]);
-                                } else {
-                                    return Err(DiskError::IoError(
-                                        std::io::ErrorKind::InvalidData.into(),
-                                    ));
-                                }
-                            }
-                            1 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::NotFound.into(),
-                                ));
-                            }
-                            2 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::InvalidInput.into(),
-                                ));
-                            }
-                            _ => {
-                                return Err(DiskError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("WebSocket read error: unknown status {}", status),
-                                )));
-                            }
-                        }
-                    }
-                    Some(Ok(_)) => {
+                let response = client.get(&url).send().await?;
+                if response.status().is_success() {
+                    let bytes = response.bytes().await?;
+                    if bytes.len() == BLOCK_SIZE {
+                        buf[..BLOCK_SIZE].copy_from_slice(&bytes);
+                    } else if bytes.is_empty() {
+                        buf[..BLOCK_SIZE].fill(0);
+                    } else {
                         return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()));
                     }
-                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
-                    None => {
-                        return Err(DiskError::TungsteniteError(
-                            tungstenite::error::Error::ConnectionClosed,
-                        ));
-                    }
+                } else {
+                    // Treat errors as empty blocks
+                    buf[..BLOCK_SIZE].fill(0);
                 }
+                Ok(())
             }
+            _ => self.read_blocks(block, &mut buf[..BLOCK_SIZE]).await,
         }
-        Ok(())
     }
 
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         match &self.backend {
-            DiskBackend::Local(file) => {
-                let mut file = file.lock().await;
-                file.seek(SeekFrom::Start(block as u64 * BLOCK_SIZE as u64))
-                    .await?;
-                file.write_all(buf).await?;
-            }
             DiskBackend::Remote {
                 base_url,
                 disk_id,
@@ -342,83 +377,112 @@ impl BlockDevice for Disk {
             } => {
                 let url = format!("{}/{}/blocks/{}", base_url, disk_id, block);
                 let response = client.put(&url).body(buf.to_vec()).send().await?;
-
                 if !response.status().is_success() {
-                    return Err(DiskError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Remote disk write error: {}", response.status()),
-                    )));
+                    return Err(DiskError::IoError(std::io::Error::other(format!(
+                        "Remote disk write error: {}",
+                        response.status()
+                    ))));
                 }
+                Ok(())
             }
-            DiskBackend::WebSocket { disk_id, ws } => {
-                // Build write request: [op:1][disk_index:2][block_id:8][data:4096]
-                let request = build_ws_request(1, *disk_id, block, Some(buf));
+            _ => self.write_blocks(block, buf).await,
+        }
+    }
 
-                let mut ws_lock = ws.lock().await;
-
-                // Send request
-                ws_lock.send(Message::Binary(request.into())).await?;
-
-                // Receive response
-                match ws_lock.next().await {
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.is_empty() {
-                            return Err(DiskError::IoError(
-                                std::io::ErrorKind::UnexpectedEof.into(),
-                            ));
-                        }
-
-                        let status = data[0];
-                        match status {
-                            0 => {} // Success
-                            1 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::NotFound.into(),
-                                ));
-                            }
-                            2 => {
-                                return Err(DiskError::IoError(
-                                    std::io::ErrorKind::InvalidInput.into(),
-                                ));
-                            }
-                            _ => {
-                                return Err(DiskError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("WebSocket write error: unknown status {}", status),
-                                )));
-                            }
-                        }
-                    }
-                    Some(Ok(_)) => {
-                        return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()));
-                    }
-                    Some(Err(e)) => return Err(DiskError::TungsteniteError(e)),
-                    None => {
-                        return Err(DiskError::TungsteniteError(
-                            tungstenite::error::Error::ConnectionClosed,
-                        ));
-                    }
-                }
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        match &self.backend {
+            DiskBackend::Local(file) => {
+                let file = file.clone();
+                let len =
+                    tokio::task::spawn_blocking(move || file.metadata().map(|m| m.len())).await??;
+                Ok(len / BLOCK_SIZE as u64)
+            }
+            DiskBackend::WebSocket { disk_id, conn } => {
+                let data = conn.request(WsOp::Info, *disk_id, 0, 0, None).await?;
+                let bytes: [u8; 8] = data[..]
+                    .try_into()
+                    .map_err(|_| DiskError::IoError(std::io::ErrorKind::InvalidData.into()))?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+            DiskBackend::Remote { .. } => {
+                Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
             }
         }
-        Ok(())
-    }
-}
-
-#[inline]
-fn build_ws_request(op: u8, disk_id: u16, block_id: u64, data: Option<&[u8]>) -> Vec<u8> {
-    let capacity = 11 + data.map(|d| d.len()).unwrap_or(0);
-    let mut request = Vec::with_capacity(capacity);
-
-    request.push(op);
-    request.extend_from_slice(&disk_id.to_le_bytes());
-    request.extend_from_slice(&block_id.to_le_bytes());
-
-    if let Some(data) = data {
-        request.extend_from_slice(data);
     }
 
-    request
+    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+        match &self.backend {
+            DiskBackend::Local(file) => {
+                let file = file.clone();
+                let len = buf.len();
+                let data = tokio::task::spawn_blocking(move || {
+                    let mut data = vec![0u8; len];
+                    read_at_zero_fill(&file, &mut data, start * BLOCK_SIZE as u64).map(|_| data)
+                })
+                .await??;
+                buf.copy_from_slice(&data);
+                Ok(())
+            }
+            DiskBackend::WebSocket { disk_id, conn } => {
+                let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
+                let reads = buf.chunks_mut(chunk).enumerate().map(|(i, out)| {
+                    let block = start + (i * WS_MAX_BLOCKS as usize) as u64;
+                    let count = (out.len() / BLOCK_SIZE) as u32;
+                    async move {
+                        let data = conn
+                            .request(WsOp::Read, *disk_id, block, count, None)
+                            .await?;
+                        if data.len() != out.len() {
+                            return Err(DiskError::IoError(std::io::ErrorKind::InvalidData.into()));
+                        }
+                        out.copy_from_slice(&data);
+                        Ok::<(), DiskError>(())
+                    }
+                });
+                try_join_all(reads).await?;
+                Ok(())
+            }
+            DiskBackend::Remote { .. } => {
+                for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+                    self.read_block(start + i as u64, out).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+        match &self.backend {
+            DiskBackend::Local(file) => {
+                let file = file.clone();
+                let data = buf.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    file.write_all_at(&data, start * BLOCK_SIZE as u64)
+                })
+                .await??;
+                Ok(())
+            }
+            DiskBackend::WebSocket { disk_id, conn } => {
+                let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
+                let writes = buf.chunks(chunk).enumerate().map(|(i, data)| {
+                    let block = start + (i * WS_MAX_BLOCKS as usize) as u64;
+                    let count = (data.len() / BLOCK_SIZE) as u32;
+                    conn.request(WsOp::Write, *disk_id, block, count, Some(data))
+                });
+                try_join_all(writes).await?;
+                Ok(())
+            }
+            DiskBackend::Remote { .. } => {
+                for (i, data) in buf.chunks(BLOCK_SIZE).enumerate() {
+                    self.write_block(start + i as u64, data.try_into().unwrap())
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -45,6 +45,15 @@ impl Stripe {
 
 #[async_trait]
 impl BlockDevice for Stripe {
+    /// Blocks per disk available on every disk (the smallest disk wins).
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        let mut min = u64::MAX;
+        for disk in self.disks.iter() {
+            min = min.min(disk.capacity_blocks().await?);
+        }
+        Ok(min)
+    }
+
     async fn flush(&self) -> Result<(), DiskError> {
         let futures = self.disks.iter().enumerate().map(|(i, disk)| async move {
             match disk.flush().await {
@@ -115,6 +124,33 @@ impl BlockDevice for Caddy {
                 Err(DiskError::UnhealthyDisk)
             }
             Caddy::Healthy(dev, disk) => disk.write_block(block, buf).await.map_err(|e| {
+                eprintln!("caddy: unable to write to disk '{}': {}", dev, e);
+                e
+            }),
+        }
+    }
+
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(_, disk) => disk.capacity_blocks().await,
+        }
+    }
+
+    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.map_err(|e| {
+                eprintln!("caddy: unable to read from disk '{}': {}", dev, e);
+                e
+            }),
+        }
+    }
+
+    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        match self {
+            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
+            Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.map_err(|e| {
                 eprintln!("caddy: unable to write to disk '{}': {}", dev, e);
                 e
             }),

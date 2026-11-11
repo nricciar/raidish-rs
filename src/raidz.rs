@@ -17,6 +17,7 @@ pub enum RaidZError {
     ReedSolomonError(reed_solomon_simd::Error),
     SerializationError(bincode::Error),
     IncompleteStripe(u64),
+    InconsistentStripe(u64),
     NotFormatted,
 }
 
@@ -27,6 +28,9 @@ impl fmt::Display for RaidZError {
             RaidZError::ReedSolomonError(err) => write!(f, "Reed Solomon error: {}", err),
             RaidZError::SerializationError(err) => write!(f, "Serialization error: {}", err),
             RaidZError::IncompleteStripe(stripe) => write!(f, "incomplete stripe: {}", stripe),
+            RaidZError::InconsistentStripe(stripe) => {
+                write!(f, "stripe {} parity is inconsistent", stripe)
+            }
             RaidZError::NotFormatted => write!(f, "array is not formatted"),
         }
     }
@@ -195,6 +199,107 @@ impl BlockDevice for RaidZ {
         stripe.lock().await.set_shard(shard_idx, buf);
         Ok(())
     }
+
+    /// Logical capacity: every stripe holds `DATA_SHARDS` data blocks.
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        Ok(self.stripe.capacity_blocks().await? * DATA_SHARDS as u64)
+    }
+
+    /// Contiguous reads become one read per data disk. Stripes with
+    /// unflushed writes (or a failed disk) fall back to per-block reads.
+    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        let n = (buf.len() / BLOCK_SIZE) as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        let d = DATA_SHARDS as u64;
+        let (s_first, s_last) = (start / d, (start + n - 1) / d);
+
+        let buffered = (s_first..=s_last).any(|s| self.writes.contains_key(&s));
+        if n > 1 && !buffered {
+            let count = (s_last - s_first + 1) as usize;
+            let runs = (0..DATA_SHARDS).map(|disk| async move {
+                let mut run = vec![0u8; count * BLOCK_SIZE];
+                self.stripe.disks[disk]
+                    .read_blocks(s_first, &mut run)
+                    .await
+                    .map(|_| run)
+            });
+            if let Ok(runs) = futures::future::try_join_all(runs).await {
+                for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+                    let lba = start + i as u64;
+                    let at = (lba / d - s_first) as usize * BLOCK_SIZE;
+                    out.copy_from_slice(&runs[(lba % d) as usize][at..at + BLOCK_SIZE]);
+                }
+                return Ok(());
+            }
+        }
+
+        for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+            self.read_block(start + i as u64, out).await?;
+        }
+        Ok(())
+    }
+
+    /// Whole stripes are encoded and written straight to the disks (one
+    /// write per disk, no read-modify-write); partial stripes at either end
+    /// go through the stripe buffer.
+    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        let d = DATA_SHARDS as u64;
+        let mut lba = start;
+        let mut rest = buf;
+
+        while !lba.is_multiple_of(d) && !rest.is_empty() {
+            let (block, tail) = rest.split_at(BLOCK_SIZE);
+            self.write_block(lba, block.try_into().unwrap()).await?;
+            rest = tail;
+            lba += 1;
+        }
+
+        let full_blocks = (rest.len() / BLOCK_SIZE) as u64 / d * d;
+        if full_blocks > 0 {
+            let (full, tail) = rest.split_at(full_blocks as usize * BLOCK_SIZE);
+            self.write_full_stripes(lba / d, full)
+                .await
+                .map_err(|e| DiskError::IoError(std::io::Error::other(format!("{}", e))))?;
+            lba += full_blocks;
+            rest = tail;
+        }
+
+        while !rest.is_empty() {
+            let (block, tail) = rest.split_at(BLOCK_SIZE);
+            self.write_block(lba, block.try_into().unwrap()).await?;
+            rest = tail;
+            lba += 1;
+        }
+        Ok(())
+    }
+
+    async fn reconstruct_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let data_index = (lba % DATA_SHARDS as u64) as usize;
+        self.reconstruct_verified(stripe_id, data_index, buf)
+            .await
+            .map_err(|e| {
+                DiskError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}", e),
+                ))
+            })
+    }
+
+    async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+        let stripe_id = lba / DATA_SHARDS as u64;
+        let data_index = (lba % DATA_SHARDS as u64) as usize;
+        // A buffered (unflushed) stripe will be rewritten in full on flush anyway.
+        if self.writes.contains_key(&stripe_id) {
+            return Ok(());
+        }
+        // Parity already encodes this data, so only the data shard needs rewriting.
+        self.stripe.disks[data_index]
+            .write_block(stripe_id, buf)
+            .await
+    }
 }
 
 impl RaidZ {
@@ -276,6 +381,114 @@ impl RaidZ {
     }
 
     /// Reconstruct a single shard using Reed-Solomon SIMD
+    /// Encode and write `data` (a whole number of stripes) starting at
+    /// `first_stripe`, issuing one contiguous write per disk.
+    async fn write_full_stripes(&self, first_stripe: u64, data: &[u8]) -> Result<(), RaidZError> {
+        let stripe_bytes = DATA_SHARDS * BLOCK_SIZE;
+        debug_assert!(data.len().is_multiple_of(stripe_bytes));
+        let stripes = data.len() / stripe_bytes;
+
+        // These stripes are being replaced wholesale; drop any buffered
+        // partial writes so a later flush can't resurrect stale data.
+        for s in first_stripe..first_stripe + stripes as u64 {
+            if let Some((_, buffered)) = self.writes.remove(&s)
+                && let Some(b) = buffered.lock().await.take_buffer()
+            {
+                let _ = self.stripe_pool.push(b);
+            }
+        }
+
+        let mut disk_bufs: Vec<Vec<u8>> = vec![vec![0u8; stripes * BLOCK_SIZE]; DISKS];
+        let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
+        for (j, stripe) in data.chunks(stripe_bytes).enumerate() {
+            let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
+            if j > 0 {
+                encoder.reset(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
+            }
+            for (i, shard) in stripe.chunks(BLOCK_SIZE).enumerate() {
+                disk_bufs[i][at.clone()].copy_from_slice(shard);
+                encoder.add_original_shard(shard)?;
+            }
+            let encoded = encoder.encode()?;
+            for (p, parity) in encoded.recovery_iter().enumerate() {
+                disk_bufs[DATA_SHARDS + p][at.clone()].copy_from_slice(parity);
+            }
+        }
+
+        let writes = self
+            .stripe
+            .disks
+            .iter()
+            .zip(disk_bufs.iter())
+            .map(|(disk, buf)| disk.write_blocks(first_stripe, buf));
+        let results = futures::future::join_all(writes).await;
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        if failures > 0 {
+            eprintln!(
+                "WARN: {} disk(s) failed writing stripes {}..{}",
+                failures,
+                first_stripe,
+                first_stripe + stripes as u64
+            );
+        }
+        if DISKS - failures >= DATA_SHARDS {
+            Ok(())
+        } else {
+            Err(RaidZError::IncompleteStripe(first_stripe))
+        }
+    }
+
+    /// Rebuild data shard `target` from the rest of the stripe and only
+    /// return it if the stripe is self-consistent: the shard is rebuilt with
+    /// the first parity, then the stripe is re-encoded and checked against the
+    /// second. A stripe with another bad shard fails instead of yielding a
+    /// plausible-looking wrong block. If a disk can't be read there is nothing
+    /// to cross-check against, so fall back to a plain reconstruction.
+    async fn reconstruct_verified(
+        &self,
+        stripe_id: u64,
+        target: usize,
+        output: &mut [u8],
+    ) -> Result<(), RaidZError> {
+        let reads = (0..DISKS).filter(|&i| i != target).map(|i| async move {
+            let mut buf = [0u8; BLOCK_SIZE];
+            self.stripe.disks[i]
+                .read_block(stripe_id, &mut buf)
+                .await
+                .map(|_| (i, buf))
+        });
+
+        let mut shards = [[0u8; BLOCK_SIZE]; DISKS];
+        let mut present = [false; DISKS];
+        for (i, buf) in futures::future::join_all(reads).await.into_iter().flatten() {
+            shards[i] = buf;
+            present[i] = true;
+        }
+        if present.iter().filter(|&&p| p).count() < DISKS - 1 {
+            return self
+                .reconstruct_from_stripe(stripe_id, target, output)
+                .await;
+        }
+
+        let spare = DATA_SHARDS + 1;
+        let mut using = present;
+        using[spare] = false;
+        let mut rebuilt = [0u8; BLOCK_SIZE];
+        self.reconstruct_shard(&mut shards, &using, target, &mut rebuilt)?;
+
+        let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
+        for (i, shard) in shards.iter().enumerate().take(DATA_SHARDS) {
+            encoder.add_original_shard(if i == target { &rebuilt } else { shard })?;
+        }
+        let encoded = encoder.encode()?;
+        if encoded.recovery(1) != Some(&shards[spare][..]) {
+            return Err(RaidZError::InconsistentStripe(stripe_id));
+        }
+
+        output[..BLOCK_SIZE].copy_from_slice(&rebuilt);
+        Ok(())
+    }
+
     fn reconstruct_shard(
         &self,
         shard_buffers: &mut [[u8; BLOCK_SIZE]; DISKS],

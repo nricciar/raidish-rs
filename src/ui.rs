@@ -1,14 +1,11 @@
 use crate::disk::BlockDevice;
-use crate::fs::{
-    FileSystem, METASLAB_TABLE_START, SPACEMAP_LOG_BLOCKS_PER_METASLAB, SUPERBLOCK_LBA,
-    UBERBLOCK_BLOCK_COUNT, UBERBLOCK_START,
-};
+use crate::fs::{FileSystem, SUPERBLOCK_LBA, UBERBLOCK_BLOCK_COUNT, UBERBLOCK_START};
+use crate::metaslab::SPACEMAP_SLOTS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
     Superblock,
     Uberblock,
-    MetaslabHeader,
-    SpaceMapLog,
+    SpaceMap,
     FileIndex,
     InodeData, // NEW: inode storage blocks
     FileData,
@@ -20,8 +17,7 @@ impl BlockType {
         match self {
             BlockType::Superblock => "\x1b[48;5;196m", // Bright red background
             BlockType::Uberblock => "\x1b[48;5;208m",  // Orange background
-            BlockType::MetaslabHeader => "\x1b[48;5;226m", // Yellow background
-            BlockType::SpaceMapLog => "\x1b[48;5;220m", // Gold background
+            BlockType::SpaceMap => "\x1b[48;5;220m",   // Gold background
             BlockType::FileIndex => "\x1b[48;5;39m",   // Bright blue background
             BlockType::InodeData => "\x1b[48;5;51m",   // Cyan background
             BlockType::FileData => "\x1b[48;5;34m",    // Green background
@@ -33,8 +29,7 @@ impl BlockType {
         match self {
             BlockType::Superblock => "S",
             BlockType::Uberblock => "U",
-            BlockType::MetaslabHeader => "H",
-            BlockType::SpaceMapLog => "L",
+            BlockType::SpaceMap => "M",
             BlockType::FileIndex => "I",
             BlockType::InodeData => "N",
             BlockType::FileData => "D",
@@ -46,8 +41,7 @@ impl BlockType {
         match self {
             BlockType::Superblock => "Superblock",
             BlockType::Uberblock => "Uberblock",
-            BlockType::MetaslabHeader => "Metaslab Headers",
-            BlockType::SpaceMapLog => "Space Map Logs",
+            BlockType::SpaceMap => "Space Map Slots",
             BlockType::FileIndex => "File Index",
             BlockType::InodeData => "Inode Data",
             BlockType::FileData => "File Data",
@@ -69,14 +63,20 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Build a complete block type map efficiently (async version)
     async fn build_block_map(&self) -> Vec<BlockType> {
         let superblock = self.superblock().await.unwrap();
-        let uber = self.uberblock().await.unwrap();
         let total_blocks = superblock.total_blocks as usize;
         let mut block_map = vec![BlockType::FileData; total_blocks]; // Default to allocated
 
         // Mark free blocks first (since they're the base state for data region)
         for ms in self.metaslabs.iter() {
             let ms = ms.read().await;
-            for (&free_start, &free_len) in &ms.free_extents {
+            let pending = ms
+                .freeing
+                .iter()
+                .chain(ms.deferred.iter().flat_map(|(_, v)| v.iter()))
+                .map(|e| (e.start, e.len));
+            for (free_start, free_len) in
+                ms.free_extents.iter().map(|(&s, &l)| (s, l)).chain(pending)
+            {
                 let start = free_start as usize;
                 let end = (free_start + free_len) as usize;
                 for i in start..end.min(total_blocks) {
@@ -87,7 +87,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Mark inode data blocks
         for inode_ref in self.file_index.read().await.files.values() {
-            for extent in &inode_ref.extents {
+            for extent in &inode_ref.inode_extents() {
                 let start = extent.start() as usize;
                 let end = (extent.start() + extent.len()) as usize;
                 for i in start..end.min(total_blocks) {
@@ -99,7 +99,11 @@ impl<D: BlockDevice> FileSystem<D> {
         // Mark file data (requires reading inodes)
         for inode_ref in self.file_index.read().await.files.values() {
             if let Ok(inode) = self.read_inode(inode_ref).await {
-                for extent in inode.inode_type.extents() {
+                for extent in &self
+                    .content_extents(&inode.inode_type)
+                    .await
+                    .unwrap_or_default()
+                {
                     let start = extent.start() as usize;
                     let end = (extent.start() + extent.len()) as usize;
                     for i in start..end.min(total_blocks) {
@@ -110,7 +114,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         // Mark file index
-        for extent in &uber.file_index_extent {
+        for extent in self.root_ptr.lock().await.iter().map(|p| p.extent()) {
             let start = extent.start() as usize;
             let end = (extent.start() + extent.len()) as usize;
             for i in start..end.min(total_blocks) {
@@ -118,18 +122,13 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        // Mark metadata regions (these override data allocations)
-        let metaslab_headers_start = METASLAB_TABLE_START as usize;
-        let metaslab_headers_end = metaslab_headers_start + superblock.metaslab_count as usize;
-        for i in metaslab_headers_start..metaslab_headers_end.min(total_blocks) {
-            block_map[i] = BlockType::MetaslabHeader;
-        }
-
-        let spacemap_logs_start = metaslab_headers_end;
-        let spacemap_logs_end = spacemap_logs_start
-            + (superblock.metaslab_count as usize * SPACEMAP_LOG_BLOCKS_PER_METASLAB as usize);
-        for i in spacemap_logs_start..spacemap_logs_end.min(total_blocks) {
-            block_map[i] = BlockType::SpaceMapLog;
+        // Mark space map slots (these override data allocations)
+        let spacemap_start = superblock.spacemap_start as usize;
+        let spacemap_end = spacemap_start
+            + (superblock.metaslab_count * SPACEMAP_SLOTS * superblock.spacemap_slot_blocks)
+                as usize;
+        for i in spacemap_start..spacemap_end.min(total_blocks) {
+            block_map[i] = BlockType::SpaceMap;
         }
 
         // Mark uberblocks
@@ -199,8 +198,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for block_type in [
             BlockType::Superblock,
             BlockType::Uberblock,
-            BlockType::MetaslabHeader,
-            BlockType::SpaceMapLog,
+            BlockType::SpaceMap,
             BlockType::FileIndex,
             BlockType::InodeData,
             BlockType::FileData,
@@ -295,39 +293,37 @@ impl<D: BlockDevice> FileSystem<D> {
 
         for (i, ms) in self.metaslabs.iter().enumerate() {
             let ms = ms.read().await;
-            let total_blocks = ms.header.block_count;
-            let free_blocks: u64 = ms.free_extents.values().sum();
-            println!(
-                "Metaslab {}: total_blocks={}, free_blocks={}, log_blocks={}/{}",
-                i,
-                total_blocks,
-                free_blocks,
-                ms.write_cursor - ms.header.spacemap_start,
-                SPACEMAP_LOG_BLOCKS_PER_METASLAB
-            );
-            let allocated_blocks = total_blocks - free_blocks;
+            let total_blocks = ms.block_count;
+            let free_blocks = ms.free_blocks();
+            let deferred_blocks = ms.pending_free_blocks();
+            let allocated_blocks = total_blocks - free_blocks - deferred_blocks;
             let utilization = (allocated_blocks as f64 / total_blocks as f64) * 100.0;
             let fragmentation = ms.free_extents.len();
-            if allocated_blocks == 0 {
+            if allocated_blocks == 0 && deferred_blocks == 0 {
                 continue;
             }
 
             println!("Metaslab #{}", i);
             println!(
                 "  Range: {} - {}",
-                ms.header.start_block,
-                ms.header.start_block + ms.header.block_count - 1
+                ms.start_block,
+                ms.start_block + ms.block_count - 1
             );
             println!("  Total: {} blocks", total_blocks);
             println!("  Used:  {} blocks ({:.1}%)", allocated_blocks, utilization);
             println!(
-                "  Free:  {} blocks in {} extents",
-                free_blocks, fragmentation
+                "  Free:  {} blocks in {} extents ({} deferred)",
+                free_blocks, fragmentation, deferred_blocks
             );
-            println!(
-                "  Space map: {} / {} log blocks used",
-                ms.header.spacemap_blocks, SPACEMAP_LOG_BLOCKS_PER_METASLAB
-            );
+            match ms.active_slot {
+                Some(slot) => println!(
+                    "  Space map: slot {} synced at TXG {}{}",
+                    slot,
+                    ms.synced_txg,
+                    if ms.dirty { " (dirty)" } else { "" }
+                ),
+                None => println!("  Space map: never synced"),
+            }
 
             // Draw a simple bar chart
             let bar_width = 50;

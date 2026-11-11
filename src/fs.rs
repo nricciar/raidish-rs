@@ -1,25 +1,30 @@
+use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
-use crate::inode::{Extent, FileIndex, FileInode, InodeType};
-use crate::metaslab::{MetaslabHeader, MetaslabState, SpaceMapEntry};
+use crate::inode::{FileIndex, FileInode, InodeType};
+use crate::metaslab::{MetaslabLayout, MetaslabState};
 use crate::raidz::{DATA_SHARDS, RaidZError};
+use crate::volume::Volume;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV10";
+pub const FS_ID: &str = "RAIDISHV12";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
 pub const UBERBLOCK_START: u64 = 3;
 pub const UBERBLOCK_BLOCK_COUNT: u64 = 15;
-pub const UBERBLOCK_STRIPE_COUNT: u64 = UBERBLOCK_BLOCK_COUNT / 3; // needs to be a multiple of DATA_SHARDS
+pub const UBERBLOCK_STRIPE_COUNT: u64 = UBERBLOCK_BLOCK_COUNT / DATA_SHARDS as u64;
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
-pub const METASLAB_SIZE_BLOCKS: u64 = 1026; // 1026 is stripe alined
-pub const METASLAB_TABLE_START: u64 = UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT + 1; // TODO: + 1 to keep it stripe aligned
-pub const SPACEMAP_LOG_BLOCKS_PER_METASLAB: u64 = 16;
+/// First block after the fixed headers; start of the space map slot region.
+pub const SPACEMAP_START: u64 = UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT;
+const _: () = assert!(UBERBLOCK_START.is_multiple_of(DATA_SHARDS as u64));
+const _: () = assert!(UBERBLOCK_BLOCK_COUNT.is_multiple_of(DATA_SHARDS as u64));
+const _: () = assert!(SPACEMAP_START.is_multiple_of(DATA_SHARDS as u64));
 
 #[derive(Debug)]
 pub enum FileSystemError {
@@ -34,6 +39,8 @@ pub enum FileSystemError {
     DirectoryNotFound,
     NotADirectory,
     NotAFile,
+    AlreadyExists,
+    InvalidArgument(String),
 }
 
 impl fmt::Display for FileSystemError {
@@ -52,6 +59,8 @@ impl fmt::Display for FileSystemError {
             FileSystemError::DirectoryNotFound => write!(f, "Directory not found"),
             FileSystemError::NotADirectory => write!(f, "Not a directory"),
             FileSystemError::NotAFile => write!(f, "Not a file"),
+            FileSystemError::AlreadyExists => write!(f, "Already exists"),
+            FileSystemError::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
         }
     }
 }
@@ -79,9 +88,11 @@ pub struct Superblock {
     pub magic: String,
     pub block_size: u32,
     pub total_blocks: u64,
-    pub metaslab_count: u32,
+    pub metaslab_count: u64,
     pub metaslab_size_blocks: u64,
-    pub metaslab_table_start: u64,
+    pub spacemap_start: u64,
+    pub spacemap_slot_blocks: u64,
+    pub data_start: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,9 +101,12 @@ pub struct Uberblock {
     pub version: u32,
     pub txg: u64,       // transaction group
     pub timestamp: u64, // optional but useful
-    pub file_index_extent: Vec<Extent>,
+    /// The root directory's serialized `FileIndex`.
+    pub root: Vec<BlockPtr>,
 }
 
+/// Header of a self-describing *label* block (superblock, uberblock, space
+/// map slot). Everything else carries its checksum in the parent `BlockPtr`.
 #[repr(C)]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BlockHeader {
@@ -105,12 +119,39 @@ pub struct BlockHeader {
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Arc<RwLock<Option<Superblock>>>,
+    /// Last committed uberblock. The open TXG is always `uberblock.txg + 1`.
     uberblock: Arc<Mutex<Option<Uberblock>>>,
+    pub(crate) layout: MetaslabLayout,
     pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
     pub(crate) file_index: Arc<RwLock<FileIndex>>,
+    /// Root file index location in the open TXG (committed by `commit_txg`).
+    pub(crate) root_ptr: Arc<Mutex<Vec<BlockPtr>>>,
+    /// Open copy-on-write volumes and their dirty records.
+    pub(crate) volumes: Arc<std::sync::Mutex<HashMap<String, Arc<Volume>>>>,
+    commit_lock: Arc<Mutex<()>>,
+    /// Commits that have begun (taken their snapshot) / finished successfully.
+    /// Lets concurrent `sync` calls share one commit (group commit).
+    commits_started: Arc<AtomicU64>,
+    commits_done: Arc<AtomicU64>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    fn empty(dev: D) -> Self {
+        FileSystem {
+            dev,
+            superblock: Arc::new(RwLock::new(None)),
+            uberblock: Arc::new(Mutex::new(None)),
+            layout: MetaslabLayout::default(),
+            metaslabs: Arc::new(Vec::new()),
+            file_index: Arc::new(RwLock::new(FileIndex::new())),
+            root_ptr: Arc::new(Mutex::new(Vec::new())),
+            volumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            commit_lock: Arc::new(Mutex::new(())),
+            commits_started: Arc::new(AtomicU64::new(0)),
+            commits_done: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub async fn superblock(&self) -> Option<Superblock> {
         self.superblock.read().await.clone()
     }
@@ -119,26 +160,27 @@ impl<D: BlockDevice> FileSystem<D> {
         self.uberblock.lock().await.clone()
     }
 
+    /// TXG that blocks written right now belong to.
+    pub(crate) async fn open_txg(&self) -> Result<u64, FileSystemError> {
+        self.uberblock
+            .lock()
+            .await
+            .as_ref()
+            .map(|u| u.txg + 1)
+            .ok_or(FileSystemError::NotFormatted)
+    }
+
     /// Format file system
     pub async fn format(dev: D, total_blocks: u64) -> Result<Self, FileSystemError> {
-        let mut fs = FileSystem {
-            dev: dev,
-            superblock: Arc::new(RwLock::new(None)),
-            uberblock: Arc::new(Mutex::new(None)),
-            metaslabs: Arc::new(Vec::new()),
-            file_index: Arc::new(RwLock::new(FileIndex {
-                next_file_id: 1,
-                files: BTreeMap::new(),
-            })),
-        };
+        let mut fs = Self::empty(dev);
 
-        // Zero out uberblock slots (TXG 0)
+        // In-memory TXG 0; everything written by format belongs to TXG 1.
         let zero_uber = Uberblock {
             magic: 0,
             version: 0,
             txg: 0,
             timestamp: 0,
-            file_index_extent: Vec::new(),
+            root: Vec::new(),
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         for slot in 0..UBERBLOCK_BLOCK_COUNT {
@@ -146,283 +188,85 @@ impl<D: BlockDevice> FileSystem<D> {
                 .await?;
         }
 
-        // Write superblock
-        let metaslab_count = (total_blocks / METASLAB_SIZE_BLOCKS) as u32;
+        let layout = MetaslabLayout::compute(total_blocks, SPACEMAP_START);
         let superblock = Superblock {
             magic: FS_ID.to_string(),
             block_size: BLOCK_SIZE as u32,
             total_blocks,
-            metaslab_count,
-            metaslab_size_blocks: METASLAB_SIZE_BLOCKS,
-            metaslab_table_start: METASLAB_TABLE_START,
+            metaslab_count: layout.metaslab_count,
+            metaslab_size_blocks: layout.metaslab_size_blocks,
+            spacemap_start: layout.spacemap_start,
+            spacemap_slot_blocks: layout.spacemap_slot_blocks,
+            data_start: layout.data_start,
         };
         for mirror_idx in 0..3 {
             fs.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock)
                 .await?;
         }
         fs.superblock = Arc::new(RwLock::new(Some(superblock)));
+        fs.layout = layout;
 
-        // Calculate metadata layout
-        let metaslab_headers_start = METASLAB_TABLE_START;
-        let metaslab_headers_end = metaslab_headers_start + metaslab_count as u64;
-
-        let spacemap_logs_start = metaslab_headers_end;
-        let spacemap_logs_end =
-            spacemap_logs_start + (metaslab_count as u64 * SPACEMAP_LOG_BLOCKS_PER_METASLAB);
-
-        let data_blocks_start = spacemap_logs_end;
-
-        let mut metaslabs = Vec::new();
-        for i in 0..metaslab_count {
-            let start_block = data_blocks_start + (i as u64 * METASLAB_SIZE_BLOCKS);
-
-            let header = MetaslabHeader {
-                start_block,
-                block_count: METASLAB_SIZE_BLOCKS,
-                spacemap_start: spacemap_logs_start + (i as u64 * SPACEMAP_LOG_BLOCKS_PER_METASLAB),
-                spacemap_blocks: 1,
-            };
-
-            // Write metaslab header with checksum
-            fs.write_block_checked_txg(METASLAB_TABLE_START + i as u64, &header)
-                .await?;
-
-            let entry = SpaceMapEntry::Free {
-                start: start_block,
-                len: METASLAB_SIZE_BLOCKS,
-            };
-
-            // Write initial space map entry with checksum
-            fs.write_block_checked_txg(header.spacemap_start, &entry)
-                .await?;
-
-            let mut free_extents = BTreeMap::new();
-            free_extents.insert(start_block, METASLAB_SIZE_BLOCKS);
-
-            let write_cursor = header.spacemap_start + 1;
-            metaslabs.push(Arc::new(RwLock::new(MetaslabState {
-                header,
-                header_block: METASLAB_TABLE_START + i as u64,
-                free_extents,
-                write_cursor,
-            })));
-        }
+        // Metaslabs start dirty, so the first commit writes slot A for each.
+        let metaslabs = (0..layout.metaslab_count as usize)
+            .map(|i| {
+                Arc::new(RwLock::new(MetaslabState::new_empty(
+                    layout.metaslab_start(i),
+                    layout.metaslab_size_blocks,
+                )))
+            })
+            .collect();
         fs.metaslabs = Arc::new(metaslabs);
 
-        // write root file index
-        fs.persist_root_index(None).await?;
+        fs.persist_root_index().await?;
+        fs.commit_txg().await?;
 
         Ok(fs)
     }
 
-    /// Update root file index
-    pub(crate) async fn persist_root_index(
-        &self,
-        extent_pool: Option<&mut Vec<Extent>>,
-    ) -> Result<(), FileSystemError> {
-        println!("persist_file_index called");
-        let data = {
-            let index = self.file_index.read().await;
-            bincode::serialize(&*index)?
-        };
-
-        // Account for block header overhead when calculating space needed
-        let blocks_needed = Self::calculate_blocks_needed(data.len());
-
-        let allocated_extents = match extent_pool {
-            Some(pool) => {
-                //Self::consume_blocks_from_pool(pool, blocks_needed as usize)
-                pool // we use all thats left
-            }
-            None => &mut self.allocate_blocks_stripe_aligned(blocks_needed).await?,
-        };
-
-        let commit_txg_extents = allocated_extents.clone();
-
-        // Write index data using checksummed blocks
-        let mut bytes_left = &data[..];
-        for extent in allocated_extents {
-            for i in 0..extent.len() {
-                let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
-
-                if take > 0 {
-                    let chunk = &bytes_left[..take];
-                    // Write with current TXG + 1 (the new transaction)
-                    self.write_block_checked_txg(extent.start() + i, &chunk)
-                        .await?;
-                    bytes_left = &bytes_left[take..];
-                } else {
-                    // Write empty block to maintain extent structure
-                    let empty: &[u8] = &[];
-                    self.write_block_checked_txg(extent.start() + i, &empty)
-                        .await?;
-                    eprintln!(
-                        "WARNING! Wasted block '{}' assigned to file index",
-                        extent.start() + i
-                    )
-                }
-            }
-        }
-
-        let old_extents = self
-            .uberblock()
-            .await
-            .map(|ub| ub.file_index_extent.clone());
-
-        self.commit_txg(commit_txg_extents).await?;
-
-        // Free old index blocks AFTER commit
-        if let Some(old_extents) = old_extents {
-            for extent in &old_extents {
-                self.free(extent.start(), extent.len()).await?;
-            }
-        }
-
-        Ok(())
+    /// Write the root file index for the open TXG and free the previous one
+    /// (in the same TXG that stops referencing it, so a crash can't leak it).
+    /// Does not commit; callers finish with `commit_txg`.
+    pub(crate) async fn persist_root_index(&self) -> Result<(), FileSystemError> {
+        let index = self.file_index.read().await.clone();
+        let ptrs = self.write_value(&index).await?;
+        let old = std::mem::replace(&mut *self.root_ptr.lock().await, ptrs);
+        self.free_object(&old).await
     }
 
     /// Read file system headers and load root file index
     pub async fn load(dev: D) -> Result<Self, FileSystemError> {
-        let mut fs = FileSystem {
-            dev: dev,
-            superblock: Arc::new(RwLock::new(None)),
-            uberblock: Arc::new(Mutex::new(None)),
-            metaslabs: Arc::new(Vec::new()),
-            file_index: Arc::new(RwLock::new(FileIndex {
-                next_file_id: 1,
-                files: BTreeMap::new(),
-            })),
-        };
+        let mut fs = Self::empty(dev);
 
         fs.scan_uberblocks().await;
 
         let superblock = fs.superblock().await.ok_or(FileSystemError::NotFormatted)?;
+        if superblock.magic != FS_ID {
+            return Err(FileSystemError::NotFormatted);
+        }
         let uber = match fs.uberblock().await {
             Some(uber) => uber,
             None => return Ok(fs),
         };
 
-        // Load metaslabs and replay space maps
-        let mut metaslabs = Vec::new();
+        fs.layout = MetaslabLayout::from_superblock(&superblock);
+        let metaslabs = fs.load_metaslabs(uber.txg).await?;
+        fs.metaslabs = Arc::new(
+            metaslabs
+                .into_iter()
+                .map(|ms| Arc::new(RwLock::new(ms)))
+                .collect(),
+        );
 
-        for i in 0..superblock.metaslab_count {
-            let (_, header): (u64, MetaslabHeader) = fs
-                .read_block_checked(superblock.metaslab_table_start + i as u64)
-                .await?;
-
-            let mut free_extents = BTreeMap::new();
-
-            // Replay spacemap log entries
-            for b in 0..header.spacemap_blocks {
-                // Try to read the space map entry
-                let (_entry_txg, entry) = fs
-                    .read_block_checked::<SpaceMapEntry>(header.spacemap_start + b as u64)
-                    .await?;
-                // Process valid entries only
-                match entry {
-                    SpaceMapEntry::Alloc { start, len } => {
-                        if len == 0 {
-                            continue;
-                        }
-
-                        // Remove allocated chunk from free map (slicing logic)
-                        let mut to_add = Vec::new();
-                        let mut to_rem = Vec::new();
-                        for (&fs, &fl) in free_extents.iter() {
-                            let fe = fs + fl;
-                            let ae = start + len;
-                            if ae <= fs || start >= fe {
-                                continue;
-                            }
-                            to_rem.push(fs);
-                            if fs < start {
-                                to_add.push((fs, start - fs));
-                            }
-                            if ae < fe {
-                                to_add.push((ae, fe - ae));
-                            }
-                        }
-                        for r in to_rem {
-                            free_extents.remove(&r);
-                        }
-                        for (s, l) in to_add {
-                            free_extents.insert(s, l);
-                        }
-
-                        //println!("LOAD: Replayed Alloc {{{}:{}}}, TXG {}", start, len, entry_txg);
-                    }
-                    SpaceMapEntry::Free { start, len } => {
-                        if len == 0 {
-                            continue;
-                        }
-
-                        // Apply merge logic consistent with free()
-                        let mut new_start = start;
-                        let mut new_len = len;
-
-                        if let Some((&prev_start, &prev_len)) =
-                            free_extents.range(..start).next_back()
-                        {
-                            if prev_start + prev_len >= start {
-                                new_start = prev_start;
-                                new_len = (prev_start + prev_len).max(start + len) - new_start;
-                                free_extents.remove(&prev_start);
-                            }
-                        }
-
-                        loop {
-                            if let Some((&next_start, &next_len)) =
-                                free_extents.range(new_start..).next()
-                            {
-                                if next_start <= new_start + new_len {
-                                    new_len = (next_start + next_len).max(new_start + new_len)
-                                        - new_start;
-                                    free_extents.remove(&next_start);
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        free_extents.insert(new_start, new_len);
-                        //println!("LOAD: Replayed Free {{{}:{}}}, TXG {}", new_start, new_len, entry_txg);
-                    }
-                    SpaceMapEntry::Invalid => break,
-                }
-            }
-
-            let write_cursor = header.spacemap_start + header.spacemap_blocks as u64;
-            metaslabs.push(Arc::new(RwLock::new(MetaslabState {
-                header,
-                header_block: superblock.metaslab_table_start + i as u64,
-                free_extents,
-                write_cursor,
-            })));
+        if let Some(p) = uber.root.iter().find(|p| p.birth_txg > uber.txg) {
+            eprintln!(
+                "WARNING: root index record born in TXG {} > uberblock TXG {}",
+                p.birth_txg, uber.txg
+            );
+            return Err(FileSystemError::ChecksumMismatch);
         }
-        fs.metaslabs = Arc::new(metaslabs);
-
-        // Reconstruct file index from extents with validation
-        let mut index_bytes = Vec::new();
-        for extent in &uber.file_index_extent {
-            for i in 0..extent.len() {
-                let (block_txg, chunk) =
-                    fs.read_block_checked::<Vec<u8>>(extent.start() + i).await?;
-                // Validate TXG matches or is from earlier transaction
-                if block_txg <= uber.txg {
-                    index_bytes.extend_from_slice(&chunk);
-                } else {
-                    println!(
-                        "WARNING: File index block has TXG {} > uberblock TXG {}",
-                        block_txg, uber.txg
-                    );
-                }
-            }
-        }
-
-        let file_index: FileIndex = bincode::deserialize(&index_bytes)?;
+        let file_index: FileIndex = fs.read_value(&uber.root).await?;
         fs.file_index = Arc::new(RwLock::new(file_index));
+        fs.root_ptr = Arc::new(Mutex::new(uber.root.clone()));
 
         Ok(fs)
     }
@@ -430,29 +274,16 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Read a files contents
     pub async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileSystemError> {
         let inode_ref = self.get_file_at_path(path).await?;
-
         let inode = self.read_inode(&inode_ref).await?;
 
-        if !inode.inode_type.is_file() {
-            return Err(FileSystemError::NotAFile);
-        }
-
-        let mut out = Vec::with_capacity(inode.inode_type.size_bytes() as usize);
-        let mut remaining = inode.inode_type.size_bytes();
-
-        let mut block_buf = [0u8; BLOCK_SIZE];
-        for extent in inode.inode_type.extents() {
-            for i in 0..extent.len() {
-                let (_, len) = self
-                    .read_raw_block_checked_into(extent.start() + i, &mut block_buf)
-                    .await?;
-                let take = remaining.min(len as u64) as usize;
-                out.extend_from_slice(&block_buf[..take]);
-                remaining -= take as u64;
+        match inode.inode_type {
+            InodeType::File { size_bytes, blocks } => {
+                let mut out = self.read_object(&blocks).await?;
+                out.truncate(size_bytes as usize);
+                Ok(out)
             }
+            _ => Err(FileSystemError::NotAFile),
         }
-
-        Ok(out)
     }
 
     /// List directory contents
@@ -462,86 +293,37 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn mkdir(&self, path: &Path) -> Result<FileId, FileSystemError> {
-        let (mut parent, old_inode_ref, path_blocks) =
-            self.get_maybe_inode_ref_at_path_with_count(path).await?;
+        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
             if !old_inode.inode_type.is_directory() {
                 return Err(FileSystemError::NotADirectory);
             }
-            Ok(old_inode.id)
-        } else {
-            let dir = FileIndex {
-                next_file_id: 1,
-                files: BTreeMap::new(),
-            };
-            let data = bincode::serialize(&dir)?;
-
-            // Account for block header overhead when calculating space needed
-            let blocks_needed = Self::calculate_blocks_needed(data.len());
-
-            let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
-
-            // Write index data using checksummed blocks
-            let mut bytes_left = &data[..];
-            for extent in &allocated_extents {
-                for i in 0..extent.len() {
-                    let take = bytes_left.len().min(BLOCK_PAYLOAD_SIZE);
-
-                    if take > 0 {
-                        let chunk = &bytes_left[..take];
-                        // Write with current TXG + 1 (the new transaction)
-                        self.write_raw_block_checked_txg(extent.start() + i, &chunk)
-                            .await?;
-                        bytes_left = &bytes_left[take..];
-                    } else {
-                        // Write empty block to maintain extent structure
-                        let empty: &[u8] = &[];
-                        self.write_raw_block_checked_txg(extent.start() + i, &empty)
-                            .await?;
-                    }
-                }
-            }
-
-            // Create or update file ID
-            let file_id = old_inode_ref
-                .as_ref()
-                .map(|r| r.file_id)
-                .unwrap_or(parent.next_file_id);
-
-            if old_inode_ref.is_none() {
-                parent.next_file_id += 1;
-            }
-
-            // Create new inode
-            let new_inode = FileInode {
-                id: file_id,
-                inode_type: InodeType::Directory {
-                    extents: allocated_extents,
-                },
-            };
-
-            let inode_data = bincode::serialize(&new_inode)?;
-            let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
-
-            let mut extent_pool = self
-                .allocate_blocks_stripe_aligned(path_blocks as u64 + blocks_needed)
-                .await?;
-
-            self.persist_directory_changes(path, parent, Some(new_inode), Some(&mut extent_pool))
-                .await?;
-
-            Ok(file_id)
+            return Ok(old_inode.id);
         }
+
+        let blocks = self.write_value(&FileIndex::new()).await?;
+        let file_id = parent.next_file_id;
+        parent.next_file_id += 1;
+
+        let new_inode = FileInode {
+            id: file_id,
+            inode_type: InodeType::Directory { blocks },
+        };
+
+        self.persist_directory_changes(path, parent, Some(new_inode))
+            .await?;
+        self.commit_txg().await?;
+
+        Ok(file_id)
     }
 
     /// Write or overwrite a files contents
     pub async fn write_file(&self, path: &Path, data: &[u8]) -> Result<FileId, FileSystemError> {
-        let (mut parent, old_inode_ref, path_blocks) =
-            self.get_maybe_inode_ref_at_path_with_count(path).await?;
+        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
-        // If exists, ensure it's a file not a virtual block device
+        // If exists, ensure it's a file not a directory or virtual block device
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
             if !old_inode.inode_type.is_file() {
@@ -549,130 +331,124 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
-        // Calculate blocks needed accounting for header overhead
-        let blocks_needed = Self::calculate_blocks_needed(data.len());
+        let blocks = self.write_object(data).await?;
 
-        let allocated_extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
-        println!("allocated extents: {:?}", allocated_extents);
-
-        // Write file data in chunks that fit in BLOCK_PAYLOAD_SIZE
-        let mut current_offset = 0;
-        for extent in &allocated_extents {
-            for i in 0..extent.len() {
-                if current_offset >= data.len() {
-                    // Write empty block for unused allocated space
-                    let empty: &[u8] = &[];
-                    self.write_raw_block_checked_txg(extent.start() + i, &empty)
-                        .await?;
-                    continue;
-                }
-
-                let take = (data.len() - current_offset).min(BLOCK_PAYLOAD_SIZE);
-                let chunk = &data[current_offset..current_offset + take];
-
-                self.write_raw_block_checked_txg(extent.start() + i, &chunk)
-                    .await?;
-                current_offset += take;
+        let file_id = match &old_inode_ref {
+            Some(r) => r.file_id,
+            None => {
+                parent.next_file_id += 1;
+                parent.next_file_id - 1
             }
-        }
+        };
 
-        // Create or update file ID
-        let file_id = old_inode_ref
-            .as_ref()
-            .map(|r| r.file_id)
-            .unwrap_or(parent.next_file_id);
-
-        if old_inode_ref.is_none() {
-            parent.next_file_id += 1;
-        }
-
-        // Create new inode
         let new_inode = FileInode {
             id: file_id,
             inode_type: InodeType::File {
                 size_bytes: data.len() as u64,
-                extents: allocated_extents,
+                blocks,
             },
         };
 
-        let inode_data = bincode::serialize(&new_inode)?;
-        let blocks_needed = Self::calculate_blocks_needed(inode_data.len());
-
-        let mut extent_pool = self
-            .allocate_blocks_stripe_aligned(path_blocks as u64 + blocks_needed)
+        self.persist_directory_changes(path, parent, Some(new_inode))
             .await?;
 
-        self.persist_directory_changes(path, parent, Some(new_inode), Some(&mut extent_pool))
-            .await?;
-
-        // Free old inode and data blocks
+        // Free the old version in the same TXG that drops it.
         if let Some(old_ref) = old_inode_ref {
-            let old_inode = self.read_inode(&old_ref).await?;
-
-            // Free old data blocks
-            for extent in old_inode.inode_type.extents() {
-                self.free(extent.start(), extent.len()).await?;
-            }
-
-            // Free old inode blocks
-            for extent in &old_ref.extents {
-                self.free(extent.start(), extent.len()).await?;
-            }
+            self.free_inode(&old_ref).await?;
         }
+
+        self.commit_txg().await?;
 
         Ok(file_id)
     }
 
     /// Delete a virtual block device or file
     pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
-        let (mut parent, inode_ref_opt, path_blocks) =
-            self.get_maybe_inode_ref_at_path_with_count(path).await?;
-
-        let inode_ref = match inode_ref_opt {
-            Some(ref inode_ref) => inode_ref,
-            None => return Err(FileSystemError::FileNotFound),
-        };
+        let (mut parent, inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let inode_ref = inode_ref.ok_or(FileSystemError::FileNotFound)?;
 
         let inode = self.read_inode(&inode_ref).await?;
-
-        for extent in inode.inode_type.extents() {
-            self.free(extent.start(), extent.len()).await?;
+        if matches!(inode.inode_type, InodeType::Volume { .. })
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            self.close_volume(name);
         }
-
-        for extent in &inode_ref.extents {
-            self.free(extent.start(), extent.len()).await?;
-        }
+        self.free_inode(&inode_ref).await?;
 
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(FileSystemError::FileNotFound)?;
-
         parent.files.remove(filename);
 
-        let mut extent_pool = self
-            .allocate_blocks_stripe_aligned(path_blocks as u64)
-            .await?;
-
-        self.persist_directory_changes(path, parent, None, Some(&mut extent_pool))
-            .await?;
+        self.persist_directory_changes(path, parent, None).await?;
+        self.commit_txg().await?;
 
         Ok(inode.id)
     }
 
+    /// Make every write completed before this call durable.
+    ///
+    /// Any commit that *starts* after this call covers those writes, so if
+    /// one finished while we waited for the commit lock there's nothing left
+    /// to do. Concurrent flushes (fsync storms, multi-queue NVMe) therefore
+    /// share commits instead of each running one.
     pub async fn sync(&self) -> Result<(), FileSystemError> {
-        let uber = self.uberblock().await.ok_or(RaidZError::NotFormatted)?;
-        self.commit_txg(uber.file_index_extent.clone()).await?;
+        let need = self.commits_started.load(Ordering::SeqCst) + 1;
+        let _guard = self.commit_lock.lock().await;
+        if self.commits_done.load(Ordering::SeqCst) >= need {
+            return Ok(());
+        }
+        self.commit_locked().await?;
         Ok(())
     }
 
-    async fn commit_txg(&self, file_index_extent: Vec<Extent>) -> Result<u64, FileSystemError> {
-        let uber = self
-            .uberblock()
-            .await
-            .ok_or(FileSystemError::NotFormatted)?;
-        let txg = uber.txg;
+    /// Commit the open TXG:
+    ///   1. write dirty metaslabs to their inactive space map slots
+    ///   2. flush
+    ///   3. write the uberblock for the TXG
+    ///   4. flush
+    ///
+    /// Only after step 4 does in-memory state advance (active slots, deferred
+    /// frees). On failure, the TXG stays open and can be retried.
+    pub(crate) async fn commit_txg(&self) -> Result<u64, FileSystemError> {
+        let _guard = self.commit_lock.lock().await;
+        self.commit_locked().await
+    }
 
+    async fn commit_locked(&self) -> Result<u64, FileSystemError> {
+        let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let txg = self.open_txg().await?;
+        // Volumes sync all-or-nothing each, so whatever did sync is safe to
+        // commit; a failure is reported after the TXG is durable.
+        let volumes = self.sync_volumes().await;
+        let root = self.root_ptr.lock().await.clone();
+
+        let synced = self.sync_metaslabs(txg).await?;
+
+        match self.write_uberblock(txg, root).await {
+            Ok(uberblock) => {
+                *self.uberblock.lock().await = Some(uberblock);
+                self.finish_metaslab_sync(txg, synced).await;
+                if volumes.is_ok() {
+                    self.commits_done.fetch_max(id, Ordering::SeqCst);
+                }
+                volumes.map(|_| txg)
+            }
+            Err(e) => {
+                self.abort_metaslab_sync(synced).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn write_uberblock(
+        &self,
+        txg: u64,
+        root: Vec<BlockPtr>,
+    ) -> Result<Uberblock, FileSystemError> {
+        // Everything the uberblock points at must be durable first.
         self.dev.flush().await?;
 
         let uberblock = Uberblock {
@@ -680,14 +456,13 @@ impl<D: BlockDevice> FileSystem<D> {
             version: 1,
             txg,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            file_index_extent,
+            root,
         };
 
-        // Determine which stripe to use (rotating through UBERBLOCK_COUNT stripes)
-        let uberblock_stripe_idx = (txg % UBERBLOCK_STRIPE_COUNT) as u64;
+        // Rotate through UBERBLOCK_STRIPE_COUNT stripes; one copy per data shard.
+        let uberblock_stripe_idx = txg % UBERBLOCK_STRIPE_COUNT;
         let uberblock_stripe_id = (UBERBLOCK_START / DATA_SHARDS as u64) + uberblock_stripe_idx;
 
-        // Serialize and prepare the uberblock block
         let payload = bincode::serialize(&uberblock)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
 
@@ -701,28 +476,30 @@ impl<D: BlockDevice> FileSystem<D> {
                 .await?;
         }
 
-        // Flush again to ensure uberblock is durable
         self.dev.flush().await?;
 
-        *self.uberblock.lock().await = Some(uberblock);
-
-        Ok(txg)
+        Ok(uberblock)
     }
 
+    /// Write a raw payload tagged with the open TXG.
     pub(crate) async fn write_raw_block_checked_txg(
         &self,
         lba: BlockId,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
-        let uber = self
-            .uberblock()
-            .await
-            .ok_or(FileSystemError::NotFormatted)?;
+        let txg = self.open_txg().await?;
+        self.write_raw_block_txg(lba, txg, data).await
+    }
 
-        // Prepare the full block with header
+    /// Write a raw payload tagged with an explicit TXG.
+    pub(crate) async fn write_raw_block_txg(
+        &self,
+        lba: BlockId,
+        txg: u64,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
         let mut block_buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(uber.txg, data, &mut block_buf)?;
-
+        self.prepare_block_buffer(txg, data, &mut block_buf)?;
         self.dev.write_block(lba, &block_buf).await?;
         Ok(())
     }
@@ -732,20 +509,9 @@ impl<D: BlockDevice> FileSystem<D> {
         lba: BlockId,
         value: &T,
     ) -> Result<(), FileSystemError> {
-        let uber = self
-            .uberblock()
-            .await
-            .ok_or(FileSystemError::NotFormatted)?;
-
         let payload = bincode::serialize(value)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
-
-        // Prepare the full block with header
-        let mut block_buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(uber.txg, &payload, &mut block_buf)?;
-
-        self.dev.write_block(lba, &block_buf).await?;
-        Ok(())
+        self.write_raw_block_checked_txg(lba, &payload).await
     }
 
     fn prepare_block_buffer(
