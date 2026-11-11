@@ -1,10 +1,11 @@
 ---
-disks:
-  - http://127.0.0.1:8881/api/v1/disks/0
-  - http://127.0.0.1:8881/api/v1/disks/1
-  - http://127.0.0.1:8881/api/v1/disks/2
-  - http://127.0.0.1:8881/api/v1/disks/3
-  - http://127.0.0.1:8881/api/v1/disks/4
+pool:
+  raidz2:
+    - http://127.0.0.1:8881/api/v1/disks/0
+    - http://127.0.0.1:8881/api/v1/disks/1
+    - http://127.0.0.1:8881/api/v1/disks/2
+    - http://127.0.0.1:8881/api/v1/disks/3
+    - http://127.0.0.1:8881/api/v1/disks/4
 etcd_config:
   enable: false
   etcd_nodes:

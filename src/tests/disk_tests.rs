@@ -244,14 +244,23 @@ async fn remote_disk_fails_fast_and_reconnects() {
     let gen0 = *reconnects.borrow_and_update();
 
     server.stop();
-    assert!(wait_until(2, || !disk.is_online()).await, "never noticed the drop");
+    assert!(
+        wait_until(2, || !disk.is_online()).await,
+        "never noticed the drop"
+    );
     let mut buf = vec![0u8; BLOCK_SIZE];
     let t = Instant::now();
     assert!(disk.read_block(0, &mut buf).await.is_err());
-    assert!(t.elapsed() < Duration::from_millis(100), "offline disk should fail fast");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "offline disk should fail fast"
+    );
 
     server.restart().await;
-    assert!(wait_until(5, || disk.is_online()).await, "never reconnected");
+    assert!(
+        wait_until(5, || disk.is_online()).await,
+        "never reconnected"
+    );
     assert!(*reconnects.borrow_and_update() > gen0);
     disk.write_block(3, &[7u8; BLOCK_SIZE]).await.unwrap();
     disk.read_block(3, &mut buf).await.unwrap();
@@ -286,7 +295,10 @@ async fn idle_connection_to_a_frozen_server_is_dropped() {
     assert!(disk.is_online(), "healthy idle connection was dropped");
 
     server.set_mode(ServerMode::Frozen);
-    assert!(wait_until(3, || !disk.is_online()).await, "frozen server not detected");
+    assert!(
+        wait_until(3, || !disk.is_online()).await,
+        "frozen server not detected"
+    );
     server.set_mode(ServerMode::Normal);
     assert!(wait_until(5, || disk.is_online()).await);
 }
@@ -315,7 +327,10 @@ async fn raidz_survives_a_hung_disk_within_the_timeout() {
     let t = Instant::now();
     raid.write_blocks(300, &data).await.unwrap();
     raid.flush().await.unwrap();
-    assert!(t.elapsed() < Duration::from_secs(3), "hung disk stalled the write");
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "hung disk stalled the write"
+    );
 
     let mut back = vec![0u8; data.len()];
     raid.read_blocks(300, &mut back).await.unwrap();

@@ -2,9 +2,9 @@
 //! follows the same sequence as the Linux initiator.
 
 use super::*;
-use crate::raidz::RaidZ;
+use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
-use crate::volume::DEFAULT_VOLBLOCKSIZE;
+use crate::vdev::Pool;
 
 const MB: u64 = 1 << 20;
 const HOSTNQN: &str = "nqn.2024-01.com.raidish:host:unit";
@@ -252,7 +252,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<RaidZ>>, std::net::SocketAddr) {
+async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::SocketAddr) {
     let fs = Arc::new(pool.format().await);
     fs.create_block("vol", size, DEFAULT_VOLBLOCKSIZE)
         .await

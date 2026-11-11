@@ -1,8 +1,8 @@
 //! Drives the NBD server over a real socket with a minimal client.
 
 use super::*;
+use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
-use crate::volume::DEFAULT_VOLBLOCKSIZE;
 use tokio::net::TcpStream;
 
 const MB: u64 = 1 << 20;
@@ -79,7 +79,7 @@ impl Client {
 async fn serve(
     pool: &TestPool,
     size: u64,
-) -> (Arc<FileSystem<crate::raidz::RaidZ>>, std::net::SocketAddr) {
+) -> (Arc<FileSystem<crate::vdev::Pool>>, std::net::SocketAddr) {
     let fs = Arc::new(pool.format().await);
     fs.create_block("vol", size, DEFAULT_VOLBLOCKSIZE)
         .await

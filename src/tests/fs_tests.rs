@@ -1,6 +1,5 @@
 use super::*;
-use crate::raidz::RaidZ;
-use crate::stripe::Stripe;
+use crate::vdev::Pool;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
@@ -22,7 +21,7 @@ async fn create_test_disk_file() -> (NamedTempFile, PathBuf) {
 }
 
 /// Helper to create a test RaidZ array with 5 disks
-async fn create_test_fs() -> (FileSystem<RaidZ>, Vec<NamedTempFile>) {
+async fn create_test_fs() -> (FileSystem<Pool>, Vec<NamedTempFile>) {
     let mut temp_files = Vec::new();
     let mut paths = Vec::new();
 
@@ -32,19 +31,9 @@ async fn create_test_fs() -> (FileSystem<RaidZ>, Vec<NamedTempFile>) {
         paths.push(path);
     }
 
-    let stripe = Stripe::new(
-        [
-            paths[0].to_str().unwrap(),
-            paths[1].to_str().unwrap(),
-            paths[2].to_str().unwrap(),
-            paths[3].to_str().unwrap(),
-            paths[4].to_str().unwrap(),
-        ],
-        DATA_SHARDS,
-    )
-    .await;
-
-    let raidz = RaidZ::new(stripe).await;
+    let p: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+    let disks = std::sync::Arc::new(crate::disks::DiskSet::new(&p).await);
+    let raidz = crate::vdev::Pool::raidz(disks, 2);
 
     let total_blocks = (100 * 1024 * 1024) / BLOCK_SIZE;
 
@@ -52,19 +41,9 @@ async fn create_test_fs() -> (FileSystem<RaidZ>, Vec<NamedTempFile>) {
         .await
         .unwrap();
 
-    let stripe = Stripe::new(
-        [
-            paths[0].to_str().unwrap(),
-            paths[1].to_str().unwrap(),
-            paths[2].to_str().unwrap(),
-            paths[3].to_str().unwrap(),
-            paths[4].to_str().unwrap(),
-        ],
-        DATA_SHARDS,
-    )
-    .await;
-
-    let raidz = RaidZ::new(stripe).await;
+    let p: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+    let disks = std::sync::Arc::new(crate::disks::DiskSet::new(&p).await);
+    let raidz = crate::vdev::Pool::raidz(disks, 2);
 
     let fs = FileSystem::load(raidz).await.unwrap();
 

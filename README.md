@@ -1,6 +1,6 @@
 # RAIDish
 
-a distributed raidz2 like filesystem proof of concept
+a distributed raidz/mirror filesystem proof of concept
 
 ## Setup
 
@@ -18,7 +18,10 @@ cargo run -- --config example-config.yaml listen node-1
 ```
 
 etcd is optional: set `etcd_config.enable: false` in the config to run without it.
-`listen` serves the raw disks on port 8881 (`--port` to change).
+`listen` serves the raw disks on port 8881 (`--port` to change). It serves the
+config's `disks` list (or, without one, the pool's disks), so a node can also
+serve a single disk with `disks: [disks/disk1]`. A remote disk is addressed as
+`http://host:port/api/v1/disks/<index in that node's list>`.
 
 step 2) format the pool from a client
 
@@ -28,6 +31,45 @@ cargo run -- --config remote-config.yaml format
 // display blockmap info to the console
 cargo run -- --config remote-config.yaml map
 ```
+
+## Pool layouts
+
+The `pool` section of the config describes how the disks are combined:
+
+```yaml
+# 3 disks, raidz1 (2 data + 1 parity)
+pool:
+  raidz1: [disks/d1, disks/d2, disks/d3]
+
+# 5 disks, raidz2 (3 data + 2 parity)
+pool:
+  raidz2: [disks/d1, disks/d2, disks/d3, disks/d4, disks/d5]
+
+# any parity
+pool:
+  raidz: { parity: 3, disks: [d1, d2, d3, d4, d5, d6] }
+
+# n-way mirror
+pool:
+  mirror: [disks/d1, disks/d2, disks/d3]
+
+# 4 disks on 4 nodes, two mirrors striped together (RAID10)
+pool:
+  stripe:
+    - mirror: [http://node1:8881/api/v1/disks/0, http://node2:8881/api/v1/disks/0]
+    - mirror: [http://node3:8881/api/v1/disks/0, http://node4:8881/api/v1/disks/0]
+```
+
+A `stripe` can mix raidz groups, mirrors and plain disks (a plain disk has no
+redundancy). Stripes can't be nested. Data is interleaved across stripe members
+in chunks of one record (~120 KiB). A stripe survives as many failed disks as
+its weakest member. `status` shows the layout and each disk's health.
+
+Records are aligned to the pool's width: the number of data shards of a raidz
+group, 1 for a mirror, and the least common multiple across a stripe's members.
+That width can be at most 30 blocks. The layout is recorded in the superblock,
+and a pool won't open with a different one. An old-style config with five
+`disks` and no `pool` is still a raidz2 pool.
 
 ## Commands
 
@@ -197,7 +239,12 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 * **No authentication** on the disk server's HTTP/websocket ports.
 * Every fsync costs a full TXG commit (~5 ms); there's no intent log yet.
 * Volumes live in the root directory, and deleting a directory leaks its contents.
-* Pools formatted before `RAIDISHV13` (per-disk labels) must be reformatted.
+* Pools formatted before `RAIDISHV14` (configurable layouts) must be reformatted.
+* Self-heal by checksum tries at most two bad disks per record, so raidz3 only
+  gets its third parity shard's worth of protection from missing (offline)
+  disks, not from silently corrupt ones.
+* The superblock and uberblocks live on the first stripe member (usually),
+  so they are only as redundant as that member.
 
 ## TODO
 

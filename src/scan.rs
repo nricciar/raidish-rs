@@ -6,7 +6,7 @@
 //! every shard of the record's stripes, data *and* parity, against what the
 //! verified contents encode to, rewriting the ones that differ. The fixed
 //! label regions (superblock, uberblocks, space maps) carry no parent
-//! checksum and are verified separately (see `RaidZ::verify_label_stripe`).
+//! checksum and are verified separately (see `Vdev::verify_labels`).
 //!
 //! A *resilver* is a scrub restricted to records born at or after the TXG
 //! the earliest degraded disk started missing writes. Because the tree is
@@ -22,10 +22,9 @@
 
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
-use crate::fs::{FileSystem, FileSystemError, LabelState, SPACEMAP_START, parse_label};
+use crate::fs::{FileSystem, FileSystemError, LabelState, parse_label};
 use crate::inode::{FileIndex, FileInode, InodeType};
-use crate::raidz::{DATA_SHARDS, StripeCheck};
-use crate::stripe::DISKS;
+use crate::vdev::StripeCheck;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,7 +40,7 @@ pub struct ScanReport {
     pub pruned: u64,
     pub shards: StripeCheck,
     pub label_stripes: u64,
-    /// Label stripes for which no valid contents could be found.
+    /// Label units (first block of each) for which no valid contents could be found.
     pub label_unrecoverable: Vec<u64>,
     /// Records that could not be read or verified, with their location.
     pub errors: Vec<String>,
@@ -81,13 +80,13 @@ impl std::fmt::Display for ScanReport {
             self.pruned,
             self.label_stripes
         )?;
-        for d in 0..DISKS {
+        for d in 0..self.shards.disks() {
             let (m, r) = (self.shards.mismatched[d], self.shards.repaired[d]);
             let mut notes = Vec::new();
-            if self.shards.unreadable[d] {
+            if self.shards.is_unreadable(d) {
                 notes.push("unreadable".to_string());
             }
-            if self.shards.write_failed[d] {
+            if self.shards.has_write_failed(d) {
                 notes.push("repair writes failed".to_string());
             }
             if self.cleared.contains(&d) {
@@ -105,13 +104,17 @@ impl std::fmt::Display for ScanReport {
             }
         }
         if self.shards.skipped > 0 {
-            writeln!(f, "  {} stripes skipped (being written)", self.shards.skipped)?;
+            writeln!(
+                f,
+                "  {} stripes skipped (being written)",
+                self.shards.skipped
+            )?;
         }
         for e in &self.errors {
             writeln!(f, "  error: {}", e)?;
         }
         for s in &self.label_unrecoverable {
-            writeln!(f, "  error: label stripe {} unrecoverable", s)?;
+            writeln!(f, "  error: label block {} unrecoverable", s)?;
         }
         if let Some(why) = &self.aborted {
             writeln!(f, "  aborted: {}", why)?;
@@ -175,7 +178,11 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let degraded = self.degraded_disks();
         let missed = self.unaccounted_misses();
-        (0..DISKS).any(|d| pool.stripe.is_online(d) && (degraded[d].is_some() || missed[d]))
+        (0..pool.disks.len()).any(|d| {
+            pool.disks.is_online(d)
+                && (degraded.get(d).is_some_and(|t| t.is_some())
+                    || missed.get(d).copied().unwrap_or(false))
+        })
     }
 
     /// `since`: None = resilver (worked out from the degraded disks once
@@ -192,14 +199,17 @@ impl<D: BlockDevice> FileSystem<D> {
             if !self.read_only {
                 self.commit_locked().await?;
             }
-            let misses: [u64; DISKS] =
-                std::array::from_fn(|d| pool.map_or(0, |p| p.stripe.miss_count(d)));
+            let misses = self.miss_counts();
             let degraded = self.degraded_disks();
             let since = match since {
                 Some(s) => s,
                 None => {
-                    let online = |d: usize| pool.is_some_and(|p| p.stripe.is_online(d));
-                    match (0..DISKS).filter(|&d| online(d)).filter_map(|d| degraded[d]).min() {
+                    let online = |d: usize| pool.is_some_and(|p| p.disks.is_online(d));
+                    match (0..degraded.len())
+                        .filter(|&d| online(d))
+                        .filter_map(|d| degraded[d])
+                        .min()
+                    {
                         Some(s) => s,
                         None => {
                             return Ok(ScanReport {
@@ -233,21 +243,21 @@ impl<D: BlockDevice> FileSystem<D> {
             && let Some(pool) = pool
         {
             let degraded = self.degraded_disks();
-            for d in 0..DISKS {
+            for d in 0..pool.disks.len() {
                 let covered = degraded[d].is_some_and(|t| t >= since);
-                let in_sync = pool.stripe.is_online(d)
-                    && pool.stripe.miss_count(d) == misses_at_start[d]
-                    && !report.shards.unreadable[d]
-                    && !report.shards.write_failed[d];
+                let in_sync = pool.disks.is_online(d)
+                    && pool.disks.miss_count(d) == misses_at_start[d]
+                    && !report.shards.is_unreadable(d)
+                    && !report.shards.has_write_failed(d);
                 if !(covered && in_sync) {
                     continue;
                 }
-                if pool.stripe.is_fenced(d) {
+                if pool.disks.is_fenced(d) {
                     if let Err(e) = self.write_disk_label(d).await {
                         eprintln!("disk {}: label write failed: {}", d, e);
                         continue;
                     }
-                    pool.stripe.set_fenced(d, false);
+                    pool.disks.set_fenced(d, false);
                 }
                 self.degraded.lock().unwrap()[d] = None;
                 report.cleared.push(d);
@@ -322,13 +332,13 @@ impl<D: BlockDevice> FileSystem<D> {
                     };
                     if level > 0 {
                         match bincode::deserialize::<Vec<Option<BlockPtr>>>(&data) {
-                            Ok(ind) => stack.extend(ind.into_iter().flatten().map(|c| {
-                                Node::Volume {
+                            Ok(ind) => {
+                                stack.extend(ind.into_iter().flatten().map(|c| Node::Volume {
                                     ptr: c,
                                     level: level - 1,
                                     path: path.clone(),
-                                }
-                            })),
+                                }))
+                            }
                             Err(e) => report
                                 .errors
                                 .push(format!("{} (volume L{}): {}", path, level, e)),
@@ -409,11 +419,10 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(pool) = self.dev.pool() {
             // Exactly what `write_record_blocks` wrote: the data zero-padded
             // to whole stripes (the rest of `asize`, if any, was never written).
-            let d = DATA_SHARDS as u64;
-            let blocks = ptr.data_blocks().div_ceil(d) * d;
+            let blocks = self.align_blocks(ptr.data_blocks());
             let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
             padded[..data.len()].copy_from_slice(&data);
-            match pool.verify_stripes(ptr.lba / d, &padded, repair).await {
+            match pool.root.verify_blocks(ptr.lba, &padded, repair).await {
                 Ok(check) => report.shards.add(&check),
                 Err(e) => {
                     report.errors.push(format!("record at {}: {}", ptr.lba, e));
@@ -429,40 +438,26 @@ impl<D: BlockDevice> FileSystem<D> {
         let Some(pool) = self.dev.pool() else {
             return;
         };
-        let d = DATA_SHARDS as u64;
-        let header = 0..SPACEMAP_START / d;
-        let spacemaps = self.layout.spacemap_start / d..self.layout.data_start / d;
         let score = |b: &[u8]| parse_label(b).ok().map(|(txg, _)| txg);
-        for stripe in header.chain(spacemaps) {
-            report.label_stripes += 1;
-            match pool.verify_label_stripe(stripe, repair, score).await {
-                Ok(Some(check)) => report.shards.add(&check),
-                Ok(None) => {
-                    // Never-written space map slots are all zeros and fine.
-                    if !self.label_stripe_is_blank(stripe).await {
-                        report.label_unrecoverable.push(stripe);
-                    }
+        let header = (0, self.header.spacemap_start);
+        let spacemaps = (
+            self.layout.spacemap_start,
+            self.layout.data_start - self.layout.spacemap_start,
+        );
+        for (lba, blocks) in [header, spacemaps] {
+            match pool.root.verify_labels(lba, blocks, repair, &score).await {
+                Ok(scan) => {
+                    report.label_stripes += scan.units;
+                    report.shards.add(&scan.check);
+                    report.label_unrecoverable.extend(scan.unrecoverable);
                 }
-                Err(e) => report.errors.push(format!("label stripe {}: {}", stripe, e)),
-            }
-        }
-    }
-
-    async fn label_stripe_is_blank(&self, stripe: u64) -> bool {
-        let Some(pool) = self.dev.pool() else {
-            return false;
-        };
-        let mut readable = 0;
-        for disk in 0..DISKS {
-            let mut b = vec![0u8; BLOCK_SIZE];
-            if pool.stripe.read_shards_raw(disk, stripe, &mut b).await.is_ok() {
-                readable += 1;
-                if b.iter().any(|&x| x != 0) {
-                    return false;
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("label blocks {}..{}: {}", lba, lba + blocks, e))
                 }
             }
         }
-        readable >= DATA_SHARDS
     }
 }
 
@@ -476,8 +471,8 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
 ) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     if let Some(pool) = fs.dev.pool() {
-        for d in 0..DISKS {
-            if let Some(mut events) = pool.stripe.disks[d].reconnects() {
+        for d in 0..pool.disks.len() {
+            if let Some(mut events) = pool.disks.disks[d].reconnects() {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     while events.changed().await.is_ok() {

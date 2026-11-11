@@ -109,7 +109,7 @@ async fn volume_writes_and_commits_stay_consistent() {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let size = 8 * 1024 * 1024u64;
-    fs.create_block("vol", size, crate::volume::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block("vol", size, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
@@ -236,7 +236,7 @@ async fn degraded_operation_and_stale_disk_return() {
     {
         let fs = pool.format().await;
         fs.mkdir(Path::new("/d")).await.unwrap();
-        fs.create_block("vol", 64 << 20, crate::volume::DEFAULT_VOLBLOCKSIZE)
+        fs.create_block("vol", 64 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
         write_generation(&fs, 1).await;
@@ -264,7 +264,11 @@ async fn degraded_operation_and_stale_disk_return() {
     {
         let fs = pool.load().await;
         let degraded = fs.degraded_disks();
-        assert!(degraded[1].is_some() && degraded[4].is_some(), "{:?}", degraded);
+        assert!(
+            degraded[1].is_some() && degraded[4].is_some(),
+            "{:?}",
+            degraded
+        );
         check_generations(&fs, 3).await;
         write_generation(&fs, 4).await;
         check_generations(&fs, 4).await;
@@ -273,7 +277,10 @@ async fn degraded_operation_and_stale_disk_return() {
         let report = fs.resilver().await.unwrap();
         assert!(report.is_clean(), "{}", report);
         assert_eq!(report.cleared, vec![1, 4], "{}", report);
-        assert!(report.shards.repaired[1] > 0 && report.shards.repaired[4] > 0, "{report}");
+        assert!(
+            report.shards.repaired[1] > 0 && report.shards.repaired[4] > 0,
+            "{report}"
+        );
         for d in [0, 2, 3] {
             assert_eq!(report.shards.mismatched[d], 0, "disk {d} touched: {report}");
         }
@@ -300,7 +307,7 @@ async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
         let (p, d) = file(n, 10 + n as u8);
         fs.write_file(&p, &d).await?;
     }
-    fs.create_block("vol", 4 << 20, crate::volume::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block("vol", 4 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await?;
     for slot in 0..40u64 {
         fs.block_write("vol", slot * 9 * 4096, &[(slot % 200 + 1) as u8; 4096])

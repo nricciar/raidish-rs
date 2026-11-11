@@ -8,18 +8,13 @@
 //!
 //! An *object* (file contents, an inode, a directory index) is a byte string
 //! stored as a list of records. Each record is a contiguous, stripe-aligned
-//! run of at most `MAX_RECORD_BLOCKS` blocks, so a record never shares a RaidZ
-//! stripe with anything else.
+//! run of at most `max_record_blocks()` blocks, so a record never shares a
+//! RaidZ stripe with anything else.
 
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
-use crate::raidz::DATA_SHARDS;
 use serde::{Deserialize, Serialize};
-
-/// Largest record, in blocks. A multiple of `DATA_SHARDS` (~120 KiB).
-pub const MAX_RECORD_BLOCKS: u64 = 30;
-const _: () = assert!(MAX_RECORD_BLOCKS.is_multiple_of(DATA_SHARDS as u64));
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlockPtr {
@@ -73,7 +68,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let mut lba = extent.start;
             let end = extent.start + extent.len;
             while lba < end {
-                let asize = MAX_RECORD_BLOCKS.min(end - lba);
+                let asize = self.max_record_blocks().min(end - lba);
                 let take = rest.len().min(asize as usize * BLOCK_SIZE);
                 let (chunk, tail) = rest.split_at(take);
                 rest = tail;
@@ -96,11 +91,11 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write a record's data, zero-padded to whole stripes so the device can
     /// write full stripes directly instead of read-modify-writing parity.
-    /// Write `data` as a single contiguous record (at most `MAX_RECORD_BLOCKS`).
+    /// Write `data` as a single contiguous record (at most `max_record_blocks()`).
     pub(crate) async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
         let blocks = data.len().div_ceil(BLOCK_SIZE) as u64;
         assert!(
-            blocks > 0 && blocks <= MAX_RECORD_BLOCKS,
+            blocks > 0 && blocks <= self.max_record_blocks(),
             "record of {} blocks",
             blocks
         );
@@ -120,8 +115,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
-        let blocks = (data.len().div_ceil(BLOCK_SIZE) as u64).div_ceil(DATA_SHARDS as u64)
-            * DATA_SHARDS as u64;
+        let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         buf[..data.len()].copy_from_slice(data);
         self.dev.write_blocks(lba, &buf).await?;

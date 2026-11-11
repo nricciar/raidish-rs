@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::DISKS;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
@@ -30,19 +31,9 @@ async fn create_test_raidz() -> (RaidZ, Vec<NamedTempFile>) {
         paths.push(path);
     }
 
-    let stripe = Stripe::new(
-        [
-            paths[0].to_str().unwrap(),
-            paths[1].to_str().unwrap(),
-            paths[2].to_str().unwrap(),
-            paths[3].to_str().unwrap(),
-            paths[4].to_str().unwrap(),
-        ],
-        DATA_SHARDS,
-    )
-    .await;
-
-    let raidz = RaidZ::new(stripe).await;
+    let p: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+    let disks = std::sync::Arc::new(crate::disks::DiskSet::new(&p).await);
+    let raidz = RaidZ::new(disks, (0..5).collect(), 2);
     (raidz, temp_files)
 }
 
@@ -138,7 +129,7 @@ async fn test_read_before_flush() {
 
 #[tokio::test]
 async fn test_stripe_buffer_completeness() {
-    let mut buffer = StripeBuffer::new();
+    let mut buffer = StripeBuffer::new(3);
 
     assert!(!buffer.is_complete(), "New buffer should not be complete");
     assert!(!buffer.has_shard(0));
@@ -169,7 +160,7 @@ async fn test_stripe_buffer_completeness() {
 
 #[tokio::test]
 async fn test_stripe_buffer_get_shard() {
-    let mut buffer = StripeBuffer::new();
+    let mut buffer = StripeBuffer::new(3);
 
     let data = [0x42u8; BLOCK_SIZE];
     buffer.set_shard(1, &data);
@@ -308,7 +299,8 @@ async fn full_stripe_writes_have_valid_parity() {
         let c = raidz.reconstruct_candidates(60 + i).await.unwrap();
         let at = i as usize * BLOCK_SIZE;
         let rebuilt: Vec<_> = c.rebuilt.iter().flatten().collect();
-        assert_eq!(rebuilt.len(), DISKS - 1, "block {}", 60 + i);
+        // Without each other disk, plus without just its own.
+        assert_eq!(rebuilt.len(), DISKS, "block {}", 60 + i);
         for r in rebuilt {
             assert_eq!(&r[..], &data[at..at + BLOCK_SIZE], "block {}", 60 + i);
         }

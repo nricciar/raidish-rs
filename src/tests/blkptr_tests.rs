@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::{DATA_SHARDS, MAX_RECORD_BLOCKS};
 use std::path::Path;
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -122,7 +123,7 @@ async fn unrecoverable_corruption_is_reported() {
     let lba = ptrs[0].lba;
     let (disk, off) = TestPool::locate(lba);
     pool.corrupt(disk, off);
-    for parity_disk in DATA_SHARDS..crate::stripe::DISKS {
+    for parity_disk in DATA_SHARDS..crate::test_util::DISKS {
         pool.corrupt(parity_disk, TestPool::stripe_offset(lba));
     }
 

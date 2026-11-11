@@ -1,10 +1,13 @@
 ---
-disks:
-  - disks/disk1
-  - disks/disk2
-  - disks/disk3
-  - disks/disk4
-  - disks/disk5
+# The disks this node serves (`listen`), as a raidz2 pool.
+# See README "Pool layouts" for other layouts.
+pool:
+  raidz2:
+    - disks/disk1
+    - disks/disk2
+    - disks/disk3
+    - disks/disk4
+    - disks/disk5
 etcd_config:
   enable: true
   etcd_nodes:

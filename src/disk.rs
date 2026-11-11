@@ -106,7 +106,7 @@ pub trait BlockDevice: Send + Sync {
 
     /// The RAID array underneath, for pool-level health operations (labels,
     /// missed-write tracking, scrub). Wrappers forward it.
-    fn pool(&self) -> Option<&crate::raidz::RaidZ> {
+    fn pool(&self) -> Option<&crate::vdev::Pool> {
         None
     }
 
@@ -122,6 +122,8 @@ pub trait BlockDevice: Send + Sync {
 
 /// Rebuilds of one block. `rebuilt[d]` is the block reconstructed without
 /// its own disk (`disk`) and without disk `d`; None if not possible.
+/// `rebuilt[disk]` is a rebuild without just its own disk (with single
+/// parity or a 2-way mirror, the only kind there is).
 #[derive(Debug, Clone, Default)]
 pub struct Candidates {
     pub disk: usize,
@@ -269,12 +271,24 @@ impl WsConn {
                         return;
                     }
                     if conn.state.idle_for() > opts.idle_timeout {
-                        eprintln!("websocket: no traffic for {:?}; dropping connection", opts.idle_timeout);
+                        eprintln!(
+                            "websocket: no traffic for {:?}; dropping connection",
+                            opts.idle_timeout
+                        );
                         conn.state.shut();
                         return;
                     }
-                    let ping = async { conn.sink.lock().await.send(Message::Ping(Bytes::new())).await };
-                    if !matches!(tokio::time::timeout(opts.request_timeout, ping).await, Ok(Ok(()))) {
+                    let ping = async {
+                        conn.sink
+                            .lock()
+                            .await
+                            .send(Message::Ping(Bytes::new()))
+                            .await
+                    };
+                    if !matches!(
+                        tokio::time::timeout(opts.request_timeout, ping).await,
+                        Ok(Ok(()))
+                    ) {
                         conn.state.shut();
                         return;
                     }
@@ -326,23 +340,24 @@ impl WsConn {
                 .map_err(DiskError::from)?;
             rx.await.map_err(|_| DiskError::Disconnected)
         };
-        let (status, payload) = match tokio::time::timeout(self.opts.request_timeout, exchange).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(e)) => {
-                self.state.pending.remove(&id);
-                if !matches!(e, DiskError::Disconnected) {
-                    self.state.shut();
+        let (status, payload) =
+            match tokio::time::timeout(self.opts.request_timeout, exchange).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(e)) => {
+                    self.state.pending.remove(&id);
+                    if !matches!(e, DiskError::Disconnected) {
+                        self.state.shut();
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-            Err(_) => {
-                // A server that stops answering is treated as gone: fail
-                // everything in flight and let the owner reconnect.
-                self.state.pending.remove(&id);
-                self.state.shut();
-                return Err(DiskError::Timeout);
-            }
-        };
+                Err(_) => {
+                    // A server that stops answering is treated as gone: fail
+                    // everything in flight and let the owner reconnect.
+                    self.state.pending.remove(&id);
+                    self.state.shut();
+                    return Err(DiskError::Timeout);
+                }
+            };
         match WsStatus::try_from(status) {
             Ok(WsStatus::Success) => Ok(payload),
             Ok(WsStatus::ErrorNotFound) => {

@@ -2,22 +2,25 @@
 extern crate rocket;
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use std::sync::Arc;
 use std::{path::Path, path::PathBuf};
 
 mod api;
 mod blkptr;
+mod config;
 mod disk;
+mod disks;
 mod fs;
 mod inode;
 mod metaslab;
+mod mirror;
 mod nbd;
 mod nvme;
 mod raidz;
 mod scan;
 mod stripe;
 mod ui;
+mod vdev;
 mod volume;
 mod websocket;
 
@@ -25,19 +28,11 @@ mod websocket;
 #[path = "tests/util.rs"]
 mod test_util;
 
-use api::EtcdConfig;
+use config::Config;
 use disk::BlockDevice;
+use disks::DiskSet;
 use fs::FileSystem;
-use raidz::{DATA_SHARDS, RaidZ};
-use stripe::Stripe;
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    disks: Vec<String>,
-    etcd_config: Option<EtcdConfig>,
-    /// Remote disk request timeout (default 10000).
-    disk_timeout_ms: Option<u64>,
-}
+use vdev::Topology;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -137,14 +132,7 @@ fn load_config(path: &str) -> std::io::Result<Config> {
     }
 
     let config_str = std::fs::read_to_string(&expanded_path)?;
-    let config: Config = serde_yaml::from_str(&config_str).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to parse config: {}", e),
-        )
-    })?;
-
-    Ok(config)
+    Config::parse(&config_str).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// How often a serving process re-checks disk health (it also reacts to
@@ -159,47 +147,86 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
     let Some(pool) = fs.dev.pool() else {
         return;
     };
-    for d in 0..stripe::DISKS {
+    let tolerance = pool.topology.fault_tolerance();
+    println!(
+        "layout: {} (survives any {} failed disk{})",
+        pool.topology.summary(),
+        tolerance,
+        if tolerance == 1 { "" } else { "s" }
+    );
+    let mut lines = Vec::new();
+    for d in 0..pool.disks.len() {
         let label = match fs.check_disk_label(d).await {
             fs::LabelState::Ok => "label ok",
             fs::LabelState::Offline => "OFFLINE",
             fs::LabelState::Foreign => "NOT A MEMBER (replaced?)",
         };
-        let state = match degraded[d] {
+        let state = match degraded.get(d).copied().flatten() {
             None => "in sync".to_string(),
             Some(t) => format!("DEGRADED since TXG {} (needs resilver)", t),
         };
-        println!(
-            "  disk {} {:<40} {:<24} {}",
+        lines.push(format!(
+            "disk {} {:<40} {:<24} {}",
             d,
-            pool.stripe.disks[d].path(),
+            pool.disks.disks[d].path(),
             label,
             state
-        );
+        ));
     }
+    print_tree(&pool.topology, &lines, 1);
+}
+
+fn print_tree(t: &Topology, disk_lines: &[String], depth: usize) {
+    let pad = "  ".repeat(depth);
+    match t {
+        Topology::Disk(d) => println!("{}{}", pad, disk_lines[*d]),
+        Topology::RaidZ { disks, .. } | Topology::Mirror { disks } => {
+            println!("{}{}", pad, t.summary());
+            for d in disks {
+                println!("{}  {}", pad, disk_lines[*d]);
+            }
+        }
+        Topology::Stripe { children } => {
+            println!("{}stripe", pad);
+            for c in children {
+                print_tree(c, disk_lines, depth + 1);
+            }
+        }
+    }
+}
+
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {}", msg);
+    std::process::exit(1);
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+    let opts = config.disk_options();
+    let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
-    if config.disks.len() != 5 {
-        eprintln!("Error: 5 disks are required");
-        std::process::exit(1);
+    if let Commands::Listen { port, id } = &cli.command {
+        let serve = config.serve_disks().unwrap_or_else(|e| fail(e));
+        let paths: Vec<&str> = serve.iter().map(|s| s.as_str()).collect();
+        let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
+        let pool = match spec {
+            // Serving the pool's own disks: share them.
+            Some(spec) if spec.paths == serve => Some(spec.on(disks.clone())),
+            Some(spec) => Some(spec.open(opts).await),
+            None => None,
+        };
+        let port = port.unwrap_or(8881);
+        let etcd = config.etcd_config;
+        api::listen(disks, pool, port, etcd, id).await;
+        return Ok(());
     }
 
-    let disk_refs: Vec<&str> = config.disks.iter().map(|s| s.as_str()).collect();
-    let disk_array: [&str; 5] = disk_refs
-        .as_slice()
-        .try_into()
-        .expect("Expected exactly 5 disks");
-    let mut disk_opts = disk::DiskOptions::default();
-    if let Some(ms) = config.disk_timeout_ms {
-        disk_opts.request_timeout = std::time::Duration::from_millis(ms);
-    }
-    let stripe = Stripe::new_with(disk_array, DATA_SHARDS, disk_opts).await;
-    let raid = RaidZ::new(stripe).await;
+    let Some(spec) = spec else {
+        fail("no pool topology configured (set `pool` in the config)");
+    };
+    let raid = spec.open(opts).await;
 
     match cli.command {
         Commands::Nbd { name, size: _ } => {
@@ -245,9 +272,8 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Block { name, size } => {
             let fs = FileSystem::load(raid).await.unwrap();
-            fs.create_block(&name, size, volume::DEFAULT_VOLBLOCKSIZE)
-                .await
-                .unwrap();
+            let vbs = fs.default_volblocksize();
+            fs.create_block(&name, size, vbs).await.unwrap();
         }
         Commands::Map => {
             let fs = FileSystem::load_readonly(raid).await.unwrap();
@@ -317,10 +343,7 @@ async fn main() -> std::io::Result<()> {
             let fs = FileSystem::load_readonly(raid).await.unwrap();
             println!("index: {:?}", fs.file_index);
         }
-        Commands::Listen { port, id } => {
-            let port = port.unwrap_or_else(|| 8881);
-            raid.listen(port, config.etcd_config, &id).await;
-        }
+        Commands::Listen { .. } => unreachable!(),
     }
     Ok(())
 }

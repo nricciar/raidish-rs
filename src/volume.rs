@@ -19,21 +19,18 @@
 //!
 //! Reads look at, in order: dirty records, records being synced, the tree.
 
-use crate::blkptr::{BlockPtr, MAX_RECORD_BLOCKS};
+use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions};
-use crate::raidz::DATA_SHARDS;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-/// Records must be whole stripes so a record never shares a stripe.
-pub const VOLBLOCK_ALIGN: u32 = (DATA_SHARDS * BLOCK_SIZE) as u32;
-pub const DEFAULT_VOLBLOCKSIZE: u32 = 4 * VOLBLOCK_ALIGN; // 48 KiB
-pub const MAX_VOLBLOCKSIZE: u32 = MAX_RECORD_BLOCKS as u32 * BLOCK_SIZE as u32;
+/// Preferred volume block size, rounded up to the pool's alignment.
+pub const TARGET_VOLBLOCKSIZE: u32 = 48 * 1024;
 pub const INDIRECT_FANOUT: u64 = 512;
 /// Commit early once this much dirty data is buffered across all volumes.
 pub const DIRTY_LIMIT_BYTES: usize = 256 << 20;
@@ -155,8 +152,26 @@ fn levels_for(records: u64) -> u8 {
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    /// Records must be whole stripes so a record never shares a stripe:
+    /// volume block sizes are multiples of this.
+    pub fn volblock_align(&self) -> u32 {
+        (self.align as usize * BLOCK_SIZE) as u32
+    }
+
+    pub fn max_volblocksize(&self) -> u32 {
+        (self.max_record_blocks() as usize * BLOCK_SIZE) as u32
+    }
+
+    /// `TARGET_VOLBLOCKSIZE` (48 KiB) rounded to this pool's alignment.
+    pub fn default_volblocksize(&self) -> u32 {
+        TARGET_VOLBLOCKSIZE
+            .div_ceil(self.volblock_align())
+            .saturating_mul(self.volblock_align())
+            .min(self.max_volblocksize())
+    }
+
     /// Create a sparse copy-on-write volume. `volblocksize` must be a multiple
-    /// of `VOLBLOCK_ALIGN` and at most `MAX_VOLBLOCKSIZE`.
+    /// of `volblock_align()` and at most `max_volblocksize()`.
     pub async fn create_block(
         &self,
         name: &str,
@@ -165,12 +180,15 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<FileId, FileSystemError> {
         if size_bytes == 0
             || volblocksize == 0
-            || !volblocksize.is_multiple_of(VOLBLOCK_ALIGN)
-            || volblocksize > MAX_VOLBLOCKSIZE
+            || !volblocksize.is_multiple_of(self.volblock_align())
+            || volblocksize > self.max_volblocksize()
         {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume size {} / volblocksize {} (must be a multiple of {} up to {})",
-                size_bytes, volblocksize, VOLBLOCK_ALIGN, MAX_VOLBLOCKSIZE
+                size_bytes,
+                volblocksize,
+                self.volblock_align(),
+                self.max_volblocksize()
             )));
         }
         let _tx = self.begin_tx().await;
@@ -517,8 +535,8 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Blocks a sync of `records` may allocate, worst case.
-    fn sync_reservation(vol: &Volume, records: &BTreeMap<u64, Dirty>) -> u64 {
-        let align = |b: u64| b.div_ceil(DATA_SHARDS as u64) * DATA_SHARDS as u64;
+    fn sync_reservation(&self, vol: &Volume, records: &BTreeMap<u64, Dirty>) -> u64 {
+        let align = |b: u64| self.align_blocks(b);
         let record_blocks = align((vol.volblocksize / BLOCK_SIZE) as u64);
         // An indirect block: 512 Option<BlockPtr> at <= 57 bytes each, plus length.
         let indirect_blocks = align((INDIRECT_FANOUT * 57 + 8).div_ceil(BLOCK_SIZE as u64));
@@ -537,7 +555,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         // Plus the inode and root index rewrite.
-        data + indirects * indirect_blocks + 3 * MAX_RECORD_BLOCKS
+        data + indirects * indirect_blocks + 3 * self.max_record_blocks()
     }
 
     async fn sync_volume(
@@ -545,7 +563,7 @@ impl<D: BlockDevice> FileSystem<D> {
         vol: &Volume,
         records: &BTreeMap<u64, Dirty>,
     ) -> Result<(), FileSystemError> {
-        let need = Self::sync_reservation(vol, records);
+        let need = self.sync_reservation(vol, records);
         if self.allocatable_blocks().await < need {
             return Err(FileSystemError::UnableToAllocateBlocks(need));
         }

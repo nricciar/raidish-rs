@@ -24,27 +24,24 @@ use crate::fs::{
     BLOCK_HEADER_SIZE as BLOCK_HEADER, BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock,
 };
 use crate::inode::Extent;
-use crate::raidz::DATA_SHARDS;
 use std::collections::{BTreeMap, VecDeque};
 
 /// Number of TXGs a freed block waits before it can be reallocated.
 pub const TXG_DEFER_SIZE: u64 = 2;
 /// Number of space map slots per metaslab (A/B).
 pub const SPACEMAP_SLOTS: u64 = 2;
-/// Bounds on metaslab size, in blocks. Both are multiples of `DATA_SHARDS`.
+/// Bounds on metaslab size, in blocks (rounded down to the pool's alignment).
 pub const METASLAB_MIN_BLOCKS: u64 = 1026;
 pub const METASLAB_MAX_BLOCKS: u64 = 262_143;
 /// Aim for roughly this many metaslabs per pool.
 pub const METASLAB_TARGET_COUNT: u64 = 128;
 
-const ALIGN: u64 = DATA_SHARDS as u64;
-
-fn align_up(v: u64) -> u64 {
-    v.div_ceil(ALIGN) * ALIGN
+fn align_up(v: u64, align: u64) -> u64 {
+    v.div_ceil(align) * align
 }
 
-fn align_down(v: u64) -> u64 {
-    (v / ALIGN) * ALIGN
+fn align_down(v: u64, align: u64) -> u64 {
+    (v / align) * align
 }
 
 /// Deterministic placement of space map slots and metaslabs on the device.
@@ -55,19 +52,22 @@ pub struct MetaslabLayout {
     pub spacemap_start: u64,
     pub spacemap_slot_blocks: u64,
     pub data_start: u64,
+    /// Allocation alignment in blocks (the pool's record alignment).
+    pub align: u64,
 }
 
 impl MetaslabLayout {
-    pub fn compute(total_blocks: u64, spacemap_start: u64) -> Self {
+    pub fn compute(total_blocks: u64, spacemap_start: u64, align: u64) -> Self {
         assert!(
-            spacemap_start.is_multiple_of(ALIGN),
+            spacemap_start.is_multiple_of(align),
             "spacemap region must be stripe aligned"
         );
 
         let size = align_down(
             (total_blocks / METASLAB_TARGET_COUNT).clamp(METASLAB_MIN_BLOCKS, METASLAB_MAX_BLOCKS),
+            align,
         );
-        let slot_blocks = Self::slot_blocks_for(size);
+        let slot_blocks = Self::slot_blocks_for(size, align);
         let per_metaslab = size + SPACEMAP_SLOTS * slot_blocks;
         let metaslab_count = total_blocks.saturating_sub(spacemap_start) / per_metaslab;
         let data_start = spacemap_start + metaslab_count * SPACEMAP_SLOTS * slot_blocks;
@@ -78,6 +78,7 @@ impl MetaslabLayout {
             spacemap_start,
             spacemap_slot_blocks: slot_blocks,
             data_start,
+            align,
         }
     }
 
@@ -88,6 +89,7 @@ impl MetaslabLayout {
             spacemap_start: sb.spacemap_start,
             spacemap_slot_blocks: sb.spacemap_slot_blocks,
             data_start: sb.data_start,
+            align: sb.align,
         }
     }
 
@@ -95,9 +97,9 @@ impl MetaslabLayout {
         metaslab_size.div_ceil(8) as usize
     }
 
-    fn slot_blocks_for(metaslab_size: u64) -> u64 {
+    fn slot_blocks_for(metaslab_size: u64, align: u64) -> u64 {
         let bytes = 2 * Self::bitmap_bytes(metaslab_size) as u64;
-        align_up(bytes.div_ceil(BLOCK_PAYLOAD_SIZE as u64))
+        align_up(bytes.div_ceil(BLOCK_PAYLOAD_SIZE as u64), align)
     }
 
     pub fn slot_lba(&self, ms_idx: usize, slot: u64) -> u64 {
@@ -133,10 +135,12 @@ pub struct MetaslabState {
     /// Slot holding the most recently committed state, if any.
     pub active_slot: Option<u64>,
     pub synced_txg: u64,
+    /// Allocation alignment in blocks.
+    pub align: u64,
 }
 
 impl MetaslabState {
-    pub fn new_empty(start_block: u64, block_count: u64) -> Self {
+    pub fn new_empty(start_block: u64, block_count: u64, align: u64) -> Self {
         let mut free_extents = BTreeMap::new();
         free_extents.insert(start_block, block_count);
         MetaslabState {
@@ -148,6 +152,7 @@ impl MetaslabState {
             dirty: true,
             active_slot: None,
             synced_txg: 0,
+            align,
         }
     }
 
@@ -214,7 +219,7 @@ impl MetaslabState {
     /// Carve out exactly `want` (stripe-aligned) contiguous blocks.
     fn take_aligned_exact(&mut self, want: u64) -> Option<Extent> {
         let (s, l, aligned) = self.free_extents.iter().find_map(|(&s, &l)| {
-            let aligned = align_up(s);
+            let aligned = align_up(s, self.align);
             (aligned + want <= s + l).then_some((s, l, aligned))
         })?;
         self.free_extents.remove(&s);
@@ -235,12 +240,12 @@ impl MetaslabState {
     /// Carve out a single stripe-aligned extent of at most `want` blocks.
     fn take_aligned(&mut self, want: u64) -> Option<Extent> {
         let found = self.free_extents.iter().find_map(|(&s, &l)| {
-            let aligned = align_up(s);
+            let aligned = align_up(s, self.align);
             let end = s + l;
             if aligned >= end {
                 return None;
             }
-            let avail = align_down(end - aligned);
+            let avail = align_down(end - aligned, self.align);
             (avail > 0).then(|| (s, l, aligned, avail.min(want)))
         })?;
 
@@ -308,7 +313,13 @@ impl MetaslabState {
 
     /// Rebuild state from an encoded slot. Deferred space is held until
     /// committed TXG `release_txg`.
-    fn decode(start_block: u64, block_count: u64, bytes: &[u8], release_txg: u64) -> Self {
+    fn decode(
+        start_block: u64,
+        block_count: u64,
+        align: u64,
+        bytes: &[u8],
+        release_txg: u64,
+    ) -> Self {
         let bm = MetaslabLayout::bitmap_bytes(block_count);
         let bit = |i: usize| bytes.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0);
 
@@ -369,6 +380,7 @@ impl MetaslabState {
             dirty: false,
             active_slot: None,
             synced_txg: 0,
+            align,
         }
     }
 }
@@ -441,7 +453,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Allocate one contiguous, stripe-aligned extent of `blocks` (rounded up
     /// to whole stripes).
     pub(crate) async fn allocate_contiguous(&self, blocks: u64) -> Result<Extent, FileSystemError> {
-        let want = align_up(blocks);
+        let want = align_up(blocks, self.layout.align);
         for ms in self.metaslabs.iter() {
             if let Some(extent) = ms.write().await.take_aligned_exact(want) {
                 return Ok(extent);
@@ -458,7 +470,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(Vec::new());
         }
 
-        let mut remaining = align_up(blocks_needed);
+        let mut remaining = align_up(blocks_needed, self.layout.align);
         let mut allocated: Vec<(usize, Extent)> = Vec::new();
 
         for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
@@ -603,8 +615,13 @@ impl<D: BlockDevice> FileSystem<D> {
 
             let state = match best {
                 Some((txg, slot, bytes)) => {
-                    let mut st =
-                        MetaslabState::decode(start, count, &bytes, uber_txg + TXG_DEFER_SIZE);
+                    let mut st = MetaslabState::decode(
+                        start,
+                        count,
+                        self.layout.align,
+                        &bytes,
+                        uber_txg + TXG_DEFER_SIZE,
+                    );
                     st.active_slot = Some(slot);
                     st.synced_txg = txg;
                     st
@@ -616,7 +633,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         "WARNING: metaslab {} has no valid space map slot; treating as full",
                         ms_idx
                     );
-                    let mut st = MetaslabState::new_empty(start, count);
+                    let mut st = MetaslabState::new_empty(start, count, self.layout.align);
                     st.free_extents.clear();
                     st.dirty = false;
                     st

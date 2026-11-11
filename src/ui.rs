@@ -1,5 +1,5 @@
 use crate::disk::BlockDevice;
-use crate::fs::{FileSystem, SUPERBLOCK_LBA, UBERBLOCK_BLOCK_COUNT, UBERBLOCK_START};
+use crate::fs::{FileSystem, SUPERBLOCK_LBA};
 use crate::metaslab::SPACEMAP_SLOTS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockType {
@@ -132,15 +132,17 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         // Mark uberblocks
-        let uberblock_start = UBERBLOCK_START as usize;
-        let uberblock_end = (UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT) as usize;
+        let uberblock_start = self.header.uberblock_start as usize;
+        let uberblock_end = (self.header.uberblock_start + self.header.uberblock_blocks()) as usize;
         for i in uberblock_start..uberblock_end.min(total_blocks) {
             block_map[i] = BlockType::Uberblock;
         }
 
         // Mark superblock
-        if SUPERBLOCK_LBA < total_blocks as u64 {
-            block_map[SUPERBLOCK_LBA as usize] = BlockType::Superblock;
+        for lba in SUPERBLOCK_LBA..SUPERBLOCK_LBA + self.header.superblock_blocks {
+            if lba < total_blocks as u64 {
+                block_map[lba as usize] = BlockType::Superblock;
+            }
         }
 
         block_map
