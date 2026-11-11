@@ -546,6 +546,23 @@ impl<D: BlockDevice> FileSystem<D> {
                 ms.deferred.push_back((txg + TXG_DEFER_SIZE, s.freeing));
             }
         }
+        if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            for ms in self.metaslabs.iter() {
+                ms.write().await.release_deferred(txg);
+            }
+        }
+    }
+
+    /// Release the deferred frees a scan held back (call after the hold is
+    /// dropped). Takes the commit lock so it can't interleave with a sync.
+    pub(crate) async fn release_held_frees(&self) {
+        let _guard = self.begin_tx().await;
+        if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return;
+        }
+        let Some(txg) = self.uberblock().await.map(|u| u.txg) else {
+            return;
+        };
         for ms in self.metaslabs.iter() {
             ms.write().await.release_deferred(txg);
         }

@@ -111,7 +111,7 @@ async fn get_block(
         .local_disk(disk_index)?
         .read_block(block_id, &mut buf)
         .await
-        .unwrap();
+        .map_err(|_| Status::InternalServerError)?;
 
     Ok(buf)
 }
@@ -140,7 +140,7 @@ async fn put_block(
         .local_disk(disk_index)?
         .write_block(block_id, bytes)
         .await
-        .unwrap();
+        .map_err(|_| Status::InternalServerError)?;
 
     Ok(Status::Ok)
 }
@@ -148,26 +148,20 @@ async fn put_block(
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
 #[get("/api/v1/disks")]
 async fn list_disks(server: &State<RaidZServer>) -> String {
-    let resp = server
-        .etcd_client
-        .clone()
-        .unwrap()
-        .leader("/myapp/nodes/leader")
-        .await
-        .unwrap();
-    let kv = resp.kv().unwrap();
-    println!("key is {:?}", kv.key_str());
-    println!("value is {:?}", kv.value_str());
-
-    let resp = server
-        .etcd_client
-        .clone()
-        .unwrap()
-        .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
-        .await
-        .unwrap();
-    for kv in resp.kvs() {
-        println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
+    if let Some(mut etcd) = server.etcd_client.clone() {
+        if let Ok(resp) = etcd.leader("/myapp/nodes/leader").await
+            && let Some(kv) = resp.kv()
+        {
+            println!("leader: {:?} = {:?}", kv.key_str(), kv.value_str());
+        }
+        if let Ok(resp) = etcd
+            .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
+            .await
+        {
+            for kv in resp.kvs() {
+                println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
+            }
+        }
     }
 
     let disk_info: Vec<_> = (0..server.disks.len())
@@ -218,6 +212,10 @@ async fn read_file(
 ///
 /// Requests are handled concurrently and answered as they complete, so a
 /// client can keep many requests in flight on one connection.
+/// Most requests one connection may have being served at once; beyond that
+/// the server stops reading, which pushes back on the client.
+const WS_MAX_IN_FLIGHT: usize = 256;
+
 #[get("/ws")]
 async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<'static> {
     let disks = server.disks.clone();
@@ -225,7 +223,8 @@ async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<
     ws.channel(move |stream| {
         Box::pin(async move {
             let (mut sink, mut source) = stream.split();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(WS_MAX_IN_FLIGHT);
+            let permits = Arc::new(tokio::sync::Semaphore::new(WS_MAX_IN_FLIGHT));
 
             let writer = tokio::spawn(async move {
                 while let Some(response) = rx.recv().await {
@@ -238,9 +237,13 @@ async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<
             while let Some(message) = source.next().await {
                 match message {
                     Ok(ws::Message::Binary(data)) => {
+                        let Ok(permit) = permits.clone().acquire_owned().await else {
+                            break;
+                        };
                         let (disks, tx) = (disks.clone(), tx.clone());
                         tokio::spawn(async move {
-                            let _ = tx.send(handle_ws_message(&data, &disks).await);
+                            let _ = tx.send(handle_ws_message(&data, &disks).await).await;
+                            drop(permit);
                         });
                     }
                     Ok(ws::Message::Close(_)) | Err(_) => break,
@@ -255,9 +258,15 @@ async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<
     })
 }
 
-async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
+/// Serve one encoded request against `disks` and encode the reply.
+pub(crate) async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
     let Some(request) = WsRequest::parse(data) else {
-        return encode_response(WsStatus::InvalidRequest, 0, &[]);
+        // Echo the id if there's one, so the client's request fails instead
+        // of waiting for a reply that never comes.
+        let id = data
+            .get(15..23)
+            .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        return encode_response(WsStatus::InvalidRequest, id, &[]);
     };
     let id = request.id();
     match serve_request(&request, disks).await {

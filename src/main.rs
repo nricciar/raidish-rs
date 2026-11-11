@@ -15,6 +15,7 @@ mod metaslab;
 mod nbd;
 mod nvme;
 mod raidz;
+mod scan;
 mod stripe;
 mod ui;
 mod volume;
@@ -34,6 +35,8 @@ use stripe::Stripe;
 struct Config {
     disks: Vec<String>,
     etcd_config: Option<EtcdConfig>,
+    /// Remote disk request timeout (default 10000).
+    disk_timeout_ms: Option<u64>,
 }
 
 #[derive(Parser)]
@@ -92,6 +95,17 @@ enum Commands {
     Ls {
         path: String,
     },
+    /// Verify every block (data and parity) and the pool labels; repair
+    /// what's wrong and bring degraded disks back in sync.
+    Scrub {
+        /// Only report; open the pool read-only and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Rebuild what degraded disks missed (only blocks written since).
+    Resilver,
+    /// Show disk health: online, label, degraded since which TXG.
+    Status,
     Listen {
         #[arg(short, long)]
         port: Option<u32>,
@@ -133,6 +147,38 @@ fn load_config(path: &str) -> std::io::Result<Config> {
     Ok(config)
 }
 
+/// How often a serving process re-checks disk health (it also reacts to
+/// reconnects immediately).
+const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
+    let degraded = fs.degraded_disks();
+    if let Some(u) = fs.uberblock().await {
+        println!("pool at TXG {}", u.txg);
+    }
+    let Some(pool) = fs.dev.pool() else {
+        return;
+    };
+    for d in 0..stripe::DISKS {
+        let label = match fs.check_disk_label(d).await {
+            fs::LabelState::Ok => "label ok",
+            fs::LabelState::Offline => "OFFLINE",
+            fs::LabelState::Foreign => "NOT A MEMBER (replaced?)",
+        };
+        let state = match degraded[d] {
+            None => "in sync".to_string(),
+            Some(t) => format!("DEGRADED since TXG {} (needs resilver)", t),
+        };
+        println!(
+            "  disk {} {:<40} {:<24} {}",
+            d,
+            pool.stripe.disks[d].path(),
+            label,
+            state
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
@@ -148,20 +194,54 @@ async fn main() -> std::io::Result<()> {
         .as_slice()
         .try_into()
         .expect("Expected exactly 5 disks");
-    let stripe = Stripe::new(disk_array, DATA_SHARDS).await;
+    let mut disk_opts = disk::DiskOptions::default();
+    if let Some(ms) = config.disk_timeout_ms {
+        disk_opts.request_timeout = std::time::Duration::from_millis(ms);
+    }
+    let stripe = Stripe::new_with(disk_array, DATA_SHARDS, disk_opts).await;
     let raid = RaidZ::new(stripe).await;
 
     match cli.command {
         Commands::Nbd { name, size: _ } => {
-            let fs = FileSystem::load(raid).await.unwrap();
-            nbd::serve_nbd(Arc::new(fs), name, 10809).await.unwrap();
+            let fs = Arc::new(FileSystem::load(raid).await.unwrap());
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
+            nbd::serve_nbd(fs, name, 10809).await.unwrap();
         }
         Commands::Nvme { name } => {
-            let fs = FileSystem::load(raid).await.unwrap();
-            let server = nvme::NvmeTcpServer::new(Arc::new(fs), name, 4420)
-                .await
-                .unwrap();
+            let fs = Arc::new(FileSystem::load(raid).await.unwrap());
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
+            let server = nvme::NvmeTcpServer::new(fs, name, 4420).await.unwrap();
             server.run().await.unwrap();
+        }
+        Commands::Scrub { dry_run } => {
+            let fs = if dry_run {
+                FileSystem::load_readonly(raid).await.unwrap()
+            } else {
+                FileSystem::load(raid).await.unwrap()
+            };
+            let report = fs.scrub(!dry_run).await.unwrap();
+            println!("{}", report);
+            if !report.is_clean() {
+                std::process::exit(2);
+            }
+        }
+        Commands::Resilver => {
+            let fs = FileSystem::load(raid).await.unwrap();
+            if !fs.needs_resilver() {
+                println!("no online disk needs a resilver");
+                print_status(&fs).await;
+                return Ok(());
+            }
+            let report = fs.resilver().await.unwrap();
+            println!("{}", report);
+            print_status(&fs).await;
+            if !report.is_clean() {
+                std::process::exit(2);
+            }
+        }
+        Commands::Status => {
+            let fs = FileSystem::load_readonly(raid).await.unwrap();
+            print_status(&fs).await;
         }
         Commands::Block { name, size } => {
             let fs = FileSystem::load(raid).await.unwrap();

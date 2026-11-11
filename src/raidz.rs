@@ -93,12 +93,11 @@ impl BlockDevice for RaidZ {
 
                 let mut read_tasks = FuturesUnordered::new();
                 for i in missing_indices {
-                    let disk = &self.stripe.disks[i];
                     read_tasks.push(async move {
                         let mut buf = [0u8; BLOCK_SIZE];
                         // A missing disk shouldn't block the write: rebuild
                         // the shard from the rest of the stripe instead.
-                        if disk.read_block(stripe_id, &mut buf).await.is_err() {
+                        if self.stripe.read_shards(i, stripe_id, &mut buf).await.is_err() {
                             self.reconstruct_from_stripe(stripe_id, i, &mut buf)
                                 .await
                                 .map_err(|e| {
@@ -135,7 +134,7 @@ impl BlockDevice for RaidZ {
 
         // Like stripe writes, flushing tolerates up to PARITY_SHARDS failed
         // disks: the data is still recoverable from the rest.
-        let flushes = self.stripe.disks.iter().map(|d| d.flush());
+        let flushes = (0..DISKS).map(|d| self.stripe.flush_disk(d));
         let results = futures::future::join_all(flushes).await;
         let failures = results.iter().filter(|r| r.is_err()).count();
         if failures > PARITY_SHARDS {
@@ -237,8 +236,8 @@ impl BlockDevice for RaidZ {
             let count = (s_last - s_first + 1) as usize;
             let runs = (0..DATA_SHARDS).map(|disk| async move {
                 let mut run = vec![0u8; count * BLOCK_SIZE];
-                self.stripe.disks[disk]
-                    .read_blocks(s_first, &mut run)
+                self.stripe
+                    .read_shards(disk, s_first, &mut run)
                     .await
                     .map(|_| run)
             });
@@ -300,8 +299,8 @@ impl BlockDevice for RaidZ {
         let target = (lba % DATA_SHARDS as u64) as usize;
         let reads = (0..DISKS).filter(|&i| i != target).map(|i| async move {
             let mut buf = [0u8; BLOCK_SIZE];
-            self.stripe.disks[i]
-                .read_block(stripe_id, &mut buf)
+            self.stripe
+                .read_shards(i, stripe_id, &mut buf)
                 .await
                 .map(|_| (i, buf))
         });
@@ -346,6 +345,10 @@ impl BlockDevice for RaidZ {
         })
     }
 
+    fn pool(&self) -> Option<&RaidZ> {
+        Some(self)
+    }
+
     async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         let stripe_id = lba / DATA_SHARDS as u64;
         let data_index = (lba % DATA_SHARDS as u64) as usize;
@@ -354,9 +357,7 @@ impl BlockDevice for RaidZ {
             return Ok(());
         }
         // Parity already encodes this data, so only the data shard needs rewriting.
-        self.stripe.disks[data_index]
-            .write_block(stripe_id, buf)
-            .await
+        self.stripe.write_shards(data_index, stripe_id, buf).await
     }
 }
 
@@ -394,11 +395,12 @@ impl RaidZ {
 
         // Read all disks except the failed one
         let mut futures = FuturesUnordered::new();
-        for (i, disk) in self.stripe.disks.iter().enumerate() {
+        for i in 0..DISKS {
             if i != data_index {
                 futures.push(async move {
                     let mut temp_buf = [0u8; BLOCK_SIZE];
-                    disk.read_block(stripe_id, &mut temp_buf)
+                    self.stripe
+                        .read_shards(i, stripe_id, &mut temp_buf)
                         .await
                         .map(|_| (i, temp_buf))
                 });
@@ -456,29 +458,12 @@ impl RaidZ {
             }
         }
 
-        let mut disk_bufs: Vec<Vec<u8>> = vec![vec![0u8; stripes * BLOCK_SIZE]; DISKS];
-        let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
-        for (j, stripe) in data.chunks(stripe_bytes).enumerate() {
-            let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
-            if j > 0 {
-                encoder.reset(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
-            }
-            for (i, shard) in stripe.chunks(BLOCK_SIZE).enumerate() {
-                disk_bufs[i][at.clone()].copy_from_slice(shard);
-                encoder.add_original_shard(shard)?;
-            }
-            let encoded = encoder.encode()?;
-            for (p, parity) in encoded.recovery_iter().enumerate() {
-                disk_bufs[DATA_SHARDS + p][at.clone()].copy_from_slice(parity);
-            }
-        }
+        let disk_bufs = Self::encode_stripes(data)?;
 
-        let writes = self
-            .stripe
-            .disks
+        let writes = disk_bufs
             .iter()
-            .zip(disk_bufs.iter())
-            .map(|(disk, buf)| disk.write_blocks(first_stripe, buf));
+            .enumerate()
+            .map(|(d, buf)| self.stripe.write_shards(d, first_stripe, buf));
         let results = futures::future::join_all(writes).await;
         let failures = results.iter().filter(|r| r.is_err()).count();
         if failures > 0 {
@@ -572,10 +557,9 @@ impl RaidZ {
         // Write all shards concurrently
         let write_futures = shard_buffers
             .iter()
-            .zip(self.stripe.disks.iter())
             .enumerate()
-            .map(|(disk_idx, (shard, disk))| async move {
-                match disk.write_block(stripe_id, shard).await {
+            .map(|(disk_idx, shard)| async move {
+                match self.stripe.write_shards(disk_idx, stripe_id, shard).await {
                     Ok(()) => Ok(disk_idx),
                     Err(e) => Err((disk_idx, e)),
                 }
@@ -614,6 +598,223 @@ impl RaidZ {
             Ok(())
         } else {
             Err(RaidZError::IncompleteStripe(stripe_id))
+        }
+    }
+}
+
+/// What `verify_stripes` found (and, if asked, fixed) per disk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StripeCheck {
+    pub stripes: u64,
+    /// Shards that didn't match what the verified data encodes to.
+    pub mismatched: [u64; DISKS],
+    /// Of those, rewritten successfully.
+    pub repaired: [u64; DISKS],
+    /// Disks that couldn't be read (offline), so weren't verified.
+    pub unreadable: [bool; DISKS],
+    /// Disks a repair write failed on.
+    pub write_failed: [bool; DISKS],
+    /// Stripes skipped because they have unflushed buffered writes.
+    pub skipped: u64,
+}
+
+impl StripeCheck {
+    pub fn add(&mut self, o: &StripeCheck) {
+        self.stripes += o.stripes;
+        self.skipped += o.skipped;
+        for d in 0..DISKS {
+            self.mismatched[d] += o.mismatched[d];
+            self.repaired[d] += o.repaired[d];
+            self.unreadable[d] |= o.unreadable[d];
+            self.write_failed[d] |= o.write_failed[d];
+        }
+    }
+}
+
+/// Every way of picking exactly `DATA_SHARDS` of the disks.
+fn shard_subsets() -> Vec<[bool; DISKS]> {
+    (0u32..1 << DISKS)
+        .filter(|m| m.count_ones() as usize == DATA_SHARDS)
+        .map(|m| std::array::from_fn(|d| m & (1 << d) != 0))
+        .collect()
+}
+
+impl RaidZ {
+    /// Encode whole stripes of `data` into one buffer per disk.
+    fn encode_stripes(data: &[u8]) -> Result<Vec<Vec<u8>>, RaidZError> {
+        let stripe_bytes = DATA_SHARDS * BLOCK_SIZE;
+        debug_assert!(data.len().is_multiple_of(stripe_bytes));
+        let stripes = data.len() / stripe_bytes;
+        let mut disk_bufs: Vec<Vec<u8>> = vec![vec![0u8; stripes * BLOCK_SIZE]; DISKS];
+        let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
+        for (j, stripe) in data.chunks(stripe_bytes).enumerate() {
+            let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
+            if j > 0 {
+                encoder.reset(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE)?;
+            }
+            for (i, shard) in stripe.chunks(BLOCK_SIZE).enumerate() {
+                disk_bufs[i][at.clone()].copy_from_slice(shard);
+                encoder.add_original_shard(shard)?;
+            }
+            let encoded = encoder.encode()?;
+            for (p, parity) in encoded.recovery_iter().enumerate() {
+                disk_bufs[DATA_SHARDS + p][at.clone()].copy_from_slice(parity);
+            }
+        }
+        Ok(disk_bufs)
+    }
+
+    /// Check the stripes starting at `first_stripe` against `data` (whole
+    /// stripes of known-good contents, e.g. a record that passed its
+    /// checksum): every shard on every disk, data and parity, must be what
+    /// `data` encodes to. With `repair`, mismatching shards are rewritten.
+    /// Stripes with buffered writes are skipped (they'll be rewritten whole).
+    pub async fn verify_stripes(
+        &self,
+        first_stripe: u64,
+        data: &[u8],
+        repair: bool,
+    ) -> Result<StripeCheck, RaidZError> {
+        let n = data.len() / (DATA_SHARDS * BLOCK_SIZE);
+        let expected = Self::encode_stripes(data)?;
+        let reads = (0..DISKS).map(|d| async move {
+            let mut run = vec![0u8; n * BLOCK_SIZE];
+            self.stripe
+                .read_shards_raw(d, first_stripe, &mut run)
+                .await
+                .ok()
+                .map(|_| run)
+        });
+        let actual = futures::future::join_all(reads).await;
+
+        let mut check = StripeCheck {
+            stripes: n as u64,
+            ..Default::default()
+        };
+        let buffered: Vec<bool> = (0..n as u64)
+            .map(|j| self.writes.contains_key(&(first_stripe + j)))
+            .collect();
+        check.skipped = buffered.iter().filter(|&&b| b).count() as u64;
+
+        for d in 0..DISKS {
+            let Some(run) = &actual[d] else {
+                check.unreadable[d] = true;
+                continue;
+            };
+            for (j, &busy) in buffered.iter().enumerate() {
+                if busy {
+                    continue;
+                }
+                let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
+                if run[at.clone()] == expected[d][at.clone()] {
+                    continue;
+                }
+                check.mismatched[d] += 1;
+                if repair {
+                    match self
+                        .stripe
+                        .write_shards(d, first_stripe + j as u64, &expected[d][at])
+                        .await
+                    {
+                        Ok(()) => check.repaired[d] += 1,
+                        Err(_) => check.write_failed[d] = true,
+                    }
+                }
+            }
+        }
+        Ok(check)
+    }
+
+    /// Verify a stripe of self-describing label blocks (superblock,
+    /// uberblocks, space map slots), which have no parent checksum. If the
+    /// shards as read are parity-consistent they're accepted; otherwise every
+    /// way of rebuilding the data from exactly `DATA_SHARDS` disks is scored
+    /// with `score` (per data block: `Some(txg)` for a valid label) and the
+    /// best (most valid labels, then newest) is taken as the truth and
+    /// checked/repaired with `verify_stripes`. Returns None if no rebuild
+    /// produced a single valid label.
+    pub async fn verify_label_stripe(
+        &self,
+        stripe: u64,
+        repair: bool,
+        score: impl Fn(&[u8]) -> Option<u64>,
+    ) -> Result<Option<StripeCheck>, RaidZError> {
+        let mut shards = [[0u8; BLOCK_SIZE]; DISKS];
+        let mut present = [false; DISKS];
+        let reads = (0..DISKS).map(|d| async move {
+            let mut b = [0u8; BLOCK_SIZE];
+            self.stripe
+                .read_shards_raw(d, stripe, &mut b)
+                .await
+                .ok()
+                .map(|_| b)
+        });
+        for (d, r) in futures::future::join_all(reads).await.into_iter().enumerate() {
+            if let Some(b) = r {
+                shards[d] = b;
+                present[d] = true;
+            }
+        }
+
+        let data_of = |use_: &[bool; DISKS]| -> Option<Vec<u8>> {
+            let mut out = vec![0u8; DATA_SHARDS * BLOCK_SIZE];
+            for i in 0..DATA_SHARDS {
+                let slot = &mut out[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+                if use_[i] {
+                    slot.copy_from_slice(&shards[i]);
+                } else {
+                    self.reconstruct_shard(&mut shards.clone(), use_, i, slot)
+                        .ok()?;
+                }
+            }
+            Some(out)
+        };
+
+        // Consistent as read (and fully readable): nothing to decide.
+        if present.iter().all(|&p| p) {
+            let mut data_only = [false; DISKS];
+            data_only[..DATA_SHARDS].fill(true);
+            if let Some(data) = data_of(&data_only) {
+                let enc = Self::encode_stripes(&data)?;
+                if (DATA_SHARDS..DISKS).all(|d| enc[d][..] == shards[d][..]) {
+                    return Ok(Some(StripeCheck {
+                        stripes: 1,
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+
+        // Rank the candidates. Every block of a label stripe is written in the
+        // same TXG (the three uberblock copies, the superblock mirrors, the
+        // blocks of one space map slot), so the truth is a full set of valid
+        // labels sharing one TXG. Stale shards mixed with current ones can
+        // decode into *valid* labels of other versions, or into rebuilds that
+        // happen to re-encode consistently with several disks, so neither
+        // validity nor agreement alone decides. Then prefer the candidate the
+        // most disks already hold, then the newest.
+        // (valid labels, one TXG, agreeing disks, TXG sum)
+        type Rank = (usize, bool, usize, u64);
+        let mut best: Option<(Rank, Vec<u8>)> = None;
+        for use_ in shard_subsets() {
+            if (0..DISKS).any(|d| use_[d] && !present[d]) {
+                continue;
+            }
+            let Some(data) = data_of(&use_) else { continue };
+            let enc = Self::encode_stripes(&data)?;
+            let agree = (0..DISKS)
+                .filter(|&d| present[d] && enc[d][..] == shards[d][..])
+                .count();
+            let txgs: Vec<u64> = data.chunks(BLOCK_SIZE).filter_map(&score).collect();
+            let uniform = txgs.len() == DATA_SHARDS && txgs.iter().all(|&t| t == txgs[0]);
+            let rank = (txgs.len(), uniform, agree, txgs.iter().sum());
+            if !txgs.is_empty() && best.as_ref().is_none_or(|(r, _)| rank > *r) {
+                best = Some((rank, data));
+            }
+        }
+        match best {
+            Some((_, data)) => Ok(Some(self.verify_stripes(stripe, &data, repair).await?)),
+            None => Ok(None),
         }
     }
 }

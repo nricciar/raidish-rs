@@ -51,12 +51,16 @@ impl TestPool {
     pub fn locate(lba: u64) -> (usize, u64) {
         let stripe = lba / DATA_SHARDS as u64;
         let disk = (lba % DATA_SHARDS as u64) as usize;
-        (disk, stripe * crate::disk::BLOCK_SIZE as u64)
+        (
+            disk,
+            (stripe + crate::stripe::DISK_LABEL_BLOCKS) * crate::disk::BLOCK_SIZE as u64,
+        )
     }
 
     /// Byte offset of a stripe's shard on any disk.
     pub fn stripe_offset(lba: u64) -> u64 {
-        (lba / DATA_SHARDS as u64) * crate::disk::BLOCK_SIZE as u64
+        (lba / DATA_SHARDS as u64 + crate::stripe::DISK_LABEL_BLOCKS)
+            * crate::disk::BLOCK_SIZE as u64
     }
 
     pub fn read_raw(&self, disk: usize, offset: u64) -> Vec<u8> {
@@ -175,6 +179,9 @@ impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
     ) -> Result<(), crate::disk::DiskError> {
         self.inner.repair_block(b, buf).await
     }
+    fn pool(&self) -> Option<&RaidZ> {
+        self.inner.pool()
+    }
 }
 
 impl TestPool {
@@ -200,6 +207,188 @@ impl TestPool {
             })
             .collect();
         let stripe = Stripe::new([&p[0], &p[1], &p[2], &p[3], &p[4]], DATA_SHARDS).await;
+        RaidZ::new(stripe).await
+    }
+}
+
+/// How a `TestDiskServer` treats requests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum ServerMode {
+    Normal = 0,
+    /// Keep reading (and answering pings) but never reply to a request.
+    Silent = 1,
+    /// Stop reading the connection entirely (no pongs either).
+    Frozen = 2,
+}
+
+/// An in-process disk server speaking the websocket block protocol (the same
+/// request handler `listen` uses), on an ephemeral port that can be stopped,
+/// restarted and made to misbehave.
+pub struct TestDiskServer {
+    pub port: u16,
+    disks: std::sync::Arc<Vec<crate::stripe::Caddy>>,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    tasks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl TestDiskServer {
+    /// Serve `paths` (local files) as disks 0..n.
+    pub async fn start(paths: &[PathBuf]) -> Self {
+        let mut disks = Vec::new();
+        for p in paths {
+            let p = p.to_str().unwrap();
+            disks.push(crate::stripe::Caddy::Healthy(
+                p.to_string(),
+                crate::disk::Disk::open(p).await.unwrap(),
+            ));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = TestDiskServer {
+            port: listener.local_addr().unwrap().port(),
+            disks: std::sync::Arc::new(disks),
+            mode: Default::default(),
+            tasks: Default::default(),
+        };
+        server.serve(listener);
+        server
+    }
+
+    pub fn url(&self, disk: usize) -> String {
+        format!("http://127.0.0.1:{}/api/v1/disks/{}", self.port, disk)
+    }
+
+    pub fn set_mode(&self, mode: ServerMode) {
+        self.mode
+            .store(mode as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Close the listener and every connection.
+    pub fn stop(&self) {
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+    }
+
+    /// Listen again on the same port.
+    pub async fn restart(&self) {
+        self.stop();
+        let mut tries = 0;
+        let listener = loop {
+            match tokio::net::TcpListener::bind(("127.0.0.1", self.port)).await {
+                Ok(l) => break l,
+                Err(e) if tries < 50 => {
+                    tries += 1;
+                    let _ = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("rebind {}: {}", self.port, e),
+            }
+        };
+        self.serve(listener);
+    }
+
+    fn serve(&self, listener: tokio::net::TcpListener) {
+        use futures_util::{SinkExt, StreamExt};
+        let (disks, mode, tasks) = (self.disks.clone(), self.mode.clone(), self.tasks.clone());
+        let accept = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (disks, mode) = (disks.clone(), mode.clone());
+                let conn = tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let (mut sink, mut source) = ws.split();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                    let writer = tokio::spawn(async move {
+                        while let Some(r) = rx.recv().await {
+                            if sink.send(tungstenite::Message::Binary(r.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    loop {
+                        if mode.load(std::sync::atomic::Ordering::SeqCst) == ServerMode::Frozen as u8
+                        {
+                            std::future::pending::<()>().await;
+                        }
+                        match source.next().await {
+                            Some(Ok(tungstenite::Message::Binary(data))) => {
+                                if mode.load(std::sync::atomic::Ordering::SeqCst)
+                                    == ServerMode::Silent as u8
+                                {
+                                    continue;
+                                }
+                                let (disks, tx) = (disks.clone(), tx.clone());
+                                tokio::spawn(async move {
+                                    let _ = tx.send(
+                                        crate::api::handle_ws_message(&data, &disks).await,
+                                    );
+                                });
+                            }
+                            Some(Ok(_)) => {}
+                            _ => break,
+                        }
+                    }
+                    writer.abort();
+                });
+                tasks.lock().unwrap().push(conn.abort_handle());
+            }
+        });
+        self.tasks.lock().unwrap().push(accept.abort_handle());
+    }
+}
+
+impl Drop for TestDiskServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Aggressive timeouts so transport failure tests run quickly.
+pub fn fast_disk_options() -> crate::disk::DiskOptions {
+    use std::time::Duration;
+    crate::disk::DiskOptions {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_millis(500),
+        ping_interval: Duration::from_millis(100),
+        idle_timeout: Duration::from_millis(400),
+        reconnect_min: Duration::from_millis(20),
+        reconnect_max: Duration::from_millis(200),
+    }
+}
+
+/// Poll `cond` every 10 ms for up to `secs` seconds.
+pub async fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    cond()
+}
+
+impl TestPool {
+    /// A device whose disks listed in `remote` are reached through `server`
+    /// (which must serve this pool's files in order), the rest opened locally.
+    pub async fn dev_remote(&self, server: &TestDiskServer, remote: &[usize]) -> RaidZ {
+        let p: Vec<String> = (0..crate::stripe::DISKS)
+            .map(|i| {
+                if remote.contains(&i) {
+                    server.url(i)
+                } else {
+                    self.paths[i].to_str().unwrap().to_string()
+                }
+            })
+            .collect();
+        let stripe = Stripe::new_with(
+            [&p[0], &p[1], &p[2], &p[3], &p[4]],
+            DATA_SHARDS,
+            fast_disk_options(),
+        )
+        .await;
         RaidZ::new(stripe).await
     }
 }

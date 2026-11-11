@@ -55,12 +55,43 @@ block name size
 // export a volume over NBD (port 10809) or NVMe/TCP (port 4420)
 nbd name
 nvme name
+// disk health: online, label, degraded since which TXG
+status
+// verify every block (data and parity) and the labels, repair what's wrong
+scrub [--dry-run]
+// rebuild only what degraded disks missed while they were away
+resilver
 // serve this node's disks (port 8881)
 listen [--port N] id
 ```
 
-`load`, `read`, `ls`, `inode`, `map`, `metaslab` and `orphaned` open the pool read-only,
-so they're safe to run against a pool that another process is serving.
+`load`, `read`, `ls`, `inode`, `map`, `metaslab`, `orphaned`, `status` and `scrub --dry-run`
+open the pool read-only, so they're safe to run against a pool that another process is serving.
+
+## Disk failures, resilver and scrub
+
+Remote disks reconnect on their own. Every request has a timeout (10 s, or
+`disk_timeout_ms` in the config). An idle connection is pinged, and dropped if
+it goes quiet. While a disk is away, requests to it fail fast and parity covers
+for it. A disk whose server is down at startup opens offline and joins once the
+server is back.
+
+Every write a disk misses is recorded, and the pool remembers the disk as
+*degraded since TXG n*. `resilver` rebuilds that disk. Because the tree is
+copy-on-write, it only reads what was written since TXG n and skips the rest.
+`nbd` and `nvme` resilver automatically when a degraded disk comes back.
+
+Each member disk carries a label with the pool's id in its first two blocks. A
+disk without a matching label (blank, replaced or foreign) is *fenced*: it gets
+no reads, because its contents can't be trusted. It then gets a full resilver.
+
+`scrub` checks every reachable block against its checksum, and checks every
+parity shard against the data, which normal reads never look at. It also checks
+the superblock, uberblocks and space maps. It repairs whatever is wrong, and a
+degraded disk is back in sync once the scrub passes.
+
+Scrub and resilver are safe while the pool is in use. They do hold back reuse
+of freed space until they finish, and they stop if the pool gets close to full.
 
 ## Virtual Block Devices
 
@@ -163,17 +194,18 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 * **One writer per pool.** Nothing yet stops two processes from writing the same pool
   (e.g. `block` from the CLI while `nbd`/`nvme` is serving), and that will corrupt it.
   Stop the server first, or use the read-only commands.
-* **No resilver.** A disk that comes back after an outage stays stale. Reads heal
-  around it, but it isn't rebuilt.
 * **No authentication** on the disk server's HTTP/websocket ports.
 * Every fsync costs a full TXG commit (~5 ms); there's no intent log yet.
 * Volumes live in the root directory, and deleting a directory leaks its contents.
+* Pools formatted before `RAIDISHV13` (per-disk labels) must be reformatted.
 
 ## TODO
 
 * pool exclusivity (writer lease) and multi-node allocation via metaslab leases
-* resilver / scrub
-* websocket reconnect and timeouts
+* fsck `--repair` (leaks, referenced-but-free blocks), rewind import to an older
+  uberblock, rebuilding space maps from the tree, `salvage` of readable data
+* fragmentation: contiguous allocation of sequential records, coalesced
+  multi-record reads, `defrag` for volumes
 * intent log (ZIL) for low-latency fsync
 * snapshots and clones
 * permissions

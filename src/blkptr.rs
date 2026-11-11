@@ -141,6 +141,16 @@ impl<D: BlockDevice> FileSystem<D> {
     /// block from parity; if that yields the right checksum, repair the bad
     /// shard on disk and return the good data.
     pub(crate) async fn read_record(&self, ptr: &BlockPtr) -> Result<Vec<u8>, FileSystemError> {
+        self.read_record_healing(ptr, !self.read_only).await
+    }
+
+    /// `read_record`, choosing whether bad shards found on the way are
+    /// rewritten (a scrub repairs, and accounts for, them itself).
+    pub(crate) async fn read_record_healing(
+        &self,
+        ptr: &BlockPtr,
+        heal: bool,
+    ) -> Result<Vec<u8>, FileSystemError> {
         let n = ptr.data_blocks();
         let mut raw = vec![0u8; n as usize * BLOCK_SIZE];
         self.dev.read_blocks(ptr.lba, &mut raw).await?;
@@ -220,7 +230,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     lba
                 );
                 let fixed: &[u8; BLOCK_SIZE] = b.as_slice().try_into().unwrap();
-                if self.read_only {
+                if !heal {
                     continue;
                 }
                 if let Err(e) = self.dev.repair_block(lba, fixed).await {
