@@ -53,6 +53,7 @@ pub async fn listen(
     port: u32,
     cluster: Arc<Cluster>,
     floor: Arc<AtomicU64>,
+    pool_map: Option<crate::inspect::PoolMap>,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -78,6 +79,7 @@ pub async fn listen(
     rocket::build()
         .manage(server)
         .manage(cluster)
+        .manage(crate::dashboard::DashboardState { pool: pool_map })
         .configure(
             rocket::Config::figment()
                 .merge(("port", port))
@@ -98,6 +100,7 @@ pub async fn listen(
             ],
         )
         .mount("/", crate::cluster::routes::routes())
+        .mount("/", crate::dashboard::routes())
         .launch()
         .await
         .unwrap();

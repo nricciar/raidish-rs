@@ -177,6 +177,48 @@ impl Config {
         }
     }
 
+    /// Where a dashboard finds each pool disk when it asks the `listen`
+    /// node on `port`: that node's own disks by their index in
+    /// `serve_disks`, the others by URL. None without a pool.
+    pub fn pool_map(&self, port: u16) -> Result<Option<crate::inspect::PoolMap>, String> {
+        self.pool_map_with(|base| crate::cluster::members::is_local_base(base, port))
+    }
+
+    /// `pool_map`, with `is_me(base)` deciding which URLs are this node.
+    pub(crate) fn pool_map_with(
+        &self,
+        is_me: impl Fn(&str) -> bool,
+    ) -> Result<Option<crate::inspect::PoolMap>, String> {
+        use crate::inspect::{DiskAddr, PoolMap};
+        let Some(spec) = self.pool_spec()? else {
+            return Ok(None);
+        };
+        let serve = self.serve_disks()?;
+        let disks = spec
+            .paths
+            .iter()
+            .map(|path| match disk_server_base(path) {
+                Some(base) if !is_me(&base) => Ok(DiskAddr::Url(path.clone())),
+                // A URL naming this node: the index is its last segment.
+                Some(_) => path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|i| i.parse().ok())
+                    .map(DiskAddr::This)
+                    .ok_or_else(|| format!("disk '{}' must end in a disk index", path)),
+                None => serve
+                    .iter()
+                    .position(|s| s == path)
+                    .map(|i| DiskAddr::This(i as u16))
+                    .ok_or_else(|| format!("local disk '{}' is not served by this node", path)),
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Some(PoolMap {
+            topology: spec.topology,
+            disks,
+        }))
+    }
+
     /// Where to ask for leases: every `listen` node that serves one of the
     /// pool's remote disks. Empty for a pool of local disks only.
     pub fn lease_endpoints(&self) -> Result<Vec<String>, String> {

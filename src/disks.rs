@@ -1,4 +1,5 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
+use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +30,10 @@ pub struct DiskSet {
 impl DiskSet {
     pub fn len(&self) -> usize {
         self.disks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.disks.is_empty()
     }
 
     pub fn is_local(&self, index: usize) -> bool {
@@ -263,6 +268,13 @@ impl Caddy {
         match self {
             Caddy::Unhealthy(_, _) => None,
             Caddy::Healthy(_, disk) => disk.reconnects(),
+        }
+    }
+
+    pub fn io_stats(&self) -> Option<crate::disk::IoStats> {
+        match self {
+            Caddy::Unhealthy(_, _) => None,
+            Caddy::Healthy(_, disk) => disk.io_stats(),
         }
     }
 

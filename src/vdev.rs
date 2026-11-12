@@ -16,6 +16,7 @@ use crate::disks::{DiskSet, MAX_DISKS};
 use crate::mirror::Mirror;
 use crate::raidz::{RaidZ, RaidZError};
 use crate::stripe::Stripe;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

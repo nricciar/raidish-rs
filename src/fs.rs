@@ -193,8 +193,8 @@ pub enum LabelState {
 pub(crate) fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        &web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             .to_le_bytes(),

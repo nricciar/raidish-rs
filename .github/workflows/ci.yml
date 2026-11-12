@@ -30,6 +30,13 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      # The release build bundles the web dashboard (see build.rs).
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -41,6 +48,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+
+      - name: Clippy (wasm)
+        run: cargo clippy -p raidish -p raidish-web --target wasm32-unknown-unknown
 
       - name: Check formatting
         run: cargo fmt --all --check

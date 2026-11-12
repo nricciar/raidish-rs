@@ -1,6 +1,7 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
 use crate::disks::DiskSet;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
+use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -301,7 +302,7 @@ impl BlockDevice for RaidZ {
         // self-heal of a whole record can't stall other tasks (disk
         // keepalives, servers) for hundreds of milliseconds.
         let (data, parity) = (self.data, self.parity);
-        let rebuilds = tokio::task::spawn_blocking(move || {
+        let rebuilds = crate::rt::spawn_blocking(move || {
             // (excluded shard position, or `target` for "only itself", rebuild)
             let mut out: Vec<(usize, Vec<u8>)> = Vec::new();
             for exclude in 0..n {
@@ -612,7 +613,7 @@ impl RaidZ {
         // part: off the async thread.
         let (data, parity) = (self.data, self.parity);
         let candidates =
-            tokio::task::spawn_blocking(move || label_candidates(data, parity, &shards, &present))
+            crate::rt::spawn_blocking(move || label_candidates(data, parity, &shards, &present))
                 .await
                 .map_err(|e| RaidZError::DiskError(io_err(e)))??;
         let Some(candidates) = candidates else {

@@ -120,3 +120,42 @@ fn record_sizes_follow_alignment() {
     assert_eq!(max_record_blocks(4), 28);
     assert_eq!(max_record_blocks(30), 30);
 }
+
+#[test]
+fn pool_map_names_this_nodes_disks_by_index() {
+    use crate::inspect::DiskAddr;
+    let config = Config::parse(
+        "pool:\n  raidz1:\n    - http://10.0.0.2:8881/api/v1/disks/0\n    - http://10.0.0.1:8881/api/v1/disks/4\n    - disks/d3\n",
+    )
+    .unwrap();
+    let map = config
+        .pool_map_with(|base| base == "http://10.0.0.1:8881")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        map.disks,
+        [
+            DiskAddr::Url("http://10.0.0.2:8881/api/v1/disks/0".into()),
+            DiskAddr::This(4),
+            // Served (from `serve_disks`, i.e. the pool's paths) as disk 2.
+            DiskAddr::This(2),
+        ]
+    );
+    assert_eq!(
+        map.urls("http://nas:8881/")[2],
+        "http://nas:8881/api/v1/disks/2"
+    );
+    let json = serde_json::to_string(&map).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::inspect::PoolMap>(&json).unwrap(),
+        map
+    );
+
+    assert!(
+        Config::parse("disks: [a]\n")
+            .unwrap()
+            .pool_map_with(|_| false)
+            .unwrap()
+            .is_none()
+    );
+}

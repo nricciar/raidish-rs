@@ -722,6 +722,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Copy everything still readable under `dest`: files as files, volumes
     /// as sparse `<name>.img` images. Unreadable records are zero-filled and
     /// reported; unreadable directories are reported and skipped.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn salvage(&self, dest: &Path) -> Result<SalvageReport, FileSystemError> {
         use std::os::unix::fs::FileExt;
         let io = |e: std::io::Error| FileSystemError::DiskError(e.into());

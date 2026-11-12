@@ -1,0 +1,16 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+# `trunk serve` (http://127.0.0.1:8080) proxies to a local `raidish listen`,
+# so the dashboard can be developed with hot reload against a real node.
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+[[proxy]]
+backend = "http://127.0.0.1:8881/api/"
+
+[[proxy]]
+backend = "ws://127.0.0.1:8881/ws"
+ws = true

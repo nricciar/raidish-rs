@@ -392,6 +392,7 @@ impl<D: BlockDevice> FileSystem<D> {
 /// (a replaced disk is fenced and fully resilvered), and whenever an online
 /// disk is degraded, resilver it. Also re-checks periodically, since misses
 /// are only noticed at commit time.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_health_monitor<D: BlockDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     interval: Duration,
