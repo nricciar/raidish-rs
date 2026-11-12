@@ -561,10 +561,34 @@ impl<D: BlockDevice> FileSystem<D> {
                 .map(|u| u.root.clone())
                 .collect();
             let _tx = fs.begin_tx().await;
-            let report = fs.rebuild_spacemaps_locked(&older, true).await?;
+            // Never forced: freeing what an unreadable part of the chosen
+            // tree references would destroy data salvage could still get.
+            let report = fs
+                .rebuild_spacemaps_locked(&older, false)
+                .await
+                .map_err(|e| {
+                    FileSystemError::InvalidArgument(format!(
+                        "rewind to TXG {} refused: {} (open it read-only to salvage)",
+                        uber.txg, e
+                    ))
+                })?;
             eprintln!("rewind: {}", report);
             let txg = fs.commit_locked().await?;
             eprintln!("rewind: committed as TXG {}", txg);
+            // The discarded TXGs must never be imported again: their space
+            // is free now and about to be reused.
+            for u in ring
+                .iter()
+                .filter(|u| u.txg > uber.txg && u.txg % UBERBLOCK_SLOTS != txg % UBERBLOCK_SLOTS)
+            {
+                if let Err(e) = fs.invalidate_uberblock_slot(u.txg).await {
+                    eprintln!(
+                        "WARNING: rewind: could not erase discarded TXG {}: {}",
+                        u.txg, e
+                    );
+                }
+            }
+            fs.dev.flush().await?;
         }
 
         Ok(fs)
@@ -954,6 +978,27 @@ impl<D: BlockDevice> FileSystem<D> {
         self.dev.flush().await?;
 
         Ok(uberblock)
+    }
+
+    /// Overwrite the ring slot holding TXG `txg` with an invalid (zero-magic)
+    /// uberblock, so it can't be imported any more.
+    async fn invalidate_uberblock_slot(&self, txg: u64) -> Result<(), FileSystemError> {
+        let slot_blocks = self.header.uberblock_slot_blocks;
+        let base_lba = self.header.uberblock_start + (txg % UBERBLOCK_SLOTS) * slot_blocks;
+        let blank = Uberblock {
+            magic: 0,
+            version: 0,
+            txg: 0,
+            timestamp: 0,
+            root: Vec::new(),
+            degraded: Vec::new(),
+        };
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;
+        for copy in 0..slot_blocks {
+            self.dev.write_block(base_lba + copy, &buf).await?;
+        }
+        Ok(())
     }
 
     /// Write a raw payload tagged with the open TXG.

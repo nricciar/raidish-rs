@@ -27,6 +27,10 @@ async fn check_snapshot<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     if !orphans.is_empty() {
         return Err(format!("leaked blocks in committed state: {:?}", orphans));
     }
+    let fsck = snap.fsck(false).await.map_err(|e| format!("fsck: {e}"))?;
+    if !fsck.is_clean() {
+        return Err(format!("fsck of committed state: {fsck}"));
+    }
     let index = snap
         .ls(Path::new("/d"))
         .await

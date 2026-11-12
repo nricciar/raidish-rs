@@ -707,6 +707,38 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
+    /// Where to place a stretch of records starting at index `first`: after
+    /// the neighbour it follows, else after whatever this sync placed last
+    /// (`prev_end`: last index, end lba), else near where it used to be.
+    async fn run_hint(
+        &self,
+        vol: &Volume,
+        old_root: &Option<BlockPtr>,
+        first: u64,
+        prev_end: Option<(u64, u64)>,
+    ) -> Result<Option<u64>, FileSystemError> {
+        if let Some((last, end)) = prev_end
+            && last + 1 == first
+        {
+            return Ok(Some(end));
+        }
+        let before = match first {
+            0 => None,
+            _ => {
+                self.tree_lookup(vol, old_root.clone(), 0, first - 1)
+                    .await?
+            }
+        };
+        Ok(match (before, prev_end) {
+            (Some(p), _) => Some(p.lba + p.asize as u64),
+            (None, Some((_, end))) => Some(end),
+            (None, None) => self
+                .tree_lookup(vol, old_root.clone(), 0, first)
+                .await?
+                .map(|p| p.lba),
+        })
+    }
+
     /// Give back the space pre-allocated for runs that were never written.
     async fn release_jobs(&self, jobs: &[SyncJob<'_>]) {
         for job in jobs {
@@ -759,26 +791,11 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut prev_end: Option<(u64, u64)> = None; // (last index, end lba)
         for run in runs {
             let first = run[0].0;
-            let hint = match prev_end {
-                Some((last, end)) if last + 1 == first => Some(end),
-                _ => {
-                    let before = match first {
-                        0 => None,
-                        _ => {
-                            self.tree_lookup(vol, old_root.clone(), 0, first - 1)
-                                .await?
-                        }
-                    };
-                    // After the neighbour it follows, else after whatever this
-                    // sync wrote last, else near where it used to be.
-                    match (before, prev_end) {
-                        (Some(p), _) => Some(p.lba + p.asize as u64),
-                        (None, Some((_, end))) => Some(end),
-                        (None, None) => self
-                            .tree_lookup(vol, old_root.clone(), 0, first)
-                            .await?
-                            .map(|p| p.lba),
-                    }
+            let hint = match self.run_hint(vol, &old_root, first, prev_end).await {
+                Ok(h) => h,
+                Err(e) => {
+                    self.release_jobs(&jobs).await;
+                    return Err(e);
                 }
             };
             // The whole stretch in one piece if possible, else piece by piece.
@@ -1045,34 +1062,52 @@ impl<D: BlockDevice> FileSystem<D> {
         let leaves = self.volume_leaves(&vol.root(), vol.levels).await?;
         let before = frag_of(&leaves);
         let record_blocks = self.align_blocks(vol.volblocksize.div_ceil(BLOCK_SIZE) as u64);
-        let batch_records = batch_records.max(1);
-
-        for batch in leaves.chunks(batch_records) {
-            let ptrs: Vec<BlockPtr> = batch.iter().map(|(_, p)| p.clone()).collect();
-            let contiguous = batch
+        let indices: Vec<u64> = leaves.iter().map(|(i, _)| *i).collect();
+        let mut batch = batch_records.max(1);
+        let mut at = 0;
+        while at < indices.len() {
+            let n = batch.min(indices.len() - at);
+            // Room for the rewritten batch plus the space it holds until its
+            // old copy's free is released; shrink the batch to fit.
+            let need = 2 * n as u64 * record_blocks;
+            if self.allocatable_blocks().await < need {
+                if n == 1 {
+                    eprintln!("defrag: stopping, not enough free space");
+                    break;
+                }
+                batch = n / 2;
+                continue;
+            }
+            // Under the commit lock, so nothing commits between reading the
+            // records and queueing them: what's read is what's committed, and
+            // writes queued by others (dirty) are left alone.
+            let _tx = self.begin_tx().await;
+            let root = vol.root();
+            let mut current: Vec<(u64, BlockPtr)> = Vec::with_capacity(n);
+            for &idx in &indices[at..at + n] {
+                if let Some(p) = self.tree_lookup(&vol, root.clone(), 0, idx).await? {
+                    current.push((idx, p));
+                }
+            }
+            at += n;
+            let contiguous = current
                 .windows(2)
                 .all(|w| w[1].1.lba == w[0].1.lba + w[0].1.asize as u64);
             if contiguous {
                 continue;
             }
-            // Room for the rewritten batch plus the space it holds until its
-            // old copy's free is released.
-            let need = 2 * batch.len() as u64 * record_blocks;
-            if self.allocatable_blocks().await < need {
-                eprintln!("defrag: stopping, not enough free space for another batch");
-                break;
-            }
+            let ptrs: Vec<BlockPtr> = current.iter().map(|(_, p)| p.clone()).collect();
             let datas = self.read_records(&ptrs).await?;
             {
                 let mut d = vol.dirty.lock().unwrap();
-                for ((idx, _), mut data) in batch.iter().zip(datas) {
+                for ((idx, _), mut data) in current.iter().zip(datas) {
                     if d.get(*idx).is_none() {
                         data.resize(vol.volblocksize, 0);
                         d.records.insert(*idx, Dirty::Data(data));
                     }
                 }
             }
-            self.commit_txg().await?;
+            self.commit_locked().await?;
         }
         let after = frag_of(&self.volume_leaves(&vol.root(), vol.levels).await?);
         Ok((before, after))

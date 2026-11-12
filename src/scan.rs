@@ -23,7 +23,7 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError, LabelState, parse_label};
-use crate::inode::{FileIndex, FileInode, InodeType};
+use crate::fsck::{NoVisitor, Node, ObjKind};
 use crate::vdev::StripeCheck;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -128,30 +128,6 @@ impl std::fmt::Display for ScanReport {
         }
         Ok(())
     }
-}
-
-/// What a node of the walk is (for pruning, decoding and error messages).
-#[derive(Debug, Clone, Copy)]
-enum ObjKind {
-    RootIndex,
-    DirIndex,
-    Inode,
-    FileData,
-}
-
-enum Node {
-    /// A whole object: all its records are needed to decode it.
-    Object {
-        ptrs: Vec<BlockPtr>,
-        kind: ObjKind,
-        path: String,
-    },
-    /// A volume tree node; `level` 0 is a data record.
-    Volume {
-        ptr: BlockPtr,
-        level: u8,
-        path: String,
-    },
 }
 
 /// Free space below which a running scan gives up, since it keeps freed
@@ -331,17 +307,9 @@ impl<D: BlockDevice> FileSystem<D> {
                         continue;
                     };
                     if level > 0 {
-                        match bincode::deserialize::<Vec<Option<BlockPtr>>>(&data) {
-                            Ok(ind) => {
-                                stack.extend(ind.into_iter().flatten().map(|c| Node::Volume {
-                                    ptr: c,
-                                    level: level - 1,
-                                    path: path.clone(),
-                                }))
-                            }
-                            Err(e) => report
-                                .errors
-                                .push(format!("{} (volume L{}): {}", path, level, e)),
+                        match crate::fsck::expand_indirect(level, &path, &data) {
+                            Ok(children) => stack.extend(children),
+                            Err(e) => report.errors.push(e),
                         }
                     }
                 }
@@ -358,50 +326,9 @@ impl<D: BlockDevice> FileSystem<D> {
         stack: &mut Vec<Node>,
         report: &mut ScanReport,
     ) {
-        let join = |name: &str| {
-            if path.ends_with('/') {
-                format!("{}{}", path, name)
-            } else {
-                format!("{}/{}", path, name)
-            }
-        };
-        match kind {
-            ObjKind::RootIndex | ObjKind::DirIndex => match bincode::deserialize::<FileIndex>(data)
-            {
-                Ok(index) => {
-                    for (name, r) in index.files {
-                        stack.push(Node::Object {
-                            ptrs: r.inode,
-                            kind: ObjKind::Inode,
-                            path: join(&name),
-                        });
-                    }
-                }
-                Err(e) => report.errors.push(format!("{}: directory: {}", path, e)),
-            },
-            ObjKind::Inode => match bincode::deserialize::<FileInode>(data) {
-                Ok(inode) => match inode.inode_type {
-                    InodeType::File { blocks, .. } => stack.push(Node::Object {
-                        ptrs: blocks,
-                        kind: ObjKind::FileData,
-                        path: path.to_string(),
-                    }),
-                    InodeType::Directory { blocks } => stack.push(Node::Object {
-                        ptrs: blocks,
-                        kind: ObjKind::DirIndex,
-                        path: path.to_string(),
-                    }),
-                    InodeType::Volume { root, levels, .. } => {
-                        stack.extend(root.map(|ptr| Node::Volume {
-                            ptr,
-                            level: levels,
-                            path: path.to_string(),
-                        }))
-                    }
-                },
-                Err(e) => report.errors.push(format!("{}: inode: {}", path, e)),
-            },
-            ObjKind::FileData => {}
+        match crate::fsck::expand(kind, path, data, &mut NoVisitor) {
+            Ok(children) => stack.extend(children),
+            Err(e) => report.errors.push(e),
         }
     }
 

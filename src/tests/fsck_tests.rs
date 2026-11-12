@@ -259,6 +259,13 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     assert_eq!(fs.read_file(Path::new("/b")).await.unwrap(), b1);
     assert!(fs.uberblock().await.unwrap().txg > newest);
     assert!(fs.fsck(false).await.unwrap().is_clean());
+    // The discarded TXGs are gone from the ring, so nothing can go back to them.
+    let ring: Vec<u64> = fs.uberblock_ring().await.iter().map(|u| u.txg).collect();
+    assert!(
+        ring.iter().all(|&t| t <= good_txg || t > newest),
+        "discarded TXGs still importable: {:?}",
+        ring
+    );
     let c = content("/c", 1, 40_000);
     fs.write_file(Path::new("/c"), &c).await.unwrap();
     drop(fs);
@@ -268,6 +275,54 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert_eq!(fs.read_file(Path::new("/c")).await.unwrap(), c);
     assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+#[tokio::test]
+async fn writable_rewind_to_a_damaged_tree_is_refused() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.mkdir(Path::new("/d")).await.unwrap();
+    let a = content("/d/a", 1, 60_000);
+    fs.write_file(Path::new("/d/a"), &a).await.unwrap();
+    let txg = fs.uberblock().await.unwrap().txg;
+    fs.write_file(Path::new("/top"), b"top").await.unwrap();
+    // /d's index is shared by both TXGs; destroy it.
+    let dir = fs.file_index.read().await.files.get("d").cloned().unwrap();
+    let InodeType::Directory { blocks } = fs.read_inode(&dir).await.unwrap().inode_type else {
+        unreachable!()
+    };
+    let a_blocks = file_blocks(&fs, "/d/a").await;
+    drop(fs);
+    destroy_stripe(&pool, blocks[0].lba);
+
+    let opts = |read_only| LoadOptions {
+        read_only,
+        rewind: Rewind::Txg(txg),
+    };
+    // Writable: refused, rather than freeing /d's contents.
+    assert!(
+        FileSystem::load_with(pool.dev().await, opts(false))
+            .await
+            .is_err()
+    );
+    // Read-only still opens it for salvage, and nothing was freed.
+    let fs = FileSystem::load_with(pool.dev().await, opts(true))
+        .await
+        .unwrap();
+    assert!(fs.ls(Path::new("/d")).await.is_err());
+    drop(fs);
+    let fs = pool.load().await;
+    for p in &a_blocks {
+        let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
+        assert!(
+            !fs.metaslabs[ms]
+                .read()
+                .await
+                .released_map()
+                .contains_key(&p.lba),
+            "/d/a's blocks were freed"
+        );
+    }
 }
 
 #[tokio::test]

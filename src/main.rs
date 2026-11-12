@@ -353,9 +353,10 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Salvage { dest } => {
             // A damaged root shouldn't stop a salvage: fall back to the
-            // newest TXG whose root directory still reads.
+            // newest TXG whose root directory still reads. (--rewind too:
+            // salvage wants what's readable, not a fully intact tree.)
             let rewind = match rewind {
-                fs::Rewind::None => fs::Rewind::Readable,
+                fs::Rewind::None | fs::Rewind::Auto => fs::Rewind::Readable,
                 r => r,
             };
             let fs = open_fs(raid, true, rewind).await;

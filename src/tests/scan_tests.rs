@@ -1,4 +1,5 @@
 use super::*;
+use crate::inode::InodeType;
 use crate::test_util::{TOTAL_BLOCKS, TestDiskServer, TestPool, wait_until};
 use crate::vdev::Pool;
 use std::path::Path;

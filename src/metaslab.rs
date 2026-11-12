@@ -545,16 +545,24 @@ impl<D: BlockDevice> FileSystem<D> {
         hint: Option<u64>,
     ) -> Result<Extent, FileSystemError> {
         let want = align_up(blocks, self.layout.align);
+        // With a hint: from the hint onwards in its metaslab, then the
+        // following metaslabs, wrapping around. Without: first fit.
+        let mut first = 0;
         if let Some(h) = hint
             && let Some(idx) = self.layout.metaslab_for_block(h)
-            && let Some(extent) = self.metaslabs[idx]
+        {
+            if let Some(extent) = self.metaslabs[idx]
                 .write()
                 .await
                 .take_aligned_exact(want, h)
-        {
-            return Ok(extent);
+            {
+                return Ok(extent);
+            }
+            first = idx + 1;
         }
-        for ms in self.metaslabs.iter() {
+        let n = self.metaslabs.len();
+        for i in 0..n {
+            let ms = &self.metaslabs[(first + i) % n];
             if let Some(extent) = ms.write().await.take_aligned_exact(want, 0) {
                 return Ok(extent);
             }

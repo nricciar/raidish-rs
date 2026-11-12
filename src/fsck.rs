@@ -59,7 +59,8 @@ pub struct WalkReport {
     pub incomplete: bool,
 }
 
-enum Node {
+/// A pending node of a tree walk (shared with scrub, see `scan`).
+pub(crate) enum Node {
     Object {
         ptrs: Vec<BlockPtr>,
         kind: ObjKind,
@@ -70,6 +71,79 @@ enum Node {
         level: u8,
         path: String,
     },
+}
+
+/// The children of a decoded directory index or inode (none for file
+/// data), reporting directories, files and volumes to `v`. This is the one
+/// place that knows how objects reference each other.
+pub(crate) fn expand<V: Visitor>(
+    kind: ObjKind,
+    path: &str,
+    data: &[u8],
+    v: &mut V,
+) -> Result<Vec<Node>, String> {
+    match kind {
+        ObjKind::RootIndex | ObjKind::DirIndex => {
+            let index = bincode::deserialize::<FileIndex>(data)
+                .map_err(|e| format!("{}: directory: {}", path, e))?;
+            v.dir(path);
+            Ok(index
+                .files
+                .into_iter()
+                .rev()
+                .map(|(name, r)| Node::Object {
+                    ptrs: r.inode,
+                    kind: ObjKind::Inode,
+                    path: join(path, &name),
+                })
+                .collect())
+        }
+        ObjKind::Inode => {
+            let inode = bincode::deserialize::<FileInode>(data)
+                .map_err(|e| format!("{}: inode: {}", path, e))?;
+            Ok(match &inode.inode_type {
+                InodeType::File { size_bytes, blocks } => {
+                    v.file(path, *size_bytes, blocks);
+                    vec![Node::Object {
+                        ptrs: blocks.clone(),
+                        kind: ObjKind::FileData,
+                        path: path.to_string(),
+                    }]
+                }
+                InodeType::Directory { blocks } => vec![Node::Object {
+                    ptrs: blocks.clone(),
+                    kind: ObjKind::DirIndex,
+                    path: path.to_string(),
+                }],
+                InodeType::Volume { root, levels, .. } => {
+                    v.volume(path, &inode.inode_type);
+                    root.iter()
+                        .map(|ptr| Node::Volume {
+                            ptr: ptr.clone(),
+                            level: *levels,
+                            path: path.to_string(),
+                        })
+                        .collect()
+                }
+            })
+        }
+        ObjKind::FileData | ObjKind::Volume(_) => Ok(Vec::new()),
+    }
+}
+
+/// The children of a volume indirect block at `level` (> 0).
+pub(crate) fn expand_indirect(level: u8, path: &str, data: &[u8]) -> Result<Vec<Node>, String> {
+    let ind = bincode::deserialize::<Vec<Option<BlockPtr>>>(data)
+        .map_err(|e| format!("{} (volume L{}): {}", path, level, e))?;
+    Ok(ind
+        .into_iter()
+        .flatten()
+        .map(|c| Node::Volume {
+            ptr: c,
+            level: level - 1,
+            path: path.to_string(),
+        })
+        .collect())
 }
 
 fn join(path: &str, name: &str) -> String {
@@ -405,55 +479,12 @@ impl<D: BlockDevice> FileSystem<D> {
                             continue;
                         }
                     };
-                    match kind {
-                        ObjKind::RootIndex | ObjKind::DirIndex => {
-                            match bincode::deserialize::<FileIndex>(&data) {
-                                Ok(index) => {
-                                    v.dir(&path);
-                                    for (name, r) in index.files.into_iter().rev() {
-                                        stack.push(Node::Object {
-                                            ptrs: r.inode,
-                                            kind: ObjKind::Inode,
-                                            path: join(&path, &name),
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    report.errors.push(format!("{}: directory: {}", path, e));
-                                    report.incomplete = true;
-                                }
-                            }
+                    match expand(kind, &path, &data, v) {
+                        Ok(children) => stack.extend(children),
+                        Err(e) => {
+                            report.errors.push(e);
+                            report.incomplete = true;
                         }
-                        ObjKind::Inode => match bincode::deserialize::<FileInode>(&data) {
-                            Ok(inode) => match &inode.inode_type {
-                                InodeType::File { size_bytes, blocks } => {
-                                    v.file(&path, *size_bytes, blocks);
-                                    stack.push(Node::Object {
-                                        ptrs: blocks.clone(),
-                                        kind: ObjKind::FileData,
-                                        path,
-                                    });
-                                }
-                                InodeType::Directory { blocks } => stack.push(Node::Object {
-                                    ptrs: blocks.clone(),
-                                    kind: ObjKind::DirIndex,
-                                    path,
-                                }),
-                                InodeType::Volume { root, levels, .. } => {
-                                    v.volume(&path, &inode.inode_type);
-                                    stack.extend(root.iter().map(|ptr| Node::Volume {
-                                        ptr: ptr.clone(),
-                                        level: *levels,
-                                        path: path.clone(),
-                                    }));
-                                }
-                            },
-                            Err(e) => {
-                                report.errors.push(format!("{}: inode: {}", path, e));
-                                report.incomplete = true;
-                            }
-                        },
-                        ObjKind::FileData | ObjKind::Volume(_) => unreachable!(),
                     }
                 }
                 Node::Volume { ptr, level, path } => {
@@ -474,18 +505,10 @@ impl<D: BlockDevice> FileSystem<D> {
                         }
                     };
                     if level > 0 {
-                        match bincode::deserialize::<Vec<Option<BlockPtr>>>(&data) {
-                            Ok(ind) => {
-                                stack.extend(ind.into_iter().flatten().map(|c| Node::Volume {
-                                    ptr: c,
-                                    level: level - 1,
-                                    path: path.clone(),
-                                }))
-                            }
+                        match expand_indirect(level, &path, &data) {
+                            Ok(children) => stack.extend(children),
                             Err(e) => {
-                                report
-                                    .errors
-                                    .push(format!("{} (volume L{}): {}", path, level, e));
+                                report.errors.push(e);
                                 report.incomplete = true;
                             }
                         }
