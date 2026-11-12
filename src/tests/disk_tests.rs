@@ -205,3 +205,134 @@ async fn test_flush_persistence() {
         );
     }
 }
+
+// ---- remote (websocket) disks ----
+
+use crate::test_util::{ServerMode, TestDiskServer, TestPool, fast_disk_options, wait_until};
+use std::time::{Duration, Instant};
+
+async fn remote_disk(server: &TestDiskServer, idx: usize) -> Disk {
+    Disk::open_with(&server.url(idx), fast_disk_options())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn remote_read_write_roundtrip() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let disk = remote_disk(&server, 2).await;
+    assert!(disk.is_online());
+
+    let data: Vec<u8> = (0..BLOCK_SIZE * 3).map(|i| (i % 251) as u8).collect();
+    disk.write_blocks(10, &data).await.unwrap();
+    let mut back = vec![0u8; data.len()];
+    disk.read_blocks(10, &mut back).await.unwrap();
+    assert_eq!(back, data);
+    assert_eq!(
+        disk.capacity_blocks().await.unwrap(),
+        crate::test_util::TOTAL_BLOCKS
+    );
+}
+
+#[tokio::test]
+async fn remote_disk_fails_fast_and_reconnects() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let disk = remote_disk(&server, 0).await;
+    let mut reconnects = disk.reconnects().unwrap();
+    let gen0 = *reconnects.borrow_and_update();
+
+    server.stop();
+    assert!(
+        wait_until(2, || !disk.is_online()).await,
+        "never noticed the drop"
+    );
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let t = Instant::now();
+    assert!(disk.read_block(0, &mut buf).await.is_err());
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "offline disk should fail fast"
+    );
+
+    server.restart().await;
+    assert!(
+        wait_until(5, || disk.is_online()).await,
+        "never reconnected"
+    );
+    assert!(*reconnects.borrow_and_update() > gen0);
+    disk.write_block(3, &[7u8; BLOCK_SIZE]).await.unwrap();
+    disk.read_block(3, &mut buf).await.unwrap();
+    assert_eq!(buf, vec![7u8; BLOCK_SIZE]);
+}
+
+#[tokio::test]
+async fn remote_disk_times_out_on_a_silent_server() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let disk = remote_disk(&server, 1).await;
+
+    server.set_mode(ServerMode::Silent);
+    let t = Instant::now();
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let err = disk.read_block(0, &mut buf).await.unwrap_err();
+    assert!(matches!(err, DiskError::Timeout), "got {}", err);
+    assert!(t.elapsed() < Duration::from_secs(2));
+
+    server.set_mode(ServerMode::Normal);
+    assert!(wait_until(5, || disk.is_online()).await);
+    disk.read_block(0, &mut buf).await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_connection_to_a_frozen_server_is_dropped() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let disk = remote_disk(&server, 1).await;
+    // Pings keep a healthy idle connection alive past the idle timeout.
+    tokio::time::sleep(fast_disk_options().idle_timeout * 2).await;
+    assert!(disk.is_online(), "healthy idle connection was dropped");
+
+    server.set_mode(ServerMode::Frozen);
+    assert!(
+        wait_until(3, || !disk.is_online()).await,
+        "frozen server not detected"
+    );
+    server.set_mode(ServerMode::Normal);
+    assert!(wait_until(5, || disk.is_online()).await);
+}
+
+#[tokio::test]
+async fn remote_disk_opens_while_server_is_down() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    server.stop();
+    let disk = remote_disk(&server, 4).await;
+    assert!(!disk.is_online());
+    server.restart().await;
+    assert!(wait_until(5, || disk.is_online()).await);
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    disk.read_block(0, &mut buf).await.unwrap();
+}
+
+#[tokio::test]
+async fn raidz_survives_a_hung_disk_within_the_timeout() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let raid = pool.dev_remote(&server, &[4]).await;
+
+    server.set_mode(ServerMode::Silent);
+    let data: Vec<u8> = (0..BLOCK_SIZE * 30).map(|i| (i % 249) as u8).collect();
+    let t = Instant::now();
+    raid.write_blocks(300, &data).await.unwrap();
+    raid.flush().await.unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "hung disk stalled the write"
+    );
+
+    let mut back = vec![0u8; data.len()];
+    raid.read_blocks(300, &mut back).await.unwrap();
+    assert_eq!(back, data);
+}

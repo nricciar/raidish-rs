@@ -2,29 +2,59 @@ use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
 use crate::inode::{FileIndex, FileInode, InodeType};
 use crate::metaslab::{MetaslabLayout, MetaslabState};
-use crate::raidz::{DATA_SHARDS, RaidZError};
+use crate::raidz::RaidZError;
+use crate::vdev::Topology;
 use crate::volume::Volume;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV12";
+pub const FS_ID: &str = "RAIDISHV14";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
-pub const UBERBLOCK_START: u64 = 3;
-pub const UBERBLOCK_BLOCK_COUNT: u64 = 15;
-pub const UBERBLOCK_STRIPE_COUNT: u64 = UBERBLOCK_BLOCK_COUNT / DATA_SHARDS as u64;
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
-/// First block after the fixed headers; start of the space map slot region.
-pub const SPACEMAP_START: u64 = UBERBLOCK_START + UBERBLOCK_BLOCK_COUNT;
-const _: () = assert!(UBERBLOCK_START.is_multiple_of(DATA_SHARDS as u64));
-const _: () = assert!(UBERBLOCK_BLOCK_COUNT.is_multiple_of(DATA_SHARDS as u64));
-const _: () = assert!(SPACEMAP_START.is_multiple_of(DATA_SHARDS as u64));
+/// Fewest copies kept of the superblock and of each uberblock.
+pub const LABEL_COPIES: u64 = 3;
+/// Uberblock ring length (the newest valid one wins at load).
+pub const UBERBLOCK_SLOTS: u64 = 5;
+
+/// Where the fixed headers live, for a pool aligned to `align` blocks:
+/// the superblock region (one copy per block), then the uberblock ring
+/// (`UBERBLOCK_SLOTS` slots, one copy per block), then the space maps.
+/// Every region is a whole number of aligned units, so a header never
+/// shares a raidz stripe with anything else. With 3 data shards that's
+/// superblock 0..3, uberblocks 3..18, space maps from 18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderLayout {
+    pub align: u64,
+    pub superblock_blocks: u64,
+    pub uberblock_start: u64,
+    pub uberblock_slot_blocks: u64,
+    /// First block after the fixed headers; start of the space map slot region.
+    pub spacemap_start: u64,
+}
+
+impl HeaderLayout {
+    pub fn new(align: u64) -> Self {
+        let unit = LABEL_COPIES.div_ceil(align) * align;
+        HeaderLayout {
+            align,
+            superblock_blocks: unit,
+            uberblock_start: unit,
+            uberblock_slot_blocks: unit,
+            spacemap_start: unit + UBERBLOCK_SLOTS * unit,
+        }
+    }
+
+    pub fn uberblock_blocks(&self) -> u64 {
+        UBERBLOCK_SLOTS * self.uberblock_slot_blocks
+    }
+}
 
 #[derive(Debug)]
 pub enum FileSystemError {
@@ -41,6 +71,8 @@ pub enum FileSystemError {
     NotAFile,
     AlreadyExists,
     InvalidArgument(String),
+    /// The pool was formatted with a different layout than configured.
+    TopologyMismatch(String),
 }
 
 impl fmt::Display for FileSystemError {
@@ -49,6 +81,7 @@ impl fmt::Display for FileSystemError {
             FileSystemError::SerializationError(err) => write!(f, "Serialization error: {}", err),
             FileSystemError::DiskError(err) => write!(f, "Disk error: {}", err),
             FileSystemError::RaidZError(err) => write!(f, "RaidZ error: {}", err),
+            FileSystemError::TopologyMismatch(why) => write!(f, "topology mismatch: {}", why),
             FileSystemError::UnableToAllocateBlocks(count) => {
                 write!(f, "Unable to allocate {} blocks", count)
             }
@@ -93,6 +126,34 @@ pub struct Superblock {
     pub spacemap_start: u64,
     pub spacemap_slot_blocks: u64,
     pub data_start: u64,
+    /// Identifies the pool; every member disk's label carries it.
+    pub pool_guid: u64,
+    /// Record alignment in blocks (see `vdev`).
+    pub align: u64,
+    /// The vdev tree the pool was formatted with (None: not a pool device).
+    pub topology: Option<Topology>,
+}
+
+/// Which committed state to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rewind {
+    /// The newest valid uberblock (normal import).
+    #[default]
+    None,
+    /// The newest uberblock whose whole tree (metadata and data) reads back
+    /// with good checksums.
+    Auto,
+    /// The newest uberblock whose root directory reads (data may be damaged;
+    /// for salvage).
+    Readable,
+    /// The uberblock of exactly this TXG.
+    Txg(u64),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    pub read_only: bool,
+    pub rewind: Rewind,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,6 +164,45 @@ pub struct Uberblock {
     pub timestamp: u64, // optional but useful
     /// The root directory's serialized `FileIndex`.
     pub root: Vec<BlockPtr>,
+    /// Per member disk: the earliest TXG it may have missed writes from
+    /// (None = in sync). Cleared by a successful resilver.
+    pub degraded: Vec<Option<u64>>,
+}
+
+/// Identity of a member disk, stored (twice) in its label area outside the
+/// RAID address space.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DiskLabel {
+    pub pool_guid: u64,
+    pub disk_index: u8,
+    pub disk_guid: u64,
+}
+
+/// How a member disk's label compares to the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelState {
+    Ok,
+    /// Couldn't be read: the disk is offline.
+    Offline,
+    /// Readable, but no valid label of this pool for this slot: a new,
+    /// replaced or foreign disk. Its contents can't be trusted.
+    Foreign,
+}
+
+/// A random-enough 64-bit id (no RNG dependency needed).
+pub(crate) fn new_guid(salt: u64) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&salt.to_le_bytes());
+    h.update(&(&salt as *const u64 as usize).to_le_bytes());
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
 }
 
 /// Header of a self-describing *label* block (superblock, uberblock, space
@@ -153,10 +253,24 @@ pub struct FileSystem<D: BlockDevice> {
     /// Opened for inspection: never writes (no commits, no self-heal repairs),
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
+    /// See `Uberblock::degraded`; persisted with every commit.
+    pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+    /// Per-disk missed-write counts already folded into `degraded`.
+    miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Record alignment in blocks (the pool's, or 1 for a plain device).
+    pub(crate) align: u64,
+    pub(crate) header: HeaderLayout,
+    /// While non-zero, expired deferred frees are not made allocatable, so
+    /// nothing a running scan may still rewrite can be reallocated.
+    pub(crate) scan_hold: Arc<AtomicUsize>,
+    /// One scrub/resilver at a time.
+    pub(crate) scan_lock: Arc<Mutex<()>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
     fn empty(dev: D) -> Self {
+        let align = dev.pool().map_or(1, |p| p.align);
+        let disks = dev.pool().map_or(0, |p| p.disks.len());
         FileSystem {
             dev,
             superblock: Arc::new(RwLock::new(None)),
@@ -170,7 +284,38 @@ impl<D: BlockDevice> FileSystem<D> {
             commits_started: Arc::new(AtomicU64::new(0)),
             commits_done: Arc::new(AtomicU64::new(0)),
             read_only: false,
+            degraded: Arc::new(std::sync::Mutex::new(vec![None; disks])),
+            miss_seen: Arc::new(std::sync::Mutex::new(vec![0; disks])),
+            align,
+            header: HeaderLayout::new(align),
+            scan_hold: Arc::new(AtomicUsize::new(0)),
+            scan_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Leaf disks of the pool underneath (0 for a plain device).
+    pub fn disk_count(&self) -> usize {
+        self.dev.pool().map_or(0, |p| p.disks.len())
+    }
+
+    /// Every disk's missed-write count right now.
+    pub(crate) fn miss_counts(&self) -> Vec<u64> {
+        match self.dev.pool() {
+            Some(pool) => (0..pool.disks.len())
+                .map(|d| pool.disks.miss_count(d))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Largest record, in blocks.
+    pub fn max_record_blocks(&self) -> u64 {
+        crate::vdev::max_record_blocks(self.align)
+    }
+
+    /// Round `blocks` up to whole aligned units.
+    pub(crate) fn align_blocks(&self, blocks: u64) -> u64 {
+        blocks.div_ceil(self.align) * self.align
     }
 
     pub async fn superblock(&self) -> Option<Superblock> {
@@ -202,14 +347,19 @@ impl<D: BlockDevice> FileSystem<D> {
             txg: 0,
             timestamp: 0,
             root: Vec::new(),
+            degraded: vec![None; fs.disk_count()],
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
-        for slot in 0..UBERBLOCK_BLOCK_COUNT {
-            fs.write_block_checked_txg(UBERBLOCK_START + slot, &zero_uber)
+        // Disks that failed during format must not count as missed writes
+        // from before the pool existed; they are marked degraded below.
+        *fs.miss_seen.lock().unwrap() = fs.miss_counts();
+        let header = fs.header;
+        for slot in 0..header.uberblock_blocks() {
+            fs.write_block_checked_txg(header.uberblock_start + slot, &zero_uber)
                 .await?;
         }
 
-        let layout = MetaslabLayout::compute(total_blocks, SPACEMAP_START);
+        let layout = MetaslabLayout::compute(total_blocks, header.spacemap_start, fs.align);
         let superblock = Superblock {
             magic: FS_ID.to_string(),
             block_size: BLOCK_SIZE as u32,
@@ -219,13 +369,22 @@ impl<D: BlockDevice> FileSystem<D> {
             spacemap_start: layout.spacemap_start,
             spacemap_slot_blocks: layout.spacemap_slot_blocks,
             data_start: layout.data_start,
+            pool_guid: new_guid(total_blocks),
+            align: fs.align,
+            topology: fs.dev.pool().map(|p| p.topology.clone()),
         };
-        for mirror_idx in 0..3 {
+        for mirror_idx in 0..header.superblock_blocks {
             fs.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock)
                 .await?;
         }
         fs.superblock = Arc::new(RwLock::new(Some(superblock)));
         fs.layout = layout;
+        for d in 0..fs.disk_count() {
+            if fs.write_disk_label(d).await.is_err() {
+                eprintln!("format: disk {} label write failed; marking it degraded", d);
+                fs.degraded.lock().unwrap()[d] = Some(0);
+            }
+        }
 
         // Metaslabs start dirty, so the first commit writes slot A for each.
         let metaslabs = (0..layout.metaslab_count as usize)
@@ -233,6 +392,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 Arc::new(RwLock::new(MetaslabState::new_empty(
                     layout.metaslab_start(i),
                     layout.metaslab_size_blocks,
+                    layout.align,
                 )))
             })
             .collect();
@@ -256,33 +416,126 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read file system headers and load root file index
     pub async fn load(dev: D) -> Result<Self, FileSystemError> {
-        Self::load_inner(dev, false).await
+        Self::load_with(dev, LoadOptions::default()).await
     }
 
     /// Open without ever writing to the device (inspection tools, or reading
     /// a pool another process is serving). Damaged blocks are still healed in
     /// memory for the caller, just not repaired on disk.
     pub async fn load_readonly(dev: D) -> Result<Self, FileSystemError> {
-        Self::load_inner(dev, true).await
+        Self::load_with(
+            dev,
+            LoadOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
-    async fn load_inner(dev: D, read_only: bool) -> Result<Self, FileSystemError> {
+    /// Open the pool, possibly at an older committed state (`opts.rewind`).
+    ///
+    /// Rewinding to an uberblock older than the newest one, when writable,
+    /// rebuilds the space maps from the chosen tree (which frees whatever the
+    /// abandoned TXGs wrote) and commits right away with a TXG newer than any
+    /// in the ring, so the abandoned uberblocks can never win a later import.
+    pub async fn load_with(dev: D, opts: LoadOptions) -> Result<Self, FileSystemError> {
         let mut fs = Self::empty(dev);
-        fs.read_only = read_only;
+        fs.read_only = opts.read_only;
 
-        fs.scan_uberblocks().await;
+        fs.read_superblock().await;
+        let ring = fs.read_uberblock_ring().await;
 
         let superblock = fs.superblock().await.ok_or(FileSystemError::NotFormatted)?;
         if superblock.magic != FS_ID {
             return Err(FileSystemError::NotFormatted);
         }
-        let uber = match fs.uberblock().await {
-            Some(uber) => uber,
-            None => return Ok(fs),
+        if superblock.align != fs.align {
+            return Err(FileSystemError::TopologyMismatch(format!(
+                "pool is aligned to {} blocks, configured layout to {}",
+                superblock.align, fs.align
+            )));
+        }
+        if let Some(pool) = fs.dev.pool()
+            && superblock.topology.as_ref() != Some(&pool.topology)
+        {
+            return Err(FileSystemError::TopologyMismatch(format!(
+                "pool was formatted as {}, configured as {}",
+                superblock
+                    .topology
+                    .as_ref()
+                    .map_or("a plain device".to_string(), |t| t.summary()),
+                pool.topology.summary()
+            )));
+        }
+        let Some(newest) = ring.first().cloned() else {
+            return Ok(fs);
         };
-
         fs.layout = MetaslabLayout::from_superblock(&superblock);
-        let metaslabs = fs.load_metaslabs(uber.txg).await?;
+
+        let uber = match opts.rewind {
+            Rewind::None => newest.clone(),
+            Rewind::Txg(t) => ring.iter().find(|u| u.txg == t).cloned().ok_or_else(|| {
+                FileSystemError::InvalidArgument(format!(
+                    "no valid uberblock for TXG {} (have: {:?})",
+                    t,
+                    ring.iter().map(|u| u.txg).collect::<Vec<_>>()
+                ))
+            })?,
+            Rewind::Auto => fs.first_intact(&ring).await?,
+            Rewind::Readable => {
+                let mut pick = None;
+                for u in &ring {
+                    if fs.read_value::<FileIndex>(&u.root).await.is_ok() {
+                        pick = Some(u.clone());
+                        break;
+                    }
+                    eprintln!("rewind: TXG {}: root directory unreadable", u.txg);
+                }
+                pick.ok_or_else(|| {
+                    FileSystemError::InvalidArgument("no uberblock with a readable root".into())
+                })?
+            }
+        };
+        let rewound = uber.txg < newest.txg;
+        if rewound {
+            eprintln!(
+                "rewind: opening TXG {} (newest is TXG {}; {} newer TXG(s) discarded)",
+                uber.txg,
+                newest.txg,
+                ring.iter().filter(|u| u.txg > uber.txg).count()
+            );
+        }
+        // A rewound pool's next TXG must be newer than everything in the
+        // ring; it keeps the chosen tree.
+        *fs.uberblock.lock().await = Some(Uberblock {
+            txg: newest.txg,
+            ..uber.clone()
+        });
+
+        // Conservative: a disk degraded in any newer TXG stays degraded.
+        let mut degraded = uber.degraded.clone();
+        for u in ring.iter().filter(|u| u.txg > uber.txg) {
+            for (d, since) in u.degraded.iter().enumerate() {
+                if d < degraded.len()
+                    && let Some(s) = since
+                {
+                    degraded[d] = Some(degraded[d].map_or(*s, |t| t.min(*s)));
+                }
+            }
+        }
+        degraded.resize(fs.disk_count(), None);
+        *fs.degraded.lock().unwrap() = degraded;
+        *fs.miss_seen.lock().unwrap() = fs.miss_counts();
+        fs.adopt_disks().await;
+        let (metaslabs, missing) = fs.load_metaslabs(uber.txg).await?;
+        if !missing.is_empty() && !(rewound && !fs.read_only) {
+            eprintln!(
+                "WARNING: {} metaslab(s) without a valid space map are treated as full; \
+                 run `fsck --rebuild-spacemaps` to recover the space",
+                missing.len()
+            );
+        }
         fs.metaslabs = Arc::new(
             metaslabs
                 .into_iter()
@@ -301,7 +554,72 @@ impl<D: BlockDevice> FileSystem<D> {
         fs.file_index = Arc::new(RwLock::new(file_index));
         fs.root_ptr = Arc::new(Mutex::new(uber.root.clone()));
 
+        if rewound && !fs.read_only {
+            let older: Vec<Vec<BlockPtr>> = ring
+                .iter()
+                .filter(|u| u.txg < uber.txg)
+                .map(|u| u.root.clone())
+                .collect();
+            let _tx = fs.begin_tx().await;
+            // Never forced: freeing what an unreadable part of the chosen
+            // tree references would destroy data salvage could still get.
+            let report = fs
+                .rebuild_spacemaps_locked(&older, false)
+                .await
+                .map_err(|e| {
+                    FileSystemError::InvalidArgument(format!(
+                        "rewind to TXG {} refused: {} (open it read-only to salvage)",
+                        uber.txg, e
+                    ))
+                })?;
+            eprintln!("rewind: {}", report);
+            let txg = fs.commit_locked().await?;
+            eprintln!("rewind: committed as TXG {}", txg);
+            // The discarded TXGs must never be imported again: their space
+            // is free now and about to be reused.
+            for u in ring
+                .iter()
+                .filter(|u| u.txg > uber.txg && u.txg % UBERBLOCK_SLOTS != txg % UBERBLOCK_SLOTS)
+            {
+                if let Err(e) = fs.invalidate_uberblock_slot(u.txg).await {
+                    eprintln!(
+                        "WARNING: rewind: could not erase discarded TXG {}: {}",
+                        u.txg, e
+                    );
+                }
+            }
+            fs.dev.flush().await?;
+        }
+
         Ok(fs)
+    }
+
+    /// The newest uberblock of `ring` whose whole tree verifies.
+    async fn first_intact(&self, ring: &[Uberblock]) -> Result<Uberblock, FileSystemError> {
+        for u in ring {
+            if u.root.iter().any(|p| p.birth_txg > u.txg) {
+                eprintln!("rewind: TXG {}: root newer than its uberblock", u.txg);
+                continue;
+            }
+            let walk = self.verify_tree(&u.root).await;
+            if walk.errors.is_empty() {
+                return Ok(u.clone());
+            }
+            eprintln!(
+                "rewind: TXG {} has {} damaged record(s), e.g. {}",
+                u.txg,
+                walk.errors.len(),
+                walk.errors[0]
+            );
+        }
+        Err(FileSystemError::InvalidArgument(
+            "rewind: no uberblock in the ring has an intact tree".into(),
+        ))
+    }
+
+    /// Every valid uberblock in the ring, newest first (one per TXG).
+    pub async fn uberblock_ring(&self) -> Vec<Uberblock> {
+        self.read_uberblock_ring().await
     }
 
     /// Read a files contents
@@ -475,7 +793,10 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let synced = self.sync_metaslabs(txg).await?;
 
-        match self.write_uberblock(txg, root).await {
+        // The uberblock-carrying flush below is the last write of this TXG;
+        // misses from it are caught by the next commit (as `txg`).
+        let degraded = self.account_misses(txg);
+        match self.write_uberblock(txg, root, degraded).await {
             Ok(uberblock) => {
                 *self.uberblock.lock().await = Some(uberblock);
                 self.finish_metaslab_sync(txg, synced).await;
@@ -491,10 +812,142 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
+    /// Fold missed writes since the last commit into `degraded`. A miss seen
+    /// now happened during TXG `txg` or late in `txg - 1` (the previous
+    /// commit's uberblock write), so the disk needs everything from `txg - 1`.
+    fn account_misses(&self, txg: u64) -> Vec<Option<u64>> {
+        let mut degraded = self.degraded.lock().unwrap();
+        if let Some(pool) = self.dev.pool() {
+            let mut seen = self.miss_seen.lock().unwrap();
+            for d in 0..pool.disks.len() {
+                let count = pool.disks.miss_count(d);
+                if count != seen[d] {
+                    seen[d] = count;
+                    let since = txg.saturating_sub(1);
+                    if degraded[d].is_none() {
+                        eprintln!("disk {} missed writes; degraded since TXG {}", d, since);
+                    }
+                    degraded[d] = Some(degraded[d].map_or(since, |t| t.min(since)));
+                }
+            }
+        }
+        degraded.clone()
+    }
+
+    /// Mark `disk` as needing everything from TXG `since` (persisted at the
+    /// next commit).
+    pub(crate) fn mark_degraded(&self, disk: usize, since: u64) {
+        let mut degraded = self.degraded.lock().unwrap();
+        degraded[disk] = Some(degraded[disk].map_or(since, |t| t.min(since)));
+    }
+
+    /// Per disk: have writes failed since the last commit folded them into
+    /// `degraded`?
+    pub(crate) fn unaccounted_misses(&self) -> Vec<bool> {
+        let seen = self.miss_seen.lock().unwrap();
+        self.miss_counts()
+            .iter()
+            .zip(seen.iter())
+            .map(|(now, seen)| now != seen)
+            .collect()
+    }
+
+    pub fn degraded_disks(&self) -> Vec<Option<u64>> {
+        self.degraded.lock().unwrap().clone()
+    }
+
+    /// The label this pool expects on member `disk`.
+    async fn expected_label(&self, disk: usize) -> Option<DiskLabel> {
+        let sb = self.superblock().await?;
+        Some(DiskLabel {
+            pool_guid: sb.pool_guid,
+            disk_index: disk as u8,
+            disk_guid: 0,
+        })
+    }
+
+    /// Compare member `disk`'s label with the pool.
+    pub async fn check_disk_label(&self, disk: usize) -> LabelState {
+        let (Some(pool), Some(want)) = (self.dev.pool(), self.expected_label(disk).await) else {
+            return LabelState::Ok;
+        };
+        let mut readable = false;
+        for copy in 0..crate::disks::DISK_LABEL_BLOCKS {
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            if pool.disks.read_label(disk, copy, &mut buf).await.is_err() {
+                continue;
+            }
+            readable = true;
+            if let Ok((_, len)) = parse_label(&buf)
+                && let Ok(label) = bincode::deserialize::<DiskLabel>(
+                    &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len],
+                )
+                && label.pool_guid == want.pool_guid
+                && label.disk_index == want.disk_index
+            {
+                return LabelState::Ok;
+            }
+        }
+        if readable {
+            LabelState::Foreign
+        } else {
+            LabelState::Offline
+        }
+    }
+
+    /// Write member `disk`'s label (both copies).
+    pub(crate) async fn write_disk_label(&self, disk: usize) -> Result<(), FileSystemError> {
+        let pool = self.dev.pool().ok_or(FileSystemError::NotFormatted)?;
+        let mut label = self
+            .expected_label(disk)
+            .await
+            .ok_or(FileSystemError::NotFormatted)?;
+        label.disk_guid = new_guid(disk as u64);
+        let payload = bincode::serialize(&label)?;
+        let txg = self.uberblock().await.map_or(0, |u| u.txg);
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(txg, &payload, &mut buf)?;
+        for copy in 0..crate::disks::DISK_LABEL_BLOCKS {
+            pool.disks.write_label(disk, copy, &buf).await?;
+        }
+        pool.disks.flush_disk(disk).await?;
+        Ok(())
+    }
+
+    /// Check every member's label (at load, or when a disk reconnects): a
+    /// foreign disk is fenced (no reads) and needs a full resilver.
+    pub(crate) async fn adopt_disks(&self) {
+        for d in 0..self.disk_count() {
+            self.adopt_disk(d).await;
+        }
+    }
+
+    pub(crate) async fn adopt_disk(&self, d: usize) -> LabelState {
+        let state = self.check_disk_label(d).await;
+        let Some(pool) = self.dev.pool() else {
+            return state;
+        };
+        match state {
+            LabelState::Ok => {}
+            // Whatever it misses from now on is counted as failed writes.
+            LabelState::Offline => eprintln!("disk {} is offline", d),
+            LabelState::Foreign => {
+                eprintln!(
+                    "disk {} has no label for this pool (new or replaced?); fencing it until resilvered",
+                    d
+                );
+                pool.disks.set_fenced(d, true);
+                self.mark_degraded(d, 0);
+            }
+        }
+        state
+    }
+
     async fn write_uberblock(
         &self,
         txg: u64,
         root: Vec<BlockPtr>,
+        degraded: Vec<Option<u64>>,
     ) -> Result<Uberblock, FileSystemError> {
         // Everything the uberblock points at must be durable first.
         self.dev.flush().await?;
@@ -505,11 +958,12 @@ impl<D: BlockDevice> FileSystem<D> {
             txg,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             root,
+            degraded,
         };
 
-        // Rotate through UBERBLOCK_STRIPE_COUNT stripes; one copy per data shard.
-        let uberblock_stripe_idx = txg % UBERBLOCK_STRIPE_COUNT;
-        let uberblock_stripe_id = (UBERBLOCK_START / DATA_SHARDS as u64) + uberblock_stripe_idx;
+        // Rotate through the ring; one copy per block of the slot.
+        let slot_blocks = self.header.uberblock_slot_blocks;
+        let base_lba = self.header.uberblock_start + (txg % UBERBLOCK_SLOTS) * slot_blocks;
 
         let payload = bincode::serialize(&uberblock)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
@@ -517,16 +971,34 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut block_buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(txg, &payload, &mut block_buf)?;
 
-        let base_lba = uberblock_stripe_id * DATA_SHARDS as u64;
-        for shard_idx in 0..DATA_SHARDS {
-            self.dev
-                .write_block(base_lba + shard_idx as u64, &block_buf)
-                .await?;
+        for copy in 0..slot_blocks {
+            self.dev.write_block(base_lba + copy, &block_buf).await?;
         }
 
         self.dev.flush().await?;
 
         Ok(uberblock)
+    }
+
+    /// Overwrite the ring slot holding TXG `txg` with an invalid (zero-magic)
+    /// uberblock, so it can't be imported any more.
+    async fn invalidate_uberblock_slot(&self, txg: u64) -> Result<(), FileSystemError> {
+        let slot_blocks = self.header.uberblock_slot_blocks;
+        let base_lba = self.header.uberblock_start + (txg % UBERBLOCK_SLOTS) * slot_blocks;
+        let blank = Uberblock {
+            magic: 0,
+            version: 0,
+            txg: 0,
+            timestamp: 0,
+            root: Vec::new(),
+            degraded: Vec::new(),
+        };
+        let mut buf = [0u8; BLOCK_SIZE];
+        self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;
+        for copy in 0..slot_blocks {
+            self.dev.write_block(base_lba + copy, &buf).await?;
+        }
+        Ok(())
     }
 
     /// Write a raw payload tagged with the open TXG.
@@ -582,9 +1054,9 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    async fn scan_uberblocks(&self) -> Option<(u64, Uberblock)> {
-        // The superblock is written to three mirrors; use the first good one.
-        for mirror in 0..3 {
+    async fn read_superblock(&self) {
+        // The superblock is written to several mirrors; use the first good one.
+        for mirror in 0..self.header.superblock_blocks {
             match self
                 .read_block_checked::<Superblock>(SUPERBLOCK_LBA + mirror)
                 .await
@@ -596,33 +1068,53 @@ impl<D: BlockDevice> FileSystem<D> {
                 Err(e) => eprintln!("superblock mirror {}: {:?}", mirror, e),
             }
         }
+    }
 
-        let mut best: Option<(u64, Uberblock)> = None;
-
-        for i in 0..UBERBLOCK_BLOCK_COUNT {
-            let lba = UBERBLOCK_START + i;
-            if let Ok((txg, ub)) = self.read_block_checked::<Uberblock>(lba).await {
-                if ub.magic != UBERBLOCK_MAGIC {
+    /// Every valid uberblock version found in the ring, newest first.
+    async fn read_uberblock_ring(&self) -> Vec<Uberblock> {
+        let mut found: Vec<Uberblock> = Vec::new();
+        for i in 0..self.header.uberblock_blocks() {
+            let lba = self.header.uberblock_start + i;
+            for (txg, ub) in self.read_label_versions::<Uberblock>(lba).await {
+                if ub.magic != UBERBLOCK_MAGIC || ub.txg != txg {
                     continue;
                 }
-                match &best {
-                    None => {
-                        best = Some((txg, ub));
-                    }
-                    Some((best_txg, _)) if txg > *best_txg => {
-                        best = Some((txg, ub));
-                    }
-                    _ => {}
+                if !found.iter().any(|u| u.txg == txg) {
+                    found.push(ub);
                 }
             }
         }
+        found.sort_by_key(|u| std::cmp::Reverse(u.txg));
+        found
+    }
 
-        // Initialize TXG state from the latest committed uberblock
-        if let Some((_txg, uberblock)) = best.clone() {
-            *self.uberblock.lock().await = Some(uberblock);
+    /// Every valid version of label block `lba`: as normally read, and as
+    /// held by the other copies / rebuilt from parity. A disk that missed
+    /// writes still returns well-formed (older) labels, and on a mirror (or
+    /// a single-data-shard raidz) every copy of an uberblock slot may come
+    /// from that one disk, so the normal read alone could roll the pool back.
+    async fn read_label_versions<T: for<'a> Deserialize<'a>>(&self, lba: BlockId) -> Vec<(u64, T)> {
+        let mut blocks = Vec::new();
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if self.dev.read_block(lba, &mut buf).await.is_ok() {
+            blocks.push(buf);
         }
-
-        best
+        if let Ok(c) = self.dev.reconstruct_candidates(lba).await {
+            for b in c.rebuilt.into_iter().flatten() {
+                if !blocks.contains(&b) {
+                    blocks.push(b);
+                }
+            }
+        }
+        blocks
+            .iter()
+            .filter_map(|buf| {
+                let (txg, len) = parse_label(buf).ok()?;
+                let value =
+                    bincode::deserialize(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len]).ok()?;
+                Some((txg, value))
+            })
+            .collect()
     }
 
     /// Returns deserialized type from block
@@ -633,19 +1125,10 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut buf = vec![0u8; BLOCK_SIZE];
         self.dev.read_block(lba, &mut buf).await?;
 
-        let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
-
-        let payload_start = BLOCK_HEADER_SIZE;
-        let payload_end = payload_start + header.payload_len as usize;
-        let payload = &buf[payload_start..payload_end];
-
-        let checksum = *blake3::hash(payload).as_bytes();
-        if checksum != header.checksum {
-            return Err(FileSystemError::ChecksumMismatch);
-        }
-
-        let value = bincode::deserialize(payload)?;
-        Ok((header.txg, value))
+        // parse_label bounds-checks the header (a corrupt length used to panic).
+        let (txg, len) = parse_label(&buf)?;
+        let value = bincode::deserialize(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len])?;
+        Ok((txg, value))
     }
 }
 

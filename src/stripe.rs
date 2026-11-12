@@ -1,181 +1,175 @@
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError};
-use futures::future::join_all;
-use std::sync::Arc;
+//! Stripe (RAID0) vdev over child vdevs (raidz groups, mirrors or single
+//! disks).
+//!
+//! The address space is interleaved across the children in chunks of
+//! `chunk` blocks: chunk `c` lives on child `c % n`, as that child's chunk
+//! `c / n`. The chunk is a multiple of every child's width, so an aligned
+//! record split at a chunk boundary is still aligned on both children.
+//! Requests that cross a boundary are split. A stripe tolerates no more
+//! failures than its weakest child.
 
-pub const DISKS: usize = 5;
+use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
+use crate::raidz::RaidZError;
+use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev, lcm, max_record_blocks};
 
 #[derive(Debug)]
 pub struct Stripe {
-    pub disks: Arc<Vec<Caddy>>,
-    data_shards: usize,
+    children: Vec<Box<dyn Vdev>>,
+    width: u64,
+    chunk: u64,
+}
+
+/// One piece of a request: `len` blocks at `local` on `child`, starting
+/// `offset` blocks into the request.
+struct Segment {
+    child: usize,
+    local: u64,
+    offset: u64,
+    len: u64,
 }
 
 impl Stripe {
-    pub fn len(&self) -> usize {
-        self.disks.len()
-    }
-
-    pub fn data_shards(&self) -> usize {
-        self.data_shards
-    }
-
-    pub fn is_local(&self, index: usize) -> bool {
-        self.disks[index].is_local()
-    }
-
-    pub async fn new(paths: [&str; DISKS], data_shards: usize) -> Self {
-        let disk_futures: Vec<_> = paths.iter().map(|path| Disk::open(path)).collect();
-        let results = join_all(disk_futures).await;
-
-        let disks: Vec<Caddy> = results
-            .into_iter()
-            .zip(paths.iter())
-            .map(|(result, &path)| match result {
-                Ok(disk) => Caddy::Healthy(path.to_string(), disk),
-                Err(error) => Caddy::Unhealthy(path.to_string(), error),
-            })
-            .collect();
-
+    pub fn new(children: Vec<Box<dyn Vdev>>) -> Self {
+        assert!(!children.is_empty());
+        let width = children.iter().map(|c| c.width()).fold(1, lcm);
         Stripe {
-            disks: Arc::new(disks),
-            data_shards,
+            children,
+            width,
+            chunk: max_record_blocks(width),
         }
+    }
+
+    fn locate(&self, lba: BlockId) -> (usize, u64) {
+        let n = self.children.len() as u64;
+        let c = lba / self.chunk;
+        ((c % n) as usize, (c / n) * self.chunk + lba % self.chunk)
+    }
+
+    /// Inverse of `locate`.
+    fn global(&self, child: usize, local: u64) -> u64 {
+        let n = self.children.len() as u64;
+        ((local / self.chunk) * n + child as u64) * self.chunk + local % self.chunk
+    }
+
+    fn segments(&self, lba: BlockId, blocks: u64) -> Vec<Segment> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset < blocks {
+            let at = lba + offset;
+            let len = (self.chunk - at % self.chunk).min(blocks - offset);
+            let (child, local) = self.locate(at);
+            out.push(Segment {
+                child,
+                local,
+                offset,
+                len,
+            });
+            offset += len;
+        }
+        out
     }
 }
 
 #[async_trait]
 impl BlockDevice for Stripe {
-    /// Blocks per disk available on every disk (the smallest disk wins).
-    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
-        let mut min = u64::MAX;
-        for disk in self.disks.iter() {
-            min = min.min(disk.capacity_blocks().await?);
-        }
-        Ok(min)
-    }
-
     async fn flush(&self) -> Result<(), DiskError> {
-        let futures = self.disks.iter().enumerate().map(|(i, disk)| async move {
-            match disk.flush().await {
-                Ok(_) => Ok(()),
-                Err(e) => Err((i, e)),
-            }
-        });
-        let results = futures::future::join_all(futures).await;
-
-        let mut failures = Vec::new();
-
-        for result in results {
-            match result {
-                Ok(_) => (),
-                Err((_disk_idx, disk_error)) => {
-                    failures.push(disk_error);
-                }
-            }
-        }
-
-        if let Some(failure) = failures.pop() {
-            Err(failure)
-        } else {
-            Ok(())
-        }
+        let results = futures::future::join_all(self.children.iter().map(|c| c.flush())).await;
+        results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
     }
 
     async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        let stripe = lba as usize / self.data_shards;
-        let data_index = lba as usize % self.data_shards;
-
-        self.disks[data_index].read_block(stripe as u64, buf).await
+        let (child, local) = self.locate(lba);
+        self.children[child].read_block(local, buf).await
     }
 
     async fn write_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        let stripe = lba as usize / self.data_shards;
-        let data_index = lba as usize % self.data_shards;
-
-        self.disks[data_index].write_block(stripe as u64, buf).await
-    }
-}
-
-#[derive(Debug)]
-pub enum Caddy {
-    Healthy(String, Disk),
-    Unhealthy(String, DiskError),
-}
-
-#[async_trait]
-impl BlockDevice for Caddy {
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(dev, e) => {
-                eprintln!("caddy: unable to read from unhealthy disk '{}': {}", dev, e);
-                Err(DiskError::UnhealthyDisk)
-            }
-            Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.map_err(|e| {
-                eprintln!("caddy: unable to read from disk '{}': {}", dev, e);
-                e
-            }),
-        }
+        let (child, local) = self.locate(lba);
+        self.children[child].write_block(local, buf).await
     }
 
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(dev, e) => {
-                eprintln!("caddy: unable to write to unhealthy disk '{}': {}", dev, e);
-                Err(DiskError::UnhealthyDisk)
-            }
-            Caddy::Healthy(dev, disk) => disk.write_block(block, buf).await.map_err(|e| {
-                eprintln!("caddy: unable to write to disk '{}': {}", dev, e);
-                e
-            }),
-        }
-    }
-
+    /// Every child contributes as many whole chunks as the smallest has.
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
-        match self {
-            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(_, disk) => disk.capacity_blocks().await,
+        let mut min = u64::MAX;
+        for c in &self.children {
+            min = min.min(c.capacity_blocks().await?);
         }
+        Ok(min / self.chunk * self.chunk * self.children.len() as u64)
     }
 
     async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.map_err(|e| {
-                eprintln!("caddy: unable to read from disk '{}': {}", dev, e);
-                e
-            }),
+        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+        let mut rest = buf;
+        let mut reads = Vec::new();
+        for s in &segs {
+            let (part, tail) = rest.split_at_mut(s.len as usize * BLOCK_SIZE);
+            rest = tail;
+            reads.push(self.children[s.child].read_blocks(s.local, part));
         }
+        futures::future::try_join_all(reads).await.map(|_| ())
     }
 
     async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.map_err(|e| {
-                eprintln!("caddy: unable to write to disk '{}': {}", dev, e);
-                e
-            }),
-        }
+        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+        let writes = segs.iter().map(|s| {
+            let at = s.offset as usize * BLOCK_SIZE;
+            self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize * BLOCK_SIZE])
+        });
+        futures::future::try_join_all(writes).await.map(|_| ())
     }
 
-    async fn flush(&self) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(dev, e) => {
-                eprintln!("caddy: unable to flush unhealthy disk '{}': {}", dev, e);
-                Err(DiskError::UnhealthyDisk)
-            }
-            Caddy::Healthy(dev, disk) => disk.flush().await.map_err(|e| {
-                eprintln!("caddy: unable to flush disk '{}': {}", dev, e);
-                e
-            }),
-        }
+    async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {
+        let (child, local) = self.locate(lba);
+        self.children[child].reconstruct_candidates(local).await
+    }
+
+    async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+        let (child, local) = self.locate(lba);
+        self.children[child].repair_block(local, buf).await
     }
 }
 
-impl Caddy {
-    pub fn is_local(&self) -> bool {
-        match self {
-            Caddy::Unhealthy(_, _) => false,
-            Caddy::Healthy(_, disk) => disk.is_local(),
+#[async_trait]
+impl Vdev for Stripe {
+    fn width(&self) -> u64 {
+        self.width
+    }
+
+    async fn verify_blocks(
+        &self,
+        lba: BlockId,
+        data: &[u8],
+        repair: bool,
+    ) -> Result<StripeCheck, RaidZError> {
+        let mut check = StripeCheck::default();
+        for s in self.segments(lba, (data.len() / BLOCK_SIZE) as u64) {
+            let at = s.offset as usize * BLOCK_SIZE;
+            let part = &data[at..at + s.len as usize * BLOCK_SIZE];
+            check.add(
+                &self.children[s.child]
+                    .verify_blocks(s.local, part, repair)
+                    .await?,
+            );
         }
+        Ok(check)
+    }
+
+    async fn verify_labels(
+        &self,
+        lba: BlockId,
+        blocks: u64,
+        repair: bool,
+        score: LabelScore<'_>,
+    ) -> Result<LabelScan, RaidZError> {
+        let mut scan = LabelScan::default();
+        for s in self.segments(lba, blocks) {
+            let mut part = self.children[s.child]
+                .verify_labels(s.local, s.len, repair, score)
+                .await?;
+            for b in part.unrecoverable.iter_mut() {
+                *b = self.global(s.child, *b);
+            }
+            scan.add(part);
+        }
+        Ok(scan)
     }
 }

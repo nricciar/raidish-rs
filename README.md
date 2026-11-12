@@ -1,6 +1,6 @@
 # RAIDish
 
-a distributed raidz2 like filesystem proof of concept
+a distributed raidz/mirror filesystem proof of concept
 
 ## Setup
 
@@ -29,6 +29,34 @@ cargo run -- --config remote-config.yaml format
 cargo run -- --config remote-config.yaml map
 ```
 
+## Pool layouts
+
+The `pool` section of the config describes how the disks are combined:
+
+```yaml
+# 3 disks, raidz1 (2 data + 1 parity)
+pool:
+  raidz1: [disks/d1, disks/d2, disks/d3]
+
+# 5 disks, raidz2 (3 data + 2 parity)
+pool:
+  raidz2: [disks/d1, disks/d2, disks/d3, disks/d4, disks/d5]
+
+# any parity
+pool:
+  raidz: { parity: 3, disks: [d1, d2, d3, d4, d5, d6] }
+
+# n-way mirror
+pool:
+  mirror: [disks/d1, disks/d2, disks/d3]
+
+# 4 disks on 4 nodes, two mirrors striped together (RAID10)
+pool:
+  stripe:
+    - mirror: [http://node1:8881/api/v1/disks/0, http://node2:8881/api/v1/disks/0]
+    - mirror: [http://node3:8881/api/v1/disks/0, http://node4:8881/api/v1/disks/0]
+```
+
 ## Commands
 
 ```
@@ -55,12 +83,56 @@ block name size
 // export a volume over NBD (port 10809) or NVMe/TCP (port 4420)
 nbd name
 nvme name
+// disk health: online, label, degraded since which TXG
+status
+// verify every block (data and parity) and the labels, repair what's wrong
+scrub [--dry-run]
+// rebuild only what degraded disks missed while they were away
+resilver
+// check space maps against the tree (leaks, in-use blocks marked free, cross-links)
+fsck [--repair] [--rebuild-spacemaps [--force]]
+// copy everything still readable to a local directory
+salvage path/to/dir
+// lay a volume's records out contiguously (--check: only report)
+defrag name [--batch N] [--check]
 // serve this node's disks (port 8881)
 listen [--port N] id
 ```
 
-`load`, `read`, `ls`, `inode`, `map`, `metaslab` and `orphaned` open the pool read-only,
-so they're safe to run against a pool that another process is serving.
+Every command takes `--rewind` or `--txg N` to open an older committed state (see below).
+
+`load`, `read`, `ls`, `inode`, `map`, `metaslab`, `orphaned`, `status`, `scrub --dry-run`,
+`fsck` (without `--repair`), `salvage` and `defrag --check` open the pool read-only, so they're safe to run against a pool that another process is serving.
+
+## Recovery
+
+`fsck` walks the whole tree and compares what it references with the space
+maps. It reports *leaks* (allocated, referenced by nothing), *referenced-but-free*
+blocks (live data the allocator could hand out again), *cross-links* (two
+pointers to the same blocks) and unreadable metadata. `fsck --repair`
+re-allocates live space and frees leaks.
+
+`fsck --rebuild-spacemaps` throws the space maps away and derives them from
+the tree.
+
+The uberblock ring keeps the last 5 committed TXGs, and freed space isn't
+reused for 4 TXGs, so each of them is a complete, intact tree. To go back:
+
+* `--rewind` opens the newest TXG whose whole tree (metadata and data)
+  verifies.
+* `--txg N` opens exactly TXG `N`. `status` lists the TXGs you can rewind to.
+
+A writable command commits the rewind. It rebuilds the space maps from the
+chosen tree, which frees what the discarded TXGs wrote, and it commits with a
+TXG newer than any in the ring, so the discarded TXGs are gone for good.
+
+Read-only commands (`ls`, `read`, `salvage`, ...) only look at the older state.
+
+`salvage dir` copies every file it can read into `dir`, and each volume as a
+sparse `<name>.img`. Records that fail their checksum are zero-filled, and it
+reports each damaged item with the byte ranges that were lost. If the newest
+root directory is unreadable, it falls back to the newest TXG whose root still
+reads.
 
 ## Virtual Block Devices
 
@@ -163,17 +235,19 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 * **One writer per pool.** Nothing yet stops two processes from writing the same pool
   (e.g. `block` from the CLI while `nbd`/`nvme` is serving), and that will corrupt it.
   Stop the server first, or use the read-only commands.
-* **No resilver.** A disk that comes back after an outage stays stale. Reads heal
-  around it, but it isn't rebuilt.
 * **No authentication** on the disk server's HTTP/websocket ports.
 * Every fsync costs a full TXG commit (~5 ms); there's no intent log yet.
 * Volumes live in the root directory, and deleting a directory leaks its contents.
+* Pools formatted before `RAIDISHV14` (configurable layouts) must be reformatted.
+* Self-heal by checksum tries at most two bad disks per record, so raidz3 only
+  gets its third parity shard's worth of protection from missing (offline)
+  disks, not from silently corrupt ones.
+* The superblock and uberblocks live on the first stripe member (usually),
+  so they are only as redundant as that member.
 
 ## TODO
 
 * pool exclusivity (writer lease) and multi-node allocation via metaslab leases
-* resilver / scrub
-* websocket reconnect and timeouts
 * intent log (ZIL) for low-latency fsync
 * snapshots and clones
 * permissions

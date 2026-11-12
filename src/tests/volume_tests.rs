@@ -1,6 +1,7 @@
 use super::*;
-use crate::raidz::RaidZ;
 use crate::test_util::TestPool;
+use crate::test_util::{DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, VOLBLOCK_ALIGN};
+use crate::vdev::Pool;
 use std::path::Path;
 
 const MB: u64 = 1024 * 1024;
@@ -11,7 +12,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn allocated(fs: &FileSystem<RaidZ>) -> u64 {
+async fn allocated(fs: &FileSystem<Pool>) -> u64 {
     let mut used = 0;
     for ms in fs.metaslabs.iter() {
         let ms = ms.read().await;
@@ -21,13 +22,13 @@ async fn allocated(fs: &FileSystem<RaidZ>) -> u64 {
 }
 
 /// Commit enough TXGs that every deferred free is released.
-async fn settle(fs: &FileSystem<RaidZ>) {
+async fn settle(fs: &FileSystem<Pool>) {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
 }
 
-async fn read(fs: &FileSystem<RaidZ>, offset: u64, len: usize) -> Vec<u8> {
+async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = fs.block_read("vol", offset, &mut buf).await.unwrap();
     buf.truncate(n);
@@ -103,7 +104,7 @@ async fn writes_visible_before_and_after_sync_and_reload() {
         .await
         .unwrap();
 
-    async fn check(fs: &FileSystem<RaidZ>, a: &[u8], b: &[u8], c: &[u8]) {
+    async fn check(fs: &FileSystem<Pool>, a: &[u8], b: &[u8], c: &[u8]) {
         assert_eq!(read(fs, 8192, a.len()).await, a);
         assert_eq!(read(fs, 100_003, b.len()).await, b);
         assert_eq!(read(fs, 10 * DEFAULT_VOLBLOCKSIZE as u64, c.len()).await, c);

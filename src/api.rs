@@ -1,7 +1,7 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::disks::{Caddy, DiskSet};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::raidz::RaidZ;
-use crate::stripe::Caddy;
+use crate::vdev::Pool;
 use crate::websocket::{WsOp, WsRequest, WsStatus, encode_response};
 use etcd_client::{Client, GetOptions, LockOptions};
 use rocket::data::{Data, ToByteUnit};
@@ -19,14 +19,14 @@ pub struct EtcdConfig {
     pub etcd_nodes: Vec<String>,
 }
 
-pub struct RaidZServer {
+pub struct DiskServer {
     disks: Arc<Vec<Caddy>>,
-    /// Only present if the local disks hold a formatted pool.
-    fs: Option<FileSystem<RaidZ>>,
+    /// Only present if a pool is configured and formatted.
+    fs: Option<FileSystem<Pool>>,
     etcd_client: Option<Client>,
 }
 
-impl RaidZServer {
+impl DiskServer {
     fn local_disk(&self, disk_index: usize) -> Result<&Caddy, Status> {
         let disk = self.disks.get(disk_index).ok_or(Status::NotFound)?;
         if !disk.is_local() {
@@ -36,10 +36,17 @@ impl RaidZServer {
     }
 }
 
-impl RaidZ {
-    /// Start an HTTP/WebSocket server that exposes all local disks in this RaidZ array
-    /// Only local disks are exposed - remote disks are skipped
-    pub async fn listen(self, port: u32, etcd_config: Option<EtcdConfig>, id: &str) {
+/// Start an HTTP/WebSocket server that exposes `disks` (by their index in
+/// the set). Only local disks are served; remote ones are refused. `pool`,
+/// if configured, backs the read-only file endpoint.
+pub async fn listen(
+    disks: Arc<DiskSet>,
+    pool: Option<Pool>,
+    port: u32,
+    etcd_config: Option<EtcdConfig>,
+    id: &str,
+) {
+    {
         let etcd_client = match etcd_config {
             Some(etcd_config) if etcd_config.enable => {
                 let mut etcd_cli = Client::connect(etcd_config.etcd_nodes, None).await.unwrap();
@@ -59,17 +66,20 @@ impl RaidZ {
 
         // Serving blocks doesn't need a formatted pool (that's how a remote
         // client formats it in the first place).
-        let disks = self.stripe.disks.clone();
+        let disks = disks.disks.clone();
         // Read-only: this process only serves raw blocks; the pool's writer is
         // whoever formats/serves it remotely.
-        let fs = match FileSystem::load_readonly(self).await {
-            Ok(fs) => Some(fs),
-            Err(e) => {
-                println!("serving raw disks only ({})", e);
-                None
-            }
+        let fs = match pool {
+            None => None,
+            Some(pool) => match FileSystem::load_readonly(pool).await {
+                Ok(fs) => Some(fs),
+                Err(e) => {
+                    println!("serving raw disks only ({})", e);
+                    None
+                }
+            },
         };
-        let server = RaidZServer {
+        let server = DiskServer {
             disks,
             fs,
             etcd_client,
@@ -104,14 +114,14 @@ impl RaidZ {
 async fn get_block(
     disk_index: usize,
     block_id: u64,
-    server: &State<RaidZServer>,
+    server: &State<DiskServer>,
 ) -> Result<Vec<u8>, Status> {
     let mut buf = vec![0u8; BLOCK_SIZE];
     server
         .local_disk(disk_index)?
         .read_block(block_id, &mut buf)
         .await
-        .unwrap();
+        .map_err(|_| Status::InternalServerError)?;
 
     Ok(buf)
 }
@@ -123,7 +133,7 @@ async fn put_block(
     disk_index: usize,
     block_id: u64,
     data: Data<'_>,
-    server: &State<RaidZServer>,
+    server: &State<DiskServer>,
 ) -> Result<Status, Status> {
     let bytes = data
         .open(10.mebibytes())
@@ -140,34 +150,28 @@ async fn put_block(
         .local_disk(disk_index)?
         .write_block(block_id, bytes)
         .await
-        .unwrap();
+        .map_err(|_| Status::InternalServerError)?;
 
     Ok(Status::Ok)
 }
 
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
 #[get("/api/v1/disks")]
-async fn list_disks(server: &State<RaidZServer>) -> String {
-    let resp = server
-        .etcd_client
-        .clone()
-        .unwrap()
-        .leader("/myapp/nodes/leader")
-        .await
-        .unwrap();
-    let kv = resp.kv().unwrap();
-    println!("key is {:?}", kv.key_str());
-    println!("value is {:?}", kv.value_str());
-
-    let resp = server
-        .etcd_client
-        .clone()
-        .unwrap()
-        .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
-        .await
-        .unwrap();
-    for kv in resp.kvs() {
-        println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
+async fn list_disks(server: &State<DiskServer>) -> String {
+    if let Some(mut etcd) = server.etcd_client.clone() {
+        if let Ok(resp) = etcd.leader("/myapp/nodes/leader").await
+            && let Some(kv) = resp.kv()
+        {
+            println!("leader: {:?} = {:?}", kv.key_str(), kv.value_str());
+        }
+        if let Ok(resp) = etcd
+            .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
+            .await
+        {
+            for kv in resp.kvs() {
+                println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
+            }
+        }
     }
 
     let disk_info: Vec<_> = (0..server.disks.len())
@@ -185,7 +189,7 @@ async fn list_disks(server: &State<RaidZServer>) -> String {
 
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
-async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
+async fn flush_disks(disk_index: usize, server: &State<DiskServer>) -> Status {
     match server.local_disk(disk_index) {
         Ok(disk) => match disk.flush().await {
             Ok(()) => Status::Ok,
@@ -198,7 +202,7 @@ async fn flush_disks(disk_index: usize, server: &State<RaidZServer>) -> Status {
 #[get("/api/v1/files/<path..>")]
 async fn read_file(
     path: std::path::PathBuf,
-    server: &State<RaidZServer>,
+    server: &State<DiskServer>,
 ) -> Result<Vec<u8>, Status> {
     let fs = server.fs.as_ref().ok_or(Status::ServiceUnavailable)?;
     match fs.read_file(path.as_path()).await {
@@ -218,14 +222,19 @@ async fn read_file(
 ///
 /// Requests are handled concurrently and answered as they complete, so a
 /// client can keep many requests in flight on one connection.
+/// Most requests one connection may have being served at once; beyond that
+/// the server stops reading, which pushes back on the client.
+const WS_MAX_IN_FLIGHT: usize = 256;
+
 #[get("/ws")]
-async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<'static> {
+async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'static> {
     let disks = server.disks.clone();
 
     ws.channel(move |stream| {
         Box::pin(async move {
             let (mut sink, mut source) = stream.split();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(WS_MAX_IN_FLIGHT);
+            let permits = Arc::new(tokio::sync::Semaphore::new(WS_MAX_IN_FLIGHT));
 
             let writer = tokio::spawn(async move {
                 while let Some(response) = rx.recv().await {
@@ -238,9 +247,13 @@ async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<
             while let Some(message) = source.next().await {
                 match message {
                     Ok(ws::Message::Binary(data)) => {
+                        let Ok(permit) = permits.clone().acquire_owned().await else {
+                            break;
+                        };
                         let (disks, tx) = (disks.clone(), tx.clone());
                         tokio::spawn(async move {
-                            let _ = tx.send(handle_ws_message(&data, &disks).await);
+                            let _ = tx.send(handle_ws_message(&data, &disks).await).await;
+                            drop(permit);
                         });
                     }
                     Ok(ws::Message::Close(_)) | Err(_) => break,
@@ -255,9 +268,15 @@ async fn ws_endpoint(ws: WebSocket, server: &State<RaidZServer>) -> ws::Channel<
     })
 }
 
-async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
+/// Serve one encoded request against `disks` and encode the reply.
+pub(crate) async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
     let Some(request) = WsRequest::parse(data) else {
-        return encode_response(WsStatus::InvalidRequest, 0, &[]);
+        // Echo the id if there's one, so the client's request fails instead
+        // of waiting for a reply that never comes.
+        let id = data
+            .get(15..23)
+            .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        return encode_response(WsStatus::InvalidRequest, id, &[]);
     };
     let id = request.id();
     match serve_request(&request, disks).await {

@@ -1,9 +1,12 @@
 use super::*;
-use crate::raidz::RaidZ;
 use crate::test_util::{TOTAL_BLOCKS, TestPool};
+use crate::vdev::Pool;
+
+/// Alignment of the default test pool (raidz2: 3 data shards).
+const ALIGN: u64 = crate::test_util::DATA_SHARDS as u64;
 use std::path::{Path, PathBuf};
 
-async fn free_map(fs: &FileSystem<RaidZ>) -> Vec<BTreeMap<u64, u64>> {
+async fn free_map(fs: &FileSystem<Pool>) -> Vec<BTreeMap<u64, u64>> {
     let mut out = Vec::new();
     for ms in fs.metaslabs.iter() {
         out.push(ms.read().await.free_extents.clone());
@@ -11,7 +14,7 @@ async fn free_map(fs: &FileSystem<RaidZ>) -> Vec<BTreeMap<u64, u64>> {
     out
 }
 
-async fn total_free(fs: &FileSystem<RaidZ>) -> (u64, u64) {
+async fn total_free(fs: &FileSystem<Pool>) -> (u64, u64) {
     let mut free = 0;
     let mut pending = 0;
     for ms in fs.metaslabs.iter() {
@@ -25,7 +28,7 @@ async fn total_free(fs: &FileSystem<RaidZ>) -> (u64, u64) {
 #[test]
 fn layout_is_stripe_aligned_and_fits() {
     for total in [25_600u64, 500_000, 10_000_000, 100_000_000] {
-        let l = MetaslabLayout::compute(total, crate::fs::SPACEMAP_START);
+        let l = MetaslabLayout::compute(total, crate::test_util::SPACEMAP_START, ALIGN);
         assert_eq!(l.metaslab_size_blocks % ALIGN, 0);
         assert_eq!(l.spacemap_slot_blocks % ALIGN, 0);
         assert_eq!(l.data_start % ALIGN, 0);
@@ -44,7 +47,7 @@ fn layout_is_stripe_aligned_and_fits() {
 #[test]
 fn encode_decode_round_trip() {
     let start = 3000;
-    let mut ms = MetaslabState::new_empty(start, 1026);
+    let mut ms = MetaslabState::new_empty(start, 1026, ALIGN);
     let a = ms.take_aligned(30).unwrap();
     let b = ms.take_aligned(60).unwrap();
     let c = ms.take_aligned(9).unwrap();
@@ -52,7 +55,7 @@ fn encode_decode_round_trip() {
     ms.deferred.push_back((7, vec![c.clone()]));
 
     let bytes = ms.encode();
-    let decoded = MetaslabState::decode(start, 1026, &bytes, 42);
+    let decoded = MetaslabState::decode(start, 1026, ALIGN, &bytes, 42);
 
     assert_eq!(decoded.free_extents, ms.free_extents);
     // freeing + deferred both come back as deferred, released at the given TXG.
@@ -218,8 +221,11 @@ async fn uncommitted_slot_write_is_ignored() {
         let ms = fs.metaslabs[0].read().await;
         (ms.active_slot.unwrap() + 1) % SPACEMAP_SLOTS
     };
-    let bogus =
-        MetaslabState::new_empty(fs.layout.metaslab_start(0), fs.layout.metaslab_size_blocks);
+    let bogus = MetaslabState::new_empty(
+        fs.layout.metaslab_start(0),
+        fs.layout.metaslab_size_blocks,
+        ALIGN,
+    );
     fs.write_slot(fs.layout.slot_lba(0, inactive), txg + 1, &bogus.encode())
         .await
         .unwrap();

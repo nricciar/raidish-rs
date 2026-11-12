@@ -19,21 +19,18 @@
 //!
 //! Reads look at, in order: dirty records, records being synced, the tree.
 
-use crate::blkptr::{BlockPtr, MAX_RECORD_BLOCKS};
+use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions};
-use crate::raidz::DATA_SHARDS;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-/// Records must be whole stripes so a record never shares a stripe.
-pub const VOLBLOCK_ALIGN: u32 = (DATA_SHARDS * BLOCK_SIZE) as u32;
-pub const DEFAULT_VOLBLOCKSIZE: u32 = 4 * VOLBLOCK_ALIGN; // 48 KiB
-pub const MAX_VOLBLOCKSIZE: u32 = MAX_RECORD_BLOCKS as u32 * BLOCK_SIZE as u32;
+/// Preferred volume block size, rounded up to the pool's alignment.
+pub const TARGET_VOLBLOCKSIZE: u32 = 48 * 1024;
 pub const INDIRECT_FANOUT: u64 = 512;
 /// Commit early once this much dirty data is buffered across all volumes.
 pub const DIRTY_LIMIT_BYTES: usize = 256 << 20;
@@ -41,6 +38,46 @@ const INDIRECT_CACHE_ENTRIES: usize = 1024;
 /// Clean data records kept in memory per volume.
 pub const RECORD_CACHE_BYTES: usize = 64 << 20;
 const SYNC_WRITE_CONCURRENCY: usize = 32;
+/// Consecutive dirty records are written as one contiguous run of at most
+/// this many blocks (one allocation, one device write).
+pub const RUN_MAX_BLOCKS: u64 = 256;
+
+/// How scattered a volume's records are on disk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FragReport {
+    /// Allocated (non-hole) data records.
+    pub records: u64,
+    /// Places where the next allocated record (by index) does not start
+    /// right where the previous one ends: each costs a separate read.
+    pub breaks: u64,
+}
+
+impl std::fmt::Display for FragReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} records, {} discontiguities ({:.1}% fragmented)",
+            self.records,
+            self.breaks,
+            if self.records > 1 {
+                self.breaks as f64 * 100.0 / (self.records - 1) as f64
+            } else {
+                0.0
+            }
+        )
+    }
+}
+
+/// A write job of a volume sync: a run of consecutive records in space
+/// allocated up front, or a single record allocated on its own.
+enum SyncJob<'a> {
+    Run {
+        start: u64,
+        len: u64,
+        records: Vec<(u64, &'a [u8])>,
+    },
+    Single(u64, &'a [u8]),
+}
 
 type Indirect = Vec<Option<BlockPtr>>;
 
@@ -143,6 +180,16 @@ impl Volume {
     }
 }
 
+fn frag_of(leaves: &[(u64, BlockPtr)]) -> FragReport {
+    FragReport {
+        records: leaves.len() as u64,
+        breaks: leaves
+            .windows(2)
+            .filter(|w| w[1].1.lba != w[0].1.lba + w[0].1.asize as u64)
+            .count() as u64,
+    }
+}
+
 /// Indirect levels needed to address `records` records.
 fn levels_for(records: u64) -> u8 {
     let mut levels = 1;
@@ -155,8 +202,26 @@ fn levels_for(records: u64) -> u8 {
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    /// Records must be whole stripes so a record never shares a stripe:
+    /// volume block sizes are multiples of this.
+    pub fn volblock_align(&self) -> u32 {
+        (self.align as usize * BLOCK_SIZE) as u32
+    }
+
+    pub fn max_volblocksize(&self) -> u32 {
+        (self.max_record_blocks() as usize * BLOCK_SIZE) as u32
+    }
+
+    /// `TARGET_VOLBLOCKSIZE` (48 KiB) rounded to this pool's alignment.
+    pub fn default_volblocksize(&self) -> u32 {
+        TARGET_VOLBLOCKSIZE
+            .div_ceil(self.volblock_align())
+            .saturating_mul(self.volblock_align())
+            .min(self.max_volblocksize())
+    }
+
     /// Create a sparse copy-on-write volume. `volblocksize` must be a multiple
-    /// of `VOLBLOCK_ALIGN` and at most `MAX_VOLBLOCKSIZE`.
+    /// of `volblock_align()` and at most `max_volblocksize()`.
     pub async fn create_block(
         &self,
         name: &str,
@@ -165,12 +230,15 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<FileId, FileSystemError> {
         if size_bytes == 0
             || volblocksize == 0
-            || !volblocksize.is_multiple_of(VOLBLOCK_ALIGN)
-            || volblocksize > MAX_VOLBLOCKSIZE
+            || !volblocksize.is_multiple_of(self.volblock_align())
+            || volblocksize > self.max_volblocksize()
         {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume size {} / volblocksize {} (must be a multiple of {} up to {})",
-                size_bytes, volblocksize, VOLBLOCK_ALIGN, MAX_VOLBLOCKSIZE
+                size_bytes,
+                volblocksize,
+                self.volblock_align(),
+                self.max_volblocksize()
             )));
         }
         let _tx = self.begin_tx().await;
@@ -338,7 +406,20 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(0);
         }
         let len = ((vol.size_bytes - offset) as usize).min(buf.len());
+        if len == 0 {
+            return Ok(0);
+        }
         let vbs = vol.volblocksize;
+
+        // Fetch every committed record the range needs up front, so records
+        // that are adjacent on disk are read together.
+        let first = offset / vbs as u64;
+        let last = (offset + len as u64 - 1) / vbs as u64;
+        let fetched = if last > first {
+            self.prefetch_records(&vol, first..=last).await?
+        } else {
+            HashMap::new()
+        };
 
         let mut done = 0;
         while done < len {
@@ -352,14 +433,58 @@ impl<D: BlockDevice> FileSystem<D> {
             match pending {
                 Some(Dirty::Data(d)) => out.copy_from_slice(&d[at..at + n]),
                 Some(Dirty::Hole) => out.fill(0),
-                None => match self.read_committed_record(&vol, idx).await? {
-                    Some(d) => out.copy_from_slice(&d[at..at + n]),
-                    None => out.fill(0),
-                },
+                None => {
+                    let committed = match fetched.get(&idx) {
+                        Some(d) => d.clone(),
+                        None => self.read_committed_record(&vol, idx).await?,
+                    };
+                    match committed {
+                        Some(d) => out.copy_from_slice(&d[at..at + n]),
+                        None => out.fill(0),
+                    }
+                }
             }
             done += n;
         }
         Ok(done)
+    }
+
+    /// Committed contents of the records in `range` that aren't dirty (None
+    /// = hole), reading uncached ones with coalesced reads.
+    async fn prefetch_records(
+        &self,
+        vol: &Volume,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<HashMap<u64, Option<Arc<Vec<u8>>>>, FileSystemError> {
+        let root = vol.root();
+        let mut out = HashMap::new();
+        let mut need: Vec<(u64, BlockPtr)> = Vec::new();
+        for idx in range {
+            if vol.dirty.lock().unwrap().get(idx).is_some() {
+                continue;
+            }
+            match self.tree_lookup(vol, root.clone(), 0, idx).await? {
+                None => {
+                    out.insert(idx, None);
+                }
+                Some(ptr) => match vol.records.lock().unwrap().get((ptr.lba, ptr.birth_txg)) {
+                    Some(d) => {
+                        out.insert(idx, Some(d));
+                    }
+                    None => need.push((idx, ptr)),
+                },
+            }
+        }
+        let ptrs: Vec<BlockPtr> = need.iter().map(|(_, p)| p.clone()).collect();
+        let datas = self.read_records(&ptrs).await?;
+        let mut cache = vol.records.lock().unwrap();
+        for ((idx, ptr), mut data) in need.into_iter().zip(datas) {
+            data.resize(vol.volblocksize, 0);
+            let data = Arc::new(data);
+            cache.insert((ptr.lba, ptr.birth_txg), data.clone());
+            out.insert(idx, Some(data));
+        }
+        Ok(out)
     }
 
     /// Write data to a virtual block device at a specific byte offset
@@ -517,8 +642,8 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Blocks a sync of `records` may allocate, worst case.
-    fn sync_reservation(vol: &Volume, records: &BTreeMap<u64, Dirty>) -> u64 {
-        let align = |b: u64| b.div_ceil(DATA_SHARDS as u64) * DATA_SHARDS as u64;
+    fn sync_reservation(&self, vol: &Volume, records: &BTreeMap<u64, Dirty>) -> u64 {
+        let align = |b: u64| self.align_blocks(b);
         let record_blocks = align((vol.volblocksize / BLOCK_SIZE) as u64);
         // An indirect block: 512 Option<BlockPtr> at <= 57 bytes each, plus length.
         let indirect_blocks = align((INDIRECT_FANOUT * 57 + 8).div_ceil(BLOCK_SIZE as u64));
@@ -537,7 +662,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         // Plus the inode and root index rewrite.
-        data + indirects * indirect_blocks + 3 * MAX_RECORD_BLOCKS
+        data + indirects * indirect_blocks + 3 * self.max_record_blocks()
     }
 
     async fn sync_volume(
@@ -545,7 +670,7 @@ impl<D: BlockDevice> FileSystem<D> {
         vol: &Volume,
         records: &BTreeMap<u64, Dirty>,
     ) -> Result<(), FileSystemError> {
-        let need = Self::sync_reservation(vol, records);
+        let need = self.sync_reservation(vol, records);
         if self.allocatable_blocks().await < need {
             return Err(FileSystemError::UnableToAllocateBlocks(need));
         }
@@ -582,6 +707,47 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
+    /// Where to place a stretch of records starting at index `first`: after
+    /// the neighbour it follows, else after whatever this sync placed last
+    /// (`prev_end`: last index, end lba), else near where it used to be.
+    async fn run_hint(
+        &self,
+        vol: &Volume,
+        old_root: &Option<BlockPtr>,
+        first: u64,
+        prev_end: Option<(u64, u64)>,
+    ) -> Result<Option<u64>, FileSystemError> {
+        if let Some((last, end)) = prev_end
+            && last + 1 == first
+        {
+            return Ok(Some(end));
+        }
+        let before = match first {
+            0 => None,
+            _ => {
+                self.tree_lookup(vol, old_root.clone(), 0, first - 1)
+                    .await?
+            }
+        };
+        Ok(match (before, prev_end) {
+            (Some(p), _) => Some(p.lba + p.asize as u64),
+            (None, Some((_, end))) => Some(end),
+            (None, None) => self
+                .tree_lookup(vol, old_root.clone(), 0, first)
+                .await?
+                .map(|p| p.lba),
+        })
+    }
+
+    /// Give back the space pre-allocated for runs that were never written.
+    async fn release_jobs(&self, jobs: &[SyncJob<'_>]) {
+        for job in jobs {
+            if let SyncJob::Run { start, len, .. } = job {
+                self.unallocate(*start, *len).await;
+            }
+        }
+    }
+
     async fn release(&self, ptrs: &[BlockPtr]) {
         for p in ptrs {
             let e = p.extent();
@@ -598,38 +764,128 @@ impl<D: BlockDevice> FileSystem<D> {
         allocated: &mut Vec<BlockPtr>,
         replaced: &mut Vec<BlockPtr>,
     ) -> Result<Option<BlockPtr>, FileSystemError> {
-        // 1. Data records, written concurrently. All-zero records become holes.
-        //    (Futures are boxed explicitly: a combinator chain over borrowed
-        //    records trips rustc's higher-ranked Send inference, #100013.)
-        type Job<'a> = Pin<
-            Box<dyn Future<Output = Result<(u64, Option<BlockPtr>), FileSystemError>> + Send + 'a>,
-        >;
-        let mut jobs = records.iter().map(|(&idx, rec)| -> Job<'_> {
+        // 1. Data records. Each stretch of consecutive indices gets one
+        //    contiguous allocation (placed after its neighbour where possible)
+        //    and is written in runs of up to RUN_MAX_BLOCKS, one device write
+        //    each, concurrently. All-zero records become holes.
+        let old_root = vol.root();
+        let record_blocks = self.align_blocks(vol.volblocksize.div_ceil(BLOCK_SIZE) as u64);
+        let run_max = (RUN_MAX_BLOCKS / record_blocks).max(1) as usize;
+        let mut leaves: Vec<(u64, Option<BlockPtr>)> = Vec::with_capacity(records.len());
+        let mut runs: Vec<Vec<(u64, &[u8])>> = Vec::new();
+        for (&idx, rec) in records {
             match rec {
-                Dirty::Data(buf) if buf.iter().any(|&b| b != 0) => {
-                    Box::pin(async move { Ok((idx, Some(self.write_record(buf).await?))) })
-                }
-                _ => Box::pin(async move { Ok((idx, None)) }),
+                Dirty::Data(buf) if buf.iter().any(|&b| b != 0) => match runs.last_mut() {
+                    Some(run) if run.last().is_some_and(|(i, _)| i + 1 == idx) => {
+                        run.push((idx, buf))
+                    }
+                    _ => runs.push(vec![(idx, buf)]),
+                },
+                _ => leaves.push((idx, None)),
             }
-        });
+        }
+
+        // Allocate every run up front, in index order, so placement doesn't
+        // depend on which write finishes first.
+        let mut jobs: Vec<SyncJob<'_>> = Vec::with_capacity(runs.len());
+        let mut prev_end: Option<(u64, u64)> = None; // (last index, end lba)
+        for run in runs {
+            let first = run[0].0;
+            let hint = match self.run_hint(vol, &old_root, first, prev_end).await {
+                Ok(h) => h,
+                Err(e) => {
+                    self.release_jobs(&jobs).await;
+                    return Err(e);
+                }
+            };
+            // The whole stretch in one piece if possible, else piece by piece.
+            let pieces: Vec<&[(u64, &[u8])]> = match self
+                .allocate_run(run.len() as u64 * record_blocks, hint)
+                .await
+            {
+                Ok(e) => {
+                    let mut at = e.start;
+                    for chunk in run.chunks(run_max) {
+                        let len = chunk.len() as u64 * record_blocks;
+                        jobs.push(SyncJob::Run {
+                            start: at,
+                            len,
+                            records: chunk.to_vec(),
+                        });
+                        at += len;
+                    }
+                    prev_end = Some((run[run.len() - 1].0, e.start + e.len));
+                    continue;
+                }
+                Err(FileSystemError::UnableToAllocateBlocks(_)) => run.chunks(run_max).collect(),
+                Err(e) => {
+                    self.release_jobs(&jobs).await;
+                    return Err(e);
+                }
+            };
+            for chunk in pieces {
+                let len = chunk.len() as u64 * record_blocks;
+                let hint = prev_end.map(|(_, end)| end).or(hint);
+                match self.allocate_run(len, hint).await {
+                    Ok(e) => {
+                        prev_end = Some((chunk[chunk.len() - 1].0, e.start + e.len));
+                        jobs.push(SyncJob::Run {
+                            start: e.start,
+                            len: e.len,
+                            records: chunk.to_vec(),
+                        });
+                    }
+                    Err(FileSystemError::UnableToAllocateBlocks(_)) => {
+                        jobs.extend(chunk.iter().map(|&(i, b)| SyncJob::Single(i, b)));
+                    }
+                    Err(e) => {
+                        self.release_jobs(&jobs).await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // (Futures are boxed explicitly: a combinator chain over borrowed
+        // records trips rustc's higher-ranked Send inference, #100013.)
+        type Job<'a> = Pin<
+            Box<dyn Future<Output = Result<Vec<(u64, BlockPtr)>, FileSystemError>> + Send + 'a>,
+        >;
+        let mut pending = jobs.into_iter();
         let mut in_flight = FuturesUnordered::new();
-        let mut leaves = Vec::with_capacity(records.len());
         let mut failed = None;
         loop {
             while failed.is_none() && in_flight.len() < SYNC_WRITE_CONCURRENCY {
-                match jobs.next() {
-                    Some(job) => in_flight.push(job),
+                let job: Job<'_> = match pending.next() {
+                    Some(SyncJob::Run {
+                        start,
+                        len,
+                        records,
+                    }) => Box::pin(async move {
+                        let datas: Vec<&[u8]> = records.iter().map(|(_, b)| *b).collect();
+                        match self.write_records_at(start, record_blocks, &datas).await {
+                            Ok(ptrs) => Ok(records.iter().map(|(i, _)| *i).zip(ptrs).collect()),
+                            Err(e) => {
+                                self.unallocate(start, len).await;
+                                Err(e)
+                            }
+                        }
+                    }),
+                    Some(SyncJob::Single(idx, buf)) => {
+                        Box::pin(async move { Ok(vec![(idx, self.write_record(buf).await?)]) })
+                    }
                     None => break,
-                }
+                };
+                in_flight.push(job);
             }
             // On failure stop scheduling, but drain what's in flight so every
             // successful allocation is recorded and can be released.
             match in_flight.next().await {
-                Some(Ok((idx, ptr))) => {
-                    if let Some(p) = &ptr {
-                        allocated.push(p.clone());
+                Some(Ok(written)) => {
+                    for (idx, ptr) in written {
+                        allocated.push(ptr.clone());
+                        leaves.push((idx, Some(ptr)));
                     }
-                    leaves.push((idx, ptr));
                 }
                 Some(Err(e)) => {
                     failed.get_or_insert(e);
@@ -638,11 +894,12 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         if let Some(e) = failed {
+            let rest: Vec<SyncJob<'_>> = pending.collect();
+            self.release_jobs(&rest).await;
             return Err(e);
         }
 
         // 2. Indirect blocks, bottom up.
-        let old_root = vol.root();
         let mut changes: BTreeMap<u64, Option<BlockPtr>> = leaves.into_iter().collect();
         for level in 1..=vol.levels {
             let mut parents: BTreeMap<u64, Vec<(u64, Option<BlockPtr>)>> = BTreeMap::new();
@@ -755,6 +1012,105 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         Ok(out)
+    }
+
+    /// Every allocated data record of a committed volume tree, in index order.
+    pub(crate) async fn volume_leaves(
+        &self,
+        root: &Option<BlockPtr>,
+        levels: u8,
+    ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
+        let mut out = Vec::new();
+        // Depth first, children pushed in reverse so they pop in index order.
+        let mut stack: Vec<(BlockPtr, u8, u64)> =
+            root.iter().map(|r| (r.clone(), levels, 0)).collect();
+        while let Some((ptr, level, base)) = stack.pop() {
+            if level == 0 {
+                out.push((base, ptr));
+                continue;
+            }
+            let ind: Indirect = bincode::deserialize(&self.read_record(&ptr).await?)?;
+            let span = INDIRECT_FANOUT.pow((level - 1) as u32);
+            for (slot, child) in ind.into_iter().enumerate().rev() {
+                if let Some(c) = child {
+                    stack.push((c, level - 1, base + slot as u64 * span));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// How scattered volume `name`'s committed records are.
+    pub async fn fragmentation(&self, name: &str) -> Result<FragReport, FileSystemError> {
+        let vol = self.open_volume(name).await?;
+        let leaves = self.volume_leaves(&vol.root(), vol.levels).await?;
+        Ok(frag_of(&leaves))
+    }
+
+    /// Rewrite volume `name` so its records are laid out in index order,
+    /// contiguously, in batches of `batch_records` (one commit each). Batches
+    /// that are already contiguous are skipped; records written concurrently
+    /// are left to the writer. Returns the fragmentation before and after.
+    pub async fn defrag(
+        &self,
+        name: &str,
+        batch_records: usize,
+    ) -> Result<(FragReport, FragReport), FileSystemError> {
+        let vol = self.open_volume(name).await?;
+        // Start from a committed tree.
+        self.sync().await?;
+        let leaves = self.volume_leaves(&vol.root(), vol.levels).await?;
+        let before = frag_of(&leaves);
+        let record_blocks = self.align_blocks(vol.volblocksize.div_ceil(BLOCK_SIZE) as u64);
+        let indices: Vec<u64> = leaves.iter().map(|(i, _)| *i).collect();
+        let mut batch = batch_records.max(1);
+        let mut at = 0;
+        while at < indices.len() {
+            let n = batch.min(indices.len() - at);
+            // Room for the rewritten batch plus the space it holds until its
+            // old copy's free is released; shrink the batch to fit.
+            let need = 2 * n as u64 * record_blocks;
+            if self.allocatable_blocks().await < need {
+                if n == 1 {
+                    eprintln!("defrag: stopping, not enough free space");
+                    break;
+                }
+                batch = n / 2;
+                continue;
+            }
+            // Under the commit lock, so nothing commits between reading the
+            // records and queueing them: what's read is what's committed, and
+            // writes queued by others (dirty) are left alone.
+            let _tx = self.begin_tx().await;
+            let root = vol.root();
+            let mut current: Vec<(u64, BlockPtr)> = Vec::with_capacity(n);
+            for &idx in &indices[at..at + n] {
+                if let Some(p) = self.tree_lookup(&vol, root.clone(), 0, idx).await? {
+                    current.push((idx, p));
+                }
+            }
+            at += n;
+            let contiguous = current
+                .windows(2)
+                .all(|w| w[1].1.lba == w[0].1.lba + w[0].1.asize as u64);
+            if contiguous {
+                continue;
+            }
+            let ptrs: Vec<BlockPtr> = current.iter().map(|(_, p)| p.clone()).collect();
+            let datas = self.read_records(&ptrs).await?;
+            {
+                let mut d = vol.dirty.lock().unwrap();
+                for ((idx, _), mut data) in current.iter().zip(datas) {
+                    if d.get(*idx).is_none() {
+                        data.resize(vol.volblocksize, 0);
+                        d.records.insert(*idx, Dirty::Data(data));
+                    }
+                }
+            }
+            self.commit_locked().await?;
+        }
+        let after = frag_of(&self.volume_leaves(&vol.root(), vol.levels).await?);
+        Ok((before, after))
     }
 
     /// Forget an open volume (on delete); its unsynced writes are discarded.

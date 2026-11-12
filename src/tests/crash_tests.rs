@@ -27,6 +27,10 @@ async fn check_snapshot<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     if !orphans.is_empty() {
         return Err(format!("leaked blocks in committed state: {:?}", orphans));
     }
+    let fsck = snap.fsck(false).await.map_err(|e| format!("fsck: {e}"))?;
+    if !fsck.is_clean() {
+        return Err(format!("fsck of committed state: {fsck}"));
+    }
     let index = snap
         .ls(Path::new("/d"))
         .await
@@ -109,7 +113,7 @@ async fn volume_writes_and_commits_stay_consistent() {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let size = 8 * 1024 * 1024u64;
-    fs.create_block("vol", size, crate::volume::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block("vol", size, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
@@ -236,7 +240,7 @@ async fn degraded_operation_and_stale_disk_return() {
     {
         let fs = pool.format().await;
         fs.mkdir(Path::new("/d")).await.unwrap();
-        fs.create_block("vol", 64 << 20, crate::volume::DEFAULT_VOLBLOCKSIZE)
+        fs.create_block("vol", 64 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
         write_generation(&fs, 1).await;
@@ -259,15 +263,36 @@ async fn degraded_operation_and_stale_disk_return() {
         write_generation(&fs, 3).await;
         check_generations(&fs, 3).await;
     }
-    // Both come back holding stale contents (no resilver). Everything must
-    // still read correctly and new writes must not clobber live data.
+    // Both come back holding stale contents. Everything must still read
+    // correctly and new writes must not clobber live data.
     {
         let fs = pool.load().await;
+        let degraded = fs.degraded_disks();
+        assert!(
+            degraded[1].is_some() && degraded[4].is_some(),
+            "{:?}",
+            degraded
+        );
         check_generations(&fs, 3).await;
         write_generation(&fs, 4).await;
         check_generations(&fs, 4).await;
+
+        // Resilver brings both back in sync...
+        let report = fs.resilver().await.unwrap();
+        assert!(report.is_clean(), "{}", report);
+        assert_eq!(report.cleared, vec![1, 4], "{}", report);
+        assert!(
+            report.shards.repaired[1] > 0 && report.shards.repaired[4] > 0,
+            "{report}"
+        );
+        for d in [0, 2, 3] {
+            assert_eq!(report.shards.mismatched[d], 0, "disk {d} touched: {report}");
+        }
     }
-    let fs = pool.load().await;
+    // ...so the pool now survives losing the *other* two disks.
+    let fs = FileSystem::load(pool.dev_without(&[0, 3]).await)
+        .await
+        .unwrap();
     check_generations(&fs, 4).await;
 }
 
@@ -286,7 +311,7 @@ async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
         let (p, d) = file(n, 10 + n as u8);
         fs.write_file(&p, &d).await?;
     }
-    fs.create_block("vol", 4 << 20, crate::volume::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block("vol", 4 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await?;
     for slot in 0..40u64 {
         fs.block_write("vol", slot * 9 * 4096, &[(slot % 200 + 1) as u8; 4096])
@@ -298,6 +323,9 @@ async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
         fs.write_file(&p, &d).await?;
     }
     fs.delete(Path::new("/d/f1")).await?;
+    // A scrub in the middle: crashing in its commits must be harmless too.
+    let r = fs.scrub(true).await?;
+    assert!(r.is_clean(), "{}", r);
     for slot in 0..40u64 {
         if slot % 3 == 0 {
             fs.block_zero("vol", slot * 9 * 4096, 4096).await?;
@@ -341,6 +369,12 @@ async fn crash_at_every_point_of_a_workload() {
             .unwrap_or_else(|e| panic!("k={k}/{total}: pool failed to load after crash: {e}"));
         let orphans = fs.find_orphaned_blocks().await.unwrap();
         assert!(orphans.is_empty(), "k={k}/{total}: leaked {:?}", orphans);
+        // Every reachable shard (data and parity) and label is consistent.
+        let scrub = fs.scrub(false).await.unwrap();
+        assert!(
+            scrub.is_clean() && scrub.mismatched() == 0,
+            "k={k}/{total}: {scrub}"
+        );
         if let Ok(index) = fs.ls(Path::new("/d")).await {
             for name in index.files.keys() {
                 let data = fs

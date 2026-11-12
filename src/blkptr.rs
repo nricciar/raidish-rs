@@ -8,18 +8,19 @@
 //!
 //! An *object* (file contents, an inode, a directory index) is a byte string
 //! stored as a list of records. Each record is a contiguous, stripe-aligned
-//! run of at most `MAX_RECORD_BLOCKS` blocks, so a record never shares a RaidZ
-//! stripe with anything else.
+//! run of at most `max_record_blocks()` blocks, so a record never shares a
+//! RaidZ stripe with anything else.
 
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
-use crate::raidz::DATA_SHARDS;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
-/// Largest record, in blocks. A multiple of `DATA_SHARDS` (~120 KiB).
-pub const MAX_RECORD_BLOCKS: u64 = 30;
-const _: () = assert!(MAX_RECORD_BLOCKS.is_multiple_of(DATA_SHARDS as u64));
+/// Most blocks fetched by one coalesced read of physically adjacent records.
+pub const COALESCE_MAX_BLOCKS: u64 = 256;
+/// Coalesced reads in flight at once.
+const READ_CONCURRENCY: usize = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlockPtr {
@@ -50,6 +51,26 @@ impl BlockPtr {
     }
 }
 
+/// Split `ptrs` into runs of records that are physically adjacent (each
+/// starts where the previous one's allocation ends), so each run can be
+/// fetched with one read of at most `COALESCE_MAX_BLOCKS` blocks.
+pub fn coalesce_groups(ptrs: &[BlockPtr]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < ptrs.len() {
+        let mut j = i + 1;
+        while j < ptrs.len()
+            && ptrs[j].lba == ptrs[j - 1].lba + ptrs[j - 1].asize as u64
+            && ptrs[j].lba + ptrs[j].data_blocks() - ptrs[i].lba <= COALESCE_MAX_BLOCKS
+        {
+            j += 1;
+        }
+        groups.push(i..j);
+        i = j;
+    }
+    groups
+}
+
 /// Logical size of an object.
 pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
     ptrs.iter().map(|p| p.lsize as u64).sum()
@@ -73,7 +94,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let mut lba = extent.start;
             let end = extent.start + extent.len;
             while lba < end {
-                let asize = MAX_RECORD_BLOCKS.min(end - lba);
+                let asize = self.max_record_blocks().min(end - lba);
                 let take = rest.len().min(asize as usize * BLOCK_SIZE);
                 let (chunk, tail) = rest.split_at(take);
                 rest = tail;
@@ -96,11 +117,11 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write a record's data, zero-padded to whole stripes so the device can
     /// write full stripes directly instead of read-modify-writing parity.
-    /// Write `data` as a single contiguous record (at most `MAX_RECORD_BLOCKS`).
+    /// Write `data` as a single contiguous record (at most `max_record_blocks()`).
     pub(crate) async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
         let blocks = data.len().div_ceil(BLOCK_SIZE) as u64;
         assert!(
-            blocks > 0 && blocks <= MAX_RECORD_BLOCKS,
+            blocks > 0 && blocks <= self.max_record_blocks(),
             "record of {} blocks",
             blocks
         );
@@ -119,9 +140,37 @@ impl<D: BlockDevice> FileSystem<D> {
         })
     }
 
+    /// Write `records` back to back at `start`, each in `record_blocks`
+    /// (stripe aligned) blocks, with a single device write. The space must
+    /// already be allocated; returns one pointer per record.
+    pub(crate) async fn write_records_at(
+        &self,
+        start: u64,
+        record_blocks: u64,
+        records: &[&[u8]],
+    ) -> Result<Vec<BlockPtr>, FileSystemError> {
+        debug_assert_eq!(record_blocks, self.align_blocks(record_blocks));
+        let txg = self.open_txg().await?;
+        let stride = record_blocks as usize * BLOCK_SIZE;
+        let mut buf = vec![0u8; stride * records.len()];
+        let mut ptrs = Vec::with_capacity(records.len());
+        for (i, data) in records.iter().enumerate() {
+            assert!(data.len() <= stride, "record larger than its slot");
+            buf[i * stride..i * stride + data.len()].copy_from_slice(data);
+            ptrs.push(BlockPtr {
+                lba: start + i as u64 * record_blocks,
+                asize: record_blocks as u32,
+                lsize: data.len() as u32,
+                birth_txg: txg,
+                checksum: *blake3::hash(data).as_bytes(),
+            });
+        }
+        self.dev.write_blocks(start, &buf).await?;
+        Ok(ptrs)
+    }
+
     async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
-        let blocks = (data.len().div_ceil(BLOCK_SIZE) as u64).div_ceil(DATA_SHARDS as u64)
-            * DATA_SHARDS as u64;
+        let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         buf[..data.len()].copy_from_slice(data);
         self.dev.write_blocks(lba, &buf).await?;
@@ -131,8 +180,53 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Read and verify a whole object.
     pub(crate) async fn read_object(&self, ptrs: &[BlockPtr]) -> Result<Vec<u8>, FileSystemError> {
         let mut out = Vec::with_capacity(object_size(ptrs) as usize);
-        for ptr in ptrs {
-            out.extend_from_slice(&self.read_record(ptr).await?);
+        for data in self.read_records(ptrs).await? {
+            out.extend_from_slice(&data);
+        }
+        Ok(out)
+    }
+
+    /// Read and verify several records, in order. Records that sit back to
+    /// back on disk are fetched with one device read (up to
+    /// `COALESCE_MAX_BLOCKS`); any record of such a read that fails its
+    /// checksum is re-read on its own through the self-healing path.
+    pub(crate) async fn read_records(
+        &self,
+        ptrs: &[BlockPtr],
+    ) -> Result<Vec<Vec<u8>>, FileSystemError> {
+        let groups = coalesce_groups(ptrs);
+        let reads = groups.into_iter().map(|g| self.read_group(&ptrs[g]));
+        let results: Vec<_> = stream::iter(reads)
+            .buffered(READ_CONCURRENCY)
+            .collect()
+            .await;
+        let mut out = Vec::with_capacity(ptrs.len());
+        for r in results {
+            out.extend(r?);
+        }
+        Ok(out)
+    }
+
+    async fn read_group(&self, ptrs: &[BlockPtr]) -> Result<Vec<Vec<u8>>, FileSystemError> {
+        if ptrs.len() == 1 {
+            return Ok(vec![self.read_record(&ptrs[0]).await?]);
+        }
+        let first = ptrs[0].lba;
+        let last = &ptrs[ptrs.len() - 1];
+        let span = last.lba + last.data_blocks() - first;
+        let mut raw = vec![0u8; span as usize * BLOCK_SIZE];
+        let read_ok = self.dev.read_blocks(first, &mut raw).await.is_ok();
+        let mut out = Vec::with_capacity(ptrs.len());
+        for p in ptrs {
+            if read_ok {
+                let at = (p.lba - first) as usize * BLOCK_SIZE;
+                let data = &raw[at..at + p.lsize as usize];
+                if *blake3::hash(data).as_bytes() == p.checksum {
+                    out.push(data.to_vec());
+                    continue;
+                }
+            }
+            out.push(self.read_record(p).await?);
         }
         Ok(out)
     }
@@ -141,6 +235,16 @@ impl<D: BlockDevice> FileSystem<D> {
     /// block from parity; if that yields the right checksum, repair the bad
     /// shard on disk and return the good data.
     pub(crate) async fn read_record(&self, ptr: &BlockPtr) -> Result<Vec<u8>, FileSystemError> {
+        self.read_record_healing(ptr, !self.read_only).await
+    }
+
+    /// `read_record`, choosing whether bad shards found on the way are
+    /// rewritten (a scrub repairs, and accounts for, them itself).
+    pub(crate) async fn read_record_healing(
+        &self,
+        ptr: &BlockPtr,
+        heal: bool,
+    ) -> Result<Vec<u8>, FileSystemError> {
         let n = ptr.data_blocks();
         let mut raw = vec![0u8; n as usize * BLOCK_SIZE];
         self.dev.read_blocks(ptr.lba, &mut raw).await?;
@@ -220,7 +324,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     lba
                 );
                 let fixed: &[u8; BLOCK_SIZE] = b.as_slice().try_into().unwrap();
-                if self.read_only {
+                if !heal {
                     continue;
                 }
                 if let Err(e) = self.dev.repair_block(lba, fixed).await {
