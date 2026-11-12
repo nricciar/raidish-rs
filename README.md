@@ -18,10 +18,7 @@ cargo run -- --config example-config.yaml listen node-1
 ```
 
 etcd is optional: set `etcd_config.enable: false` in the config to run without it.
-`listen` serves the raw disks on port 8881 (`--port` to change). It serves the
-config's `disks` list (or, without one, the pool's disks), so a node can also
-serve a single disk with `disks: [disks/disk1]`. A remote disk is addressed as
-`http://host:port/api/v1/disks/<index in that node's list>`.
+`listen` serves the raw disks on port 8881 (`--port` to change).
 
 step 2) format the pool from a client
 
@@ -59,17 +56,6 @@ pool:
     - mirror: [http://node1:8881/api/v1/disks/0, http://node2:8881/api/v1/disks/0]
     - mirror: [http://node3:8881/api/v1/disks/0, http://node4:8881/api/v1/disks/0]
 ```
-
-A `stripe` can mix raidz groups, mirrors and plain disks (a plain disk has no
-redundancy). Stripes can't be nested. Data is interleaved across stripe members
-in chunks of one record (~120 KiB). A stripe survives as many failed disks as
-its weakest member. `status` shows the layout and each disk's health.
-
-Records are aligned to the pool's width: the number of data shards of a raidz
-group, 1 for a mirror, and the least common multiple across a stripe's members.
-That width can be at most 30 blocks. The layout is recorded in the superblock,
-and a pool won't open with a different one. An old-style config with five
-`disks` and no `pool` is still a raidz2 pool.
 
 ## Commands
 
@@ -118,45 +104,16 @@ Every command takes `--rewind` or `--txg N` to open an older committed state (se
 `load`, `read`, `ls`, `inode`, `map`, `metaslab`, `orphaned`, `status`, `scrub --dry-run`,
 `fsck` (without `--repair`), `salvage` and `defrag --check` open the pool read-only, so they're safe to run against a pool that another process is serving.
 
-## Disk failures, resilver and scrub
-
-Remote disks reconnect on their own. Every request has a timeout (10 s, or
-`disk_timeout_ms` in the config). An idle connection is pinged, and dropped if
-it goes quiet. While a disk is away, requests to it fail fast and parity covers
-for it. A disk whose server is down at startup opens offline and joins once the
-server is back.
-
-Every write a disk misses is recorded, and the pool remembers the disk as
-*degraded since TXG n*. `resilver` rebuilds that disk. Because the tree is
-copy-on-write, it only reads what was written since TXG n and skips the rest.
-`nbd` and `nvme` resilver automatically when a degraded disk comes back.
-
-Each member disk carries a label with the pool's id in its first two blocks. A
-disk without a matching label (blank, replaced or foreign) is *fenced*: it gets
-no reads, because its contents can't be trusted. It then gets a full resilver.
-
-`scrub` checks every reachable block against its checksum, and checks every
-parity shard against the data, which normal reads never look at. It also checks
-the superblock, uberblocks and space maps. It repairs whatever is wrong, and a
-degraded disk is back in sync once the scrub passes.
-
-Scrub and resilver are safe while the pool is in use. They do hold back reuse
-of freed space until they finish, and they stop if the pool gets close to full.
-
 ## Recovery
 
 `fsck` walks the whole tree and compares what it references with the space
 maps. It reports *leaks* (allocated, referenced by nothing), *referenced-but-free*
 blocks (live data the allocator could hand out again), *cross-links* (two
 pointers to the same blocks) and unreadable metadata. `fsck --repair`
-re-allocates live space and frees leaks. Leaks are left alone if part of the
-tree couldn't be read, because then it isn't known what that part references.
-`fsck` holds the commit lock while it runs, so writers wait.
+re-allocates live space and frees leaks.
 
 `fsck --rebuild-spacemaps` throws the space maps away and derives them from
-the tree. Use it when a space map is lost: the metaslab loads as full, and a
-warning at import says so. It refuses if part of the tree is unreadable,
-unless you pass `--force`.
+the tree.
 
 The uberblock ring keeps the last 5 committed TXGs, and freed space isn't
 reused for 4 TXGs, so each of them is a complete, intact tree. To go back:
@@ -168,6 +125,7 @@ reused for 4 TXGs, so each of them is a complete, intact tree. To go back:
 A writable command commits the rewind. It rebuilds the space maps from the
 chosen tree, which frees what the discarded TXGs wrote, and it commits with a
 TXG newer than any in the ring, so the discarded TXGs are gone for good.
+
 Read-only commands (`ls`, `read`, `salvage`, ...) only look at the older state.
 
 `salvage dir` copies every file it can read into `dir`, and each volume as a
@@ -175,19 +133,6 @@ sparse `<name>.img`. Records that fail their checksum are zero-filled, and it
 reports each damaged item with the byte ranges that were lost. If the newest
 root directory is unreadable, it falls back to the newest TXG whose root still
 reads.
-
-## Fragmentation
-
-When a volume commits, each stretch of consecutive dirty records gets a single
-contiguous allocation, placed right after the record before it where there's
-room. Files are allocated in one piece if any free extent fits them. Reads
-fetch records that sit back to back on disk with one device read (up to 1 MiB),
-and verify each record's checksum on its own.
-
-Random overwrites still scatter a volume over time. `defrag name` rewrites it
-in index order, one commit per batch, and skips batches that are already
-contiguous. `defrag --check` prints how fragmented a volume is. While it runs,
-a defrag needs free space for about two batches.
 
 ## Virtual Block Devices
 
