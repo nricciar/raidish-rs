@@ -173,11 +173,19 @@ impl WsConn {
         &self,
         op: WsOp,
         disk_id: u16,
+        fence: Option<&(usize, Arc<crate::fence::ClientFence>)>,
         block: u64,
         count: u32,
         data: Option<&[u8]>,
     ) -> Result<Bytes, DiskError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (epoch, lent) = match op {
+            WsOp::Flush | WsOp::Info => (lease_epoch(), false),
+            _ => match fence {
+                Some((i, f)) => f.epoch_for(Some(*i), block, count),
+                None => (lease_epoch(), false),
+            },
+        };
         let (tx, rx) = oneshot::channel();
         self.state.pending.insert(id, tx);
         if self.is_closed() {
@@ -186,7 +194,7 @@ impl WsConn {
         }
 
         // One deadline covers queueing for the sink, sending and the reply.
-        let msg = encode_request(op, disk_id, block, count, id, lease_epoch(), data);
+        let msg = encode_request(op, disk_id, block, count, id, epoch, data);
         let exchange = async {
             self.sink
                 .lock()
@@ -214,7 +222,7 @@ impl WsConn {
                     return Err(DiskError::Timeout);
                 }
             };
-        check_status(status)?;
+        check_status_in(status, lent)?;
         Ok(payload)
     }
 }
@@ -227,6 +235,8 @@ impl WsConn {
 pub struct RemoteDisk {
     url: String,
     disk_id: u16,
+    /// This disk's index in its pool and that pool client's fence.
+    fence: std::sync::OnceLock<(usize, Arc<crate::fence::ClientFence>)>,
     opts: DiskOptions,
     conn: std::sync::RwLock<Option<Arc<WsConn>>>,
     reconnecting: AtomicBool,
@@ -249,6 +259,7 @@ impl RemoteDisk {
         let disk = Arc::new(RemoteDisk {
             url,
             disk_id,
+            fence: std::sync::OnceLock::new(),
             opts,
             conn: std::sync::RwLock::new(None),
             reconnecting: AtomicBool::new(false),
@@ -315,6 +326,10 @@ impl RemoteDisk {
         self.current().is_some()
     }
 
+    pub(super) fn set_fence(&self, index: usize, fence: Arc<crate::fence::ClientFence>) {
+        let _ = self.fence.set((index, fence));
+    }
+
     pub(super) fn subscribe(&self) -> watch::Receiver<u64> {
         self.generation.subscribe()
     }
@@ -330,7 +345,9 @@ impl RemoteDisk {
             self.ensure_reconnect();
             return Err(DiskError::Disconnected);
         };
-        let result = conn.request(op, self.disk_id, block, count, data).await;
+        let result = conn
+            .request(op, self.disk_id, self.fence.get(), block, count, data)
+            .await;
         if conn.is_closed() {
             self.ensure_reconnect();
         }

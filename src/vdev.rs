@@ -75,6 +75,37 @@ impl Topology {
         }
     }
 
+    /// The pool blocks `[start, end)` whose data or parity shard `shard`
+    /// (a block after the label area) of leaf `disk` holds, or None if
+    /// `disk` isn't in this tree. The inverse of how each vdev places
+    /// blocks: raidz stripe `s` holds blocks `s*data..(s+1)*data`, a
+    /// mirror (or plain disk) block `s`, a stripe interleaves its
+    /// children in chunks.
+    pub fn pool_range_of(&self, disk: usize, shard: u64) -> Option<(u64, u64)> {
+        match self {
+            Topology::Disk(d) => (*d == disk).then_some((shard, shard + 1)),
+            Topology::Mirror { disks } => disks.contains(&disk).then_some((shard, shard + 1)),
+            Topology::RaidZ { parity, disks } => {
+                let data = (disks.len() - parity) as u64;
+                disks
+                    .contains(&disk)
+                    .then_some((shard * data, (shard + 1) * data))
+            }
+            Topology::Stripe { children } => {
+                let n = children.len() as u64;
+                let chunk = max_record_blocks(self.width());
+                children.iter().enumerate().find_map(|(i, c)| {
+                    let (s, e) = c.pool_range_of(disk, shard)?;
+                    // A child's range never crosses a chunk (the chunk is
+                    // a multiple of every child's width).
+                    let global =
+                        |local: u64| ((local / chunk) * n + i as u64) * chunk + local % chunk;
+                    Some((global(s), global(e - 1) + 1))
+                })
+            }
+        }
+    }
+
     /// How many disks can fail (in the worst place) without losing data.
     pub fn fault_tolerance(&self) -> usize {
         match self {

@@ -765,6 +765,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 volblocksize,
                 levels,
                 root,
+                ..
             } = inode
             else {
                 continue;

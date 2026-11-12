@@ -19,7 +19,6 @@ use std::fmt::Debug;
 use std::io::{Cursor, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 type NodeId = u64;
@@ -62,8 +61,8 @@ pub struct Store {
     inner: Arc<Mutex<Inner>>,
     /// The applied state, for readers outside Raft (status, fencing).
     view: Arc<RwLock<ClusterState>>,
-    /// Raised to the pool epoch whenever a newer `pool` grant is applied.
-    floor: Arc<AtomicU64>,
+    /// This node's disk server fencing, fed every applied state.
+    fence: Arc<crate::fence::ServerFence>,
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SErr> {
@@ -112,7 +111,7 @@ impl Inner {
 
 impl Store {
     /// Open (or create) the store in `dir`.
-    pub fn open(dir: &Path, floor: Arc<AtomicU64>) -> Result<Self, String> {
+    pub fn open(dir: &Path, fence: Arc<crate::fence::ServerFence>) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
         let err = |e: SErr| format!("{}: {}", dir.display(), e);
         let vote = read_json(&dir.join("vote.json")).map_err(err)?;
@@ -127,10 +126,10 @@ impl Store {
             .unwrap_or_default();
         let snapshot: Option<StoredSnapshot> =
             read_json(&dir.join("snapshot.json")).map_err(err)?;
-        floor.fetch_max(sm.state.pool_epoch(), Ordering::SeqCst);
+        observe(&fence, &sm.state);
         Ok(Store {
             view: Arc::new(RwLock::new(sm.state.clone())),
-            floor,
+            fence,
             inner: Arc::new(Mutex::new(Inner {
                 dir: dir.to_path_buf(),
                 vote,
@@ -154,9 +153,19 @@ impl Store {
     }
 
     fn publish(&self, state: &ClusterState) {
-        self.floor.fetch_max(state.pool_epoch(), Ordering::SeqCst);
+        observe(&self.fence, state);
         *self.view.write().unwrap() = state.clone();
     }
+}
+
+fn observe(fence: &crate::fence::ServerFence, state: &ClusterState) {
+    fence.observe(
+        state.pool_epoch(),
+        state
+            .metaslabs
+            .iter()
+            .map(|(&i, g)| (i, g.writer.is_some(), g.epoch)),
+    );
 }
 
 impl RaftLogReader<TypeConfig> for Store {

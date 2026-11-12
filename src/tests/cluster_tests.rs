@@ -2,7 +2,6 @@ use super::lease::{HeldLease, LeaseClient};
 use super::state::{ClusterState, POOL, Request, Response};
 use super::*;
 use crate::test_util::wait_until;
-use std::sync::atomic::Ordering;
 
 fn acquire(owner: &str, now_ms: u64, ttl_ms: u64) -> Request {
     Request::Acquire {
@@ -217,7 +216,7 @@ fn url_pointing_here_is_this_node() {
 
 struct TestNode {
     cluster: Arc<Cluster>,
-    floor: Arc<AtomicU64>,
+    floor: Arc<crate::fence::ServerFence>,
     shutdown: rocket::Shutdown,
     url: String,
 }
@@ -233,7 +232,7 @@ fn free_port() -> u16 {
 /// Start a node whose pool config is `paths` (every node gets the same
 /// URLs; each finds itself by port).
 async fn start_node(name: &str, paths: &[String], port: u16, dir: &std::path::Path) -> TestNode {
-    let floor = Arc::new(AtomicU64::new(0));
+    let floor = Arc::new(crate::fence::ServerFence::default());
     let members = derive(paths, "test", |b| is_local_base(b, port)).unwrap();
     let cluster = Cluster::start(name, members, dir.join(name), floor.clone())
         .await
@@ -304,12 +303,7 @@ async fn three_nodes_elect_grant_and_fail_over() {
     assert!(err.contains("writer a"), "{}", err);
 
     // Every node's fencing floor learns the epoch.
-    assert!(
-        wait_until(5, || nodes
-            .iter()
-            .all(|n| n.floor.load(Ordering::SeqCst) == a.epoch))
-        .await
-    );
+    assert!(wait_until(5, || nodes.iter().all(|n| n.floor.pool_floor() == a.epoch)).await);
 
     // Lose the leader: the other two elect a new one, and the lease survives.
     let leader = leader_of(&all).unwrap();
@@ -338,12 +332,7 @@ async fn three_nodes_elect_grant_and_fail_over() {
         .await
         .unwrap();
     assert!(b.epoch > a.epoch);
-    assert!(
-        wait_until(5, || rest
-            .iter()
-            .all(|n| n.floor.load(Ordering::SeqCst) == b.epoch))
-        .await
-    );
+    assert!(wait_until(5, || rest.iter().all(|n| n.floor.pool_floor() == b.epoch)).await);
     // The old writer's lease is gone for good.
     let lost = survivors
         .call(&LeaseOp::Renew {
@@ -399,7 +388,7 @@ async fn single_node_restarts_with_its_state() {
 
     // Same data dir: the epoch (and so the fencing floor) is remembered.
     let node = start_node("solo", &pool, port, dir.path()).await;
-    assert_eq!(node.floor.load(Ordering::SeqCst), a.epoch);
+    assert_eq!(node.floor.pool_floor(), a.epoch);
     assert!(wait_until(10, || leader_of(&[&node]).is_some()).await);
     let err = HeldLease::acquire(client.clone(), POOL, "b").await.err();
     assert!(err.is_some(), "a's lease is still live");
@@ -428,15 +417,10 @@ async fn node_with_a_different_layout_is_refused() {
     assert!(wait_until(10, || leader_of(&good).is_some()).await);
     let client = LeaseClient::new(vec![nodes[0].url.clone(), nodes[1].url.clone()]);
     let a = HeldLease::acquire(client, POOL, "a").await.unwrap();
-    assert!(
-        wait_until(5, || good
-            .iter()
-            .all(|n| n.floor.load(Ordering::SeqCst) == a.epoch))
-        .await
-    );
+    assert!(wait_until(5, || good.iter().all(|n| n.floor.pool_floor() == a.epoch)).await);
     // The odd one never joins in.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert_eq!(nodes[2].floor.load(Ordering::SeqCst), 0);
+    assert_eq!(nodes[2].floor.pool_floor(), 0);
     assert!(
         nodes[2]
             .cluster
@@ -497,4 +481,70 @@ async fn swapped_nodes_are_detected() {
     for n in &nodes {
         stop_node(n).await;
     }
+}
+
+fn lend(idx: u32, writer: &str, writer_epoch: u64, pool_epoch: u64, now_ms: u64) -> Request {
+    Request::Lend {
+        idx,
+        writer: writer.into(),
+        writer_epoch,
+        pool_owner: "c".into(),
+        pool_epoch,
+        now_ms,
+    }
+}
+
+#[test]
+fn metaslab_lend_and_return() {
+    use super::state::Domain;
+    let mut s = ClusterState::default();
+    s.apply(&acquire("c", 0, 1000)); // committer: epoch 1
+    let w = Request::Acquire {
+        resource: "writer/2".into(),
+        owner: "w".into(),
+        desc: String::new(),
+        ttl_ms: 1000,
+        now_ms: 0,
+    };
+    assert!(matches!(s.apply(&w), Response::Granted { epoch: 2, .. }));
+    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 1);
+
+    assert_eq!(
+        s.apply(&lend(3, "writer/2", 2, 1, 10)),
+        Response::Fenced { epoch: 3 }
+    );
+    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 3);
+    assert_eq!(s.fence_epoch(Domain::Pool), 1);
+    // Not twice, not by someone who isn't the committer, not to a writer
+    // that isn't live.
+    assert!(matches!(
+        s.apply(&lend(3, "writer/2", 2, 1, 20)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&lend(4, "writer/2", 2, 9, 20)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&lend(4, "writer/2", 1, 1, 20)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&lend(4, "writer/2", 2, 1, 5000)),
+        Response::Refused(_)
+    ));
+
+    // A new committer doesn't move a lent metaslab's fence.
+    s.apply(&acquire("c2", 2000, 1000)); // epoch 4
+    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 3);
+    assert_eq!(s.fence_epoch(Domain::Metaslab(4)), 4);
+    let ret = Request::Return {
+        idx: 3,
+        pool_owner: "c2".into(),
+        pool_epoch: 4,
+        now_ms: 2100,
+    };
+    assert_eq!(s.apply(&ret), Response::Fenced { epoch: 5 });
+    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 5);
+    assert!(s.lent_to(3).is_none());
 }

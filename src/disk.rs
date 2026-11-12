@@ -5,7 +5,6 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use url::ParseError;
@@ -14,19 +13,18 @@ pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
 pub type FileId = u64;
 
-/// This process's pool lease epoch, sent with every remote request (0: no
-/// lease). See `crate::cluster`.
-static LEASE_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Runs when a disk server says our epoch is stale: another writer has the
 /// pool now. `main` makes this exit; it must never be retried.
 static ON_STALE_EPOCH: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
+/// This process's pool lease epoch, sent with remote requests outside
+/// metaslabs lent to it (0: no lease). See `crate::fence`.
 pub fn set_lease_epoch(epoch: u64) {
-    LEASE_EPOCH.store(epoch, Ordering::SeqCst);
+    crate::fence::client().set_pool_epoch(epoch);
 }
 
 pub fn lease_epoch() -> u64 {
-    LEASE_EPOCH.load(Ordering::SeqCst)
+    crate::fence::client().pool_epoch()
 }
 
 pub fn on_stale_epoch(f: fn()) {
@@ -142,6 +140,39 @@ pub trait BlockDevice: Send + Sync {
     }
 }
 
+/// A shared device (e.g. a pool both a disk server's fencing and its
+/// read-only file endpoint look at).
+#[async_trait]
+impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
+    async fn flush(&self) -> Result<(), DiskError> {
+        (**self).flush().await
+    }
+    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        (**self).read_block(block, buf).await
+    }
+    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+        (**self).write_block(block, buf).await
+    }
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        (**self).capacity_blocks().await
+    }
+    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+        (**self).read_blocks(start, buf).await
+    }
+    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+        (**self).write_blocks(start, buf).await
+    }
+    async fn reconstruct_candidates(&self, block: BlockId) -> Result<Candidates, DiskError> {
+        (**self).reconstruct_candidates(block).await
+    }
+    async fn repair_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+        (**self).repair_block(block, buf).await
+    }
+    fn pool(&self) -> Option<&crate::vdev::Pool> {
+        (**self).pool()
+    }
+}
+
 /// Rebuilds of one block. `rebuilt[d]` is the block reconstructed without
 /// its own disk (`disk`) and without disk `d`; None if not possible.
 /// `rebuilt[disk]` is a rebuild without just its own disk (with single
@@ -154,7 +185,15 @@ pub struct Candidates {
 
 /// Map a websocket reply status to a result. A stale epoch runs the
 /// `on_stale_epoch` hook (another writer has the pool).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn check_status(status: u8) -> Result<(), DiskError> {
+    check_status_in(status, false)
+}
+
+/// `check_status` for a request fenced by a lent metaslab's epoch
+/// (`lent`): a refusal there means this process's writer lost that
+/// metaslab, which the writer handles itself; the hook isn't run.
+pub(crate) fn check_status_in(status: u8, lent: bool) -> Result<(), DiskError> {
     match WsStatus::try_from(status) {
         Ok(WsStatus::Success) => Ok(()),
         Ok(WsStatus::ErrorNotFound) => Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
@@ -162,7 +201,7 @@ pub(crate) fn check_status(status: u8) -> Result<(), DiskError> {
             Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into()))
         }
         Ok(WsStatus::StaleEpoch) => {
-            if let Some(f) = ON_STALE_EPOCH.get() {
+            if !lent && let Some(f) = ON_STALE_EPOCH.get() {
                 f();
             }
             Err(DiskError::StaleEpoch)
@@ -269,6 +308,22 @@ impl Disk {
             DiskBackend::WebSocket(r) => Some(r.io_stats()),
             #[allow(unreachable_patterns)]
             _ => None,
+        }
+    }
+
+    /// Tell a remote disk its index in the pool and its pool client's
+    /// fence, so requests carry the right epoch (see `crate::fence`).
+    /// No-op for local disks.
+    pub fn set_fence(&self, index: usize, fence: std::sync::Arc<crate::fence::ClientFence>) {
+        // The browser only reads.
+        #[cfg(target_arch = "wasm32")]
+        let _ = (index, fence);
+        #[cfg(not(target_arch = "wasm32"))]
+        match &self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            DiskBackend::Local(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            DiskBackend::WebSocket(r) => r.set_fence(index, fence),
         }
     }
 

@@ -22,7 +22,7 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions};
+use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions, VolumeProps};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -82,7 +82,7 @@ enum SyncJob<'a> {
 type Indirect = Vec<Option<BlockPtr>>;
 
 #[derive(Debug, Clone)]
-enum Dirty {
+pub(crate) enum Dirty {
     Data(Vec<u8>),
     Hole,
 }
@@ -143,12 +143,23 @@ impl RecordCache {
     }
 }
 
+/// A volume as listed (see `FileSystem::list_volumes`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    pub volblocksize: u32,
+    pub props: VolumeProps,
+}
+
 pub struct Volume {
     pub name: String,
     pub size_bytes: u64,
     pub volblocksize: usize,
     pub levels: u8,
     root: Mutex<Option<BlockPtr>>,
+    /// Placement settings (rewritten with the inode, see `VolumeProps`).
+    pub(crate) props: Mutex<VolumeProps>,
     dirty: Mutex<DirtyState>,
     /// Indirect blocks keyed by (lba, birth_txg): immutable once written, and
     /// a reused lba always has a newer birth TXG.
@@ -159,6 +170,16 @@ pub struct Volume {
 impl Volume {
     fn root(&self) -> Option<BlockPtr> {
         self.root.lock().unwrap().clone()
+    }
+
+    /// The root of the committed tree.
+    pub(crate) fn root_ptr(&self) -> Option<BlockPtr> {
+        self.root()
+    }
+
+    /// Switch readers to a newly committed tree.
+    pub(crate) fn set_root(&self, root: Option<BlockPtr>) {
+        *self.root.lock().unwrap() = root;
     }
 
     #[cfg(test)]
@@ -259,6 +280,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 volblocksize,
                 levels,
                 root: None,
+                props: VolumeProps::default(),
             },
         };
         let inode_ptrs = self.write_value(&inode).await?;
@@ -294,6 +316,7 @@ impl<D: BlockDevice> FileSystem<D> {
             volblocksize,
             levels,
             root,
+            props,
         } = self.read_inode(&inode_ref).await?.inode_type
         else {
             return Err(FileSystemError::NotAFile);
@@ -305,6 +328,7 @@ impl<D: BlockDevice> FileSystem<D> {
             volblocksize: volblocksize as usize,
             levels,
             root: Mutex::new(root),
+            props: Mutex::new(props),
             dirty: Mutex::new(DirtyState::default()),
             cache: Mutex::new(HashMap::new()),
             records: Mutex::new(RecordCache::default()),
@@ -317,6 +341,61 @@ impl<D: BlockDevice> FileSystem<D> {
             .entry(name.to_string())
             .or_insert(vol)
             .clone())
+    }
+
+    /// Every volume in the root directory with its size and placement.
+    pub async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, FileSystemError> {
+        let entries: Vec<(String, InodeRef)> = self
+            .file_index
+            .read()
+            .await
+            .files
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut out = Vec::new();
+        for (name, r) in entries {
+            if let InodeType::Volume {
+                size_bytes,
+                volblocksize,
+                props,
+                ..
+            } = self.read_inode(&r).await?.inode_type
+            {
+                out.push(VolumeInfo {
+                    name,
+                    size_bytes,
+                    volblocksize,
+                    props,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Change a volume's placement settings (committed right away).
+    pub async fn set_volume_props(
+        &self,
+        name: &str,
+        props: VolumeProps,
+    ) -> Result<(), FileSystemError> {
+        let _tx = self.begin_tx().await;
+        let vol = self.open_volume(name).await?;
+        let before = std::mem::replace(&mut *vol.props.lock().unwrap(), props);
+        match self.update_volume_inode(&vol, vol.root()).await {
+            Ok(old_inode) => {
+                for ptr in &old_inode {
+                    let e = ptr.extent();
+                    self.free(e.start, e.len).await?;
+                }
+            }
+            Err(e) => {
+                *vol.props.lock().unwrap() = before;
+                return Err(e);
+            }
+        }
+        self.commit_locked().await?;
+        Ok(())
     }
 
     pub(crate) fn volumes_dirty_bytes(&self) -> usize {
@@ -671,6 +750,9 @@ impl<D: BlockDevice> FileSystem<D> {
         records: &BTreeMap<u64, Dirty>,
     ) -> Result<(), FileSystemError> {
         let need = self.sync_reservation(vol, records);
+        if let Some(w) = self.writer.clone() {
+            return self.writer_sync_volume(&w, vol, records, need).await;
+        }
         if self.allocatable_blocks().await < need {
             return Err(FileSystemError::UnableToAllocateBlocks(need));
         }
@@ -748,6 +830,10 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
+    pub(crate) async fn release_ptrs(&self, ptrs: &[BlockPtr]) {
+        self.release(ptrs).await
+    }
+
     async fn release(&self, ptrs: &[BlockPtr]) {
         for p in ptrs {
             let e = p.extent();
@@ -757,7 +843,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write the dirty records and the indirect blocks above them. Returns
     /// the new root without changing anything visible.
-    async fn build_tree(
+    pub(crate) async fn build_tree(
         &self,
         vol: &Volume,
         records: &BTreeMap<u64, Dirty>,
@@ -953,7 +1039,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Link a new inode for `vol` into the root index. Returns the old inode's
     /// records for the caller to free once the sync is final; on failure the
     /// index is left as it was.
-    async fn update_volume_inode(
+    pub(crate) async fn update_volume_inode(
         &self,
         vol: &Volume,
         root: Option<BlockPtr>,
@@ -974,6 +1060,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 volblocksize: vol.volblocksize as u32,
                 levels: vol.levels,
                 root,
+                props: vol.props.lock().unwrap().clone(),
             },
         };
         let inode_ptrs = self.write_value(&inode).await?;

@@ -12,6 +12,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Weak};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;

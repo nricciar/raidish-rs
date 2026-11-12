@@ -323,3 +323,70 @@ async fn stripe_requests_crossing_chunks_are_split() {
         data[10 * BLOCK_SIZE..11 * BLOCK_SIZE]
     );
 }
+
+/// Every raw disk block a pool write touches maps back (through
+/// `Topology::pool_range_of`) to the metaslab that was written: the disk
+/// servers' fencing domains agree with where the vdevs put the data.
+#[tokio::test]
+async fn fence_domains_match_placement_on_every_layout() {
+    use crate::disk::BlockDevice;
+    use crate::fence::{Domain, FenceMap};
+    for t in layouts() {
+        let what = t.summary();
+        let pool = TestPool::with_topology(t.clone()).await;
+        let fs = pool.format().await;
+        fs.dev.flush().await.unwrap();
+        let layout = fs.layout;
+        assert!(layout.metaslab_count >= 2, "{}", what);
+        let disk_len = |d: usize| std::fs::metadata(&pool.paths[d]).unwrap().len();
+        let snapshot = |d: usize| std::fs::read(&pool.paths[d]).unwrap();
+        let before: Vec<Vec<u8>> = (0..t.leaves().len()).map(snapshot).collect();
+
+        // Two records' worth at the start of metaslab 1, then one at its end.
+        let k = 1;
+        let rec = fs.max_record_blocks();
+        let start = layout.metaslab_start(k);
+        let end = start + layout.metaslab_size_blocks - rec;
+        for at in [start, end] {
+            let buf =
+                vec![0xA5u8; (rec * 2).min(layout.metaslab_size_blocks) as usize * BLOCK_SIZE];
+            let len = if at == start {
+                buf.len()
+            } else {
+                rec as usize * BLOCK_SIZE
+            };
+            fs.dev.write_blocks(at, &buf[..len]).await.unwrap();
+        }
+        fs.dev.flush().await.unwrap();
+
+        let map = FenceMap::new(t.clone(), layout);
+        let mut changed = 0;
+        for (d, before) in before.iter().enumerate() {
+            let after = snapshot(d);
+            let blocks = disk_len(d) / BLOCK_SIZE as u64;
+            for b in 0..blocks {
+                let r = b as usize * BLOCK_SIZE..(b as usize + 1) * BLOCK_SIZE;
+                if before[r.clone()] != after[r] {
+                    changed += 1;
+                    assert_eq!(
+                        map.domain_of(d, b),
+                        Domain::Metaslab(k as u32),
+                        "{}: disk {} raw block {}",
+                        what,
+                        d,
+                        b
+                    );
+                }
+            }
+        }
+        assert!(changed > 0, "{}", what);
+        // Labels and headers are the pool's.
+        assert_eq!(map.domain_of(0, 0), Domain::Pool, "{}", what);
+        assert_eq!(
+            map.domain_of(0, crate::disks::DISK_LABEL_BLOCKS),
+            Domain::Pool,
+            "{}",
+            what
+        );
+    }
+}

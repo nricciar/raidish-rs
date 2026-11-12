@@ -11,25 +11,15 @@ use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::{State, get, put};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use ws::WebSocket;
 
-/// The newest pool lease epoch this disk server knows of, from the cluster
-/// or from requests. Writes carrying an older epoch are refused.
-#[derive(Debug, Default)]
-pub struct EpochFloor(pub Arc<AtomicU64>);
-
-impl EpochFloor {
-    /// Note `epoch` and say whether a write carrying it may go ahead.
-    pub fn admit(&self, epoch: u64) -> bool {
-        epoch >= self.0.fetch_max(epoch, Ordering::SeqCst)
-    }
-}
+/// What this disk server fences writes with (see `crate::fence`).
+pub type EpochFloor = crate::fence::ServerFence;
 
 pub struct DiskServer {
     disks: Arc<Vec<Caddy>>,
     /// Only present if a pool is configured and formatted.
-    fs: Option<FileSystem<Pool>>,
+    fs: Option<FileSystem<Arc<Pool>>>,
     floor: Arc<EpochFloor>,
 }
 
@@ -47,19 +37,27 @@ impl DiskServer {
 /// the set). Only local disks are served; remote ones are refused. `pool`,
 /// if configured, backs the read-only file endpoint. `cluster` is this
 /// node's control-plane member (its routes share the port).
+#[allow(clippy::too_many_arguments)]
 pub async fn listen(
     disks: Arc<DiskSet>,
     pool: Option<Pool>,
     port: u32,
     cluster: Arc<Cluster>,
-    floor: Arc<AtomicU64>,
+    floor: Arc<EpochFloor>,
     pool_map: Option<crate::inspect::PoolMap>,
+    committer: crate::committer::CommitterSlot,
+    agent: crate::agent::AgentState,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
     let disks = disks.disks.clone();
     // Read-only: this process only serves raw blocks; the pool's writer is
     // whoever formats/serves it remotely.
+    let pool = pool.map(Arc::new);
+    if let Some(pool) = pool.clone() {
+        let fence = floor.clone();
+        tokio::spawn(async move { refresh_fence_map(pool, fence).await });
+    }
     let fs = match pool {
         None => None,
         Some(pool) => match FileSystem::load_readonly(pool).await {
@@ -70,15 +68,13 @@ pub async fn listen(
             }
         },
     };
-    let server = DiskServer {
-        disks,
-        fs,
-        floor: Arc::new(EpochFloor(floor)),
-    };
+    let server = DiskServer { disks, fs, floor };
 
     rocket::build()
         .manage(server)
         .manage(cluster)
+        .manage(committer)
+        .manage(agent)
         .manage(crate::dashboard::DashboardState { pool: pool_map })
         .configure(
             rocket::Config::figment()
@@ -96,14 +92,49 @@ pub async fn listen(
                 list_disks,
                 flush_disks,
                 read_file,
-                ws_endpoint
+                ws_endpoint,
+                agent_status
             ],
         )
         .mount("/", crate::cluster::routes::routes())
+        .mount("/", crate::committer::routes::routes())
         .mount("/", crate::dashboard::routes())
         .launch()
         .await
         .unwrap();
+}
+
+/// HTTP: GET /api/v1/agent/status - the volumes this node runs.
+#[get("/api/v1/agent/status")]
+async fn agent_status(
+    agent: &State<crate::agent::AgentState>,
+) -> rocket::serde::json::Json<crate::agent::AgentStatus> {
+    rocket::serde::json::Json(agent.read().unwrap().clone())
+}
+
+/// Keep the fencing domain map in step with the pool's layout: known once
+/// the pool is formatted, and changed by a reformat.
+async fn refresh_fence_map(pool: Arc<Pool>, fence: Arc<EpochFloor>) {
+    let mut last: Option<(u64, u64)> = None;
+    loop {
+        if let Some(sb) = crate::fs::read_superblock_of(&pool).await {
+            let key = (sb.pool_guid, sb.data_start);
+            if last != Some(key) {
+                let layout = crate::metaslab::MetaslabLayout::from_superblock(&sb);
+                fence.set_map(Some(crate::fence::FenceMap::new(
+                    pool.topology.clone(),
+                    layout,
+                )));
+                last = Some(key);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(if last.is_some() {
+            10
+        } else {
+            2
+        }))
+        .await;
+    }
 }
 
 /// The `X-Raidish-Epoch` header of an HTTP block write (0 if absent).
@@ -151,7 +182,7 @@ async fn put_block(
     epoch: HeaderEpoch,
     server: &State<DiskServer>,
 ) -> Result<Status, Status> {
-    if !server.floor.admit(epoch.0) {
+    if !server.floor.admit(disk_index, block_id, 1, epoch.0, true) {
         return Err(Status::Conflict);
     }
     let bytes = data
@@ -193,9 +224,7 @@ async fn list_disks(server: &State<DiskServer>) -> String {
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
 async fn flush_disks(disk_index: usize, epoch: HeaderEpoch, server: &State<DiskServer>) -> Status {
-    if !server.floor.admit(epoch.0) {
-        return Status::Conflict;
-    }
+    let _ = epoch;
     match server.local_disk(disk_index) {
         Ok(disk) => match disk.flush().await {
             Ok(()) => Status::Ok,
@@ -304,14 +333,16 @@ async fn serve_request(
     floor: &EpochFloor,
 ) -> Result<Vec<u8>, WsStatus> {
     let op = request.op().ok_or(WsStatus::InvalidRequest)?;
-    // Every request raises the floor (a new writer's first reads fence the
-    // old one out), but only writes and flushes are refused.
-    if !floor.admit(request.epoch()) && matches!(op, WsOp::Write | WsOp::Flush) {
-        return Err(WsStatus::StaleEpoch);
-    }
     let disk_index = request.disk_index() as usize;
     let block = request.block_id();
     let count = request.count();
+    // Reads raise the pool floor (a new committer's first reads fence the
+    // old one out); only writes are refused (see `fence::ServerFence::admit`).
+    if matches!(op, WsOp::Read | WsOp::Write)
+        && !floor.admit(disk_index, block, count, request.epoch(), op == WsOp::Write)
+    {
+        return Err(WsStatus::StaleEpoch);
+    }
 
     let disk = disks
         .get(disk_index)

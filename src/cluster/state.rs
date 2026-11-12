@@ -13,8 +13,23 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The resource a pool writer leases.
+/// The resource a pool writer (the committer) leases.
 pub const POOL: &str = "pool";
+
+pub use crate::fence::Domain;
+
+/// Who may write a metaslab's data, and since which epoch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MetaslabGrant {
+    /// The writer lease resource (`writer/<node>`) it's lent to; None:
+    /// back with the committer.
+    pub writer: Option<String>,
+    /// That writer lease's epoch.
+    pub writer_epoch: u64,
+    /// Epoch of the lend (or of the return): the fencing token of the
+    /// metaslab while lent.
+    pub epoch: u64,
+}
 
 /// A command proposed through Raft.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -38,6 +53,23 @@ pub enum Request {
         owner: String,
         epoch: u64,
     },
+    /// The committer (current `pool` holder) lends metaslab `idx` to the
+    /// holder of `writer` at `writer_epoch`.
+    Lend {
+        idx: u32,
+        writer: String,
+        writer_epoch: u64,
+        pool_owner: String,
+        pool_epoch: u64,
+        now_ms: u64,
+    },
+    /// The committer takes metaslab `idx` back.
+    Return {
+        idx: u32,
+        pool_owner: String,
+        pool_epoch: u64,
+        now_ms: u64,
+    },
 }
 
 /// What applying a [`Request`] produced.
@@ -57,6 +89,12 @@ pub enum Response {
     /// The caller's lease is gone (taken over, or released).
     Lost,
     Released,
+    /// A metaslab lend/return went through; `epoch` fences its data now.
+    Fenced {
+        epoch: u64,
+    },
+    /// A lend/return was refused (not the committer, writer not live, ...).
+    Refused(String),
     /// Raft-internal entries (blank, membership).
     #[default]
     None,
@@ -84,6 +122,9 @@ pub struct ClusterState {
     /// Every resource ever leased. Released or expired leases stay, so the
     /// resource's last epoch is never forgotten.
     pub leases: BTreeMap<String, Lease>,
+    /// Metaslabs ever lent, by index. Never forgotten, like leases.
+    #[serde(default)]
+    pub metaslabs: BTreeMap<u32, MetaslabGrant>,
 }
 
 impl ClusterState {
@@ -92,8 +133,87 @@ impl ClusterState {
         self.leases.get(POOL).map_or(0, |l| l.epoch)
     }
 
+    /// The epoch that fences writes to `domain`: the pool lease for the pool
+    /// and metaslabs the committer keeps, the lend for lent metaslabs.
+    pub fn fence_epoch(&self, domain: Domain) -> u64 {
+        match domain {
+            Domain::Pool => self.pool_epoch(),
+            Domain::Metaslab(i) => match self.metaslabs.get(&i) {
+                Some(g) if g.writer.is_some() => g.epoch,
+                Some(g) => g.epoch.max(self.pool_epoch()),
+                None => self.pool_epoch(),
+            },
+        }
+    }
+
+    /// Is `idx` lent to a writer?
+    pub fn lent_to(&self, idx: u32) -> Option<&MetaslabGrant> {
+        self.metaslabs.get(&idx).filter(|g| g.writer.is_some())
+    }
+
+    /// Does `owner` hold the live `resource` lease at `epoch`?
+    pub fn holds(&self, resource: &str, owner: Option<&str>, epoch: u64, now_ms: u64) -> bool {
+        self.leases.get(resource).is_some_and(|l| {
+            l.epoch == epoch && l.live(now_ms) && owner.is_none_or(|o| o == l.owner)
+        })
+    }
+
     pub fn apply(&mut self, req: &Request) -> Response {
         match req {
+            Request::Lend {
+                idx,
+                writer,
+                writer_epoch,
+                pool_owner,
+                pool_epoch,
+                now_ms,
+            } => {
+                if !self.holds(POOL, Some(pool_owner), *pool_epoch, *now_ms) {
+                    return Response::Refused("not the committer".into());
+                }
+                if !self.holds(writer, None, *writer_epoch, *now_ms) {
+                    return Response::Refused(format!(
+                        "{} is not live at {}",
+                        writer, writer_epoch
+                    ));
+                }
+                if let Some(g) = self.lent_to(*idx) {
+                    return Response::Refused(format!(
+                        "metaslab {} is lent to {:?}",
+                        idx, g.writer
+                    ));
+                }
+                self.epoch += 1;
+                self.metaslabs.insert(
+                    *idx,
+                    MetaslabGrant {
+                        writer: Some(writer.clone()),
+                        writer_epoch: *writer_epoch,
+                        epoch: self.epoch,
+                    },
+                );
+                Response::Fenced { epoch: self.epoch }
+            }
+            Request::Return {
+                idx,
+                pool_owner,
+                pool_epoch,
+                now_ms,
+            } => {
+                if !self.holds(POOL, Some(pool_owner), *pool_epoch, *now_ms) {
+                    return Response::Refused("not the committer".into());
+                }
+                self.epoch += 1;
+                self.metaslabs.insert(
+                    *idx,
+                    MetaslabGrant {
+                        writer: None,
+                        writer_epoch: 0,
+                        epoch: self.epoch,
+                    },
+                );
+                Response::Fenced { epoch: self.epoch }
+            }
             Request::Acquire {
                 resource,
                 owner,

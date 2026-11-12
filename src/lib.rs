@@ -13,6 +13,8 @@
 extern crate rocket;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod agent;
+#[cfg(not(target_arch = "wasm32"))]
 mod api;
 pub mod blkptr;
 #[cfg(not(target_arch = "wasm32"))]
@@ -20,11 +22,14 @@ pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod cluster;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod committer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 mod dashboard;
 pub mod disk;
 pub mod disks;
+pub mod fence;
 pub mod fs;
 mod fsck;
 pub mod inode;
@@ -44,6 +49,7 @@ mod ui;
 pub mod vdev;
 mod volume;
 pub mod websocket;
+pub mod writer;
 
 #[cfg(test)]
 #[path = "tests/util.rs"]

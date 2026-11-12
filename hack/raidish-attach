@@ -1,0 +1,419 @@
+#!/bin/bash
+# raidish-attach: the only privileged operations the raidish `listen` agent
+# needs to attach/detach kernel block devices for raidish volumes. Meant for a
+# single NOPASSWD sudo rule (called with `sudo -n`), so it must be INSTALLED
+# ROOT-OWNED (not run from the repo, which your user can write to):
+#
+#   sudo install -o root -g root -m 0755 hack/raidish-attach /usr/local/sbin/
+#
+# SAFETY: this machine's system disk may be NVMe, and NVMe/NBD device names are
+# assigned dynamically. No command accepts a device path, a mountpoint or
+# extra options. The caller supplies only a volume name (strict charset), and
+# an address/port that must be on an allowlist.
+#   - nvme-*: the namespace is resolved from sysfs and only accepted if its
+#     subsystem NQN is exactly the volume's NQN, every controller path is
+#     transport "tcp" to the given address:port, and its model string starts
+#     with "RAIDISH". Detach refuses unless the same holds.
+#   - nbd-*: attach picks a free /dev/nbdN (no /sys/block/nbdN/pid) and records
+#     volume -> device (+ the client pid) under /run/raidish. Detach uses ONLY
+#     that record, and only while the pid still matches.
+#   - Both detaches refuse a device that is mounted or held by another device.
+#
+# Allowlist: by default 127.0.0.1 with NVMe port 4420 / NBD port 10809. It can
+# only be widened by a root-owned (not group/world-writable) /etc/raidish/attach.conf
+# containing lines of the form (parsed, never sourced; '#' comments allowed):
+#   NVME_ADDRS="127.0.0.1 10.0.0.5"
+#   NVME_PORTS="4420"
+#   NBD_ADDRS="127.0.0.1"
+#   NBD_PORTS="10809"
+#
+# RAIDISH_ATTACH_DRY_RUN=1 prints the commands that would run and changes
+# nothing (sudo normally strips this variable, so it is for manual use).
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+CONF=/etc/raidish/attach.conf
+STATE=/run/raidish
+NQN_PREFIX=nqn.2024-01.com.raidish:nvme:
+DRY=${RAIDISH_ATTACH_DRY_RUN:-}
+[[ $DRY == 1 ]] || DRY=
+
+NVME_ADDRS="127.0.0.1"
+NVME_PORTS="4420"
+NBD_ADDRS="127.0.0.1"
+NBD_PORTS="10809"
+
+die() { echo "raidish-attach: $*" >&2; exit 1; }
+
+if [[ -z $DRY ]]; then
+    [[ $EUID -eq 0 ]] || die "must be run via sudo"
+fi
+
+# Run (or, in dry-run mode, print) a command.
+run() {
+    if [[ -n $DRY ]]; then
+        printf '+'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+load_conf() {
+    [[ -e $CONF ]] || return 0
+    [[ -f $CONF && ! -L $CONF ]] || die "$CONF must be a regular file"
+    local owner mode
+    read -r owner mode < <(stat -c '%u %a' "$CONF")
+    [[ $owner == 0 ]] || die "$CONF must be owned by root"
+    (( (8#$mode & 8#022) == 0 )) || die "$CONF must not be group/world-writable"
+    local line key val re='^(NVME_ADDRS|NVME_PORTS|NBD_ADDRS|NBD_PORTS)=("?)([0-9A-Fa-f:. ]*)("?)$'
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ $line =~ $re && ${BASH_REMATCH[2]} == "${BASH_REMATCH[4]}" ]] || die "$CONF: bad line: $line"
+        key=${BASH_REMATCH[1]}
+        val=${BASH_REMATCH[3]}
+        case $key in
+        NVME_ADDRS) NVME_ADDRS=$val ;;
+        NVME_PORTS) NVME_PORTS=$val ;;
+        NBD_ADDRS) NBD_ADDRS=$val ;;
+        NBD_PORTS) NBD_PORTS=$val ;;
+        esac
+    done <"$CONF"
+}
+
+valid_volume() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "bad volume name"; }
+
+# check_target <ADDRS> <PORTS> <addr> <port>
+check_target() {
+    local addrs=$1 ports=$2 addr=$3 port=$4 x ok=''
+    [[ $addr =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || die "bad address"
+    [[ $port =~ ^[0-9]{1,5}$ ]] || die "bad port"
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || die "bad port"
+    port=$((10#$port))
+    ok=
+    for x in $addrs; do [[ $x == "$addr" ]] && ok=1; done
+    [[ -n $ok ]] || die "address $addr is not allowed"
+    ok=
+    for x in $ports; do [[ $x == "$port" ]] && ok=1; done
+    [[ -n $ok ]] || die "port $port is not allowed"
+}
+
+# Refuse a block device (name, no /dev/) that is mounted or held by another device.
+need_unused() {
+    local name=$1 m
+    m=$(findmnt -rn -S "/dev/$name" -o TARGET || true)
+    [[ -z $m ]] || die "refusing: /dev/$name is mounted at $m"
+    local h
+    for h in /sys/block/"$name"/holders/*; do
+        [[ -e $h ]] && die "refusing: /dev/$name is in use by ${h##*/}"
+    done
+    return 0
+}
+
+lock() {
+    [[ -n $DRY ]] && return 0
+    mkdir -p "$STATE"
+    [[ -d $STATE && ! -L $STATE && $(stat -c %u "$STATE") == 0 ]] || die "$STATE is not a root-owned directory"
+    exec 9>"$STATE/lock"
+    flock -w 30 9 || die "timed out waiting for lock"
+}
+
+# ---------------------------------------------------------------- NVMe ----
+
+# Is controller directory $1 a TCP path to nqn $2 at $3:$4, model RAIDISH*?
+ctrl_is_ours() {
+    local c=$1 nqn=$2 addr=$3 port=$4 a
+    [[ $(cat "$c/transport" 2>/dev/null) == tcp ]] || return 1
+    [[ $(cat "$c/subsysnqn" 2>/dev/null) == "$nqn" ]] || return 1
+    [[ $(cat "$c/model" 2>/dev/null) == RAIDISH* ]] || return 1
+    a=$(cat "$c/address" 2>/dev/null) || return 1
+    [[ ,$a, == *,traddr=$addr,* && ,$a, == *,trsvcid=$port,* ]] || return 1
+}
+
+# Controllers (real sysfs paths) whose subsystem NQN is $1, whoever they point at.
+ctrls_for_nqn() {
+    local c
+    for c in /sys/class/nvme/nvme*; do
+        [[ -e $c ]] || continue
+        c=$(readlink -f "$c")
+        [[ $(cat "$c/subsysnqn" 2>/dev/null) == "$1" ]] && echo "$c"
+    done
+    return 0
+}
+
+# find_ns <nqn> <addr> <port>: print the namespace block device name (no /dev/)
+# or nothing. Dies if ambiguous.
+find_ns() {
+    local nqn=$1 addr=$2 port=$3
+    local found=() d name parent ctrls c ok
+    for d in /sys/block/nvme*; do
+        [[ -e $d ]] || continue
+        name=${d##*/}
+        [[ $name =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        parent=$(dirname "$(readlink -f "$d")")
+        [[ $(cat "$parent/subsysnqn" 2>/dev/null) == "$nqn" ]] || continue
+        # Parent is a controller (single path) or a subsystem (multipath head).
+        if [[ -e $parent/transport ]]; then
+            ctrls=("$parent")
+        else
+            ctrls=()
+            for c in "$parent"/nvme[0-9]*; do
+                [[ -e $c/transport ]] && ctrls+=("$(readlink -f "$c")")
+            done
+            [[ $(cat "$parent/model" 2>/dev/null) == RAIDISH* ]] || continue
+        fi
+        ok=$(( ${#ctrls[@]} > 0 ))
+        for c in "${ctrls[@]}"; do ctrl_is_ours "$c" "$nqn" "$addr" "$port" || ok=0; done
+        (( ok )) && found+=("$name")
+    done
+    (( ${#found[@]} <= 1 )) || die "refusing: ${#found[@]} namespaces match ${found[*]}"
+    [[ ${#found[@]} -eq 1 ]] && echo "${found[0]}"
+    return 0
+}
+
+# Print the stable /dev/disk/by-id path of block device name $1, or nothing.
+by_id_path() {
+    local name=$1 l best=
+    for l in /dev/disk/by-id/nvme-*; do
+        [[ -L $l && $l != *-part[0-9]* ]] || continue
+        [[ $(readlink -f "$l") == "/dev/$name" ]] || continue
+        # Prefer the model_serial_nsid name over eui./uuid. aliases.
+        if [[ $l == /dev/disk/by-id/nvme-RAIDISH* ]]; then best=$l; break; fi
+        [[ -n $best ]] || best=$l
+    done
+    [[ -z $best ]] || echo "$best"
+    return 0
+}
+
+nvme_attach() {
+    local vol=$1 addr=$2 port=$3 nqn name path
+    valid_volume "$vol"
+    check_target "$NVME_ADDRS" "$NVME_PORTS" "$addr" "$port"
+    port=$((10#$port))
+    nqn=$NQN_PREFIX$vol
+
+    if [[ -n $DRY ]]; then
+        run modprobe nvme-tcp
+        run nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn"
+        echo "# would verify the namespace via sysfs (subsysnqn, tcp $addr:$port, model RAIDISH*)"
+        echo "# would print its /dev/disk/by-id/nvme-... path"
+        return 0
+    fi
+    lock
+
+    # Already attached to exactly this target: idempotent.
+    name=$(find_ns "$nqn" "$addr" "$port")
+    if [[ -z $name ]]; then
+        [[ -z $(ctrls_for_nqn "$nqn") ]] || die "$nqn is already connected to a different target"
+        modprobe nvme-tcp
+        nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn" >/dev/null
+        for _ in $(seq 1 100); do
+            name=$(find_ns "$nqn" "$addr" "$port")
+            [[ -n $name ]] && break
+            sleep 0.1
+        done
+        if [[ -z $name ]]; then
+            nvme disconnect -n "$nqn" >/dev/null 2>&1 || true
+            die "connected, but no RAIDISH namespace appeared for $vol (target is not raidish?); disconnected"
+        fi
+    fi
+    [[ -b /dev/$name ]] || die "/dev/$name is not a block device"
+    udevadm settle --timeout=5 >/dev/null 2>&1 || true
+    path=
+    for _ in $(seq 1 50); do
+        path=$(by_id_path "$name")
+        [[ -n $path ]] && break
+        sleep 0.1
+    done
+    if [[ -z $path ]]; then
+        nvme disconnect -n "$nqn" >/dev/null 2>&1 || true
+        die "no stable /dev/disk/by-id path for /dev/$name; disconnected"
+    fi
+    echo "$path"
+}
+
+nvme_detach() {
+    local vol=$1 nqn c ok='' name d parent
+    valid_volume "$vol"
+    nqn=$NQN_PREFIX$vol
+    if [[ -n $DRY ]]; then
+        echo "# would verify a tcp RAIDISH controller for $nqn exists and its namespace is unused"
+        run nvme disconnect -n "$nqn"
+        return 0
+    fi
+    lock
+    # Every controller for this NQN must be a tcp RAIDISH one; at least one must exist.
+    while read -r c; do
+        [[ -n $c ]] || continue
+        [[ $(cat "$c/transport" 2>/dev/null) == tcp && $(cat "$c/model" 2>/dev/null) == RAIDISH* ]] \
+            || die "refusing: controller ${c##*/} for $nqn is not a raidish tcp controller"
+        ok=1
+    done < <(ctrls_for_nqn "$nqn")
+    [[ -n $ok ]] || die "$vol is not attached via nvme"
+    for d in /sys/block/nvme*; do
+        [[ -e $d ]] || continue
+        name=${d##*/}
+        [[ $name =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        parent=$(dirname "$(readlink -f "$d")")
+        [[ $(cat "$parent/subsysnqn" 2>/dev/null) == "$nqn" ]] || continue
+        need_unused "$name"
+    done
+    nvme disconnect -n "$nqn"
+}
+
+# ----------------------------------------------------------------- NBD ----
+
+nbd_rec() { echo "$STATE/nbd-$1"; }
+
+# Read the record for volume $1 into REC_DEV, REC_PID, REC_ADDR, REC_PORT.
+read_rec() {
+    local f
+    f=$(nbd_rec "$1")
+    [[ -f $f && ! -L $f && $(stat -c %u "$f") == 0 ]] || return 1
+    REC_DEV='' REC_PID='' REC_ADDR='' REC_PORT=''
+    local k v
+    while IFS='=' read -r k v; do
+        case $k in
+        dev) REC_DEV=$v ;;
+        pid) REC_PID=$v ;;
+        addr) REC_ADDR=$v ;;
+        port) REC_PORT=$v ;;
+        esac
+    done <"$f"
+    [[ $REC_DEV =~ ^/dev/nbd[0-9]+$ && $REC_PID =~ ^[0-9]+$ ]] || die "corrupt record $f"
+}
+
+# Is the recorded device still the client we started?
+rec_live() { [[ $(cat "/sys/block/${REC_DEV#/dev/}/pid" 2>/dev/null) == "$REC_PID" ]]; }
+
+nbd_attach() {
+    local vol=$1 addr=$2 port=$3 d name dev='' pid
+    valid_volume "$vol"
+    check_target "$NBD_ADDRS" "$NBD_PORTS" "$addr" "$port"
+    port=$((10#$port))
+
+    if [[ -n $DRY ]]; then
+        run modprobe nbd
+    else
+        lock
+        if read_rec "$vol"; then
+            if rec_live; then
+                [[ $REC_ADDR == "$addr" && $REC_PORT == "$port" ]] \
+                    || die "$vol is already attached on $REC_DEV to a different target"
+                echo "$REC_DEV"
+                return 0
+            fi
+            rm -f "$(nbd_rec "$vol")"   # stale
+        fi
+        modprobe nbd
+    fi
+
+    # First free device: exists, no client pid, zero size, not mounted or held.
+    for d in /sys/block/nbd[0-9]*; do
+        [[ -e $d ]] || continue
+        name=${d##*/}
+        [[ $name =~ ^nbd[0-9]+$ ]] || continue
+        [[ -b /dev/$name && ! -e $d/pid ]] || continue
+        [[ $(cat "$d/size" 2>/dev/null) == 0 ]] || continue
+        [[ -z $(findmnt -rn -S "/dev/$name" -o TARGET || true) ]] || continue
+        dev=/dev/$name
+        break
+    done
+    [[ -n $dev ]] || die "no free /dev/nbdN"
+
+    run nbd-client -N "$vol" -b 4096 "$addr" "$port" "$dev"
+    if [[ -n $DRY ]]; then
+        echo "# would record $vol -> $dev under $STATE and print the device"
+        echo "$dev"
+        return 0
+    fi
+    pid=$(cat "/sys/block/${dev#/dev/}/pid" 2>/dev/null || true)
+    if [[ ! $pid =~ ^[0-9]+$ ]]; then
+        nbd-client -d "$dev" >/dev/null 2>&1 || true
+        die "nbd-client did not attach $dev; detached"
+    fi
+    printf 'dev=%s\npid=%s\naddr=%s\nport=%s\n' "$dev" "$pid" "$addr" "$port" >"$(nbd_rec "$vol").tmp"
+    mv -f "$(nbd_rec "$vol").tmp" "$(nbd_rec "$vol")"
+    echo "$dev"
+}
+
+nbd_detach() {
+    local vol=$1
+    valid_volume "$vol"
+    if [[ -n $DRY ]]; then
+        echo "# would read the device recorded for $vol under $STATE and check it is unused"
+        run nbd-client -d "/dev/nbdN-from-record"
+        return 0
+    fi
+    lock
+    read_rec "$vol" || die "no record for $vol; not attached by raidish-attach"
+    if ! rec_live; then
+        rm -f "$(nbd_rec "$vol")"
+        die "$vol: $REC_DEV is no longer the recorded client; stale record removed"
+    fi
+    need_unused "${REC_DEV#/dev/}"
+    nbd-client -d "$REC_DEV"
+    rm -f "$(nbd_rec "$vol")"
+}
+
+# ---------------------------------------------------------------- list ----
+
+list() {
+    local c nqn addr f vol name path
+    for c in /sys/class/nvme/nvme*; do
+        [[ -e $c ]] || continue
+        c=$(readlink -f "$c")
+        nqn=$(cat "$c/subsysnqn" 2>/dev/null) || continue
+        [[ $nqn == "$NQN_PREFIX"* && $(cat "$c/transport" 2>/dev/null) == tcp \
+            && $(cat "$c/model" 2>/dev/null) == RAIDISH* ]] || continue
+        vol=${nqn#"$NQN_PREFIX"}
+        addr=$(tr ',' ' ' <"$c/address" 2>/dev/null || true)
+        name=$(find_ns_of_ctrl "$c")
+        path=
+        [[ -z $name ]] || path=$(by_id_path "$name")
+        echo "nvme $vol ${name:+/dev/$name} ${path:--} state=$(cat "$c/state" 2>/dev/null) $addr"
+    done
+    for f in "$STATE"/nbd-*; do
+        [[ -e $f && $f != *.tmp ]] || continue
+        vol=${f##*/nbd-}
+        [[ $vol =~ ^[A-Za-z0-9._-]{1,64}$ ]] || continue
+        read_rec "$vol" || continue
+        echo "nbd $vol $REC_DEV - state=$(rec_live && echo live || echo stale) traddr=$REC_ADDR trsvcid=$REC_PORT"
+    done
+    return 0
+}
+
+# Namespace block device name under controller dir $1 (single-path layout) or empty.
+find_ns_of_ctrl() {
+    local n
+    for n in "$1"/nvme[0-9]*n[0-9]*; do
+        [[ -e $n ]] && { echo "${n##*/}"; return 0; }
+    done
+    return 0
+}
+
+usage() {
+    cat >&2 <<EOF
+usage: sudo -n raidish-attach <command> [args]
+  nvme-attach <volume> <addr> <port>  nvme connect ${NQN_PREFIX}<volume>; print /dev/disk/by-id path
+  nvme-detach <volume>                nvme disconnect ${NQN_PREFIX}<volume>
+  nbd-attach  <volume> <addr> <port>  nbd-client -N <volume> on a free /dev/nbdN; print the device
+  nbd-detach  <volume>                detach the device recorded by nbd-attach
+  list                                show devices attached by raidish
+EOF
+    exit 2
+}
+
+cmd=${1:-}
+[[ -n $cmd ]] || usage
+load_conf
+case "$cmd" in
+nvme-attach) [[ $# -eq 4 ]] || usage; nvme_attach "$2" "$3" "$4" ;;
+nvme-detach) [[ $# -eq 2 ]] || usage; nvme_detach "$2" ;;
+nbd-attach) [[ $# -eq 4 ]] || usage; nbd_attach "$2" "$3" "$4" ;;
+nbd-detach) [[ $# -eq 2 ]] || usage; nbd_detach "$2" ;;
+list) [[ $# -eq 1 ]] || usage; list ;;
+*) usage ;;
+esac

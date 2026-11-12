@@ -37,6 +37,9 @@ pub struct Config {
     pub cluster: Option<ClusterConfig>,
     /// Remote disk request timeout (default 10000).
     pub disk_timeout_ms: Option<u64>,
+    /// How `listen` exports and attaches the volumes placed on it.
+    #[serde(default)]
+    pub automount: crate::agent::AutomountConfig,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]

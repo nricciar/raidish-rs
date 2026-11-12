@@ -1,4 +1,8 @@
-//! NVMe over TCP target exporting one copy-on-write volume as namespace 1.
+//! NVMe over TCP target exporting copy-on-write volumes. Each volume is its
+//! own subsystem, `nqn.2024-01.com.raidish:nvme:<volume>`, with the volume as
+//! namespace 1; one listener serves all of them and the host picks one by
+//! SUBNQN in Connect. Exports are added and removed at runtime; removing one
+//! closes its queues (in-flight commands finish first) and commits.
 //!
 //! Each TCP connection is one queue pair. The first capsule on it must be a
 //! Fabrics Connect, which decides whether it is the admin queue (qid 0, which
@@ -14,17 +18,26 @@
 //! Set `RAIDISH_NVME_TRACE=1` to log every command.
 
 use crate::disk::BlockDevice;
-use crate::fs::FileSystem;
-use std::collections::HashMap;
+use crate::fs::{FileSystem, FileSystemError};
+use crate::nbd::{DEFAULT_BIND, ExportLife, ExportSession, ensure_sync_loop, export_closed};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio::task::JoinSet;
 
-pub const SUBSYS_NQN: &str = "nqn.2024-01.com.raidish:nvme:vdisk0";
+/// Subsystem NQNs are this followed by the volume name.
+pub const NQN_PREFIX: &str = "nqn.2024-01.com.raidish:nvme:";
+/// NQNs are at most 223 bytes.
+const MAX_NQN: usize = 223;
+
+/// The subsystem NQN a volume is exported under.
+pub fn subsystem_nqn(volume: &str) -> String {
+    format!("{}{}", NQN_PREFIX, volume)
+}
 pub const LBA_SIZE: u64 = 4096;
 const LBA_SHIFT: u8 = 12;
 
@@ -211,7 +224,39 @@ struct CtrlRegs {
 
 struct Controller {
     cntlid: u16,
+    export: Arc<Export>,
     regs: Mutex<CtrlRegs>,
+}
+
+/// One exported volume: a subsystem with a single namespace.
+struct Export {
+    volume: String,
+    nqn: String,
+    serial: String,
+    nsze: u64,
+    uuid: [u8; 16],
+    life: ExportLife,
+}
+
+impl Export {
+    fn new(volume: &str, size: u64) -> Self {
+        let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
+        // SN is 20 bytes and must differ between subsystems: names too long
+        // to fit after the prefix are replaced by a hash.
+        let serial = if volume.len() <= 12 && volume.is_ascii() {
+            format!("RAIDISH-{}", volume)
+        } else {
+            format!("RAIDISH-{}", &hash.to_hex()[..12])
+        };
+        Export {
+            volume: volume.to_string(),
+            nqn: subsystem_nqn(volume),
+            serial,
+            nsze: size / LBA_SIZE,
+            uuid: hash.as_bytes()[..16].try_into().unwrap(),
+            life: ExportLife::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -224,9 +269,8 @@ struct QueueInfo {
 
 struct Target<D: BlockDevice> {
     fs: Arc<FileSystem<D>>,
-    volume: String,
-    nsze: u64,
-    uuid: [u8; 16],
+    /// By subsystem NQN.
+    exports: Mutex<BTreeMap<String, Arc<Export>>>,
     ctrls: Mutex<HashMap<u16, Arc<Controller>>>,
     next_cntlid: AtomicU16,
 }
@@ -235,69 +279,109 @@ struct Conn<D: BlockDevice> {
     target: Arc<Target<D>>,
     writer: AsyncMutex<OwnedWriteHalf>,
     queue: Mutex<Option<QueueInfo>>,
+    /// Hold on the export this queue connected to.
+    session: Mutex<Option<ExportSession>>,
+    /// Signalled once Connect attaches the queue to an export.
+    connected: Notify,
     sqhd: AtomicU32,
     /// PDU data offset for C2H data, honouring the host's HPDA.
     c2h_pdo: usize,
     peer: String,
 }
 
+/// An NVMe/TCP target exporting any number of volumes of one file system.
 pub struct NvmeTcpServer<D: BlockDevice> {
     target: Arc<Target<D>>,
+    bind: String,
     port: u16,
 }
 
+/// The NVMe/TCP port.
+#[allow(dead_code)]
+pub const NVME_PORT: u16 = 4420;
+
+// The multi-export API is driven by the node agent; until it lands only the
+// single-export CLI wrapper and the tests use all of it.
+#[allow(dead_code)]
 impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
+    /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
         fs: Arc<FileSystem<D>>,
         volume: String,
         port: u16,
-    ) -> Result<Self, crate::fs::FileSystemError> {
-        let size = fs.open_volume(&volume).await?.size_bytes;
-        let uuid: [u8; 16] = blake3::hash(format!("raidish-ns:{}", volume).as_bytes()).as_bytes()
-            [..16]
-            .try_into()
-            .unwrap();
-        Ok(NvmeTcpServer {
+    ) -> Result<Self, FileSystemError> {
+        let server = Self::with_bind(fs, DEFAULT_BIND, port);
+        server.add_export(&volume).await?;
+        Ok(server)
+    }
+
+    /// A target with no exports that `run` binds to `bind:port`.
+    pub fn with_bind(fs: Arc<FileSystem<D>>, bind: impl Into<String>, port: u16) -> Self {
+        NvmeTcpServer {
             target: Arc::new(Target {
                 fs,
-                volume,
-                nsze: size / LBA_SIZE,
-                uuid,
+                exports: Mutex::new(BTreeMap::new()),
                 ctrls: Mutex::new(HashMap::new()),
                 next_cntlid: AtomicU16::new(1),
             }),
+            bind: bind.into(),
             port,
-        })
+        }
     }
 
+    /// Export volume `volume` as subsystem `subsystem_nqn(volume)`.
+    pub async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
+        let nqn = subsystem_nqn(volume);
+        if volume.is_empty() || nqn.len() > MAX_NQN || volume.contains('\0') {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume name '{}' does not fit in an NQN",
+                volume
+            )));
+        }
+        let size = self.target.fs.open_volume(volume).await?.size_bytes;
+        let mut exports = self.target.exports.lock().unwrap();
+        if exports.contains_key(&nqn) {
+            return Err(FileSystemError::AlreadyExists);
+        }
+        exports.insert(nqn, Arc::new(Export::new(volume, size)));
+        Ok(())
+    }
+
+    /// Stop exporting `volume`: new connects are refused, its queues are
+    /// closed once their in-flight commands finish, then everything is
+    /// committed. Returns false if it wasn't exported.
+    pub async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
+        let nqn = subsystem_nqn(volume);
+        let Some(export) = self.target.exports.lock().unwrap().remove(&nqn) else {
+            return Ok(false);
+        };
+        export.life.close(&format!("nvme: {}", nqn)).await;
+        self.target.fs.sync().await?;
+        Ok(true)
+    }
+
+    /// Names of the exported volumes, sorted by NQN.
+    pub fn exports(&self) -> Vec<String> {
+        let exports = self.target.exports.lock().unwrap();
+        exports.values().map(|e| e.volume.clone()).collect()
+    }
+
+    /// Bind `bind:port` and serve until the listener fails.
     pub async fn run(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
+        let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
         self.serve(listener).await
     }
 
+    /// Serve connections from an already-bound listener.
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
-        println!(
-            "NVMe/TCP target {} on {} (volume '{}', {} x {} byte LBAs)",
-            SUBSYS_NQN,
-            listener.local_addr()?,
-            self.target.volume,
-            self.target.nsze,
-            LBA_SIZE
-        );
-
-        // Background TXG sync, as for NBD.
-        let fs = self.target.fs.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(crate::nbd::SYNC_INTERVAL);
-            loop {
-                tick.tick().await;
-                if fs.has_dirty_volumes()
-                    && let Err(e) = fs.sync().await
-                {
-                    eprintln!("nvme: background sync failed: {}", e);
-                }
-            }
-        });
+        ensure_sync_loop(&self.target.fs, "nvme");
+        for e in self.target.exports.lock().unwrap().values() {
+            println!(
+                "NVMe/TCP target {} (volume '{}', {} x {} byte LBAs)",
+                e.nqn, e.volume, e.nsze, LBA_SIZE
+            );
+        }
+        println!("NVMe/TCP listening on {}", listener.local_addr()?);
 
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -385,6 +469,8 @@ async fn handle_connection<D: BlockDevice + Send + Sync + 'static>(
         target,
         writer: AsyncMutex::new(wr),
         queue: Mutex::new(None),
+        session: Mutex::new(None),
+        connected: Notify::new(),
         sqhd: AtomicU32::new(0),
         c2h_pdo: 24usize.div_ceil(align) * align,
         peer,
@@ -408,16 +494,42 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
 ) -> std::io::Result<()> {
     let mut pending: HashMap<u16, PendingWrite> = HashMap::new();
     let mut tasks = JoinSet::new();
+    // Close signal of the export, once Connect has picked one.
+    let mut closed: Option<watch::Receiver<bool>> = None;
 
     let result = loop {
         while let Some(r) = tasks.try_join_next() {
             r.map_err(std::io::Error::other)??;
         }
 
-        let pdu = match read_pdu(rd).await {
-            Ok(pdu) => pdu,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
-            Err(e) => break Err(e),
+        // Read the next PDU, giving up if the export is removed meanwhile.
+        // The read itself is not cancel-safe, so it is only dropped then.
+        let read = read_pdu(rd);
+        tokio::pin!(read);
+        let pdu = loop {
+            if closed.is_none() {
+                closed = conn
+                    .session
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.close_signal());
+            }
+            let waiting = closed.is_none();
+            tokio::select! {
+                r = &mut read => break Some(r),
+                _ = export_closed(&mut closed) => break None,
+                _ = conn.connected.notified(), if waiting => {}
+            }
+        };
+        let pdu = match pdu {
+            Some(Ok(pdu)) => pdu,
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+            Some(Err(e)) => break Err(e),
+            None => {
+                trace!("nvme: {}: export removed, closing queue", conn.peer);
+                break Ok(());
+            }
         };
 
         match pdu[0] {
@@ -577,7 +689,7 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
         match &queue {
             None => Some(Completion::generic(SC_CMD_SEQ_ERROR)),
             Some(q) if q.qid == 0 => admin(conn, q, &sqe, &data),
-            Some(_) => Some(io(conn, &sqe, &data).await),
+            Some(q) => Some(io(conn, q, &sqe, &data).await),
         }
     };
 
@@ -633,12 +745,17 @@ fn fabrics<D: BlockDevice>(
                 dw0: ((in_data as u32) << 16) | offset,
                 ..Completion::err(SCT_FABRICS, SC_CONNECT_INVALID_PARAM)
             };
-            if subnqn != SUBSYS_NQN {
+            let Some(export) = target.exports.lock().unwrap().get(&subnqn).cloned() else {
                 return Some(bad(true, 256));
-            }
+            };
             if sqsize == 0 || sqsize >= QUEUE_ENTRIES {
                 return Some(bad(false, 44));
             }
+
+            // Refused once the export is being removed.
+            let Some(session) = export.life.join() else {
+                return Some(bad(true, 256));
+            };
 
             let ctrl = if qid == 0 {
                 if cntlid != 0xffff && cntlid != 0xfffe {
@@ -647,6 +764,7 @@ fn fabrics<D: BlockDevice>(
                 let id = target.next_cntlid.fetch_add(1, Ordering::Relaxed);
                 let ctrl = Arc::new(Controller {
                     cntlid: id,
+                    export: export.clone(),
                     regs: Mutex::new(CtrlRegs {
                         cc: 0,
                         csts: 0,
@@ -660,6 +778,10 @@ fn fabrics<D: BlockDevice>(
                 let Some(ctrl) = target.ctrls.lock().unwrap().get(&cntlid).cloned() else {
                     return Some(bad(true, 16));
                 };
+                if !Arc::ptr_eq(&ctrl.export, &export) {
+                    // That controller belongs to another subsystem.
+                    return Some(bad(true, 16));
+                }
                 let regs = ctrl.regs.lock().unwrap();
                 if regs.csts & 1 == 0 || qid > regs.io_queues.max(1) {
                     drop(regs);
@@ -671,6 +793,8 @@ fn fabrics<D: BlockDevice>(
 
             let cntlid = ctrl.cntlid;
             *conn.queue.lock().unwrap() = Some(QueueInfo { qid, sqsize, ctrl });
+            *conn.session.lock().unwrap() = Some(session);
+            conn.connected.notify_one();
             conn.sqhd.store(0, Ordering::Relaxed);
             Completion::with_dw0(cntlid as u32)
         }
@@ -727,20 +851,20 @@ fn fabrics<D: BlockDevice>(
 }
 
 fn admin<D: BlockDevice>(
-    conn: &Conn<D>,
+    _conn: &Conn<D>,
     q: &QueueInfo,
     sqe: &Sqe,
     _data: &[u8],
 ) -> Option<Completion> {
-    let target = &conn.target;
+    let export = &q.ctrl.export;
     Some(match sqe.opcode() {
         ADM_IDENTIFY => {
             let cns = sqe.cdw(10) & 0xff;
             let nsid = sqe.nsid();
             let page = match cns {
-                0x00 if nsid == 1 => identify_ns(target),
+                0x00 if nsid == 1 => identify_ns(export),
                 0x00 => return Some(Completion::generic(SC_INVALID_NS)),
-                0x01 => identify_ctrl(target, q.ctrl.cntlid),
+                0x01 => identify_ctrl(export, q.ctrl.cntlid),
                 0x02 => {
                     let mut list = vec![0u8; 4096];
                     if nsid < 1 {
@@ -752,7 +876,7 @@ fn admin<D: BlockDevice>(
                     let mut list = vec![0u8; 4096];
                     list[0] = 0x03; // NIDT: UUID
                     list[1] = 16;
-                    put(&mut list, 4, &target.uuid);
+                    put(&mut list, 4, &export.uuid);
                     list
                 }
                 _ => return Some(Completion::generic(SC_INVALID_FIELD)),
@@ -804,19 +928,20 @@ fn admin<D: BlockDevice>(
 
 async fn io<D: BlockDevice + Send + Sync + 'static>(
     conn: &Conn<D>,
+    q: &QueueInfo,
     sqe: &Sqe,
     data: &[u8],
 ) -> Completion {
-    let target = &conn.target;
     if sqe.nsid() != 1 {
         return Completion::generic(SC_INVALID_NS);
     }
-    let fs = &target.fs;
-    let name = &target.volume;
+    let export = &q.ctrl.export;
+    let fs = &conn.target.fs;
+    let name = &export.volume;
 
     let range = |slba: u64, nlb: u64| -> Option<(u64, usize)> {
         let end = slba.checked_add(nlb)?;
-        (end <= target.nsze).then_some((slba * LBA_SIZE, (nlb * LBA_SIZE) as usize))
+        (end <= export.nsze).then_some((slba * LBA_SIZE, (nlb * LBA_SIZE) as usize))
     };
     let fail = |what: &str, e: crate::fs::FileSystemError| {
         eprintln!("nvme: {} {} failed: {}", what, sqe.cid(), e);
@@ -889,9 +1014,9 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
     }
 }
 
-fn identify_ctrl<D: BlockDevice>(target: &Target<D>, cntlid: u16) -> Vec<u8> {
+fn identify_ctrl(export: &Export, cntlid: u16) -> Vec<u8> {
     let mut id = vec![0u8; 4096];
-    put_str(&mut id, 4, 20, &format!("RAIDISH-{}", target.volume)); // SN
+    put_str(&mut id, 4, 20, &export.serial); // SN
     put_str(&mut id, 24, 40, "RAIDISH NVMe-TCP Volume"); // MN
     put_str(&mut id, 64, 8, env!("CARGO_PKG_VERSION")); // FR
     id[77] = MDTS;
@@ -909,7 +1034,7 @@ fn identify_ctrl<D: BlockDevice>(target: &Target<D>, cntlid: u16) -> Vec<u8> {
     put(&mut id, 520, &((1u16 << 2) | (1 << 3)).to_le_bytes()); // ONCS: DSM, Write Zeroes
     id[525] = 0x01; // VWC present
     put(&mut id, 536, &((1u32 << 0) | (1 << 20)).to_le_bytes()); // SGLS: SGLs, offsets
-    put(&mut id, 768, SUBSYS_NQN.as_bytes()); // SUBNQN (NUL padded)
+    put(&mut id, 768, export.nqn.as_bytes()); // SUBNQN (NUL padded)
     // Fabrics: in-capsule size in 16-byte units, response size, no ICDOFF.
     put(
         &mut id,
@@ -921,16 +1046,16 @@ fn identify_ctrl<D: BlockDevice>(target: &Target<D>, cntlid: u16) -> Vec<u8> {
     id
 }
 
-fn identify_ns<D: BlockDevice>(target: &Target<D>) -> Vec<u8> {
+fn identify_ns(export: &Export) -> Vec<u8> {
     let mut id = vec![0u8; 4096];
-    put(&mut id, 0, &target.nsze.to_le_bytes()); // NSZE
-    put(&mut id, 8, &target.nsze.to_le_bytes()); // NCAP
-    put(&mut id, 16, &target.nsze.to_le_bytes()); // NUSE
+    put(&mut id, 0, &export.nsze.to_le_bytes()); // NSZE
+    put(&mut id, 8, &export.nsze.to_le_bytes()); // NCAP
+    put(&mut id, 16, &export.nsze.to_le_bytes()); // NUSE
     id[24] = 0x01; // NSFEAT: thin provisioned
     id[25] = 0; // NLBAF (0-based): one format
     id[26] = 0; // FLBAS: format 0
     id[33] = 0x09; // DLFEAT: deallocated reads zeros, Write Zeroes may deallocate
-    put(&mut id, 104, &target.uuid); // NGUID
+    put(&mut id, 104, &export.uuid); // NGUID
     put(&mut id, 128, &((LBA_SHIFT as u32) << 16).to_le_bytes()); // LBAF0: 4 KiB, no metadata
     id
 }
