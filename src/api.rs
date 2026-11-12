@@ -1,29 +1,36 @@
+use crate::cluster::Cluster;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::disks::{Caddy, DiskSet};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::vdev::Pool;
 use crate::websocket::{WsOp, WsRequest, WsStatus, encode_response};
-use etcd_client::{Client, GetOptions, LockOptions};
 use rocket::data::{Data, ToByteUnit};
 use rocket::figment::util::map;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
+use rocket::request::{FromRequest, Outcome, Request};
 use rocket::{State, get, put};
-use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use ws::WebSocket;
 
-#[derive(Deserialize, Debug)]
-pub struct EtcdConfig {
-    pub enable: bool,
-    pub etcd_nodes: Vec<String>,
+/// The newest pool lease epoch this disk server knows of, from the cluster
+/// or from requests. Writes carrying an older epoch are refused.
+#[derive(Debug, Default)]
+pub struct EpochFloor(pub Arc<AtomicU64>);
+
+impl EpochFloor {
+    /// Note `epoch` and say whether a write carrying it may go ahead.
+    pub fn admit(&self, epoch: u64) -> bool {
+        epoch >= self.0.fetch_max(epoch, Ordering::SeqCst)
+    }
 }
 
 pub struct DiskServer {
     disks: Arc<Vec<Caddy>>,
     /// Only present if a pool is configured and formatted.
     fs: Option<FileSystem<Pool>>,
-    etcd_client: Option<Client>,
+    floor: Arc<EpochFloor>,
 }
 
 impl DiskServer {
@@ -38,73 +45,78 @@ impl DiskServer {
 
 /// Start an HTTP/WebSocket server that exposes `disks` (by their index in
 /// the set). Only local disks are served; remote ones are refused. `pool`,
-/// if configured, backs the read-only file endpoint.
+/// if configured, backs the read-only file endpoint. `cluster` is this
+/// node's control-plane member (its routes share the port).
 pub async fn listen(
     disks: Arc<DiskSet>,
     pool: Option<Pool>,
     port: u32,
-    etcd_config: Option<EtcdConfig>,
-    id: &str,
+    cluster: Arc<Cluster>,
+    floor: Arc<AtomicU64>,
 ) {
-    {
-        let etcd_client = match etcd_config {
-            Some(etcd_config) if etcd_config.enable => {
-                let mut etcd_cli = Client::connect(etcd_config.etcd_nodes, None).await.unwrap();
-
-                // register us with etcd
-                let lease_id = etcd_cli.lease_grant(10, None).await.unwrap().id();
-                tokio::spawn(keepalive(etcd_cli.clone(), lease_id));
-
-                register_node(&mut etcd_cli, id, lease_id).await.unwrap();
-
-                tokio::spawn(elect_leader(etcd_cli.clone(), lease_id, id.to_string()));
-
-                Some(etcd_cli)
+    // Serving blocks doesn't need a formatted pool (that's how a remote
+    // client formats it in the first place).
+    let disks = disks.disks.clone();
+    // Read-only: this process only serves raw blocks; the pool's writer is
+    // whoever formats/serves it remotely.
+    let fs = match pool {
+        None => None,
+        Some(pool) => match FileSystem::load_readonly(pool).await {
+            Ok(fs) => Some(fs),
+            Err(e) => {
+                println!("serving raw disks only ({})", e);
+                None
             }
-            _ => None,
-        };
+        },
+    };
+    let server = DiskServer {
+        disks,
+        fs,
+        floor: Arc::new(EpochFloor(floor)),
+    };
 
-        // Serving blocks doesn't need a formatted pool (that's how a remote
-        // client formats it in the first place).
-        let disks = disks.disks.clone();
-        // Read-only: this process only serves raw blocks; the pool's writer is
-        // whoever formats/serves it remotely.
-        let fs = match pool {
-            None => None,
-            Some(pool) => match FileSystem::load_readonly(pool).await {
-                Ok(fs) => Some(fs),
-                Err(e) => {
-                    println!("serving raw disks only ({})", e);
-                    None
-                }
-            },
-        };
-        let server = DiskServer {
-            disks,
-            fs,
-            etcd_client,
-        };
+    rocket::build()
+        .manage(server)
+        .manage(cluster)
+        .configure(
+            rocket::Config::figment()
+                .merge(("port", port))
+                .merge((
+                    "limits",
+                    map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB"],
+                )),
+        )
+        .mount(
+            "/",
+            routes![
+                get_block,
+                put_block,
+                list_disks,
+                flush_disks,
+                read_file,
+                ws_endpoint
+            ],
+        )
+        .mount("/", crate::cluster::routes::routes())
+        .launch()
+        .await
+        .unwrap();
+}
 
-        rocket::build()
-            .manage(server)
-            .configure(rocket::Config::figment().merge(("port", port)).merge((
-                "limits",
-                map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB"],
-            )))
-            .mount(
-                "/",
-                routes![
-                    get_block,
-                    put_block,
-                    list_disks,
-                    flush_disks,
-                    read_file,
-                    ws_endpoint
-                ],
-            )
-            .launch()
-            .await
-            .unwrap();
+/// The `X-Raidish-Epoch` header of an HTTP block write (0 if absent).
+pub struct HeaderEpoch(u64);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for HeaderEpoch {
+    type Error = ();
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ()> {
+        let epoch = req
+            .headers()
+            .get_one("X-Raidish-Epoch")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Outcome::Success(HeaderEpoch(epoch))
     }
 }
 
@@ -133,8 +145,12 @@ async fn put_block(
     disk_index: usize,
     block_id: u64,
     data: Data<'_>,
+    epoch: HeaderEpoch,
     server: &State<DiskServer>,
 ) -> Result<Status, Status> {
+    if !server.floor.admit(epoch.0) {
+        return Err(Status::Conflict);
+    }
     let bytes = data
         .open(10.mebibytes())
         .into_bytes()
@@ -158,22 +174,6 @@ async fn put_block(
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
 #[get("/api/v1/disks")]
 async fn list_disks(server: &State<DiskServer>) -> String {
-    if let Some(mut etcd) = server.etcd_client.clone() {
-        if let Ok(resp) = etcd.leader("/myapp/nodes/leader").await
-            && let Some(kv) = resp.kv()
-        {
-            println!("leader: {:?} = {:?}", kv.key_str(), kv.value_str());
-        }
-        if let Ok(resp) = etcd
-            .get("/myapp/nodes/", Some(GetOptions::new().with_prefix()))
-            .await
-        {
-            for kv in resp.kvs() {
-                println!("kv: {:?} -- {:?}", kv.key_str(), kv.value_str());
-            }
-        }
-    }
-
     let disk_info: Vec<_> = (0..server.disks.len())
         .map(|i| {
             serde_json::json!({
@@ -189,7 +189,10 @@ async fn list_disks(server: &State<DiskServer>) -> String {
 
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
-async fn flush_disks(disk_index: usize, server: &State<DiskServer>) -> Status {
+async fn flush_disks(disk_index: usize, epoch: HeaderEpoch, server: &State<DiskServer>) -> Status {
+    if !server.floor.admit(epoch.0) {
+        return Status::Conflict;
+    }
     match server.local_disk(disk_index) {
         Ok(disk) => match disk.flush().await {
             Ok(()) => Status::Ok,
@@ -229,6 +232,7 @@ const WS_MAX_IN_FLIGHT: usize = 256;
 #[get("/ws")]
 async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'static> {
     let disks = server.disks.clone();
+    let floor = server.floor.clone();
 
     ws.channel(move |stream| {
         Box::pin(async move {
@@ -250,9 +254,11 @@ async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'
                         let Ok(permit) = permits.clone().acquire_owned().await else {
                             break;
                         };
-                        let (disks, tx) = (disks.clone(), tx.clone());
+                        let (disks, tx, floor) = (disks.clone(), tx.clone(), floor.clone());
                         tokio::spawn(async move {
-                            let _ = tx.send(handle_ws_message(&data, &disks).await).await;
+                            let _ = tx
+                                .send(handle_ws_message(&data, &disks, &floor).await)
+                                .await;
                             drop(permit);
                         });
                     }
@@ -269,7 +275,11 @@ async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'
 }
 
 /// Serve one encoded request against `disks` and encode the reply.
-pub(crate) async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> Vec<u8> {
+pub(crate) async fn handle_ws_message(
+    data: &[u8],
+    disks: &Arc<Vec<Caddy>>,
+    floor: &EpochFloor,
+) -> Vec<u8> {
     let Some(request) = WsRequest::parse(data) else {
         // Echo the id if there's one, so the client's request fails instead
         // of waiting for a reply that never comes.
@@ -279,7 +289,7 @@ pub(crate) async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> V
         return encode_response(WsStatus::InvalidRequest, id, &[]);
     };
     let id = request.id();
-    match serve_request(&request, disks).await {
+    match serve_request(&request, disks, floor).await {
         Ok(payload) => encode_response(WsStatus::Success, id, &payload),
         Err(status) => encode_response(status, id, &[]),
     }
@@ -288,8 +298,14 @@ pub(crate) async fn handle_ws_message(data: &[u8], disks: &Arc<Vec<Caddy>>) -> V
 async fn serve_request(
     request: &WsRequest<'_>,
     disks: &Arc<Vec<Caddy>>,
+    floor: &EpochFloor,
 ) -> Result<Vec<u8>, WsStatus> {
     let op = request.op().ok_or(WsStatus::InvalidRequest)?;
+    // Every request raises the floor (a new writer's first reads fence the
+    // old one out), but only writes and flushes are refused.
+    if !floor.admit(request.epoch()) && matches!(op, WsOp::Write | WsOp::Flush) {
+        return Err(WsStatus::StaleEpoch);
+    }
     let disk_index = request.disk_index() as usize;
     let block = request.block_id();
     let count = request.count();
@@ -319,45 +335,6 @@ async fn serve_request(
         }
         WsOp::Info => Ok(disk.capacity_blocks().await?.to_le_bytes().to_vec()),
     }
-}
-
-async fn keepalive(mut client: Client, lease_id: i64) {
-    let (mut ka, _ks) = client.lease_keep_alive(lease_id).await.unwrap();
-
-    while ka.keep_alive().await.is_ok() {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-
-    // If this exits, node is considered dead
-}
-
-async fn elect_leader(mut client: Client, lease_id: i64, value: String) {
-    let resp = client
-        .campaign("/myapp/nodes/leader", value, lease_id)
-        .await
-        .unwrap();
-    let leader = resp.leader().unwrap();
-
-    // if we are here this node is the node leader
-
-    println!(
-        "election name:{:?}, leaseId:{:?}",
-        leader.name_str(),
-        leader.lease()
-    );
-}
-
-async fn register_node(
-    client: &mut Client,
-    node_id: &str,
-    lease_id: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let lock_options = LockOptions::new().with_lease(lease_id);
-    client
-        .lock(format!("/myapp/nodes/{}", node_id), Some(lock_options))
-        .await?;
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -5,14 +5,18 @@
 //! a contiguous range of `count` blocks (at most `WS_MAX_BLOCKS`).
 //!
 //! ```text
-//! request:  [op:1][disk:2][block:8][count:4][id:8][data: count*4096 for writes]
+//! request:  [op:1][disk:2][block:8][count:4][id:8][epoch:8][data: count*4096 for writes]
 //! response: [status:1][id:8][data: count*4096 for reads]
 //! ```
 //! All integers are little endian.
+//!
+//! `epoch` is the sender's pool lease epoch (0 without one). The server
+//! remembers the newest epoch it has seen (from requests or from the
+//! cluster) and refuses writes and flushes with an older one: `StaleEpoch`.
 
 use crate::disk::{BLOCK_SIZE, DiskError};
 
-pub const WS_REQUEST_HEADER_LEN: usize = 23;
+pub const WS_REQUEST_HEADER_LEN: usize = 31;
 pub const WS_RESPONSE_HEADER_LEN: usize = 9;
 /// Largest range in one message (1 MiB of data).
 pub const WS_MAX_BLOCKS: u32 = 256;
@@ -47,6 +51,8 @@ pub enum WsStatus {
     Success = 0,
     ErrorNotFound = 1,
     InvalidRequest = 2,
+    /// A write or flush from a writer whose lease epoch is out of date.
+    StaleEpoch = 3,
 }
 
 impl TryFrom<u8> for WsStatus {
@@ -57,14 +63,18 @@ impl TryFrom<u8> for WsStatus {
             0 => Ok(WsStatus::Success),
             1 => Ok(WsStatus::ErrorNotFound),
             2 => Ok(WsStatus::InvalidRequest),
+            3 => Ok(WsStatus::StaleEpoch),
             _ => Err(()),
         }
     }
 }
 
 impl From<DiskError> for WsStatus {
-    fn from(_error: DiskError) -> Self {
-        WsStatus::ErrorNotFound
+    fn from(error: DiskError) -> Self {
+        match error {
+            DiskError::StaleEpoch => WsStatus::StaleEpoch,
+            _ => WsStatus::ErrorNotFound,
+        }
     }
 }
 
@@ -74,6 +84,7 @@ pub fn encode_request(
     block: u64,
     count: u32,
     id: u64,
+    epoch: u64,
     data: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(WS_REQUEST_HEADER_LEN + data.map_or(0, |d| d.len()));
@@ -82,6 +93,7 @@ pub fn encode_request(
     out.extend_from_slice(&block.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&epoch.to_le_bytes());
     if let Some(data) = data {
         out.extend_from_slice(data);
     }
@@ -131,6 +143,10 @@ impl<'a> WsRequest<'a> {
 
     pub fn id(&self) -> u64 {
         u64::from_le_bytes(self.data[15..23].try_into().unwrap())
+    }
+
+    pub fn epoch(&self) -> u64 {
+        u64::from_le_bytes(self.data[23..31].try_into().unwrap())
     }
 
     /// Write payload, if it is exactly `count` blocks.

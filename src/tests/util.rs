@@ -273,6 +273,8 @@ pub struct TestDiskServer {
     pub port: u16,
     disks: std::sync::Arc<Vec<crate::disks::Caddy>>,
     mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// The server's lease epoch floor (see `api::EpochFloor`).
+    pub floor: std::sync::Arc<crate::api::EpochFloor>,
     tasks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
@@ -292,6 +294,7 @@ impl TestDiskServer {
             port: listener.local_addr().unwrap().port(),
             disks: std::sync::Arc::new(disks),
             mode: Default::default(),
+            floor: Default::default(),
             tasks: Default::default(),
         };
         server.serve(listener);
@@ -335,9 +338,10 @@ impl TestDiskServer {
     fn serve(&self, listener: tokio::net::TcpListener) {
         use futures_util::{SinkExt, StreamExt};
         let (disks, mode, tasks) = (self.disks.clone(), self.mode.clone(), self.tasks.clone());
+        let floor = self.floor.clone();
         let accept = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (disks, mode) = (disks.clone(), mode.clone());
+                let (disks, mode, floor) = (disks.clone(), mode.clone(), floor.clone());
                 let conn = tokio::spawn(async move {
                     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -368,10 +372,11 @@ impl TestDiskServer {
                                 {
                                     continue;
                                 }
-                                let (disks, tx) = (disks.clone(), tx.clone());
+                                let (disks, tx, floor) = (disks.clone(), tx.clone(), floor.clone());
                                 tokio::spawn(async move {
-                                    let _ =
-                                        tx.send(crate::api::handle_ws_message(&data, &disks).await);
+                                    let _ = tx.send(
+                                        crate::api::handle_ws_message(&data, &disks, &floor).await,
+                                    );
                                 });
                             }
                             Some(Ok(_)) => {}

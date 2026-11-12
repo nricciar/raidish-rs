@@ -7,7 +7,6 @@ a distributed raidz/mirror filesystem proof of concept
 step 1) run a server with our disks
 
 ```
-make setup-etcd-cluster
 mkdir disks/
 fallocate -l 1G disks/disk1
 fallocate -l 1G disks/disk2
@@ -17,7 +16,6 @@ fallocate -l 1G disks/disk5
 cargo run -- --config example-config.yaml listen node-1
 ```
 
-etcd is optional: set `etcd_config.enable: false` in the config to run without it.
 `listen` serves the raw disks on port 8881 (`--port` to change).
 
 step 2) format the pool from a client
@@ -28,6 +26,37 @@ cargo run -- --config remote-config.yaml format
 // display blockmap info to the console
 cargo run -- --config remote-config.yaml map
 ```
+
+## Config
+
+**The pool config is the cluster config.** Each remote disk URL names a
+`listen` node, and local paths are this node. Give every node the same pool,
+with its own disks as local paths (or as URLs pointing at itself):
+
+```yaml
+# on node A (10.0.0.1); B and C list their own disk locally instead
+pool:
+  raidz1:
+    - /dev/disk/by-id/ata-A                  # this node
+    - http://10.0.0.2:8881/api/v1/disks/1    # node B
+    - http://10.0.0.3:8881/api/v1/disks/2    # node C
+```
+
+```
+raidish --config node.yaml listen            # on each node
+raidish --config client.yaml cluster status  # leader, members, leases
+```
+
+* Disks with the same `host:port` belong to one node, so a node with several
+  disks is a single member.
+* A node's id is the lowest pool position of its disks (A=0, B=1, C=2 above).
+  Every node works out the same ids. Use one address form per node: listing
+  the same box as an IP in one place and a hostname in another makes two
+  members.
+* A pool of only local disks is a cluster of one.
+* Every node must list the disks in the same order. Raft traffic between nodes
+  whose configs disagree is refused, and at startup each node asks its peers
+  who they are and logs `CONFIG MISMATCH` if the answers don't fit.
 
 ## Pool layouts
 
@@ -96,7 +125,7 @@ salvage path/to/dir
 // lay a volume's records out contiguously (--check: only report)
 defrag name [--batch N] [--check]
 // serve this node's disks (port 8881)
-listen [--port N] id
+listen [--port N] [name]
 ```
 
 Every command takes `--rewind` or `--txg N` to open an older committed state (see below).
@@ -232,9 +261,12 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 
 ## Limitations
 
-* **One writer per pool.** Nothing yet stops two processes from writing the same pool
-  (e.g. `block` from the CLI while `nbd`/`nvme` is serving), and that will corrupt it.
-  Stop the server first, or use the read-only commands.
+* **One writer per pool.** The pool lease enforces this, so e.g. `block` is refused
+  while `nbd` is serving. Stop the server first, or use the read-only commands.
+  Writers on local disk paths (not served by `listen`) aren't fenced.
+* Cluster members are fixed when the cluster first starts. Changing the pool's
+  nodes means starting over with empty data directories.
+* A killed writer's lease takes up to 10 s to expire before another writer can start.
 * **No authentication** on the disk server's HTTP/websocket ports.
 * Every fsync costs a full TXG commit (~5 ms); there's no intent log yet.
 * Volumes live in the root directory, and deleting a directory leaks its contents.
@@ -247,7 +279,7 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 
 ## TODO
 
-* pool exclusivity (writer lease) and multi-node allocation via metaslab leases
+* per-volume leases (each node writes its own VMs) and multi-node allocation via metaslab leases
 * intent log (ZIL) for low-latency fsync
 * snapshots and clones
 * permissions

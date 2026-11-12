@@ -18,6 +18,25 @@ pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
 pub type FileId = u64;
 
+/// This process's pool lease epoch, sent with every remote request (0: no
+/// lease). See `crate::cluster`.
+static LEASE_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Runs when a disk server says our epoch is stale: another writer has the
+/// pool now. `main` makes this exit; it must never be retried.
+static ON_STALE_EPOCH: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_lease_epoch(epoch: u64) {
+    LEASE_EPOCH.store(epoch, Ordering::SeqCst);
+}
+
+pub fn lease_epoch() -> u64 {
+    LEASE_EPOCH.load(Ordering::SeqCst)
+}
+
+pub fn on_stale_epoch(f: fn()) {
+    let _ = ON_STALE_EPOCH.set(f);
+}
+
 #[derive(Debug)]
 pub enum DiskError {
     IoError(std::io::Error),
@@ -28,6 +47,8 @@ pub enum DiskError {
     /// A remote disk didn't answer in time.
     Timeout,
     InvalidUri(ParseError),
+    /// The disk server refused a write: our lease epoch is out of date.
+    StaleEpoch,
 }
 
 impl fmt::Display for DiskError {
@@ -39,6 +60,7 @@ impl fmt::Display for DiskError {
             DiskError::Disconnected => write!(f, "disk is disconnected"),
             DiskError::Timeout => write!(f, "disk timed out"),
             DiskError::InvalidUri(err) => write!(f, "invalid URI: {}", err),
+            DiskError::StaleEpoch => write!(f, "stale lease epoch (another writer holds the pool)"),
         }
     }
 }
@@ -330,7 +352,7 @@ impl WsConn {
         }
 
         // One deadline covers queueing for the sink, sending and the reply.
-        let msg = encode_request(op, disk_id, block, count, id, data);
+        let msg = encode_request(op, disk_id, block, count, id, lease_epoch(), data);
         let exchange = async {
             self.sink
                 .lock()
@@ -365,6 +387,12 @@ impl WsConn {
             }
             Ok(WsStatus::InvalidRequest) => {
                 Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into()))
+            }
+            Ok(WsStatus::StaleEpoch) => {
+                if let Some(f) = ON_STALE_EPOCH.get() {
+                    f();
+                }
+                Err(DiskError::StaleEpoch)
             }
             Err(_) => Err(DiskError::IoError(std::io::Error::other(format!(
                 "websocket: unknown status {}",

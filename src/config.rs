@@ -16,7 +16,7 @@
 //! with no `pool:` is what `listen` serves; for compatibility, exactly five
 //! of them with no `pool:` also make a raidz2 pool, the old fixed layout.
 
-use crate::api::EtcdConfig;
+use crate::cluster::ClusterConfig;
 use crate::disk::DiskOptions;
 use crate::disks::DiskSet;
 use crate::vdev::{Pool, Topology};
@@ -32,7 +32,9 @@ pub struct Config {
     /// The pool layout.
     #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
     pub pool: Option<VdevConfig>,
-    pub etcd_config: Option<EtcdConfig>,
+    /// Control-plane settings (see `crate::cluster`). The members themselves
+    /// come from `pool`.
+    pub cluster: Option<ClusterConfig>,
     /// Remote disk request timeout (default 10000).
     pub disk_timeout_ms: Option<u64>,
 }
@@ -162,6 +164,34 @@ impl Config {
         }
     }
 
+    /// The cluster a `listen` node on `port` belongs to, from the pool's
+    /// disks (see `cluster::members`). A cluster of one without a pool.
+    pub fn cluster_members(&self, port: u16) -> Result<crate::cluster::members::Members, String> {
+        match self.pool_spec()? {
+            None => Ok(crate::cluster::members::Members::solo()),
+            Some(spec) => crate::cluster::members::derive(
+                &spec.paths,
+                &format!("{:?}", spec.topology),
+                |base| crate::cluster::members::is_local_base(base, port),
+            ),
+        }
+    }
+
+    /// Where to ask for leases: every `listen` node that serves one of the
+    /// pool's remote disks. Empty for a pool of local disks only.
+    pub fn lease_endpoints(&self) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        for path in self.pool_spec()?.map(|s| s.paths).unwrap_or_default() {
+            let Some(base) = disk_server_base(&path) else {
+                continue;
+            };
+            if !out.contains(&base) {
+                out.push(base);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn disk_options(&self) -> DiskOptions {
         let mut opts = DiskOptions::default();
         if let Some(ms) = self.disk_timeout_ms {
@@ -169,6 +199,22 @@ impl Config {
         }
         opts
     }
+}
+
+/// `http://host:port` of the `listen` node serving a remote disk path
+/// (`http://host:port/api/v1/disks/N`, or `ws://`), None for local paths.
+pub fn disk_server_base(path: &str) -> Option<String> {
+    let url = url::Url::parse(path).ok()?;
+    let scheme = match url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => return None,
+    };
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(p) => format!("{}://{}:{}", scheme, host, p),
+        None => format!("{}://{}", scheme, host),
+    })
 }
 
 #[cfg(test)]

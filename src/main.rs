@@ -7,6 +7,7 @@ use std::{path::Path, path::PathBuf};
 
 mod api;
 mod blkptr;
+mod cluster;
 mod config;
 mod disk;
 mod disks;
@@ -144,8 +145,63 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u32>,
 
-        id: String,
+        /// A name for this node (logs, data directory); defaults to
+        /// `node-<id>`, the id coming from the pool config.
+        id: Option<String>,
     },
+    /// The control plane: members, leader, leases.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClusterCommands {
+    /// Show members, the leader and who holds which lease.
+    Status,
+}
+
+impl Commands {
+    /// Does this command write to the pool (and so need the pool lease)?
+    fn writes(&self) -> bool {
+        match self {
+            Commands::Format { .. }
+            | Commands::Nbd { .. }
+            | Commands::Nvme { .. }
+            | Commands::Block { .. }
+            | Commands::Delete { .. }
+            | Commands::Write { .. }
+            | Commands::Mkdir { .. }
+            | Commands::Resilver => true,
+            Commands::Scrub { dry_run } => !dry_run,
+            Commands::Fsck {
+                repair,
+                rebuild_spacemaps,
+                ..
+            } => *repair || *rebuild_spacemaps,
+            Commands::Defrag { check, .. } => !check,
+            _ => false,
+        }
+    }
+
+    /// What the lease says this writer is doing.
+    fn describe(&self) -> String {
+        match self {
+            Commands::Nbd { name, .. } => format!("nbd {}", name),
+            Commands::Nvme { name } => format!("nvme {}", name),
+            Commands::Block { name, .. } => format!("block {}", name),
+            Commands::Delete { path } => format!("delete {}", path),
+            Commands::Write { dest, .. } => format!("write {}", dest),
+            Commands::Mkdir { path } => format!("mkdir {}", path),
+            Commands::Defrag { name, .. } => format!("defrag {}", name),
+            Commands::Format { .. } => "format".into(),
+            Commands::Resilver => "resilver".into(),
+            Commands::Scrub { .. } => "scrub".into(),
+            Commands::Fsck { .. } => "fsck".into(),
+            _ => "writer".into(),
+        }
+    }
 }
 
 fn load_config(path: &str) -> std::io::Result<Config> {
@@ -279,10 +335,77 @@ async fn main() -> std::io::Result<()> {
             None => None,
         };
         let port = port.unwrap_or(8881);
-        let etcd = config.etcd_config;
-        api::listen(disks, pool, port, etcd, id).await;
+        let members = config
+            .cluster_members(port as u16)
+            .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
+        let name = id.clone().unwrap_or_else(|| format!("node-{}", members.me));
+        let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
+            Some(d) => expand_tilde(d).join(&name),
+            None => cluster::default_data_dir(&name),
+        };
+        println!(
+            "cluster: node {} ({}), {} member{}",
+            members.me,
+            name,
+            members.disks.len(),
+            if members.disks.len() == 1 { "" } else { "s" }
+        );
+        let floor = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let node = cluster::Cluster::start(&name, members, data_dir, floor.clone())
+            .await
+            .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
+        api::listen(disks, pool, port, node, floor).await;
         return Ok(());
     }
+
+    if let Commands::Cluster { command } = &cli.command {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            fail("no cluster to ask: the pool has no remote disks");
+        }
+        match command {
+            ClusterCommands::Status => {
+                let status = cluster::lease::LeaseClient::new(endpoints)
+                    .status()
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                print_cluster_status(&status);
+            }
+        }
+        return Ok(());
+    }
+
+    // The pool's one writer: take the lease before touching any disk, so
+    // our first requests already carry the new epoch (that is what fences
+    // out a previous writer).
+    let lease = if cli.command.writes() {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            None
+        } else {
+            let client = cluster::lease::LeaseClient::new(endpoints);
+            let held = cluster::lease::HeldLease::acquire(
+                client,
+                cluster::state::POOL,
+                &cli.command.describe(),
+            )
+            .await
+            .unwrap_or_else(|e| fail(format!("cannot take the pool lease: {}", e)));
+            disk::set_lease_epoch(held.epoch);
+            disk::on_stale_epoch(|| {
+                eprintln!("Error: another writer has taken over the pool; stopping");
+                std::process::exit(3);
+            });
+            let held = Arc::new(held);
+            held.hold(|msg| {
+                eprintln!("Error: {}; stopping", msg);
+                std::process::exit(3);
+            });
+            Some(held)
+        }
+    } else {
+        None
+    };
 
     let Some(spec) = spec else {
         fail("no pool topology configured (set `pool` in the config)");
@@ -323,13 +446,13 @@ async fn main() -> std::io::Result<()> {
             if !fs.needs_resilver() {
                 println!("no online disk needs a resilver");
                 print_status(&fs).await;
-                return Ok(());
-            }
-            let report = fs.resilver().await.unwrap();
-            println!("{}", report);
-            print_status(&fs).await;
-            if !report.is_clean() {
-                std::process::exit(2);
+            } else {
+                let report = fs.resilver().await.unwrap();
+                println!("{}", report);
+                print_status(&fs).await;
+                if !report.is_clean() {
+                    std::process::exit(2);
+                }
             }
         }
         Commands::Fsck {
@@ -457,7 +580,58 @@ async fn main() -> std::io::Result<()> {
             let fs = open_fs(raid, true, rewind).await;
             println!("index: {:?}", fs.file_index);
         }
-        Commands::Listen { .. } => unreachable!(),
+        Commands::Listen { .. } | Commands::Cluster { .. } => unreachable!(),
+    }
+    if let Some(lease) = lease {
+        lease.release().await;
     }
     Ok(())
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+fn print_cluster_status(s: &cluster::Status) {
+    match s.leader {
+        Some(l) => println!("leader: node {} (term {})", l, s.term),
+        None => println!("leader: none (no quorum?) (term {})", s.term),
+    }
+    println!("members (as seen by node {}, {}):", s.id, s.node);
+    for m in &s.members {
+        let mark = if s.leader == Some(m.id) { " *" } else { "" };
+        let addr = m.addr.as_deref().unwrap_or("(this node)");
+        let disks: Vec<String> = m.disks.iter().map(|d| d.to_string()).collect();
+        println!(
+            "  node {:<3} {:<28} disks {}{}",
+            m.id,
+            addr,
+            disks.join(","),
+            mark
+        );
+    }
+    println!("layout: {}", s.fingerprint);
+    println!("epoch: {}", s.state.epoch);
+    if s.state.leases.is_empty() {
+        println!("leases: none");
+    }
+    for (resource, l) in &s.state.leases {
+        let state = if l.released {
+            "released".to_string()
+        } else if l.expires_ms > s.now_ms {
+            format!(
+                "expires in {:.1}s",
+                (l.expires_ms - s.now_ms) as f64 / 1000.0
+            )
+        } else {
+            "expired".to_string()
+        };
+        println!(
+            "lease {:<8} epoch {:<4} {} ({}) {}",
+            resource, l.epoch, l.desc, l.owner, state
+        );
+    }
 }
