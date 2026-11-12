@@ -8,9 +8,7 @@ pool:
     - disks/disk3
     - disks/disk4
     - disks/disk5
-etcd_config:
-  enable: true
-  etcd_nodes:
-    - http://127.0.0.1:12379
-    - http://127.0.0.1:22379
-    - http://127.0.0.1:32379
+# The cluster comes from the pool: each remote disk URL is a `listen` node,
+# local paths are this node. All local, as here: a cluster of one.
+# cluster:
+#   data_dir: ~/.raidish     # Raft state goes in <data_dir>/<name>
