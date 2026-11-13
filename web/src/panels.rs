@@ -45,11 +45,20 @@ pub fn Hero(p: &HeroProps) -> Html {
     } else {
         0.0
     };
+    // Only say "more" once redundancy has actually been consumed.
+    let more = if r.failures_left < r.fault_tolerance {
+        " more"
+    } else {
+        ""
+    };
     let survives = match (r.health, r.failures_left) {
         (Health::Faulted, _) => "Data is unavailable: too many disks are missing".to_string(),
+        (_, 0) if r.fault_tolerance == 0 => {
+            "No redundancy: any disk failure loses data".to_string()
+        }
         (_, 0) => "No redundancy left: one more failure loses data".to_string(),
-        (_, 1) => "Survives 1 more disk failure".to_string(),
-        (_, n) => format!("Survives {} more disk failures", n),
+        (_, 1) => format!("Can survive 1{} disk failure", more),
+        (_, n) => format!("Can survive {}{} disk failures", n, more),
     };
     let offline = r.disks.iter().filter(|d| d.unavailable()).count();
     let resilver = r

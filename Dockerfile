@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # raidish in a container: see docker-compose.yml and "Try it with Docker" in
 # the README.
 #
@@ -22,17 +23,17 @@ RUN case "$TARGETARCH" in \
  && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${arch}-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin trunk
 
-# Fetch the dependencies in their own layer (manifests only), so a source
-# change doesn't download them again.
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY web/Cargo.toml web/
-RUN mkdir -p src web/src \
- && touch src/lib.rs src/main.rs web/src/main.rs \
- && cargo fetch --locked \
- && rm -rf src web/src
-
+# BuildKit cache mounts keep the cargo registry, compiled dependencies
+# (target/, including the dashboard's target/web) and trunk's downloaded
+# tools (wasm-bindgen) between builds, so a source change only recompiles
+# our own crates. They live outside the image: `docker builder prune`
+# clears them.
 COPY . .
-RUN if [ -n "$RAIDISH_SKIP_UI" ]; then export RAIDISH_SKIP_UI; else unset RAIDISH_SKIP_UI; fi \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/src/target \
+    if [ -n "$RAIDISH_SKIP_UI" ]; then export RAIDISH_SKIP_UI; else unset RAIDISH_SKIP_UI; fi \
  && cargo build --release --locked --bin raidish \
  && cp target/release/raidish /usr/local/bin/raidish
 

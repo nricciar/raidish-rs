@@ -333,8 +333,7 @@ pub async fn main() -> std::io::Result<()> {
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
-    if let Commands::Listen { port, no_committer } = &cli.command
-    {
+    if let Commands::Listen { port, no_committer } = &cli.command {
         let serve = config.serve_disks().unwrap_or_else(|e| fail(e));
         let paths: Vec<&str> = serve.iter().map(|s| s.as_str()).collect();
         let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
