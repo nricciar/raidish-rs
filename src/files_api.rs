@@ -180,6 +180,7 @@ fn record_stream<D: BlockDevice + 'static>(
 
 #[get("/api/v1/files/<path..>")]
 async fn get_file(
+    _auth: crate::auth::CanRead,
     path: PathBuf,
     st: &State<FilesState>,
 ) -> Result<ByteStream<BoxStream<'static, Vec<u8>>>, ApiError> {
@@ -238,12 +239,19 @@ async fn list_any(st: &FilesState, path: &Path) -> Result<Json<Vec<DirEntry>>, A
 }
 
 #[get("/api/v1/dir")]
-async fn list_root(st: &State<FilesState>) -> Result<Json<Vec<DirEntry>>, ApiError> {
+async fn list_root(
+    _auth: crate::auth::CanRead,
+    st: &State<FilesState>,
+) -> Result<Json<Vec<DirEntry>>, ApiError> {
     list_any(st, Path::new("")).await
 }
 
 #[get("/api/v1/dir/<path..>")]
-async fn list_dir(path: PathBuf, st: &State<FilesState>) -> Result<Json<Vec<DirEntry>>, ApiError> {
+async fn list_dir(
+    _auth: crate::auth::CanRead,
+    path: PathBuf,
+    st: &State<FilesState>,
+) -> Result<Json<Vec<DirEntry>>, ApiError> {
     list_any(st, &path).await
 }
 
@@ -303,6 +311,7 @@ async fn upload(
 
 #[put("/api/v1/files/<path..>", data = "<data>")]
 async fn put_file(
+    _auth: crate::auth::CanWrite,
     path: PathBuf,
     data: Data<'_>,
     limits: &Limits,
@@ -342,14 +351,22 @@ async fn put_file(
 }
 
 #[delete("/api/v1/files/<path..>")]
-async fn delete_file(path: PathBuf, st: &State<FilesState>) -> Result<Json<FileId>, ApiError> {
+async fn delete_file(
+    _auth: crate::auth::CanWrite,
+    path: PathBuf,
+    st: &State<FilesState>,
+) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
     fs.refresh_root().await.map_err(api_err)?;
     fs.delete(&path).await.map(Json).map_err(api_err)
 }
 
 #[put("/api/v1/dir/<path..>")]
-async fn make_dir(path: PathBuf, st: &State<FilesState>) -> Result<Json<FileId>, ApiError> {
+async fn make_dir(
+    _auth: crate::auth::CanWrite,
+    path: PathBuf,
+    st: &State<FilesState>,
+) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
     fs.mkdir(&path).await.map(Json).map_err(api_err)
 }

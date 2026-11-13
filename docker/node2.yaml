@@ -2,11 +2,14 @@
 # the disks in the same order; a URL's disk index is its pool position.
 pool:
   raidz1:
-    - http://node0:8881/api/v1/disks/0
-    - http://node1:8882/api/v1/disks/1
+    - https://node0:8881/api/v1/disks/0
+    - https://node1:8882/api/v1/disks/1
     - /data/disk
 cluster:
   data_dir: /data/raft
 # Export volumes, but don't attach kernel devices (unprivileged containers).
 automount:
   helper: none
+# The certificate bundle `pki` made for this node (see docker-compose.yml).
+tls:
+  dir: /etc/raidish/tls

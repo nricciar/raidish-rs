@@ -40,6 +40,11 @@ pub struct Config {
     /// How `listen` exports and attaches the volumes placed on it.
     #[serde(default)]
     pub automount: crate::agent::AutomountConfig,
+    /// Certificates (see `crate::tls`). Without it: plain HTTP, no auth.
+    pub tls: Option<crate::tls::TlsConfig>,
+    /// Who may do what once `tls` is on (see `crate::auth`).
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]

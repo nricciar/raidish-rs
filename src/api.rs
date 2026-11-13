@@ -46,6 +46,8 @@ pub async fn listen(
     committer: crate::committer::CommitterSlot,
     agent: crate::agent::AgentState,
     files: crate::files_api::WriterSlot,
+    tls: Option<&crate::tls::TlsConfig>,
+    auth: crate::auth::AuthState,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -73,27 +75,47 @@ pub async fn listen(
         read_only,
         // Any node takes lease requests (followers forward to the leader).
         leases: Arc::new(crate::cluster::lease::LeaseClient::new(vec![format!(
-            "http://127.0.0.1:{}",
+            "{}://127.0.0.1:{}",
+            crate::tls::scheme(),
             port
         )])),
     };
     let server = DiskServer { disks, floor };
 
+    let mut figment = rocket::Config::figment()
+        .merge(("port", port))
+        .merge((
+            "limits",
+            map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB", "upload" => "64 GiB"],
+        ));
+    if let Some(tls) = tls {
+        let path = |p: Option<std::path::PathBuf>, what: &str| {
+            p.map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| panic!("tls: no {} configured", what))
+        };
+        figment = figment
+            .merge(("tls.certs", path(tls.cert_path(), "cert")))
+            .merge(("tls.key", path(tls.key_path(), "key")))
+            // Ask for a client certificate but don't insist: browsers
+            // present a token instead (checked per route, `crate::auth`).
+            .merge(("tls.mutual.ca_certs", path(tls.ca_path(), "ca")))
+            .merge(("tls.mutual.mandatory", false));
+    }
+
     rocket::build()
+        .manage(auth)
         .manage(server)
         .manage(files)
         .manage(cluster)
         .manage(committer)
         .manage(agent)
         .manage(crate::dashboard::DashboardState { pool: pool_map })
-        .configure(
-            rocket::Config::figment()
-                .merge(("port", port))
-                .merge((
-                    "limits",
-                    map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB", "upload" => "64 GiB"],
-                )),
+        .configure(figment)
+        .register(
+            "/",
+            rocket::catchers![crate::auth::unauthorized, crate::auth::forbidden],
         )
+        .mount("/", rocket::routes![crate::auth::whoami])
         .mount(
             "/",
             routes![
@@ -117,6 +139,7 @@ pub async fn listen(
 /// HTTP: GET /api/v1/agent/status - the volumes this node runs.
 #[get("/api/v1/agent/status")]
 async fn agent_status(
+    _auth: crate::auth::CanRead,
     agent: &State<crate::agent::AgentState>,
 ) -> rocket::serde::json::Json<crate::agent::AgentStatus> {
     rocket::serde::json::Json(agent.read().unwrap().clone())
@@ -168,6 +191,7 @@ impl<'r> FromRequest<'r> for HeaderEpoch {
 /// Reads a block directly from a specific disk in the array
 #[get("/api/v1/disks/<disk_index>/blocks/<block_id>")]
 async fn get_block(
+    _auth: crate::auth::CanRead,
     disk_index: usize,
     block_id: u64,
     server: &State<DiskServer>,
@@ -186,6 +210,7 @@ async fn get_block(
 /// Writes a block directly to a specific disk in the array
 #[put("/api/v1/disks/<disk_index>/blocks/<block_id>", data = "<data>")]
 async fn put_block(
+    _auth: crate::auth::CanWrite,
     disk_index: usize,
     block_id: u64,
     data: Data<'_>,
@@ -217,7 +242,7 @@ async fn put_block(
 
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
 #[get("/api/v1/disks")]
-async fn list_disks(server: &State<DiskServer>) -> String {
+async fn list_disks(_auth: crate::auth::CanRead, server: &State<DiskServer>) -> String {
     let disk_info: Vec<_> = (0..server.disks.len())
         .map(|i| {
             serde_json::json!({
@@ -233,7 +258,12 @@ async fn list_disks(server: &State<DiskServer>) -> String {
 
 /// HTTP: POST /api/v1/flush - Flush all local disks
 #[post("/api/v1/disks/<disk_index>/flush")]
-async fn flush_disks(disk_index: usize, epoch: HeaderEpoch, server: &State<DiskServer>) -> Status {
+async fn flush_disks(
+    _auth: crate::auth::CanWrite,
+    disk_index: usize,
+    epoch: HeaderEpoch,
+    server: &State<DiskServer>,
+) -> Status {
     let _ = epoch;
     match server.local_disk(disk_index) {
         Ok(disk) => match disk.flush().await {
@@ -253,7 +283,12 @@ async fn flush_disks(disk_index: usize, epoch: HeaderEpoch, server: &State<DiskS
 const WS_MAX_IN_FLIGHT: usize = 256;
 
 #[get("/ws")]
-async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'static> {
+async fn ws_endpoint(
+    who: crate::auth::Principal,
+    ws: WebSocket,
+    server: &State<DiskServer>,
+) -> ws::Channel<'static> {
+    let can_write = who.can_write();
     let disks = server.disks.clone();
     let floor = server.floor.clone();
 
@@ -280,7 +315,7 @@ async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'
                         let (disks, tx, floor) = (disks.clone(), tx.clone(), floor.clone());
                         tokio::spawn(async move {
                             let _ = tx
-                                .send(handle_ws_message(&data, &disks, &floor).await)
+                                .send(handle_ws_message_as(&data, &disks, &floor, can_write).await)
                                 .await;
                             drop(permit);
                         });
@@ -298,11 +333,35 @@ async fn ws_endpoint(ws: WebSocket, server: &State<DiskServer>) -> ws::Channel<'
 }
 
 /// Serve one encoded request against `disks` and encode the reply.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn handle_ws_message(
     data: &[u8],
     disks: &Arc<Vec<Caddy>>,
     floor: &EpochFloor,
 ) -> Vec<u8> {
+    handle_ws_message_as(data, disks, floor, true).await
+}
+
+/// One websocket request from a caller who may (or may not) write. A
+/// read-only caller's writes and flushes are refused, and its reads carry no
+/// epoch: only writers may raise the fencing floor.
+pub(crate) async fn handle_ws_message_as(
+    data: &[u8],
+    disks: &Arc<Vec<Caddy>>,
+    floor: &EpochFloor,
+    can_write: bool,
+) -> Vec<u8> {
+    let mut owned;
+    let mut data = data;
+    if !can_write && data.len() >= crate::websocket::WS_REQUEST_HEADER_LEN {
+        let id = u64::from_le_bytes(data[15..23].try_into().unwrap());
+        if matches!(WsOp::try_from(data[0]), Ok(WsOp::Write | WsOp::Flush)) {
+            return encode_response(WsStatus::Forbidden, id, &[]);
+        }
+        owned = data.to_vec();
+        owned[23..31].fill(0);
+        data = &owned;
+    }
     let Some(request) = WsRequest::parse(data) else {
         // Echo the id if there's one, so the client's request fails instead
         // of waiting for a reply that never comes.

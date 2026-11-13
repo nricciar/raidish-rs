@@ -16,9 +16,13 @@ extern crate rocket;
 pub mod agent;
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auth;
 pub mod blkptr;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
 mod cluster;
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,10 +47,14 @@ mod mirror;
 mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
 mod nvme;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pki;
 mod raidz;
 mod rt;
 mod scan;
 mod stripe;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
 pub mod vdev;

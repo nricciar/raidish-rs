@@ -200,7 +200,7 @@ impl Cluster {
         let config = Arc::new(config.validate().map_err(|e| e.to_string())?);
         let store = Store::open(&data_dir, fence)?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
-        let http = reqwest::Client::builder()
+        let http = crate::tls::http_builder()
             .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| e.to_string())?;

@@ -25,7 +25,10 @@ pub fn routes() -> Vec<rocket::Route> {
 
 /// GET /api/v1/pool - the pool layout and where each disk is served.
 #[get("/api/v1/pool")]
-fn pool(state: &State<DashboardState>) -> Result<Json<PoolMap>, Status> {
+fn pool(
+    _auth: crate::auth::CanRead,
+    state: &State<DashboardState>,
+) -> Result<Json<PoolMap>, Status> {
     state.pool.clone().map(Json).ok_or(Status::NotFound)
 }
 

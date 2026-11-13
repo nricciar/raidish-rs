@@ -27,7 +27,7 @@ impl LeaseClient {
                 .into_iter()
                 .map(|e| e.trim_end_matches('/').to_string())
                 .collect(),
-            http: reqwest::Client::builder()
+            http: crate::tls::http_builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(5))
                 .build()

@@ -18,6 +18,15 @@ const LAYOUT_MIN_MS: f64 = 30_000.0;
 /// I/O samples kept per disk (one per refresh).
 const HISTORY: usize = 36;
 
+/// Who's signed in (None on a node without TLS: no sign-in).
+#[derive(Properties, PartialEq)]
+pub struct Props {
+    #[prop_or_default]
+    pub user: Option<String>,
+    #[prop_or_default]
+    pub on_sign_out: Callback<()>,
+}
+
 pub enum Msg {
     Opened(Result<Rc<Session>, String>),
     Refresh,
@@ -60,7 +69,7 @@ pub struct App {
 
 impl Component for App {
     type Message = Msg;
-    type Properties = ();
+    type Properties = Props;
 
     fn create(ctx: &Context<Self>) -> Self {
         ctx.link()
@@ -220,6 +229,14 @@ impl Component for App {
                         <span class="muted">{ format!("via node {} ({})", c.id, c.node) }</span>
                     }).unwrap_or_default() }
                     { self.refresh_note() }
+                    if let Some(user) = &ctx.props().user {
+                        <span class="user">
+                            <span class="muted">{ user }</span>
+                            <button class="btn small" onclick={ctx.props().on_sign_out.reform(|_| ())}>
+                                { "Sign out" }
+                            </button>
+                        </span>
+                    }
                 </div>
             </header>
         };

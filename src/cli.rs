@@ -134,6 +134,16 @@ enum Commands {
         #[command(subcommand)]
         command: VolumeCommands,
     },
+    /// The cluster's certificate authority: issue node and client certs.
+    Cert {
+        #[command(subcommand)]
+        command: crate::cli_pki::CertCommands,
+    },
+    /// Tokens for the dashboard and scripts (signed by your admin cert).
+    Token {
+        #[command(subcommand)]
+        command: crate::cli_pki::TokenCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,6 +322,35 @@ fn print_tree(t: &Topology, disk_lines: &[String], depth: usize) {
     }
 }
 
+/// Warn if this node's certificate expires within 30 days (or has).
+fn warn_expiry(tls: &crate::tls::TlsConfig) {
+    let Ok(Some((chain, _))) = tls.identity() else {
+        return;
+    };
+    let Some(info) = chain.first().and_then(|c| crate::pki::inspect_der(c).ok()) else {
+        return;
+    };
+    let left = info.not_after - ::time::OffsetDateTime::now_utc();
+    println!(
+        "tls: serving as '{}' ({}), certificate expires {}",
+        info.name,
+        info.role.map(|r| r.to_string()).unwrap_or("?".into()),
+        info.expiry()
+    );
+    if left < ::time::Duration::days(30) {
+        eprintln!(
+            "WARNING: this node's certificate {} on {}: reissue it with `raidish cert issue {} --role node --force`",
+            if left.is_negative() {
+                "expired"
+            } else {
+                "expires"
+            },
+            info.not_after.date(),
+            info.name
+        );
+    }
+}
+
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("Error: {}", msg);
     std::process::exit(1);
@@ -329,7 +368,28 @@ async fn open_fs<D: BlockDevice>(dev: D, read_only: bool, rewind: fs::Rewind) ->
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
+    // Certificates are managed without (or before there is) a config.
+    if let Commands::Cert { command } = &cli.command {
+        let config_path = cli.config.clone();
+        crate::cli_pki::run(command, &move || {
+            let config = load_config(&config_path).unwrap_or_else(|e| fail(e));
+            config
+                .pool_spec()
+                .unwrap_or_else(|e| fail(e))
+                .map(|s| s.paths)
+                .unwrap_or_default()
+        });
+        return Ok(());
+    }
     let config = load_config(&cli.config)?;
+    crate::tls::init(config.tls.as_ref()).unwrap_or_else(|e| fail(e));
+    if let Ok(Some(spec)) = config.pool_spec() {
+        crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
+    }
+    if let Commands::Token { command } = &cli.command {
+        crate::cli_pki::run_token(command, &config);
+        return Ok(());
+    }
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
@@ -383,7 +443,7 @@ pub async fn main() -> std::io::Result<()> {
         let slot: crate::committer::CommitterSlot = Default::default();
         let agent_state: crate::agent::AgentState = Default::default();
         let files: crate::files_api::WriterSlot = Default::default();
-        let me = format!("http://127.0.0.1:{}", port);
+        let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
             // committer's writes are fenced like everyone else's.
@@ -430,7 +490,14 @@ pub async fn main() -> std::io::Result<()> {
             );
             tokio::spawn(agent.run());
         }
-        println!("dashboard: http://localhost:{}/", port);
+        let auth = crate::auth::AuthState(config.tls.as_ref().map(|t| {
+            crate::auth::Verifier::from_config(t, &config.auth)
+                .unwrap_or_else(|e| fail(format!("tls: {}", e)))
+        }));
+        if let Some(t) = &config.tls {
+            warn_expiry(t);
+        }
+        println!("dashboard: {}://localhost:{}/", crate::tls::scheme(), port);
         api::listen(
             disks,
             pool,
@@ -441,6 +508,8 @@ pub async fn main() -> std::io::Result<()> {
             slot,
             agent_state,
             files,
+            config.tls.as_ref(),
+            auth,
         )
         .await;
         return Ok(());
@@ -719,7 +788,10 @@ pub async fn main() -> std::io::Result<()> {
                 }
             }
         }
-        Commands::Listen { .. } | Commands::Cluster { .. } => unreachable!(),
+        Commands::Listen { .. }
+        | Commands::Cluster { .. }
+        | Commands::Cert { .. }
+        | Commands::Token { .. } => unreachable!(),
     }
     if let Some(lease) = lease {
         lease.release().await;

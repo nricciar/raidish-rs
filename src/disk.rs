@@ -200,6 +200,10 @@ pub(crate) fn check_status_in(status: u8, lent: bool) -> Result<(), DiskError> {
         Ok(WsStatus::InvalidRequest) => {
             Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into()))
         }
+        Ok(WsStatus::Forbidden) => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "this certificate or token may not write",
+        ))),
         Ok(WsStatus::StaleEpoch) => {
             if !lent && let Some(f) = ON_STALE_EPOCH.get() {
                 f();
@@ -267,6 +271,8 @@ mod remote;
 pub use remote::RemoteDisk;
 #[cfg(not(target_arch = "wasm32"))]
 pub use remote::WsConn;
+#[cfg(target_arch = "wasm32")]
+pub use remote::set_access_token;
 
 #[derive(Debug, Clone)]
 enum DiskBackend {

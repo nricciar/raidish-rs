@@ -571,7 +571,7 @@ impl CommitClient {
                 .into_iter()
                 .map(|e| e.trim_end_matches('/').to_string())
                 .collect(),
-            http: reqwest::Client::builder()
+            http: crate::tls::http_builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -787,6 +787,7 @@ pub mod routes {
 
     #[get("/api/v1/pool/committer")]
     pub async fn committer(
+        _auth: crate::auth::CanRead,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<CommitterInfo, CommitError>> {
         match current(slot).await {
@@ -797,6 +798,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/lend", data = "<req>")]
     pub async fn lend(
+        _auth: crate::auth::CanWrite,
         req: Json<LendRequest>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<LentMetaslab, CommitError>> {
@@ -808,6 +810,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/return", data = "<req>")]
     pub async fn give_back(
+        _auth: crate::auth::CanWrite,
         req: Json<ReturnRequest>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
@@ -819,6 +822,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/commit", data = "<req>")]
     pub async fn commit(
+        _auth: crate::auth::CanWrite,
         req: Json<VolumeCommit>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<Committed, CommitError>> {
@@ -830,6 +834,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/commit_fs", data = "<req>")]
     pub async fn commit_fs(
+        _auth: crate::auth::CanWrite,
         req: Json<FsCommit>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<FsCommitted, CommitError>> {
@@ -841,6 +846,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/claim", data = "<req>")]
     pub async fn claim(
+        _auth: crate::auth::CanWrite,
         req: Json<ClaimRequest>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
@@ -855,6 +861,7 @@ pub mod routes {
 
     #[get("/api/v1/pool/volumes")]
     pub async fn volumes(
+        _auth: crate::auth::CanRead,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<Vec<VolumeInfo>, CommitError>> {
         match current(slot).await {
@@ -865,6 +872,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/volumes", data = "<req>")]
     pub async fn create(
+        _auth: crate::auth::CanWrite,
         req: Json<CreateVolume>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
@@ -875,7 +883,11 @@ pub mod routes {
     }
 
     #[delete("/api/v1/pool/volumes/<name>")]
-    pub async fn remove(name: &str, slot: &State<CommitterSlot>) -> Json<Result<(), CommitError>> {
+    pub async fn remove(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
             Some(c) => fs_err(c.delete_volume(name).await),
             None => not_committer(),
@@ -884,6 +896,7 @@ pub mod routes {
 
     #[put("/api/v1/pool/volumes/<name>/props", data = "<props>")]
     pub async fn props(
+        _auth: crate::auth::CanWrite,
         name: &str,
         props: Json<VolumeProps>,
         slot: &State<CommitterSlot>,

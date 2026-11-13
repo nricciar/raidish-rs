@@ -9,6 +9,7 @@ mod app;
 mod blockmap;
 mod cluster;
 mod fmt;
+mod login;
 mod panels;
 mod session;
 
@@ -16,6 +17,6 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     {
         console_error_panic_hook::set_once();
-        yew::Renderer::<app::App>::new().render();
+        yew::Renderer::<login::Root>::new().render();
     }
 }
