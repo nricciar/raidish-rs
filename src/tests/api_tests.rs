@@ -47,12 +47,13 @@ async fn stale_epoch_writes_are_refused() {
     assert_eq!(s, WsStatus::Success);
     assert_eq!(data, a);
 
-    // The old writer is now fenced: writes and flushes are refused, the
-    // block is untouched. Reads still work.
+    // The old writer is now fenced: writes are refused, the block is
+    // untouched. Reads still work, and so do flushes (they only make
+    // admitted writes durable).
     let (s, _) = send(&disks, &floor, WsOp::Write, 7, 5, Some(&b)).await;
     assert_eq!(s, WsStatus::StaleEpoch);
     let (s, _) = send(&disks, &floor, WsOp::Flush, 0, 5, None).await;
-    assert_eq!(s, WsStatus::StaleEpoch);
+    assert_eq!(s, WsStatus::Success);
     let (s, _) = send(&disks, &floor, WsOp::Write, 7, 0, Some(&b)).await;
     assert_eq!(s, WsStatus::StaleEpoch, "no epoch at all is older still");
     let (s, data) = send(&disks, &floor, WsOp::Read, 7, 5, None).await;
@@ -72,7 +73,7 @@ async fn floor_from_the_cluster_fences_too() {
     let disks = local_disks(&pool).await;
     let floor = EpochFloor::default();
     // The cluster applied a pool grant at epoch 3 (no request seen yet).
-    floor.0.fetch_max(3, Ordering::SeqCst);
+    floor.raise_pool(3);
     let a = vec![1u8; BLOCK_SIZE];
     let (s, _) = send(&disks, &floor, WsOp::Write, 1, 2, Some(&a)).await;
     assert_eq!(s, WsStatus::StaleEpoch);
@@ -96,7 +97,7 @@ async fn remote_client_sees_stale_epoch() {
     let pool = TestPool::new().await;
     let server = TestDiskServer::start(&pool.paths).await;
     // Someone with a newer lease than ours (this process sends epoch 0).
-    server.floor.0.fetch_max(1, Ordering::SeqCst);
+    server.floor.raise_pool(1);
     let disk = Disk::open_with(&server.url(0), fast_disk_options())
         .await
         .unwrap();

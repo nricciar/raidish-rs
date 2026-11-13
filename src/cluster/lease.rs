@@ -89,6 +89,8 @@ pub struct HeldLease {
     pub resource: String,
     pub owner: String,
     pub epoch: u64,
+    /// Set by `release`: the renew loop stops quietly.
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl HeldLease {
@@ -111,6 +113,7 @@ impl HeldLease {
                 resource: resource.into(),
                 owner,
                 epoch,
+                released: Default::default(),
             }),
             Response::Held {
                 owner,
@@ -137,6 +140,9 @@ impl HeldLease {
             let mut valid_from = Instant::now();
             loop {
                 tokio::time::sleep(ttl / 3).await;
+                if me.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 let sent = Instant::now();
                 let op = LeaseOp::Renew {
                     resource: me.resource.clone(),
@@ -146,6 +152,7 @@ impl HeldLease {
                 };
                 match me.client.call(&op).await {
                     Ok(Response::Granted { epoch, .. }) if epoch == me.epoch => valid_from = sent,
+                    Ok(_) if me.released.load(std::sync::atomic::Ordering::SeqCst) => return,
                     Ok(other) => {
                         on_lost(format!("lease on {} lost ({:?})", me.resource, other));
                         return;
@@ -166,6 +173,8 @@ impl HeldLease {
     }
 
     pub async fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let op = LeaseOp::Release {
             resource: self.resource.clone(),
             owner: self.owner.clone(),

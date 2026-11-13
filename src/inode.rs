@@ -51,7 +51,64 @@ pub enum InodeType {
         volblocksize: u32,
         levels: u8,
         root: Option<BlockPtr>,
+        props: VolumeProps,
     },
+}
+
+/// How a volume is exported to the kernel when it is auto-mounted.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    Nbd,
+    Nvme,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "nbd" => Ok(Transport::Nbd),
+            "nvme" => Ok(Transport::Nvme),
+            _ => Err(format!("unknown transport '{}' (nbd or nvme)", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Transport::Nbd => "nbd",
+            Transport::Nvme => "nvme",
+        })
+    }
+}
+
+/// Placement of a volume across the cluster's `listen` nodes.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VolumeProps {
+    /// Nodes (by name) that may run the volume, most preferred first. It
+    /// runs on the first live one and stays there (no fail-back) until
+    /// moved. Empty: any node.
+    pub nodes: Vec<String>,
+    /// Export it and attach the kernel device wherever it runs. None: only
+    /// run by hand (`nbd` / `nvme`).
+    pub automount: Option<Transport>,
+    /// A disabled volume isn't placed anywhere.
+    pub enabled: bool,
+    /// Asked to move to this node (`volume move`): it goes there while that
+    /// node is live, and the node clears this once it runs the volume.
+    pub move_to: Option<String>,
+}
+
+impl Default for VolumeProps {
+    fn default() -> Self {
+        VolumeProps {
+            nodes: Vec::new(),
+            automount: None,
+            enabled: true,
+            move_to: None,
+        }
+    }
 }
 
 impl InodeType {

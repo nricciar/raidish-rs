@@ -11,6 +11,7 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev, lcm, max_record_blocks};
+use async_trait::async_trait;
 
 #[derive(Debug)]
 pub struct Stripe {

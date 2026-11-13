@@ -1,4 +1,5 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
+use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,11 +25,17 @@ pub struct DiskSet {
     pub disks: Arc<Vec<Caddy>>,
     fenced: AtomicU64,
     misses: Vec<AtomicU64>,
+    /// The epochs this pool client's remote requests carry (see `crate::fence`).
+    pub fence: Arc<crate::fence::ClientFence>,
 }
 
 impl DiskSet {
     pub fn len(&self) -> usize {
         self.disks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.disks.is_empty()
     }
 
     pub fn is_local(&self, index: usize) -> bool {
@@ -43,12 +50,17 @@ impl DiskSet {
     pub async fn new_with(paths: &[&str], opts: DiskOptions) -> Self {
         assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
         let results = join_all(paths.iter().map(|path| Disk::open_with(path, opts))).await;
+        let fence = Arc::new(crate::fence::ClientFence::default());
 
         let disks: Vec<Caddy> = results
             .into_iter()
             .zip(paths.iter())
-            .map(|(result, &path)| match result {
-                Ok(disk) => Caddy::Healthy(path.to_string(), disk),
+            .enumerate()
+            .map(|(i, (result, &path))| match result {
+                Ok(disk) => {
+                    disk.set_fence(i, fence.clone());
+                    Caddy::Healthy(path.to_string(), disk)
+                }
                 Err(error) => {
                     eprintln!("disk '{}' unavailable: {}", path, error);
                     Caddy::Unhealthy(path.to_string(), error)
@@ -56,11 +68,14 @@ impl DiskSet {
             })
             .collect();
 
-        Self::from_caddies(disks)
+        let mut set = Self::from_caddies(disks);
+        set.fence = fence;
+        set
     }
 
     pub fn from_caddies(disks: Vec<Caddy>) -> Self {
         DiskSet {
+            fence: Default::default(),
             misses: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
             disks: Arc::new(disks),
             fenced: AtomicU64::new(0),
@@ -263,6 +278,13 @@ impl Caddy {
         match self {
             Caddy::Unhealthy(_, _) => None,
             Caddy::Healthy(_, disk) => disk.reconnects(),
+        }
+    }
+
+    pub fn io_stats(&self) -> Option<crate::disk::IoStats> {
+        match self {
+            Caddy::Unhealthy(_, _) => None,
+            Caddy::Healthy(_, disk) => disk.io_stats(),
         }
     }
 

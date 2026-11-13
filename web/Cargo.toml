@@ -1,0 +1,27 @@
+[package]
+name = "raidish-web"
+version = "0.1.0"
+edition = "2024"
+description = "The raidish web dashboard: runs the raidish core in the browser"
+publish = false
+
+[dependencies]
+raidish = { path = ".." }
+yew = { version = "0.23", features = ["csr"] }
+gloo-net = { version = "0.7", default-features = false, features = ["http", "json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+console_error_panic_hook = "0.1.7"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Document",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "MouseEvent",
+    "CssStyleDeclaration",
+    "Element",
+] }

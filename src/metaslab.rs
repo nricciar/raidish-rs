@@ -139,6 +139,9 @@ pub struct MetaslabState {
     pub synced_txg: u64,
     /// Allocation alignment in blocks.
     pub align: u64,
+    /// Lent to a volume writer (see `crate::writer`): the committer doesn't
+    /// allocate from it, though its map (free space, frees) stays here.
+    pub lent: bool,
 }
 
 impl MetaslabState {
@@ -155,6 +158,7 @@ impl MetaslabState {
             active_slot: None,
             synced_txg: 0,
             align,
+            lent: false,
         }
     }
 
@@ -185,6 +189,14 @@ impl MetaslabState {
                     .flat_map(|(_, v)| v.iter())
                     .map(|e| (e.start, e.len)),
             )
+    }
+
+    /// Is all of `[start, start + len)` allocatable free space?
+    pub(crate) fn is_free(&self, start: u64, len: u64) -> bool {
+        self.free_extents
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(&s, &l)| s + l >= start + len)
     }
 
     fn overlaps_released(&self, start: u64, len: u64) -> bool {
@@ -289,6 +301,9 @@ impl MetaslabState {
     /// Carve out exactly `want` (stripe-aligned) contiguous blocks, from the
     /// first free extent that fits at or after block `from`.
     fn take_aligned_exact(&mut self, want: u64, from: u64) -> Option<Extent> {
+        if self.lent {
+            return None;
+        }
         let align = self.align;
         let containing = self
             .free_extents
@@ -319,6 +334,9 @@ impl MetaslabState {
 
     /// Carve out a single stripe-aligned extent of at most `want` blocks.
     fn take_aligned(&mut self, want: u64) -> Option<Extent> {
+        if self.lent {
+            return None;
+        }
         let found = self.free_extents.iter().find_map(|(&s, &l)| {
             let aligned = align_up(s, self.align);
             let end = s + l;
@@ -461,6 +479,7 @@ impl MetaslabState {
             active_slot: None,
             synced_txg: 0,
             align,
+            lent: false,
         }
     }
 }
@@ -525,7 +544,10 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn allocatable_blocks(&self) -> u64 {
         let mut total = 0;
         for ms in self.metaslabs.iter() {
-            total += ms.read().await.free_blocks();
+            let ms = ms.read().await;
+            if !ms.lent {
+                total += ms.free_blocks();
+            }
         }
         total
     }

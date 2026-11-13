@@ -2,6 +2,8 @@
 
 a distributed raidz/mirror filesystem proof of concept
 
+![Portal](hack/overview.png)
+
 ## Setup
 
 step 1) run a server with our disks
@@ -13,7 +15,7 @@ fallocate -l 1G disks/disk2
 fallocate -l 1G disks/disk3
 fallocate -l 1G disks/disk4
 fallocate -l 1G disks/disk5
-cargo run -- --config example-config.yaml listen node-1
+cargo run -- --config example-config.yaml listen
 ```
 
 `listen` serves the raw disks on port 8881 (`--port` to change).
@@ -26,6 +28,61 @@ cargo run -- --config remote-config.yaml format
 // display blockmap info to the console
 cargo run -- --config remote-config.yaml map
 ```
+
+## Try it with Docker
+
+`docker-compose.yml` runs a 3-node cluster: one 1 GiB disk per node in a
+raidz1 pool (survives losing any one node), with the dashboard.
+
+```
+docker compose up --build
+```
+
+The first start formats the pool and creates a demo volume (the `init`
+service). Each node publishes its port on 127.0.0.1 only (node0 8881, node1
+8882, node2 8883), because the disk servers have no authentication.
+
+The dashboard runs in your browser and talks to every node by the name in the
+pool config (`node0`, `node1`, `node2`), so add them to your hosts file once:
+
+```
+echo "127.0.0.1 node0 node1 node2" | sudo tee -a /etc/hosts
+```
+
+and open http://node0:8881/ (any node's port works).
+
+Run commands from any node. Inside the containers the default config
+(`docker/client.yaml`) reaches every disk through its disk server:
+
+```
+docker compose exec node0 raidish cluster status
+docker compose exec node0 raidish status
+docker compose exec node0 raidish volume create vm1 104857600
+docker compose exec node0 raidish volume list
+```
+
+Break things:
+
+```
+// lose a node: the pool goes degraded; if it was the committer, another node takes over
+docker compose kill node2
+// bring it back: the committer resilvers what it missed
+docker compose start node2
+// a hung node: its leases expire, another node takes over, and it steps down
+// (fenced) once it wakes up
+docker compose pause node0
+docker compose unpause node0
+// check the result
+docker compose exec node0 raidish fsck
+// start over with empty disks
+docker compose down -v
+```
+
+`docker/node{0,1,2}.yaml` are the nodes' configs (each lists its own disk as
+a local path). `DISK_SIZE=4G docker compose up` sizes new disks.
+`docker build --build-arg RAIDISH_SKIP_UI=1 -t raidish .` builds the image
+without the dashboard. The containers export volumes but don't attach kernel
+block devices.
 
 ## Config
 
@@ -124,8 +181,14 @@ fsck [--repair] [--rebuild-spacemaps [--force]]
 salvage path/to/dir
 // lay a volume's records out contiguously (--check: only report)
 defrag name [--batch N] [--check]
-// serve this node's disks (port 8881)
-listen [--port N] [name]
+// volumes and where they run (through the committer when `listen` runs one)
+volume create name size
+volume delete name
+volume list
+volume set name [--nodes n1,n2] [--automount nbd|nvme|none] [--enable|--disable]
+volume move name node
+// serve this node's disks (port 8881), commit the pool, run the volumes placed here
+listen [--port N] [--no-committer]
 ```
 
 Every command takes `--rewind` or `--txg N` to open an older committed state (see below).
@@ -162,6 +225,36 @@ sparse `<name>.img`. Records that fail their checksum are zero-filled, and it
 reports each damaged item with the byte ranges that were lost. If the newest
 root directory is unreadable, it falls back to the newest TXG whose root still
 reads.
+
+### Placement and auto-mount
+
+Each `listen` node also runs an *agent*. It keeps a `node/<name>` lease
+(liveness) and runs the volumes placed on it:
+
+```
+raidish --config client.yaml volume create vm0 21474836480
+raidish --config client.yaml volume set vm0 --nodes node-0,node-1 --automount nvme
+raidish --config client.yaml volume list
+raidish --config client.yaml volume move vm0 node-1
+```
+
+* A volume with `--automount` runs on the first live node in `--nodes` (any
+  live node if the list is empty). It **stays** where it runs while that node
+  is live: if node-0 dies it moves to node-1, and stays there when node-0 comes
+  back. `volume move` moves it explicitly. `--disable` stops it everywhere.
+* Where it runs, the agent exports it (NBD on 10809, NVMe/TCP on 4420, export
+  name / NQN `nqn.2024-01.com.raidish:nvme:<name>`) and attaches the kernel
+  device through the `hack/raidish-attach` root helper (see Testing).
+  `GET /api/v1/agent/status` lists what a node runs and on which device.
+* A node's name is `node-<id>`.
+
+```yaml
+automount:
+  bind: 127.0.0.1        # where the exports listen and the initiator connects
+  nbd_port: 10809
+  nvme_port: 4420
+  helper: /usr/local/sbin/raidish-attach   # `none`: export only, don't attach
+```
 
 ## Virtual Block Devices
 
@@ -259,18 +352,35 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 
 (The same for `raidish-nvme-test`.)
 
+`hack/raidish-attach` is the narrow root helper the `listen` agent calls (via `sudo -n`) to
+attach and detach kernel block devices for volumes: `nvme-attach|nbd-attach <volume> <addr> <port>`,
+`nvme-detach|nbd-detach <volume>`, `list`. It accepts no device paths, validates the volume name
+(`^[A-Za-z0-9._-]{1,64}$`), only connects to allowlisted address/port pairs (default `127.0.0.1`
+with 4420 for NVMe and 10809 for NBD; widen only via a root-owned `/etc/raidish/attach.conf`, see
+the script header), only touches NVMe namespaces whose model starts with `RAIDISH`, and detaches
+NBD devices only from its own records under `/run/raidish/`. `RAIDISH_ATTACH_DRY_RUN=1` prints the
+commands without running them.
+
+```
+sudo install -o root -g root -m 0755 hack/raidish-attach /usr/local/sbin/
+echo "$(whoami) ALL=(root) NOPASSWD: /usr/local/sbin/raidish-attach" | sudo tee /etc/sudoers.d/raidish-attach
+sudo chmod 0440 /etc/sudoers.d/raidish-attach
+```
+
 ## Limitations
 
-* **One writer per pool.** The pool lease enforces this, so e.g. `block` is refused
-  while `nbd` is serving. Stop the server first, or use the read-only commands.
+* Without a running committer a pool has one writer (the `pool` lease holder).
   Writers on local disk paths (not served by `listen`) aren't fenced.
-* Cluster members are fixed when the cluster first starts. Changing the pool's
-  nodes means starting over with empty data directories.
-* A killed writer's lease takes up to 10 s to expire before another writer can start.
-* **No authentication** on the disk server's HTTP/websocket ports.
+* Every volume commit is its own TXG at the committer (no batching across
+  writers yet), and a writer's flush waits for the committer, however long a
+  committer failover takes.
+* Scrub/resilver repairs by the committer can't write into metaslabs lent to a
+  writer (they're fenced); those are repaired once the metaslab comes back.
+* A killed writer's lease takes up to 10 s to expire before another writer (or
+  node, for a placed volume) can start.
+* **No authentication** on the disk server's HTTP/websocket ports (or the dashboard).
 * Every fsync costs a full TXG commit (~5 ms); there's no intent log yet.
 * Volumes live in the root directory, and deleting a directory leaks its contents.
-* Pools formatted before `RAIDISHV14` (configurable layouts) must be reformatted.
 * Self-heal by checksum tries at most two bad disks per record, so raidz3 only
   gets its third parity shard's worth of protection from missing (offline)
   disks, not from silently corrupt ones.
@@ -279,7 +389,7 @@ sudo chmod 0440 /etc/sudoers.d/raidish-nbd-test
 
 ## TODO
 
-* per-volume leases (each node writes its own VMs) and multi-node allocation via metaslab leases
+* batch volume commits from several writers into one TXG
 * intent log (ZIL) for low-latency fsync
 * snapshots and clones
 * permissions

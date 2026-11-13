@@ -8,6 +8,8 @@ use crate::vdev::Pool;
 
 const MB: u64 = 1 << 20;
 const HOSTNQN: &str = "nqn.2024-01.com.raidish:host:unit";
+/// Subsystem of the volume `serve` exports.
+const VOL_NQN: &str = "nqn.2024-01.com.raidish:nvme:vol";
 
 struct Rsp {
     dw0: u32,
@@ -201,9 +203,14 @@ impl Host {
         self.wait(cid, &[]).await
     }
 
-    /// Full admin bring-up; returns the controller id.
+    /// Full admin bring-up of `vol`; returns the controller id.
     async fn bring_up_admin(&mut self, io_queues: u16) -> u16 {
-        let r = self.fabrics_connect(0, 0xffff, SUBSYS_NQN).await;
+        self.bring_up_admin_of(VOL_NQN, io_queues).await
+    }
+
+    /// Full admin bring-up of subsystem `nqn`; returns the controller id.
+    async fn bring_up_admin_of(&mut self, nqn: &str, io_queues: u16) -> u16 {
+        let r = self.fabrics_connect(0, 0xffff, nqn).await;
         assert!(r.ok(), "admin connect status {:#x}", r.status);
         let cntlid = r.dw0 as u16;
 
@@ -252,11 +259,36 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+/// Export `volumes` (name, size) from one target on an ephemeral port.
+async fn serve_many(
+    pool: &TestPool,
+    volumes: &[(&str, u64)],
+) -> (
+    Arc<FileSystem<Pool>>,
+    Arc<NvmeTcpServer<Pool>>,
+    std::net::SocketAddr,
+) {
+    let fs = Arc::new(pool.format().await);
+    let server = Arc::new(NvmeTcpServer::with_bind(fs.clone(), DEFAULT_BIND, 0));
+    for &(name, size) in volumes {
+        fs.create_block(name, size, DEFAULT_VOLBLOCKSIZE)
+            .await
+            .unwrap();
+        server.add_export(name).await.unwrap();
+    }
+    let listener = TcpListener::bind((DEFAULT_BIND, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let s = server.clone();
+    tokio::spawn(async move { s.serve(listener).await });
+    (fs, server, addr)
+}
+
 async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::SocketAddr) {
     let fs = Arc::new(pool.format().await);
     fs.create_block("vol", size, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
+    // The single-export constructor the CLI uses.
     let server = NvmeTcpServer::new(fs.clone(), "vol".into(), 0)
         .await
         .unwrap();
@@ -264,6 +296,161 @@ async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { server.serve(listener).await });
     (fs, addr)
+}
+
+#[test]
+fn nqns_and_serials() {
+    assert_eq!(subsystem_nqn("vol"), VOL_NQN);
+    // The NQN the kernel test script connects to is unchanged.
+    assert_eq!(
+        subsystem_nqn("vdisk0"),
+        "nqn.2024-01.com.raidish:nvme:vdisk0"
+    );
+    assert_eq!(Export::new("vdisk0", 0).serial, "RAIDISH-vdisk0");
+    // Long names that would truncate to the same SN get distinct hashes.
+    let (a, b) = (
+        Export::new("database-volume-1", 0),
+        Export::new("database-volume-2", 0),
+    );
+    assert_ne!(a.serial, b.serial);
+    assert!(a.serial.len() <= 20);
+}
+
+#[tokio::test]
+async fn two_volumes_on_one_target() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 32 * MB)]).await;
+    assert_eq!(server.exports(), vec!["alpha", "beta"]);
+    let (alpha, beta) = (subsystem_nqn("alpha"), subsystem_nqn("beta"));
+
+    let mut admin_a = Host::connect(addr).await;
+    let cntlid_a = admin_a.bring_up_admin_of(&alpha, 1).await;
+    let mut admin_b = Host::connect(addr).await;
+    let cntlid_b = admin_b.bring_up_admin_of(&beta, 1).await;
+    assert_ne!(cntlid_a, cntlid_b);
+
+    // Identify reports each subsystem's own NQN, serial and size.
+    for (h, nqn, sn, size) in [
+        (&mut admin_a, &alpha, "RAIDISH-alpha", 16 * MB),
+        (&mut admin_b, &beta, "RAIDISH-beta", 32 * MB),
+    ] {
+        let id = h.admin(ADM_IDENTIFY, 0, 0x01, 0, 4096).await.data;
+        assert_eq!(cstr(&id[768..1024]), *nqn);
+        assert_eq!(String::from_utf8_lossy(&id[4..24]).trim_end(), sn);
+        let ns = h.admin(ADM_IDENTIFY, 1, 0x00, 0, 4096).await;
+        assert_eq!(le64(&ns.data, 0), size / LBA_SIZE, "NSZE");
+    }
+
+    // An I/O queue can only join a controller of the subsystem it names.
+    let mut h = Host::connect(addr).await;
+    let r = h.fabrics_connect(1, cntlid_a, &beta).await;
+    assert_eq!((r.sct(), r.sc()), (SCT_FABRICS, SC_CONNECT_INVALID_PARAM));
+    assert_eq!(r.dw0, 1 << 16 | 16, "points at CNTLID");
+
+    // Unknown subsystems are refused.
+    let mut h = Host::connect(addr).await;
+    let r = h.fabrics_connect(0, 0xffff, &subsystem_nqn("gamma")).await;
+    assert_eq!((r.sct(), r.sc()), (SCT_FABRICS, SC_CONNECT_INVALID_PARAM));
+    assert_eq!(r.dw0, 1 << 16 | 256, "points at SUBNQN");
+
+    // Each queue reaches its own volume.
+    let mut qa = Host::connect(addr).await;
+    assert!(qa.fabrics_connect(1, cntlid_a, &alpha).await.ok());
+    let mut qb = Host::connect(addr).await;
+    assert!(qb.fabrics_connect(1, cntlid_b, &beta).await.ok());
+    let (da, db) = (pattern(8192, 1), pattern(8192, 2));
+    assert!(qa.io(IO_WRITE, 3, 2, &da, 0, true).await.ok());
+    assert!(qb.io(IO_WRITE, 3, 2, &db, 0, false).await.ok());
+    assert!(qa.io(IO_READ, 3, 2, &[], 8192, false).await.data == da);
+    assert!(qb.io(IO_READ, 3, 2, &[], 8192, false).await.data == db);
+    let mut buf = vec![0u8; 8192];
+    fs.block_read("alpha", 3 * 4096, &mut buf).await.unwrap();
+    assert!(buf == da);
+    fs.block_read("beta", 3 * 4096, &mut buf).await.unwrap();
+    assert!(buf == db);
+    // Alpha's namespace ends at 16 MiB even though beta's doesn't.
+    let last = 16 * MB / LBA_SIZE;
+    assert_eq!(
+        qa.io(IO_READ, last, 1, &[], 4096, false).await.sc(),
+        SC_LBA_RANGE
+    );
+    assert!(qb.io(IO_READ, last, 1, &[], 4096, false).await.ok());
+}
+
+#[tokio::test]
+async fn add_export_validation() {
+    let pool = TestPool::new().await;
+    let (_fs, server, _addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    assert!(matches!(
+        server.add_export("vol").await,
+        Err(FileSystemError::AlreadyExists)
+    ));
+    assert!(server.add_export("missing").await.is_err());
+    assert!(server.add_export("").await.is_err());
+    assert!(
+        server.add_export(&"x".repeat(200)).await.is_err(),
+        "NQN too long"
+    );
+    assert_eq!(server.exports(), vec!["vol"]);
+}
+
+/// The target hangs up on `h` within a few seconds.
+async fn assert_hung_up(h: &mut Host) {
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), read_pdu(&mut h.rd))
+        .await
+        .expect("target should close the queue");
+    assert!(r.is_err(), "expected EOF");
+}
+
+#[tokio::test]
+async fn remove_export_flushes_and_closes_its_queues() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 16 * MB)]).await;
+    let (alpha, beta) = (subsystem_nqn("alpha"), subsystem_nqn("beta"));
+
+    let mut admin_a = Host::connect(addr).await;
+    let cntlid_a = admin_a.bring_up_admin_of(&alpha, 1).await;
+    let mut qa = Host::connect(addr).await;
+    assert!(qa.fabrics_connect(1, cntlid_a, &alpha).await.ok());
+    let mut admin_b = Host::connect(addr).await;
+    let cntlid_b = admin_b.bring_up_admin_of(&beta, 1).await;
+    let mut qb = Host::connect(addr).await;
+    assert!(qb.fabrics_connect(1, cntlid_b, &beta).await.ok());
+    // A connection that hasn't sent Connect yet belongs to no export.
+    let mut idle = Host::connect(addr).await;
+
+    let data = pattern(4096, 7);
+    assert!(qa.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
+    assert!(fs.has_dirty_volumes(), "write not yet committed");
+
+    assert!(server.remove_export("alpha").await.unwrap());
+    assert!(!fs.has_dirty_volumes(), "removal commits");
+    assert_hung_up(&mut qa).await;
+    assert_hung_up(&mut admin_a).await;
+    assert_eq!(server.exports(), vec!["beta"]);
+
+    // Gone for new connects; beta (and not-yet-connected queues) unaffected.
+    let r = idle.fabrics_connect(0, 0xffff, &alpha).await;
+    assert_eq!(r.dw0, 1 << 16 | 256);
+    assert!(qb.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
+    assert!(qb.io(IO_READ, 0, 1, &[], 4096, false).await.data == data);
+    assert!(admin_b.admin(ADM_KEEP_ALIVE, 0, 0, 0, 0).await.ok());
+    assert!(!server.remove_export("alpha").await.unwrap());
+
+    // The committed write survives a reload, and the volume can come back.
+    let mut buf = vec![0u8; 4096];
+    pool.load()
+        .await
+        .block_read("alpha", 0, &mut buf)
+        .await
+        .unwrap();
+    assert!(buf == data);
+    server.add_export("alpha").await.unwrap();
+    let mut admin_a = Host::connect(addr).await;
+    let cntlid_a = admin_a.bring_up_admin_of(&alpha, 1).await;
+    let mut qa = Host::connect(addr).await;
+    assert!(qa.fabrics_connect(1, cntlid_a, &alpha).await.ok());
+    assert!(qa.io(IO_READ, 0, 1, &[], 4096, false).await.data == data);
 }
 
 #[tokio::test]
@@ -279,7 +466,7 @@ async fn admin_bring_up_and_identify() {
     assert_eq!(id.len(), 4096);
     assert!(id[24..64].starts_with(b"RAIDISH"));
     assert_eq!(le16(id, 78), cntlid);
-    assert_eq!(cstr(&id[768..1024]), SUBSYS_NQN);
+    assert_eq!(cstr(&id[768..1024]), VOL_NQN);
     assert_eq!(id[111], 1, "I/O controller");
     assert_eq!(
         le32(id, 1792) as usize * 16,
@@ -349,14 +536,14 @@ async fn connect_validation() {
 
     // I/O queue for a controller that doesn't exist.
     let mut h = Host::connect(addr).await;
-    let r = h.fabrics_connect(1, 0x4242, SUBSYS_NQN).await;
+    let r = h.fabrics_connect(1, 0x4242, VOL_NQN).await;
     assert_eq!(r.sc(), SC_CONNECT_INVALID_PARAM);
 
     // I/O queue before the controller is enabled.
     let mut admin = Host::connect(addr).await;
-    let cntlid = admin.fabrics_connect(0, 0xffff, SUBSYS_NQN).await.dw0 as u16;
+    let cntlid = admin.fabrics_connect(0, 0xffff, VOL_NQN).await.dw0 as u16;
     let mut h = Host::connect(addr).await;
-    assert!(!h.fabrics_connect(1, cntlid, SUBSYS_NQN).await.ok());
+    assert!(!h.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
 }
 
 #[tokio::test]
@@ -367,7 +554,7 @@ async fn io_queue_read_write_flush_trim() {
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(2).await;
     let mut q = Host::connect(addr).await;
-    assert!(q.fabrics_connect(1, cntlid, SUBSYS_NQN).await.ok());
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
 
     // In-capsule write (8 KiB), R2T write (1 MiB, several H2C PDUs).
     let small = pattern(8192, 1);
@@ -457,7 +644,7 @@ async fn data_survives_reload() {
         let mut admin = Host::connect(addr).await;
         let cntlid = admin.bring_up_admin(1).await;
         let mut q = Host::connect(addr).await;
-        assert!(q.fabrics_connect(1, cntlid, SUBSYS_NQN).await.ok());
+        assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
         for (i, chunk) in data.chunks(64 * 4096).enumerate() {
             let r = q
                 .io(
@@ -488,7 +675,7 @@ async fn pipelined_commands_on_one_queue() {
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(1).await;
     let mut q = Host::connect(addr).await;
-    assert!(q.fabrics_connect(1, cntlid, SUBSYS_NQN).await.ok());
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
 
     // 32 in-capsule writes sent back to back before reading any response.
     let mut cids = Vec::new();

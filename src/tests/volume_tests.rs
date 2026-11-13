@@ -551,3 +551,54 @@ async fn read_any<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     fs.block_read("vol", offset, &mut buf).await.unwrap();
     buf
 }
+
+#[tokio::test]
+async fn volume_props_persist_and_keep_data() {
+    use crate::inode::{Transport, VolumeProps};
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.create_block("vol", 4 * MB, DEFAULT_VOLBLOCKSIZE)
+        .await
+        .unwrap();
+    fs.create_block("other", MB, DEFAULT_VOLBLOCKSIZE)
+        .await
+        .unwrap();
+    let data = pattern(100_000, 7);
+    fs.block_write("vol", 4096, &data).await.unwrap();
+    fs.sync().await.unwrap();
+    let before = allocated(&fs).await;
+
+    let props = VolumeProps {
+        nodes: vec!["node-1".into(), "node-2".into()],
+        automount: Some(Transport::Nvme),
+        enabled: true,
+        move_to: None,
+    };
+    fs.set_volume_props("vol", props.clone()).await.unwrap();
+    // Unsynced writes ride along with the next commit, props or not.
+    fs.block_write("vol", 0, &[1u8; 10]).await.unwrap();
+    fs.set_volume_props("vol", props.clone()).await.unwrap();
+    settle(&fs).await;
+    assert!(
+        allocated(&fs).await <= before + 64,
+        "the old inodes are freed"
+    );
+    drop(fs);
+
+    let fs = pool.load().await;
+    let vols = fs.list_volumes().await.unwrap();
+    assert_eq!(vols.len(), 2);
+    let v = vols.iter().find(|v| v.name == "vol").unwrap();
+    assert_eq!(v.props, props);
+    assert_eq!(v.size_bytes, 4 * MB);
+    assert_eq!(
+        vols.iter().find(|v| v.name == "other").unwrap().props,
+        VolumeProps::default()
+    );
+    assert_eq!(read(&fs, 4096, data.len()).await, data);
+    assert_eq!(read(&fs, 0, 10).await, vec![1u8; 10]);
+    assert!(matches!(
+        fs.set_volume_props("missing", props).await,
+        Err(FileSystemError::FileNotFound)
+    ));
+}

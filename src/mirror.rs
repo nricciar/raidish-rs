@@ -10,6 +10,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
 use crate::disks::DiskSet;
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
+use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Reads of a region this many blocks long prefer the same member.

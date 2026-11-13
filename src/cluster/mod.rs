@@ -25,7 +25,6 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use store::Store;
 
@@ -73,10 +72,22 @@ pub enum LeaseOp {
         owner: String,
         epoch: u64,
     },
+    Lend {
+        idx: u32,
+        writer: String,
+        writer_epoch: u64,
+        pool_owner: String,
+        pool_epoch: u64,
+    },
+    Return {
+        idx: u32,
+        pool_owner: String,
+        pool_epoch: u64,
+    },
 }
 
 impl LeaseOp {
-    fn stamp(&self, now_ms: u64) -> Request {
+    pub(crate) fn stamp(&self, now_ms: u64) -> Request {
         match self.clone() {
             LeaseOp::Acquire {
                 resource,
@@ -110,6 +121,30 @@ impl LeaseOp {
                 resource,
                 owner,
                 epoch,
+            },
+            LeaseOp::Lend {
+                idx,
+                writer,
+                writer_epoch,
+                pool_owner,
+                pool_epoch,
+            } => Request::Lend {
+                idx,
+                writer,
+                writer_epoch,
+                pool_owner,
+                pool_epoch,
+                now_ms,
+            },
+            LeaseOp::Return {
+                idx,
+                pool_owner,
+                pool_epoch,
+            } => Request::Return {
+                idx,
+                pool_owner,
+                pool_epoch,
+                now_ms,
             },
         }
     }
@@ -145,13 +180,13 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Start this node's Raft member. `floor` is raised to the pool epoch as
-    /// grants are applied (the disk server fences with it).
+    /// Start this node's Raft member. `fence` learns every grant as it is
+    /// applied (the disk server fences with it).
     pub async fn start(
         name: &str,
         members: members::Members,
         data_dir: PathBuf,
-        floor: Arc<AtomicU64>,
+        fence: Arc<crate::fence::ServerFence>,
     ) -> Result<Arc<Cluster>, String> {
         let config = openraft::Config {
             cluster_name: "raidish".into(),
@@ -163,7 +198,7 @@ impl Cluster {
             ..Default::default()
         };
         let config = Arc::new(config.validate().map_err(|e| e.to_string())?);
-        let store = Store::open(&data_dir, floor)?;
+        let store = Store::open(&data_dir, fence)?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))

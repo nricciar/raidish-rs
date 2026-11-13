@@ -1,36 +1,60 @@
+[workspace]
+members = [".", "web"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "raidish"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "raidish"
+path = "src/main.rs"
+
+# The storage core: builds natively and for wasm32 (the web dashboard).
 [dependencies]
 reed-solomon-simd = "3.1.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-stream = { version = "0.1.17", features = ["io-util"] }
-tokio-tungstenite = "0.28.0"
-tungstenite = "0.28"
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 futures-util = "0.3"
 futures = "0.3"
-
-serde_json = { version = "1.0.133", features = ["raw_value"] }
-serde = "1.0.216"
-serde_yaml = "0.9"
-
-rocket = { version = "0.5.1", features = ["json","uuid"] }
-ws = { package = "rocket_ws", version = "0.1.1" }
-openraft = { version = "=0.9.26", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-
-clap = { version = "4.5", features = ["derive","color"] }
+serde = { version = "1.0.216", features = ["derive"] }
 url = "2.5.8"
 bincode = "1"
 blake3 = "1.8.3"
 chrono = "0.4.43"
-termion = "2.0"
-term_size = "0.3.2"
 async-trait = "0.1"
 dashmap = "6.1.0"
 crossbeam-queue = "0.3.12"
+web-time = "1.1"
+
+# Servers, cluster and the command line.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process"] }
+tokio-stream = { version = "0.1.17", features = ["io-util"] }
+serde_json = { version = "1.0.133", features = ["raw_value"] }
+tokio-tungstenite = "0.28.0"
+tungstenite = "0.28"
+serde_yaml = "0.9"
+rocket = { version = "0.5.1", features = ["json", "uuid"] }
+ws = { package = "rocket_ws", version = "0.1.1" }
+openraft = { version = "=0.9.26", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+clap = { version = "4.5", features = ["derive", "color"] }
+term_size = "0.3.2"
+
+# The browser disk backend (websocket via web-sys).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+chrono = { version = "0.4.43", features = ["wasmbind"] }
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
 
 [dev-dependencies]
 tempfile = "3.24.0"

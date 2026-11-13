@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV14";
+pub const FS_ID: &str = "RAIDISHV15";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -193,8 +193,8 @@ pub enum LabelState {
 pub(crate) fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        &web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             .to_le_bytes(),
@@ -233,11 +233,37 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(u64, usize), FileSystemError> {
     Ok((header.txg, payload_len))
 }
 
+/// Read a pool device's superblock without loading the pool (None: not
+/// formatted, or unreadable).
+pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
+    let header = HeaderLayout::new(dev.pool().map_or(1, |p| p.align));
+    for mirror in 0..header.superblock_blocks {
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if dev
+            .read_block(SUPERBLOCK_LBA + mirror, &mut buf)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let Ok((_, len)) = parse_label(&buf) else {
+            continue;
+        };
+        if let Ok(sb) =
+            bincode::deserialize::<Superblock>(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len])
+            && sb.magic == FS_ID
+        {
+            return Some(sb);
+        }
+    }
+    None
+}
+
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Arc<RwLock<Option<Superblock>>>,
     /// Last committed uberblock. The open TXG is always `uberblock.txg + 1`.
-    uberblock: Arc<Mutex<Option<Uberblock>>>,
+    pub(crate) uberblock: Arc<Mutex<Option<Uberblock>>>,
     pub(crate) layout: MetaslabLayout,
     pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
     pub(crate) file_index: Arc<RwLock<FileIndex>>,
@@ -256,7 +282,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// See `Uberblock::degraded`; persisted with every commit.
     pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
     /// Per-disk missed-write counts already folded into `degraded`.
-    miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
+    pub(crate) miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Record alignment in blocks (the pool's, or 1 for a plain device).
     pub(crate) align: u64,
     pub(crate) header: HeaderLayout,
@@ -265,6 +291,8 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) scan_hold: Arc<AtomicUsize>,
     /// One scrub/resilver at a time.
     pub(crate) scan_lock: Arc<Mutex<()>>,
+    /// Set when opened as a volume writer (see `crate::writer`).
+    pub(crate) writer: Option<Arc<crate::writer::WriterState>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -290,6 +318,18 @@ impl<D: BlockDevice> FileSystem<D> {
             header: HeaderLayout::new(align),
             scan_hold: Arc::new(AtomicUsize::new(0)),
             scan_lock: Arc::new(Mutex::new(())),
+            writer: None,
+        }
+    }
+
+    /// Tell this process's remote disk clients how the pool is laid out, so
+    /// each request carries its fencing domain's epoch.
+    fn publish_fence_map(&self) {
+        if let Some(pool) = self.dev.pool() {
+            pool.disks.fence.set_map(crate::fence::FenceMap::new(
+                pool.topology.clone(),
+                self.layout,
+            ));
         }
     }
 
@@ -379,6 +419,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         fs.superblock = Arc::new(RwLock::new(Some(superblock)));
         fs.layout = layout;
+        fs.publish_fence_map();
         for d in 0..fs.disk_count() {
             if fs.write_disk_label(d).await.is_err() {
                 eprintln!("format: disk {} label write failed; marking it degraded", d);
@@ -472,6 +513,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(fs);
         };
         fs.layout = MetaslabLayout::from_superblock(&superblock);
+        fs.publish_fence_map();
 
         let uber = match opts.rewind {
             Rewind::None => newest.clone(),
@@ -778,6 +820,15 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub(crate) async fn commit_locked(&self) -> Result<u64, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            // A volume writer commits through the committer.
+            let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
+            let r = self.writer_commit(&w).await;
+            if r.is_ok() {
+                self.commits_done.fetch_max(id, Ordering::SeqCst);
+            }
+            return r;
+        }
         if self.read_only {
             return Err(FileSystemError::InvalidArgument(
                 "pool opened read-only".into(),
@@ -1071,7 +1122,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Every valid uberblock version found in the ring, newest first.
-    async fn read_uberblock_ring(&self) -> Vec<Uberblock> {
+    pub(crate) async fn read_uberblock_ring(&self) -> Vec<Uberblock> {
         let mut found: Vec<Uberblock> = Vec::new();
         for i in 0..self.header.uberblock_blocks() {
             let lba = self.header.uberblock_start + i;
