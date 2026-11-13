@@ -2,6 +2,8 @@
 
 a distributed raidz/mirror filesystem proof of concept
 
+![Portal](hack/portal.png)
+
 ## Setup
 
 step 1) run a server with our disks
