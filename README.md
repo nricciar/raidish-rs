@@ -2,7 +2,7 @@
 
 a distributed raidz/mirror filesystem proof of concept
 
-![Portal](hack/portal.png)
+![Portal](hack/overview.png)
 
 ## Setup
 
