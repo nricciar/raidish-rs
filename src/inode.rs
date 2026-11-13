@@ -7,14 +7,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileIndex {
-    pub next_file_id: FileId,
     pub files: BTreeMap<String, InodeRef>,
 }
 
 impl FileIndex {
     pub fn new() -> Self {
         FileIndex {
-            next_file_id: 1,
             files: BTreeMap::new(),
         }
     }
@@ -52,7 +50,48 @@ pub enum InodeType {
         levels: u8,
         root: Option<BlockPtr>,
         props: VolumeProps,
+        /// The intent log of the writer running it, if any (see
+        /// `crate::zil`): writes acknowledged since the tree was committed.
+        log: Option<VolumeLog>,
     },
+}
+
+/// A volume's intent log: the regions its writer appends flushed writes
+/// to, until a commit folds them into the tree. Registered (and its space
+/// claimed) by a commit; replayed by the committer if the writer goes away
+/// first.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VolumeLog {
+    /// Oldest first (at most two: the one a commit was taken from, and the
+    /// one started by that commit).
+    pub regions: Vec<LogRegion>,
+    /// Records of `regions[0]` before this one are already in the tree.
+    pub from_seq: u64,
+    /// The writer lease (`writer/...`) whose lent space holds it.
+    pub writer: String,
+    pub writer_epoch: u64,
+    /// The `vol/<name>` lease it was written under: once that's gone, no
+    /// more records can be acknowledged, and it may be replayed.
+    pub vol_owner: String,
+    pub vol_epoch: u64,
+}
+
+/// A run of blocks holding intent log records.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LogRegion {
+    pub start: u64,
+    pub len: u64,
+    /// Tells this region's records from anything else ever written there.
+    pub guid: u64,
+}
+
+impl LogRegion {
+    pub fn extent(&self) -> Extent {
+        Extent {
+            start: self.start,
+            len: self.len,
+        }
+    }
 }
 
 /// How a volume is exported to the kernel when it is auto-mounted.
@@ -193,7 +232,16 @@ impl<D: BlockDevice> FileSystem<D> {
             InodeType::File { blocks, .. } | InodeType::Directory { blocks } => {
                 Ok(blocks.iter().map(BlockPtr::extent).collect())
             }
-            InodeType::Volume { root, levels, .. } => self.volume_tree_extents(root, *levels).await,
+            InodeType::Volume {
+                root, levels, log, ..
+            } => {
+                let mut out = self.volume_tree_extents(root, *levels).await?;
+                out.extend(
+                    log.iter()
+                        .flat_map(|l| l.regions.iter().map(LogRegion::extent)),
+                );
+                Ok(out)
+            }
         }
     }
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV15";
+pub const FS_ID: &str = "RAIDISHV17";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -73,6 +73,11 @@ pub enum FileSystemError {
     InvalidArgument(String),
     /// The pool was formatted with a different layout than configured.
     TopologyMismatch(String),
+    /// Refused because the target changed meanwhile, or is open for writing
+    /// elsewhere (a compare-and-swap or object lease check failed).
+    Conflict(String),
+    /// Can't be done right now (no committer reachable); may be retried.
+    Unavailable(String),
 }
 
 impl fmt::Display for FileSystemError {
@@ -94,6 +99,8 @@ impl fmt::Display for FileSystemError {
             FileSystemError::NotAFile => write!(f, "Not a file"),
             FileSystemError::AlreadyExists => write!(f, "Already exists"),
             FileSystemError::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
+            FileSystemError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            FileSystemError::Unavailable(msg) => write!(f, "Unavailable: {}", msg),
         }
     }
 }
@@ -167,6 +174,8 @@ pub struct Uberblock {
     /// Per member disk: the earliest TXG it may have missed writes from
     /// (None = in sync). Cleared by a successful resilver.
     pub degraded: Vec<Option<u64>>,
+    /// The next pool-wide object number (inode id). Never reused.
+    pub next_object: u64,
 }
 
 /// Identity of a member disk, stored (twice) in its label area outside the
@@ -293,6 +302,10 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) scan_lock: Arc<Mutex<()>>,
     /// Set when opened as a volume writer (see `crate::writer`).
     pub(crate) writer: Option<Arc<crate::writer::WriterState>>,
+    /// Next pool-wide object number (persisted in every uberblock).
+    pub(crate) next_object: Arc<AtomicU64>,
+    /// Serializes a writer's intent log appends (see `crate::zil`).
+    pub(crate) log_io: Arc<Mutex<()>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -319,6 +332,8 @@ impl<D: BlockDevice> FileSystem<D> {
             scan_hold: Arc::new(AtomicUsize::new(0)),
             scan_lock: Arc::new(Mutex::new(())),
             writer: None,
+            next_object: Arc::new(AtomicU64::new(1)),
+            log_io: Arc::new(Mutex::new(())),
         }
     }
 
@@ -331,6 +346,13 @@ impl<D: BlockDevice> FileSystem<D> {
                 self.layout,
             ));
         }
+    }
+
+    /// A new pool-wide object number. Only the process that commits the
+    /// pool (the committer, or a standalone pool holder) hands them out.
+    pub(crate) fn alloc_object(&self) -> FileId {
+        debug_assert!(self.writer.is_none(), "writers don't assign object numbers");
+        self.next_object.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Leaf disks of the pool underneath (0 for a plain device).
@@ -388,6 +410,7 @@ impl<D: BlockDevice> FileSystem<D> {
             timestamp: 0,
             root: Vec::new(),
             degraded: vec![None; fs.disk_count()],
+            next_object: 1,
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         // Disks that failed during format must not count as missed writes
@@ -554,6 +577,12 @@ impl<D: BlockDevice> FileSystem<D> {
             txg: newest.txg,
             ..uber.clone()
         });
+        // Never hand out a number any TXG in the ring may have used, even
+        // one a rewind discards.
+        fs.next_object.store(
+            ring.iter().map(|u| u.next_object).max().unwrap_or(1).max(1),
+            Ordering::SeqCst,
+        );
 
         // Conservative: a disk degraded in any newer TXG stays degraded.
         let mut degraded = uber.degraded.clone();
@@ -686,8 +715,19 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub async fn mkdir(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            return self.writer_mkdir(&w, path).await;
+        }
         let _tx = self.begin_tx().await;
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let id = self.mkdir_locked(path).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// `mkdir` under `begin_tx`, without committing (the committer applies
+    /// writers' mkdirs this way).
+    pub(crate) async fn mkdir_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        let (parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         if let Some(ref inode_ref) = old_inode_ref {
             let old_inode = self.read_inode(inode_ref).await?;
@@ -698,8 +738,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         let blocks = self.write_value(&FileIndex::new()).await?;
-        let file_id = parent.next_file_id;
-        parent.next_file_id += 1;
+        let file_id = self.alloc_object();
 
         let new_inode = FileInode {
             id: file_id,
@@ -708,15 +747,17 @@ impl<D: BlockDevice> FileSystem<D> {
 
         self.persist_directory_changes(path, parent, Some(new_inode))
             .await?;
-        self.commit_locked().await?;
 
         Ok(file_id)
     }
 
     /// Write or overwrite a files contents
     pub async fn write_file(&self, path: &Path, data: &[u8]) -> Result<FileId, FileSystemError> {
+        if self.writer.is_some() {
+            return self.writer_write_file(path, data).await;
+        }
         let _tx = self.begin_tx().await;
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let (parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
 
         // If exists, ensure it's a file not a directory or virtual block device
         if let Some(ref inode_ref) = old_inode_ref {
@@ -730,10 +771,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let file_id = match &old_inode_ref {
             Some(r) => r.file_id,
-            None => {
-                parent.next_file_id += 1;
-                parent.next_file_id - 1
-            }
+            None => self.alloc_object(),
         };
 
         let new_inode = FileInode {
@@ -759,7 +797,17 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Delete a virtual block device or file
     pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            return self.writer_delete(&w, path, None).await;
+        }
         let _tx = self.begin_tx().await;
+        let id = self.delete_locked(path).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// `delete` under `begin_tx`, without committing.
+    pub(crate) async fn delete_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
         let (mut parent, inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
         let inode_ref = inode_ref.ok_or(FileSystemError::FileNotFound)?;
 
@@ -778,7 +826,6 @@ impl<D: BlockDevice> FileSystem<D> {
         parent.files.remove(filename);
 
         self.persist_directory_changes(path, parent, None).await?;
-        self.commit_locked().await?;
 
         Ok(inode.id)
     }
@@ -1010,6 +1057,7 @@ impl<D: BlockDevice> FileSystem<D> {
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             root,
             degraded,
+            next_object: self.next_object.load(Ordering::SeqCst),
         };
 
         // Rotate through the ring; one copy per block of the slot.
@@ -1043,6 +1091,7 @@ impl<D: BlockDevice> FileSystem<D> {
             timestamp: 0,
             root: Vec::new(),
             degraded: Vec::new(),
+            next_object: 0,
         };
         let mut buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;

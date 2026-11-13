@@ -169,7 +169,11 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(ptrs)
     }
 
-    async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
+    pub(crate) async fn write_record_blocks(
+        &self,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
         let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
         buf[..data.len()].copy_from_slice(data);
@@ -245,12 +249,33 @@ impl<D: BlockDevice> FileSystem<D> {
         ptr: &BlockPtr,
         heal: bool,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let n = ptr.data_blocks();
+        let want = ptr.checksum;
+        self.read_verified(
+            ptr.lba,
+            ptr.data_blocks(),
+            ptr.lsize as usize,
+            &|data: &[u8]| *blake3::hash(data).as_bytes() == want,
+            heal,
+        )
+        .await
+    }
+
+    /// Read `n` blocks at `lba` (the first `lsize` bytes of them) that
+    /// `check` accepts, rebuilding bad blocks from parity until it does (see
+    /// `read_record_healing`). For records whose checksum isn't in a
+    /// pointer, like intent log records (see `crate::zil`).
+    pub(crate) async fn read_verified(
+        &self,
+        lba: u64,
+        n: u64,
+        lsize: usize,
+        check: &(dyn Fn(&[u8]) -> bool + Send + Sync),
+        heal: bool,
+    ) -> Result<Vec<u8>, FileSystemError> {
         let mut raw = vec![0u8; n as usize * BLOCK_SIZE];
-        self.dev.read_blocks(ptr.lba, &mut raw).await?;
+        self.dev.read_blocks(lba, &mut raw).await?;
         let blocks: Vec<Vec<u8>> = raw.chunks(BLOCK_SIZE).map(|b| b.to_vec()).collect();
 
-        let lsize = ptr.lsize as usize;
         let assemble = |blocks: &[Vec<u8>]| -> Vec<u8> {
             let mut data: Vec<u8> = blocks.concat();
             data.truncate(lsize);
@@ -258,7 +283,7 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         let data = assemble(&blocks);
-        if *blake3::hash(&data).as_bytes() == ptr.checksum {
+        if check(&data) {
             return Ok(data);
         }
 
@@ -266,7 +291,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // hypotheses about which disks are bad; the record checksum decides.
         let rebuilds = (0..n).map(|i| async move {
             self.dev
-                .reconstruct_candidates(ptr.lba + i)
+                .reconstruct_candidates(lba + i)
                 .await
                 .unwrap_or_default()
         });
@@ -314,11 +339,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 trial[*i] = b.clone();
             }
             let data = assemble(&trial);
-            if *blake3::hash(&data).as_bytes() != ptr.checksum {
+            if !check(&data) {
                 continue;
             }
             for (i, b) in &fix {
-                let lba = ptr.lba + *i as u64;
+                let lba = lba + *i as u64;
                 eprintln!(
                     "self-heal: block {} failed its checksum; rebuilt from parity",
                     lba

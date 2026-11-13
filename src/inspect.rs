@@ -576,7 +576,26 @@ impl<D: BlockDevice> FileSystem<D> {
 /// Disk failures `t` can still take: its tolerance minus the disks that are
 /// already unavailable (negative: data is missing).
 fn margin(t: &Topology, disks: &[DiskReport]) -> isize {
-    let bad = |d: &usize| disks.get(*d).is_some_and(|r| r.unavailable());
+    margin_by(t, &|d| disks.get(d).is_some_and(|r| r.unavailable()))
+}
+
+/// Like the pool health's margin, but a disk waiting for a resilver counts
+/// as bad too (it may hold stale data for anything written while it was
+/// away): how many more disk failures a read of recent writes survives.
+pub(crate) fn margin_for_recent_writes(report: &PoolReport) -> isize {
+    let Some(t) = &report.topology else {
+        return 0;
+    };
+    margin_by(t, &|d| {
+        report
+            .disks
+            .get(d)
+            .is_some_and(|r| r.unavailable() || r.degraded_since.is_some())
+    })
+}
+
+fn margin_by(t: &Topology, bad_disk: &dyn Fn(usize) -> bool) -> isize {
+    let bad = |d: &usize| bad_disk(*d);
     match t {
         Topology::Disk(d) => -(bad(d) as isize),
         Topology::RaidZ { parity, disks: ds } => {
@@ -585,9 +604,11 @@ fn margin(t: &Topology, disks: &[DiskReport]) -> isize {
         Topology::Mirror { disks: ds } => {
             ds.len() as isize - 1 - ds.iter().filter(|d| bad(d)).count() as isize
         }
-        Topology::Stripe { children } => {
-            children.iter().map(|c| margin(c, disks)).min().unwrap_or(0)
-        }
+        Topology::Stripe { children } => children
+            .iter()
+            .map(|c| margin_by(c, bad_disk))
+            .min()
+            .unwrap_or(0),
     }
 }
 

@@ -11,7 +11,9 @@ use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::VolumeProps;
 use crate::volume::VolumeInfo;
-use crate::writer::{CommitError, CommitSink, Committed, LentMetaslab, VolumeCommit};
+use crate::writer::{
+    CommitError, CommitSink, Committed, FsCommit, FsCommitted, LentMetaslab, VolumeCommit,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -63,15 +65,78 @@ fn check_lease(
         return Ok(());
     }
     match state.leases.get(resource) {
-        Some(l) if l.epoch > epoch || l.released || owner.is_some_and(|o| o != l.owner) => Err(
-            CommitError::Refused(format!("{} lease lost (epoch {})", resource, epoch)),
-        ),
+        // Taken over since, or this very grant released / someone else's.
+        Some(l)
+            if l.epoch > epoch
+                || (l.epoch == epoch && (l.released || owner.is_some_and(|o| o != l.owner))) =>
+        {
+            Err(CommitError::Refused(format!(
+                "{} lease lost (epoch {})",
+                resource, epoch
+            )))
+        }
+        // An older grant (whoever's, released or not): this view hasn't
+        // caught up with this one yet. Or it lapsed but may be renewed.
         _ => Err(CommitError::Retry(format!("{} lease not live", resource))),
     }
 }
 
 pub fn volume_resource(name: &str) -> String {
     format!("vol/{}", name)
+}
+
+/// The lease held on a file while it is open for writing.
+pub fn object_resource(id: crate::disk::FileId) -> String {
+    format!("obj/{}", id)
+}
+
+/// May `c` change object `id`? With an `obj/<id>` lease: only if it's
+/// held. Without one: only if no one else holds it.
+fn object_lease_ok(
+    state: &ClusterState,
+    c: &FsCommit,
+    id: crate::disk::FileId,
+) -> Result<(), CommitError> {
+    let resource = object_resource(id);
+    if let Some(l) = &c.lease {
+        return check_lease(state, &resource, Some(&l.owner), l.epoch);
+    }
+    match state.leases.get(&resource) {
+        Some(l) if !l.released && l.expires_ms > now_ms() => Err(CommitError::Refused(format!(
+            "object {} is open for writing ({})",
+            id, l.desc
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Where an intent log's `vol/<name>` lease stands, for replaying it.
+#[derive(Debug, PartialEq, Eq)]
+enum Orphan {
+    /// Held (or this view hasn't caught up with its grant yet): keep it.
+    Live,
+    /// Taken over or released: nothing more can be acknowledged; replay.
+    Gone,
+    /// Expired, but its holder could still renew it: fence it, then replay.
+    Lapsed,
+}
+
+/// Like `check_lease`: an older epoch in this view means the view lags (a
+/// committer on a Raft follower, or just after a failover), not that the
+/// log's holder is gone.
+fn orphan_state(
+    lease: Option<&crate::cluster::state::Lease>,
+    l: &crate::inode::VolumeLog,
+    now: u64,
+) -> Orphan {
+    match lease {
+        None => Orphan::Live,
+        Some(lease) if lease.epoch < l.vol_epoch => Orphan::Live,
+        Some(lease) if lease.epoch > l.vol_epoch => Orphan::Gone,
+        Some(lease) if lease.owner != l.vol_owner || lease.released => Orphan::Gone,
+        Some(lease) if lease.expires_ms + RECLAIM_GRACE_MS < now => Orphan::Lapsed,
+        Some(_) => Orphan::Live,
+    }
 }
 
 pub struct Committer<D: BlockDevice> {
@@ -246,9 +311,125 @@ impl<D: BlockDevice> Committer<D> {
         Ok(Committed { txg })
     }
 
+    /// Apply a writer's file or directory change.
+    pub async fn commit_fs(&self, c: &FsCommit) -> Result<FsCommitted, CommitError> {
+        let state = self.auth.state();
+        check_lease(&state, &c.writer, None, c.writer_epoch)?;
+        let lends = self.lends.lock().unwrap().clone();
+        self.fs
+            .apply_fs_commit(
+                c,
+                |idx| {
+                    lends
+                        .get(&idx)
+                        .is_some_and(|(w, e)| *w == c.writer && *e == c.writer_epoch)
+                },
+                |id| object_lease_ok(&state, c, id),
+            )
+            .await
+    }
+
+    /// Get `volume` ready for the holder of its `vol/<name>` lease: replay
+    /// whatever intent log an earlier holder left (it can't add to it any
+    /// more: its lease is gone).
+    pub async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        check_lease(
+            &self.auth.state(),
+            &volume_resource(volume),
+            Some(vol_owner),
+            vol_epoch,
+        )?;
+        let vol = self
+            .fs
+            .open_volume(volume)
+            .await
+            .map_err(|e| CommitError::Refused(format!("volume '{}': {}", volume, e)))?;
+        let log = vol.log.lock().unwrap().clone();
+        if let Some(l) = log
+            && (l.vol_owner != vol_owner || l.vol_epoch != vol_epoch)
+        {
+            self.fs
+                .replay_volume_log(volume, &l)
+                .await
+                .map_err(|e| CommitError::Retry(format!("replaying '{}': {}", volume, e)))?;
+        }
+        Ok(())
+    }
+
+    /// Replay the intent logs of volumes whose writer's lease is gone.
+    async fn replay_orphaned_logs(&self) {
+        let Ok(logs) = self.fs.volume_logs().await else {
+            return;
+        };
+        let state = self.auth.state();
+        let now = now_ms();
+        for (name, l) in logs {
+            let resource = volume_resource(&name);
+            let fence = match orphan_state(state.leases.get(&resource), &l, now) {
+                Orphan::Live => continue,
+                Orphan::Gone => None,
+                Orphan::Lapsed => match self.fence_lapsed(&resource, &l).await {
+                    Some(f) => Some(f),
+                    None => continue,
+                },
+            };
+            if let Err(e) = self.fs.replay_volume_log(&name, &l).await {
+                eprintln!("committer: replaying the log of '{}': {}", name, e);
+            }
+            // The log's holder is superseded either way (a failed replay is
+            // retried next time as `Gone`); let the next node have it.
+            if let Some(epoch) = fence {
+                let op = LeaseOp::Release {
+                    resource: resource.clone(),
+                    owner: self.replay_owner(),
+                    epoch,
+                };
+                if let Err(e) = self.auth.propose(op).await {
+                    eprintln!("committer: releasing {}: {}", resource, e);
+                }
+            }
+        }
+    }
+
+    /// Who holds a `vol/<name>` lease while the committer replays its log.
+    fn replay_owner(&self) -> String {
+        format!("{} (log replay)", self.owner)
+    }
+
+    /// Take over a lapsed `vol/<name>` lease, so its holder can't renew it
+    /// (a lapsed lease can be renewed until someone else is granted it) and
+    /// go on acknowledging flushes into a log that's been replayed. Returns
+    /// the epoch granted, or None if the lease is live again.
+    async fn fence_lapsed(&self, resource: &str, l: &crate::inode::VolumeLog) -> Option<u64> {
+        let op = LeaseOp::Acquire {
+            resource: resource.to_string(),
+            owner: self.replay_owner(),
+            desc: format!("committer: replaying {}'s intent log", l.writer),
+            ttl_ms: crate::cluster::lease::LEASE_TTL.as_millis() as u64,
+        };
+        match self.auth.propose(op).await {
+            // A newer epoch than the log's: its holder's renewals fail from
+            // now on, and its last one was sent over a TTL ago (the lease
+            // had expired when this was granted), so it can't be
+            // acknowledging anything any more.
+            Ok(Response::Granted { epoch, .. }) if epoch > l.vol_epoch => Some(epoch),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("committer: fencing {}: {}", resource, e);
+                None
+            }
+        }
+    }
+
     /// Take back metaslabs whose writer is gone (its lease taken over,
-    /// released, or expired).
+    /// released, or expired), after replaying any intent log it left.
     pub async fn reclaim(&self) {
+        self.replay_orphaned_logs().await;
         let state = self.auth.state();
         let now = now_ms();
         let lends = self.lends.lock().unwrap().clone();
@@ -329,6 +510,19 @@ impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
     async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
         self.committer.commit(&c).await
     }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.committer.commit_fs(&c).await
+    }
+    async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        self.committer
+            .claim_volume(volume, vol_owner, vol_epoch)
+            .await
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -343,6 +537,13 @@ pub struct ReturnRequest {
     pub writer: String,
     pub writer_epoch: u64,
     pub idx: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClaimRequest {
+    pub volume: String,
+    pub vol_owner: String,
+    pub vol_epoch: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -527,6 +728,37 @@ impl CommitSink for CommitClient {
         self.call(reqwest::Method::POST, "/api/v1/pool/commit", Some(&c), None)
             .await
     }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        // A namespace op is a single call from a client: give up after a
+        // while instead of hanging it (the outcome is then unknown, and a
+        // resend is acknowledged if it was applied).
+        self.call(
+            reqwest::Method::POST,
+            "/api/v1/pool/commit_fs",
+            Some(&c),
+            Some(20),
+        )
+        .await
+    }
+    async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        let body = ClaimRequest {
+            volume: volume.into(),
+            vol_owner: vol_owner.into(),
+            vol_epoch,
+        };
+        self.call(
+            reqwest::Method::POST,
+            "/api/v1/pool/claim",
+            Some(&body),
+            Some(20),
+        )
+        .await
+    }
 }
 
 // ---- HTTP routes, served by every `listen` node ----
@@ -596,6 +828,31 @@ pub mod routes {
         }
     }
 
+    #[post("/api/v1/pool/commit_fs", data = "<req>")]
+    pub async fn commit_fs(
+        req: Json<FsCommit>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<FsCommitted, CommitError>> {
+        match current(slot).await {
+            Some(c) => Json(c.commit_fs(&req).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/claim", data = "<req>")]
+    pub async fn claim(
+        req: Json<ClaimRequest>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => Json(
+                c.claim_volume(&req.volume, &req.vol_owner, req.vol_epoch)
+                    .await,
+            ),
+            None => not_committer(),
+        }
+    }
+
     #[get("/api/v1/pool/volumes")]
     pub async fn volumes(
         slot: &State<CommitterSlot>,
@@ -639,7 +896,7 @@ pub mod routes {
 
     pub fn routes() -> Vec<rocket::Route> {
         rocket::routes![
-            committer, lend, give_back, commit, volumes, create, remove, props
+            committer, lend, give_back, commit, commit_fs, claim, volumes, create, remove, props
         ]
     }
 }

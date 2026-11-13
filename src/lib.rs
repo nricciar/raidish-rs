@@ -30,6 +30,9 @@ mod dashboard;
 pub mod disk;
 pub mod disks;
 pub mod fence;
+pub mod file_writer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod files_api;
 pub mod fs;
 mod fsck;
 pub mod inode;
@@ -50,6 +53,7 @@ pub mod vdev;
 mod volume;
 pub mod websocket;
 pub mod writer;
+pub mod zil;
 
 #[cfg(test)]
 #[path = "tests/util.rs"]

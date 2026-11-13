@@ -1,7 +1,7 @@
 use crate::cluster::Cluster;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::disks::{Caddy, DiskSet};
-use crate::fs::{FileSystem, FileSystemError};
+use crate::fs::FileSystem;
 use crate::vdev::Pool;
 use crate::websocket::{WsOp, WsRequest, WsStatus, encode_response};
 use rocket::data::{Data, ToByteUnit};
@@ -18,8 +18,6 @@ pub type EpochFloor = crate::fence::ServerFence;
 
 pub struct DiskServer {
     disks: Arc<Vec<Caddy>>,
-    /// Only present if a pool is configured and formatted.
-    fs: Option<FileSystem<Arc<Pool>>>,
     floor: Arc<EpochFloor>,
 }
 
@@ -47,6 +45,7 @@ pub async fn listen(
     pool_map: Option<crate::inspect::PoolMap>,
     committer: crate::committer::CommitterSlot,
     agent: crate::agent::AgentState,
+    files: crate::files_api::WriterSlot,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -58,20 +57,31 @@ pub async fn listen(
         let fence = floor.clone();
         tokio::spawn(async move { refresh_fence_map(pool, fence).await });
     }
-    let fs = match pool {
+    let read_only = match pool {
         None => None,
         Some(pool) => match FileSystem::load_readonly(pool).await {
-            Ok(fs) => Some(fs),
+            Ok(fs) => Some(Arc::new(fs)),
             Err(e) => {
                 println!("serving raw disks only ({})", e);
                 None
             }
         },
     };
-    let server = DiskServer { disks, fs, floor };
+    let files = crate::files_api::FilesState {
+        node: cluster.name.clone(),
+        writer: files,
+        read_only,
+        // Any node takes lease requests (followers forward to the leader).
+        leases: Arc::new(crate::cluster::lease::LeaseClient::new(vec![format!(
+            "http://127.0.0.1:{}",
+            port
+        )])),
+    };
+    let server = DiskServer { disks, floor };
 
     rocket::build()
         .manage(server)
+        .manage(files)
         .manage(cluster)
         .manage(committer)
         .manage(agent)
@@ -81,7 +91,7 @@ pub async fn listen(
                 .merge(("port", port))
                 .merge((
                     "limits",
-                    map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB"],
+                    map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB", "upload" => "64 GiB"],
                 )),
         )
         .mount(
@@ -91,13 +101,13 @@ pub async fn listen(
                 put_block,
                 list_disks,
                 flush_disks,
-                read_file,
                 ws_endpoint,
                 agent_status
             ],
         )
         .mount("/", crate::cluster::routes::routes())
         .mount("/", crate::committer::routes::routes())
+        .mount("/", crate::files_api::routes())
         .mount("/", crate::dashboard::routes())
         .launch()
         .await
@@ -231,25 +241,6 @@ async fn flush_disks(disk_index: usize, epoch: HeaderEpoch, server: &State<DiskS
             Err(_) => Status::InternalServerError,
         },
         Err(status) => status,
-    }
-}
-
-#[get("/api/v1/files/<path..>")]
-async fn read_file(
-    path: std::path::PathBuf,
-    server: &State<DiskServer>,
-) -> Result<Vec<u8>, Status> {
-    let fs = server.fs.as_ref().ok_or(Status::ServiceUnavailable)?;
-    match fs.read_file(path.as_path()).await {
-        Ok(data) => Ok(data),
-        Err(err) => match err {
-            FileSystemError::FileNotFound => Err(Status::NotFound),
-            FileSystemError::NotAFile => Err(Status::BadRequest),
-            _ => {
-                eprintln!("Error reading file '{}': {}", path.display(), err);
-                Err(Status::InternalServerError)
-            }
-        },
     }
 }
 

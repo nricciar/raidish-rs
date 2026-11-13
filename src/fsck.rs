@@ -41,6 +41,8 @@ pub trait Visitor {
     fn dir(&mut self, _path: &str) {}
     fn file(&mut self, _path: &str, _size_bytes: u64, _blocks: &[BlockPtr]) {}
     fn volume(&mut self, _path: &str, _inode: &InodeType) {}
+    /// A volume's intent log region (in use, though no pointer reaches it).
+    fn log_region(&mut self, _start: u64, _len: u64) {}
 }
 
 /// A visitor that only wants the walk's own report.
@@ -115,8 +117,13 @@ pub(crate) fn expand<V: Visitor>(
                     kind: ObjKind::DirIndex,
                     path: path.to_string(),
                 }],
-                InodeType::Volume { root, levels, .. } => {
+                InodeType::Volume {
+                    root, levels, log, ..
+                } => {
                     v.volume(path, &inode.inode_type);
+                    for r in log.iter().flat_map(|l| &l.regions) {
+                        v.log_region(r.start, r.len);
+                    }
                     root.iter()
                         .map(|ptr| Node::Volume {
                             ptr: ptr.clone(),
@@ -248,6 +255,10 @@ pub struct LiveSet {
 impl Visitor for LiveSet {
     fn record(&mut self, ptr: &BlockPtr, _kind: ObjKind) {
         let overlap = insert_range(&mut self.live, ptr.lba, ptr.asize as u64);
+        self.cross_links.extend(overlap);
+    }
+    fn log_region(&mut self, start: u64, len: u64) {
+        let overlap = insert_range(&mut self.live, start, len);
         self.cross_links.extend(overlap);
     }
 }

@@ -205,7 +205,7 @@ impl<D: BlockDevice> FileSystem<D> {
             repair,
             ..Default::default()
         };
-        let walked = self.scan_tree(root, since, repair, &mut report).await;
+        let walked = self.scan_tree(root, since, &|_| repair, &mut report).await;
         {
             let _tx = self.begin_tx().await;
             self.scan_labels(repair, &mut report).await;
@@ -245,11 +245,14 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(report)
     }
 
+    /// Walk the tree from `root`, checking records born at or after
+    /// `since`; `repair(ptr)` says whether bad shards of that record may be
+    /// rewritten.
     async fn scan_tree(
         &self,
         root: Vec<BlockPtr>,
         since: u64,
-        repair: bool,
+        repair: &(dyn Fn(&BlockPtr) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) -> Result<(), FileSystemError> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
@@ -279,7 +282,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     let mut data = Vec::new();
                     let mut complete = true;
                     for ptr in &ptrs {
-                        match self.scan_record(ptr, repair, report).await {
+                        match self.scan_record(ptr, repair(ptr), report).await {
                             Some(d) => data.extend_from_slice(&d),
                             None => {
                                 report.errors.push(format!(
@@ -299,7 +302,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         report.pruned += 1;
                         continue;
                     }
-                    let Some(data) = self.scan_record(&ptr, repair, report).await else {
+                    let Some(data) = self.scan_record(&ptr, repair(&ptr), report).await else {
                         report.errors.push(format!(
                             "{} (volume L{}): record at {} unreadable",
                             path, level, ptr.lba
@@ -357,6 +360,50 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         Some(data)
+    }
+
+    /// On a writer: rebuild what degraded disks missed in the metaslabs lent
+    /// to it. The committer's resilver can't write there (its writes are
+    /// fenced out while they're lent; a running volume's intent log keeps
+    /// one lent for as long as it runs), so the writer does, under its own
+    /// fencing epoch. Committed blocks in lent space can't be reallocated
+    /// meanwhile (only this writer allocates there, and only what it was
+    /// lent as free). Once they're fixed, the committer's next resilver finds
+    /// them good and clears the disk. None: nothing to do.
+    pub async fn heal_lent(&self) -> Result<Option<ScanReport>, FileSystemError> {
+        let (Some(w), Some(pool)) = (self.writer.clone(), self.dev.pool()) else {
+            return Ok(None);
+        };
+        let lent: std::collections::HashSet<u32> = w.lent.lock().unwrap().iter().copied().collect();
+        if lent.is_empty() {
+            return Ok(None);
+        }
+        let ring = self.read_uberblock_ring().await;
+        let Some(newest) = ring.first() else {
+            return Ok(None);
+        };
+        let Some(since) = (0..newest.degraded.len())
+            .filter(|&d| pool.disks.is_online(d))
+            .filter_map(|d| newest.degraded[d])
+            .min()
+        else {
+            return Ok(None);
+        };
+        let _one = self.scan_lock.lock().await;
+        let layout = self.layout;
+        let in_lent = move |p: &BlockPtr| {
+            layout
+                .metaslab_for_block(p.lba)
+                .is_some_and(|i| lent.contains(&(i as u32)))
+        };
+        let mut report = ScanReport {
+            since,
+            repair: true,
+            ..Default::default()
+        };
+        self.scan_tree(newest.root.clone(), since, &in_lent, &mut report)
+            .await?;
+        Ok(Some(report))
     }
 
     /// Verify the fixed label regions: superblock, uberblock ring and space

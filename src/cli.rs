@@ -382,6 +382,7 @@ pub async fn main() -> std::io::Result<()> {
             .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
         let slot: crate::committer::CommitterSlot = Default::default();
         let agent_state: crate::agent::AgentState = Default::default();
+        let files: crate::files_api::WriterSlot = Default::default();
         let me = format!("http://127.0.0.1:{}", port);
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
@@ -425,11 +426,23 @@ pub async fn main() -> std::io::Result<()> {
                 access,
                 config.automount.clone(),
                 agent_state.clone(),
+                files.clone(),
             );
             tokio::spawn(agent.run());
         }
         println!("dashboard: http://localhost:{}/", port);
-        api::listen(disks, pool, port, node, floor, pool_map, slot, agent_state).await;
+        api::listen(
+            disks,
+            pool,
+            port,
+            node,
+            floor,
+            pool_map,
+            slot,
+            agent_state,
+            files,
+        )
+        .await;
         return Ok(());
     }
 

@@ -22,7 +22,7 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions, VolumeProps};
+use crate::inode::{Extent, FileInode, InodeRef, InodeType, Permissions, VolumeLog, VolumeProps};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -97,14 +97,17 @@ impl Dirty {
 }
 
 #[derive(Default)]
-struct DirtyState {
-    records: BTreeMap<u64, Dirty>,
+pub(crate) struct DirtyState {
+    pub(crate) records: BTreeMap<u64, Dirty>,
     /// Records taken by an in-progress sync (readable until it finishes).
     syncing: Option<Arc<BTreeMap<u64, Dirty>>>,
+    /// Dirty records changed since they were last written to the intent
+    /// log (a writer's flush logs exactly these, see `crate::zil`).
+    pub(crate) unlogged: std::collections::BTreeSet<u64>,
 }
 
 impl DirtyState {
-    fn get(&self, idx: u64) -> Option<&Dirty> {
+    pub(crate) fn get(&self, idx: u64) -> Option<&Dirty> {
         self.records
             .get(&idx)
             .or_else(|| self.syncing.as_ref().and_then(|s| s.get(&idx)))
@@ -160,7 +163,15 @@ pub struct Volume {
     root: Mutex<Option<BlockPtr>>,
     /// Placement settings (rewritten with the inode, see `VolumeProps`).
     pub(crate) props: Mutex<VolumeProps>,
-    dirty: Mutex<DirtyState>,
+    /// The intent log the inode records (rewritten with it).
+    pub(crate) log: Mutex<Option<VolumeLog>>,
+    /// A writer's place in its own log (None: nothing to append to; the
+    /// next flush commits instead). See `crate::zil`. Locked before `dirty`.
+    pub(crate) cursor: Mutex<Option<crate::zil::LogCursor>>,
+    /// Where the log stood when the sync in progress took its records: the
+    /// region and the first record not covered by it.
+    pub(crate) fold_from: Mutex<Option<(crate::inode::LogRegion, u64)>>,
+    pub(crate) dirty: Mutex<DirtyState>,
     /// Indirect blocks keyed by (lba, birth_txg): immutable once written, and
     /// a reused lba always has a newer birth TXG.
     cache: Mutex<HashMap<(u64, u64), Arc<Indirect>>>,
@@ -267,11 +278,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(FileSystemError::AlreadyExists);
         }
 
-        let file_id = {
-            let mut index = self.file_index.write().await;
-            index.next_file_id += 1;
-            index.next_file_id - 1
-        };
+        let file_id = self.alloc_object();
         let levels = levels_for(size_bytes.div_ceil(volblocksize as u64));
         let inode = FileInode {
             id: file_id,
@@ -281,6 +288,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 levels,
                 root: None,
                 props: VolumeProps::default(),
+                log: None,
             },
         };
         let inode_ptrs = self.write_value(&inode).await?;
@@ -317,6 +325,7 @@ impl<D: BlockDevice> FileSystem<D> {
             levels,
             root,
             props,
+            log,
         } = self.read_inode(&inode_ref).await?.inode_type
         else {
             return Err(FileSystemError::NotAFile);
@@ -329,6 +338,9 @@ impl<D: BlockDevice> FileSystem<D> {
             levels,
             root: Mutex::new(root),
             props: Mutex::new(props),
+            log: Mutex::new(log),
+            cursor: Mutex::new(None),
+            fold_from: Mutex::new(None),
             dirty: Mutex::new(DirtyState::default()),
             cache: Mutex::new(HashMap::new()),
             records: Mutex::new(RecordCache::default()),
@@ -626,13 +638,16 @@ impl<D: BlockDevice> FileSystem<D> {
                     Some(src) => Dirty::Data(src.to_vec()),
                     None => Dirty::Hole,
                 };
-                vol.dirty.lock().unwrap().records.insert(idx, rec);
+                let mut d = vol.dirty.lock().unwrap();
+                d.records.insert(idx, rec);
+                d.unlogged.insert(idx);
             } else {
                 loop {
                     {
                         let mut d = vol.dirty.lock().unwrap();
                         if let Some(Dirty::Data(buf)) = d.records.get_mut(&idx) {
                             apply(buf);
+                            d.unlogged.insert(idx);
                             break;
                         }
                         // Base on what's being synced, if anything.
@@ -644,6 +659,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         if let Some(mut buf) = base {
                             apply(&mut buf);
                             d.records.insert(idx, Dirty::Data(buf));
+                            d.unlogged.insert(idx);
                             break;
                         }
                     }
@@ -658,6 +674,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     apply(&mut buf);
                     d.records.insert(idx, Dirty::Data(buf));
+                    d.unlogged.insert(idx);
                     break;
                 }
             }
@@ -679,12 +696,17 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut first_err = None;
         for vol in vols {
             let taken = {
+                // With the cursor held, no log append is half-planned: each
+                // one is wholly before this cut (covered by this sync) or
+                // after it (see `crate::zil`).
+                let cursor = vol.cursor.lock().unwrap();
                 let mut d = vol.dirty.lock().unwrap();
                 if d.records.is_empty() {
                     continue;
                 }
                 let taken = Arc::new(std::mem::take(&mut d.records));
                 d.syncing = Some(taken.clone());
+                *vol.fold_from.lock().unwrap() = cursor.as_ref().map(|c| (c.region.clone(), c.seq));
                 taken
             };
 
@@ -711,6 +733,11 @@ impl<D: BlockDevice> FileSystem<D> {
                     d.records.entry(*k).or_insert_with(|| v.clone());
                 }
             }
+            // Synced and not written since: nothing left to log.
+            let DirtyState {
+                records, unlogged, ..
+            } = &mut *d;
+            unlogged.retain(|k| records.contains_key(k));
             drop(d);
             if let Err(e) = result {
                 eprintln!("volume '{}': sync failed: {}", vol.name, e);
@@ -1061,6 +1088,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 levels: vol.levels,
                 root,
                 props: vol.props.lock().unwrap().clone(),
+                log: vol.log.lock().unwrap().clone(),
             },
         };
         let inode_ptrs = self.write_value(&inode).await?;
