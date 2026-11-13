@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// The `desc` an agent puts on the leases it holds.
 const DESC_PREFIX: &str = "agent ";
@@ -115,7 +116,7 @@ pub type AgentState = Arc<std::sync::RwLock<AgentStatus>>;
 
 struct Running {
     lease: Arc<HeldLease>,
-    lost: Arc<AtomicBool>,
+    lost: Lost,
     info: RunningVolume,
 }
 
@@ -124,7 +125,7 @@ struct Running {
 struct NodeWriter {
     /// Held (and renewed) for as long as this writer exists.
     _lease: Arc<HeldLease>,
-    lost: Arc<AtomicBool>,
+    lost: Lost,
     fs: Arc<FileSystem<Pool>>,
     nbd: Arc<NbdServer<Pool>>,
     nvme: Arc<NvmeTcpServer<Pool>>,
@@ -182,12 +183,9 @@ impl Agent {
 
     /// Keep `node/<name>` and run the placement loop, forever.
     pub async fn run(mut self) {
-        let mut node_lease: Option<(Arc<HeldLease>, Arc<AtomicBool>)> = None;
+        let mut node_lease: Option<(Arc<HeldLease>, Lost)> = None;
         loop {
-            if node_lease
-                .as_ref()
-                .is_none_or(|(_, lost)| lost.load(Ordering::SeqCst))
-            {
+            if node_lease.as_ref().is_none_or(|(_, lost)| lost.is_lost()) {
                 node_lease = match HeldLease::acquire(
                     self.leases.clone(),
                     &node_resource(&self.node),
@@ -197,7 +195,7 @@ impl Agent {
                 {
                     Ok(l) => {
                         let l = Arc::new(l);
-                        Some((l.clone(), hold(&l)))
+                        Some((l.clone(), hold(&l, None)))
                     }
                     Err(e) => {
                         eprintln!("agent: {}", e);
@@ -225,18 +223,14 @@ impl Agent {
         let lost: Vec<String> = self
             .running
             .iter()
-            .filter(|(_, r)| r.lost.load(Ordering::SeqCst))
+            .filter(|(_, r)| r.lost.is_lost())
             .map(|(n, _)| n.clone())
             .collect();
         for name in lost {
             eprintln!("agent: lost the lease on volume '{}'", name);
             self.stop(&name, false).await;
         }
-        if self
-            .writer
-            .as_ref()
-            .is_some_and(|w| w.lost.load(Ordering::SeqCst))
-        {
+        if self.writer.as_ref().is_some_and(|w| w.lost.is_lost()) {
             eprintln!("agent: lost the writer lease; dropping every volume");
             let names: Vec<String> = self.running.keys().cloned().collect();
             for name in names {
@@ -312,8 +306,11 @@ impl Agent {
             let resource = format!("writer/{}", self.node);
             let lease =
                 Arc::new(HeldLease::acquire(self.leases.clone(), &resource, &self.desc()).await?);
-            let lost = hold(&lease);
             let sink = CommitClient::new(self.endpoints.clone()).as_writer(&resource, lease.epoch);
+            // Once the writer lease is gone, commits stop waiting for the
+            // committer (it would answer "retry" for as long as nobody
+            // else takes the lease, which for `writer/<node>` is forever).
+            let lost = hold(&lease, Some(sink.cancel.clone()));
             let fs = Arc::new(
                 FileSystem::load_writer(self.access.open().await, Arc::new(sink))
                     .await
@@ -343,7 +340,8 @@ impl Agent {
                     eprintln!("agent: NVMe/TCP target: {}", e);
                 }
             }));
-            crate::scan::spawn_health_monitor(fs.clone(), Duration::from_secs(30));
+            // No health monitor: a writer opens the pool read-only, so it
+            // couldn't repair anything (the committer's monitor does).
             self.writer = Some(NodeWriter {
                 _lease: lease,
                 lost,
@@ -362,10 +360,10 @@ impl Agent {
             HeldLease::acquire(self.leases.clone(), &volume_resource(&v.name), &self.desc())
                 .await?,
         );
-        let lost = hold(&lease);
+        let lost = hold(&lease, None);
         let started = async {
             let w = self.ensure_writer().await?;
-            w.fs.attach_volume(&v.name, &lease.owner, lease.epoch)
+            w.fs.attach_volume_until(&v.name, &lease.owner, lease.epoch, Some(lost.watch()))
                 .await
                 .map_err(|e| e.to_string())?;
             match transport {
@@ -520,13 +518,30 @@ impl Agent {
     }
 }
 
-/// Renew `lease` in the background; the flag is set once it's lost.
-fn hold(lease: &Arc<HeldLease>) -> Arc<AtomicBool> {
-    let lost = Arc::new(AtomicBool::new(false));
+/// Set once a held lease is lost.
+#[derive(Clone)]
+struct Lost(Arc<watch::Sender<bool>>);
+
+impl Lost {
+    fn is_lost(&self) -> bool {
+        *self.0.borrow()
+    }
+    fn watch(&self) -> watch::Receiver<bool> {
+        self.0.subscribe()
+    }
+}
+
+/// Renew `lease` in the background. Once it's lost the returned flag is
+/// set, and so is `cancel` (a commit client's, to stop its retries).
+fn hold(lease: &Arc<HeldLease>, cancel: Option<Arc<AtomicBool>>) -> Lost {
+    let lost = Lost(Arc::new(watch::Sender::new(false)));
     let flag = lost.clone();
     lease.hold(move |msg| {
         eprintln!("agent: {}", msg);
-        flag.store(true, Ordering::SeqCst);
+        if let Some(c) = cancel {
+            c.store(true, Ordering::SeqCst);
+        }
+        flag.0.send_replace(true);
     });
     lost
 }

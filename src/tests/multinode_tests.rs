@@ -375,3 +375,86 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     fs.block_write("a", 0, &pattern(1000, 6)).await.unwrap();
     fs.sync().await.unwrap();
 }
+
+/// Resends `Retry` answers until there is a definite one, like
+/// `CommitClient` does for a writer (a hard mount).
+struct Retrying(DirectSink<Pool>);
+
+#[async_trait]
+impl CommitSink for Retrying {
+    fn writer(&self) -> (String, u64) {
+        self.0.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.0.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+        self.0.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+        loop {
+            match self.0.commit(c.clone()).await {
+                Err(CommitError::Retry(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Retrying(DirectSink {
+        committer: s.committer.clone(),
+        writer: resource,
+        epoch,
+    }));
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink)
+        .await
+        .unwrap();
+    // A short volume lease, which lapses without anyone taking it over: the
+    // committer answers "retry" (it could still be renewed), forever.
+    let op = LeaseOp::Acquire {
+        resource: volume_resource("a"),
+        owner: "o".into(),
+        desc: "test o".into(),
+        ttl_ms: 2_000,
+    };
+    let Response::Granted { epoch: v_epoch, .. } = s.auth.propose(op).await.unwrap() else {
+        panic!("volume lease not granted");
+    };
+    let (lost, rx) = tokio::sync::watch::channel(false);
+    fs.attach_volume_until("a", "o", v_epoch, Some(rx))
+        .await
+        .unwrap();
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.sync().await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    fs.block_write("a", 0, &pattern(100_000, 2)).await.unwrap();
+    let fs = Arc::new(fs);
+    let syncing = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.sync().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!syncing.is_finished(), "the committer should say retry");
+
+    // The holder notices the lease is gone: the sync gives up.
+    lost.send_replace(true);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), syncing)
+        .await
+        .expect("sync still waiting after the lease was lost")
+        .unwrap();
+    assert!(r.is_err());
+    fs.abandon_volume("a");
+
+    // Only what was committed is there.
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}

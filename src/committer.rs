@@ -710,13 +710,17 @@ pub async fn run(
             "committer: this node commits the pool (epoch {})",
             held.epoch
         );
-        crate::scan::spawn_health_monitor(fs.clone(), Duration::from_secs(30));
+        let monitor = crate::scan::spawn_health_monitor(fs.clone(), Duration::from_secs(30));
         *slot.write().await = Some(committer.clone());
         while !lost.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             committer.reclaim().await;
         }
         *slot.write().await = None;
+        // It holds the pool (and its disk connections) for as long as it
+        // runs, and this one may no longer write: the next term opens the
+        // pool afresh with its own.
+        monitor.abort();
     }
 }
 

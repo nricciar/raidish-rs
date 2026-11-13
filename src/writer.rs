@@ -106,17 +106,34 @@ pub trait CommitSink: Send + Sync {
     async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError>;
 }
 
+/// A volume a writer runs.
+pub(crate) struct Attached {
+    /// The `vol/<name>` lease owner and epoch.
+    pub owner: String,
+    pub epoch: u64,
+    /// Turns true once that lease is lost: a commit still waiting for the
+    /// committer then gives up (see `attach_volume_until`).
+    pub lost: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
 /// A writer's side of things.
 pub(crate) struct WriterState {
     pub sink: Arc<dyn CommitSink>,
-    /// Volume name → (`vol/<name>` lease owner, epoch).
-    pub volumes: std::sync::Mutex<HashMap<String, (String, u64)>>,
+    /// Volume name → its lease.
+    pub volumes: std::sync::Mutex<HashMap<String, Attached>>,
     /// Metaslabs lent to this writer.
     pub lent: std::sync::Mutex<Vec<u32>>,
 }
 
 /// Give a metaslab back once it has less than this many free blocks.
 const RETURN_BELOW_RECORDS: u64 = 4;
+
+/// Resolves once `lost` turns true (never, if its sender is gone first).
+async fn lease_lost(mut lost: tokio::sync::watch::Receiver<bool>) {
+    if lost.wait_for(|l| *l).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
 
 impl<D: BlockDevice> FileSystem<D> {
     /// Open the pool as a volume writer: read-only, except for the records
@@ -150,6 +167,20 @@ impl<D: BlockDevice> FileSystem<D> {
         owner: &str,
         epoch: u64,
     ) -> Result<(), FileSystemError> {
+        self.attach_volume_until(name, owner, epoch, None).await
+    }
+
+    /// `attach_volume`, where `lost` turns true once the lease is lost. A
+    /// sync waiting for the committer then stops waiting: otherwise a lease
+    /// that merely lapsed (nobody took it over) would be answered "retry"
+    /// forever, and the sync would never return.
+    pub async fn attach_volume_until(
+        &self,
+        name: &str,
+        owner: &str,
+        epoch: u64,
+        lost: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(), FileSystemError> {
         let w = self
             .writer
             .as_ref()
@@ -161,10 +192,14 @@ impl<D: BlockDevice> FileSystem<D> {
         self.reload_root_index().await?;
         self.close_volume(name);
         self.open_volume(name).await?;
-        w.volumes
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), (owner.to_string(), epoch));
+        w.volumes.lock().unwrap().insert(
+            name.to_string(),
+            Attached {
+                owner: owner.to_string(),
+                epoch,
+                lost,
+            },
+        );
         Ok(())
     }
 
@@ -308,12 +343,12 @@ impl<D: BlockDevice> FileSystem<D> {
         records: &std::collections::BTreeMap<u64, crate::volume::Dirty>,
         need: u64,
     ) -> Result<(), FileSystemError> {
-        let (vol_owner, vol_epoch) = w
+        let (vol_owner, vol_epoch, lost) = w
             .volumes
             .lock()
             .unwrap()
             .get(&vol.name)
-            .cloned()
+            .map(|a| (a.owner.clone(), a.epoch, a.lost.clone()))
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
@@ -356,7 +391,17 @@ impl<D: BlockDevice> FileSystem<D> {
             missed: self.take_new_misses(),
             birth_txg,
         };
-        match w.sink.commit(commit).await {
+        let outcome = match lost {
+            None => w.sink.commit(commit).await,
+            Some(lost) => tokio::select! {
+                r = w.sink.commit(commit) => r,
+                _ = lease_lost(lost) => Err(CommitError::Retry(format!(
+                    "lost the lease on volume '{}'",
+                    vol.name
+                ))),
+            },
+        };
+        match outcome {
             Ok(c) => {
                 self.note_open_txg(c.txg + 1).await;
                 vol.set_root(new_root);
