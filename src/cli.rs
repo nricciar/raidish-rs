@@ -123,10 +123,6 @@ enum Commands {
         /// for maintenance: fsck --repair, format, defrag).
         #[arg(long)]
         no_committer: bool,
-
-        /// A name for this node (logs, data directory); defaults to
-        /// `node-<id>`, the id coming from the pool config.
-        id: Option<String>,
     },
     /// The control plane: members, leader, leases.
     Cluster {
@@ -337,11 +333,7 @@ pub async fn main() -> std::io::Result<()> {
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
-    if let Commands::Listen {
-        port,
-        id,
-        no_committer,
-    } = &cli.command
+    if let Commands::Listen { port, no_committer } = &cli.command
     {
         let serve = config.serve_disks().unwrap_or_else(|e| fail(e));
         let paths: Vec<&str> = serve.iter().map(|s| s.as_str()).collect();
@@ -356,7 +348,8 @@ pub async fn main() -> std::io::Result<()> {
         let members = config
             .cluster_members(port as u16)
             .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
-        let name = id.clone().unwrap_or_else(|| format!("node-{}", members.me));
+        // The node's name comes from its id: the pool position of its first disk.
+        let name = format!("node-{}", members.me);
         let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
             Some(d) => expand_tilde(d).join(&name),
             None => cluster::default_data_dir(&name),
