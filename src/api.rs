@@ -48,6 +48,7 @@ pub async fn listen(
     files: crate::files_api::WriterSlot,
     tls: Option<&crate::tls::TlsConfig>,
     auth: crate::auth::AuthState,
+    nfs: Option<crate::nfs::peers::NfsServers>,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -110,6 +111,7 @@ pub async fn listen(
         .manage(committer)
         .manage(agent)
         .manage(crate::dashboard::DashboardState { pool: pool_map })
+        .manage(crate::nfs::peers::NfsForwarding(nfs))
         .configure(figment)
         .register(
             "/",
@@ -130,6 +132,7 @@ pub async fn listen(
         .mount("/", crate::cluster::routes::routes())
         .mount("/", crate::committer::routes::routes())
         .mount("/", crate::files_api::routes())
+        .mount("/", crate::nfs::peers::routes())
         .mount("/", crate::dashboard::routes())
         .launch()
         .await

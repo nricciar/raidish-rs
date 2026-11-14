@@ -253,3 +253,27 @@ async fn fixed_objects_cut_writes_and_refuse_truncate() {
     assert_eq!(obj.size(), size);
     assert!(fs.object_truncate(&obj, bs as u64).await.is_err());
 }
+
+/// A single-record object (no indirect level) truncated within its record
+/// keeps what's left of it.
+#[tokio::test]
+async fn truncating_a_single_record_object_keeps_its_head() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    let bs = VOLBLOCK_ALIGN as usize;
+    let obj = ObjTree::new(
+        bs,
+        Sizing::Growable,
+        0,
+        TreeRoot {
+            ptr: None,
+            levels: 0,
+        },
+    );
+    fs.object_modify(&obj, 0, 5, Some(b"hello")).await.unwrap();
+    sync_obj(&fs, &obj).await;
+    assert_eq!(obj.levels(), 0);
+    fs.object_truncate(&obj, 2).await.unwrap();
+    sync_obj(&fs, &obj).await;
+    assert_eq!(read(&fs, &obj, 0, 10).await, b"he");
+}

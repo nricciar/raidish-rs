@@ -112,6 +112,32 @@ pub enum FsOp {
         path: String,
         attrs: crate::inode::SetAttrs,
     },
+    /// `create_at`: file or directory `name` in directory `dir`.
+    CreateAt {
+        dir: crate::disk::FileId,
+        name: String,
+        kind: crate::inode::ObjType,
+        attrs: crate::inode::SetAttrs,
+        exclusive: Option<u64>,
+    },
+    /// `remove_at`, if `name` still names object `id`.
+    RemoveAt {
+        dir: crate::disk::FileId,
+        name: String,
+        id: crate::disk::FileId,
+    },
+    /// `rename_at` of object `id`.
+    RenameAt {
+        from_dir: crate::disk::FileId,
+        from_name: String,
+        to_dir: crate::disk::FileId,
+        to_name: String,
+        id: crate::disk::FileId,
+    },
+    SetAttrId {
+        id: crate::disk::FileId,
+        attrs: crate::inode::SetAttrs,
+    },
     /// Point file `id`'s dnode at a tree the writer built on `base` (its
     /// writes at any offset, see `crate::open_file`).
     UpdateFile {
@@ -1041,7 +1067,8 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     return Err(refuse(format!("{} isn't object {} any more", from, id)));
                 }
-                object_ok(*id)?;
+                // Only the replaced object's contents are at stake (a rename
+                // doesn't touch the moved one's).
                 if let Some(t) = self.id_at(tp).await {
                     object_ok(t)?;
                 }
@@ -1090,13 +1117,81 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 *id
             }
+            FsOp::CreateAt {
+                dir,
+                name,
+                kind,
+                attrs,
+                exclusive,
+            } => {
+                self.create_at_locked(*dir, name, *kind, attrs, *exclusive)
+                    .await
+                    .map_err(|e| refuse(format!("create {}: {}", name, e)))?
+                    .0
+            }
+            FsOp::RemoveAt { dir, name, id } => {
+                let l = self
+                    .lookup_at(*dir, name)
+                    .await
+                    .map_err(|e| refuse(format!("{}: {}", name, e)))?;
+                match l.entry {
+                    // Already gone (a resend, or someone else removed it).
+                    None => 0,
+                    Some(e) if e.id != *id => {
+                        return Err(refuse(format!("{} isn't object {} any more", name, id)));
+                    }
+                    Some(_) => {
+                        object_ok(*id)?;
+                        self.remove_at_locked(*dir, name)
+                            .await
+                            .map_err(|e| refuse(format!("remove {}: {}", name, e)))?;
+                        0
+                    }
+                }
+            }
+            FsOp::RenameAt {
+                from_dir,
+                from_name,
+                to_dir,
+                to_name,
+                id,
+            } => {
+                let at = |l: &crate::inode::Lookup| l.entry.map(|e| e.id);
+                let src = self
+                    .lookup_at(*from_dir, from_name)
+                    .await
+                    .map_err(|e| refuse(format!("{}: {}", from_name, e)))?;
+                let dst = self
+                    .lookup_at(*to_dir, to_name)
+                    .await
+                    .map_err(|e| refuse(format!("{}: {}", to_name, e)))?;
+                if at(&src) != Some(*id) {
+                    if at(&dst) == Some(*id) {
+                        // A resend of a rename already applied.
+                        return Ok(*id);
+                    }
+                    return Err(refuse(format!(
+                        "{} isn't object {} any more",
+                        from_name, id
+                    )));
+                }
+                if let Some(t) = at(&dst) {
+                    object_ok(t)?;
+                }
+                self.rename_at_locked(src, dst)
+                    .await
+                    .map_err(|e| refuse(format!("rename {} to {}: {}", from_name, to_name, e)))?
+                    .0
+            }
+            FsOp::SetAttrId { id, attrs } => {
+                // Attributes aren't contents: no lease needed.
+                self.set_attrs_id_locked(*id, attrs)
+                    .await
+                    .map_err(|e| refuse(format!("object {}: {}", id, e)))?;
+                *id
+            }
             FsOp::SetAttr { path, attrs } => {
                 let p = std::path::Path::new(path);
-                let id = self
-                    .file_id(p)
-                    .await
-                    .map_err(|e| refuse(format!("{}: {}", path, e)))?;
-                object_ok(id)?;
                 self.set_attrs_locked(p, attrs)
                     .await
                     .map_err(|e| refuse(format!("{}: {}", path, e)))?

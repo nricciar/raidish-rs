@@ -84,6 +84,12 @@ pub enum LeaseOp {
         pool_owner: String,
         pool_epoch: u64,
     },
+    NfsClient {
+        client: String,
+        present: bool,
+        nfs_owner: String,
+        nfs_epoch: u64,
+    },
 }
 
 impl LeaseOp {
@@ -144,6 +150,18 @@ impl LeaseOp {
                 idx,
                 pool_owner,
                 pool_epoch,
+                now_ms,
+            },
+            LeaseOp::NfsClient {
+                client,
+                present,
+                nfs_owner,
+                nfs_epoch,
+            } => Request::NfsClient {
+                client,
+                present,
+                nfs_owner,
+                nfs_epoch,
                 now_ms,
             },
         }
@@ -318,6 +336,16 @@ impl Cluster {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// The NFSv4 client records (owner strings, hex) as this node has them.
+    pub fn nfs_clients(&self) -> Vec<String> {
+        self.store.nfs_clients()
+    }
+
+    /// Lease `resource` as this node's applied state has it.
+    pub fn lease_state(&self, resource: &str) -> Option<state::Lease> {
+        self.store.lease(resource)
     }
 
     pub fn status(&self) -> Status {

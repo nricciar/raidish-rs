@@ -13,3 +13,7 @@ automount:
 # The certificate bundle `pki` made for this node (see docker-compose.yml).
 tls:
   dir: /etc/raidish/tls
+# NFS (3 and 4.1) for the compose network (try it with: docker compose
+# --profile nfs-test up -d nfs-client; see the README).
+nfs:
+  bind: 0.0.0.0

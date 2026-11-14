@@ -148,6 +148,13 @@ pub struct Dnode {
     /// A volume's intent log, if a writer runs it (see `crate::zil`):
     /// writes acknowledged since the tree was committed.
     pub log: Option<VolumeLog>,
+    /// The directory it is linked from (the root's is itself): a
+    /// directory's `..`.
+    pub parent: FileId,
+    /// Bumped by every change to the object (contents, entries,
+    /// attributes): NFS clients validate their caches on it. Unlike a
+    /// time, it never goes backwards, whichever node's clock is involved.
+    pub change: u64,
 }
 
 impl Dnode {
@@ -163,6 +170,8 @@ impl Dnode {
             attrs: Attrs::new(mode),
             props: None,
             log: None,
+            parent: 0,
+            change: 0,
         }
     }
 
@@ -331,6 +340,26 @@ pub(crate) struct Lookup {
     pub entry: Option<DirEntry>,
 }
 
+/// Refuse names a directory can't hold.
+pub(crate) fn check_name(name: &str) -> Result<(), FileSystemError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+    {
+        return Err(FileSystemError::InvalidArgument(format!(
+            "bad name '{}'",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// Longest name in a directory, in bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+
 impl<D: BlockDevice> FileSystem<D> {
     /// Bytes per object table record.
     pub(crate) fn table_blksz(&self) -> usize {
@@ -378,7 +407,13 @@ impl<D: BlockDevice> FileSystem<D> {
         );
         let leaf = id / DNODES_PER_LEAF;
         let mut slots = self.table_leaf(leaf).await?;
-        slots[(id % DNODES_PER_LEAF) as usize] = dnode;
+        let slot = &mut slots[(id % DNODES_PER_LEAF) as usize];
+        let mut dnode = dnode;
+        if let Some(d) = &mut dnode {
+            // Every rewrite is a change (callers only rewrite to change it).
+            d.change = slot.as_ref().map_or(0, |old| old.change) + 1;
+        }
+        *slot = dnode;
         if slots.iter().all(Option::is_none) {
             self.objects.put_record(leaf, Dirty::Hole);
             return Ok(());
@@ -519,6 +554,24 @@ impl<D: BlockDevice> FileSystem<D> {
         })
     }
 
+    /// Entry `name` of directory `dir`.
+    pub(crate) async fn lookup_at(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<Lookup, FileSystemError> {
+        let parent = self.read_dnode(dir).await?;
+        let index = self.read_dir(&parent).await?;
+        let entry = index.files.get(name).copied();
+        Ok(Lookup {
+            parent_id: dir,
+            parent,
+            index,
+            name: name.to_string(),
+            entry,
+        })
+    }
+
     /// What `path` names: its object number and dnode.
     pub async fn stat(&self, path: &Path) -> Result<(FileId, Dnode), FileSystemError> {
         let entry = self
@@ -543,12 +596,14 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn link_new(
         &self,
         mut l: Lookup,
-        dnode: Dnode,
+        mut dnode: Dnode,
     ) -> Result<FileId, FileSystemError> {
         if l.entry.is_some() {
             return Err(FileSystemError::AlreadyExists);
         }
+        check_name(&l.name)?;
         let id = self.alloc_object();
+        dnode.parent = l.parent_id;
         let kind = dnode.kind;
         self.write_dnode(id, Some(dnode)).await?;
         l.index.files.insert(l.name.clone(), DirEntry { id, kind });
@@ -574,41 +629,62 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(entry.id)
     }
 
-    /// Move `from` to `to` (under `begin_tx`). `to` may replace a file
-    /// with a file or an empty directory with a directory (it is freed).
-    /// Returns the moved object's number, and the replaced one's.
+    /// Move `from` to `to` (under `begin_tx`); see `rename_at_locked`.
     pub(crate) async fn rename_locked(
         &self,
         from: &Path,
         to: &Path,
     ) -> Result<(FileId, Option<FileId>), FileSystemError> {
-        let (fc, tc) = (path_components(from), path_components(to));
         let src = self.lookup(from).await?;
+        let dst = self.lookup(to).await?;
+        self.rename_at_locked(src, dst).await
+    }
+
+    /// Move `src`'s entry to `dst` (both from `lookup`, under `begin_tx`).
+    /// `dst` may replace a file with a file or an empty directory with a
+    /// directory (it is freed). Returns the moved object's number, and the
+    /// replaced one's.
+    pub(crate) async fn rename_at_locked(
+        &self,
+        src: Lookup,
+        mut dst: Lookup,
+    ) -> Result<(FileId, Option<FileId>), FileSystemError> {
         let moved = src.entry.ok_or(FileSystemError::FileNotFound)?;
         if moved.kind == ObjType::Volume {
             return Err(FileSystemError::InvalidArgument(
                 "volumes can't be renamed".into(),
             ));
         }
-        if fc == tc {
+        if src.parent_id == dst.parent_id && src.name == dst.name {
             return Ok((moved.id, None));
         }
-        if moved.kind == ObjType::Directory && tc.starts_with(&fc) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "can't move {} inside itself",
-                from.display()
-            )));
+        check_name(&dst.name)?;
+        if moved.kind == ObjType::Directory {
+            // Not into itself: walk up from the destination.
+            let mut at = dst.parent_id;
+            for _ in 0..4096 {
+                if at == moved.id {
+                    return Err(FileSystemError::InvalidArgument(format!(
+                        "can't move '{}' inside itself",
+                        src.name
+                    )));
+                }
+                if at == ROOT_OBJECT {
+                    break;
+                }
+                at = self.read_dnode(at).await?.parent;
+            }
         }
-        let mut dst = self.lookup(to).await?;
         let replaced = match dst.entry {
             None => None,
+            Some(t) if t.id == moved.id => return Ok((moved.id, None)),
             Some(t) => {
                 let target = self.read_dnode(t.id).await?;
                 match (moved.kind, t.kind) {
                     (_, ObjType::Volume) => {
                         return Err(FileSystemError::InvalidArgument(format!(
-                            "{} is a volume",
-                            to.display()
+                            "'{}' is a volume",
+                            dst.name
                         )));
                     }
                     (ObjType::File, ObjType::File) => {}
@@ -616,7 +692,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         if !self.read_dir(&target).await?.files.is_empty() {
                             return Err(FileSystemError::InvalidArgument(format!(
                                 "directory '{}' isn't empty",
-                                to.display()
+                                dst.name
                             )));
                         }
                     }
@@ -644,9 +720,59 @@ impl<D: BlockDevice> FileSystem<D> {
                 .await?;
         }
         let mut d = self.read_dnode(moved.id).await?;
+        d.parent = dst.parent_id;
         d.attrs.ctime_ns = now_ns();
         self.write_dnode(moved.id, Some(d)).await?;
         Ok((moved.id, replaced))
+    }
+
+    /// Create a file or directory `name` in directory `dir` (under
+    /// `begin_tx`) with attributes `attrs` (mode, owner; unset: defaults). An existing one of the same
+    /// kind is fine, unless `exclusive`: then only if it was created with
+    /// the same `verifier` (a retransmitted exclusive create). Returns its
+    /// number and whether it is new.
+    pub(crate) async fn create_at_locked(
+        &self,
+        dir: FileId,
+        name: &str,
+        kind: ObjType,
+        attrs: &SetAttrs,
+        exclusive: Option<u64>,
+    ) -> Result<(FileId, bool), FileSystemError> {
+        let l = self.lookup_at(dir, name).await?;
+        if let Some(e) = l.entry {
+            let d = self.read_dnode(e.id).await?;
+            if d.kind != kind {
+                return Err(FileSystemError::AlreadyExists);
+            }
+            return match exclusive {
+                Some(v) if d.attrs.mtime_ns != v => Err(FileSystemError::AlreadyExists),
+                _ => Ok((e.id, false)),
+            };
+        }
+        let mut dnode = match kind {
+            ObjType::File => Dnode::file(self.file_blksz()),
+            ObjType::Directory => Dnode::directory(self.file_blksz()),
+            ObjType::Volume => {
+                return Err(FileSystemError::InvalidArgument(
+                    "volumes are made with `volume create`".into(),
+                ));
+            }
+        };
+        if let Some(m) = attrs.mode {
+            dnode.attrs.mode = m & 0o7777;
+        }
+        dnode.attrs.uid = attrs.uid.unwrap_or(0);
+        dnode.attrs.gid = attrs.gid.unwrap_or(0);
+        if let Some(t) = attrs.mtime_ns {
+            dnode.attrs.mtime_ns = t;
+        }
+        if let Some(v) = exclusive {
+            // Where an exclusive create's verifier is kept (NFS does this
+            // too): the caller sets the real times afterwards.
+            dnode.attrs.mtime_ns = v;
+        }
+        Ok((self.link_new(l, dnode).await?, true))
     }
 
     /// Change `path`'s attributes (under `begin_tx`). Returns its number.
@@ -655,7 +781,18 @@ impl<D: BlockDevice> FileSystem<D> {
         path: &Path,
         set: &SetAttrs,
     ) -> Result<FileId, FileSystemError> {
-        let (id, mut d) = self.stat(path).await?;
+        let (id, _) = self.stat(path).await?;
+        self.set_attrs_id_locked(id, set).await?;
+        Ok(id)
+    }
+
+    /// Change object `id`'s attributes (under `begin_tx`).
+    pub(crate) async fn set_attrs_id_locked(
+        &self,
+        id: FileId,
+        set: &SetAttrs,
+    ) -> Result<(), FileSystemError> {
+        let mut d = self.read_dnode(id).await?;
         if let Some(m) = set.mode {
             d.attrs.mode = m & 0o7777;
         }
@@ -669,8 +806,7 @@ impl<D: BlockDevice> FileSystem<D> {
             d.attrs.mtime_ns = t;
         }
         d.attrs.ctime_ns = now_ns();
-        self.write_dnode(id, Some(d)).await?;
-        Ok(id)
+        self.write_dnode(id, Some(d)).await
     }
 
     /// Point file `id` at new contents (under `begin_tx`), freeing the old.

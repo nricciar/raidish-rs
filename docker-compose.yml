@@ -92,6 +92,21 @@ services:
       node1: { condition: service_healthy }
       node2: { condition: service_healthy }
 
+  # Optional (`docker compose --profile nfs-test up -d nfs-client`): a
+  # privileged container with the NFS client tools, to mount the nodes'
+  # NFS servers, e.g.
+  #   docker compose exec nfs-client mount -t nfs \
+  #     -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock node0:/ /mnt
+  nfs-client:
+    profiles: ["nfs-test"]
+    build:
+      context: docker
+      dockerfile: nfs-client.Dockerfile
+    privileged: true
+    entrypoint: ["sleep", "infinity"]
+    depends_on:
+      init: { condition: service_completed_successfully }
+
 volumes:
   node0:
   node1:

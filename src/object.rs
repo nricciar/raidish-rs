@@ -92,6 +92,21 @@ impl DirtyState {
             .get(&idx)
             .or_else(|| self.syncing.as_ref().and_then(|s| s.get(&idx)))
     }
+
+    /// Unsynced records at `idx` or later: whether each holds data.
+    fn from(&self, idx: u64) -> BTreeMap<u64, bool> {
+        let mut out = BTreeMap::new();
+        // Being synced first; newer writes over them.
+        if let Some(syncing) = &self.syncing {
+            for (&i, d) in syncing.range(idx..) {
+                out.insert(i, matches!(d, Dirty::Data(_)));
+            }
+        }
+        for (&i, d) in self.records.range(idx..) {
+            out.insert(i, matches!(d, Dirty::Data(_)));
+        }
+        out
+    }
 }
 
 /// Committed data records, keyed like the indirect cache by (lba, birth_txg)
@@ -1055,6 +1070,45 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The allocated data records of a committed tree at index `first` or
     /// later, in index order (subtrees wholly before `first` aren't read).
+    /// The first byte at `offset` or after that is data (`data`) or in a
+    /// hole, by record (unsynced writes included); None: there is none
+    /// before the end. `offset` must be within the object.
+    pub(crate) async fn object_seek(
+        &self,
+        obj: &ObjTree,
+        offset: u64,
+        data: bool,
+    ) -> Result<Option<u64>, FileSystemError> {
+        let size = obj.size();
+        let bs = obj.blksz as u64;
+        let (start, last) = (offset / bs, size.saturating_sub(1) / bs);
+        let mut held: std::collections::BTreeSet<u64> = self
+            .tree_leaves_from(obj, &obj.root(), start)
+            .await?
+            .into_iter()
+            .map(|(i, _)| i)
+            .filter(|&i| i <= last)
+            .collect();
+        let dirty = obj.dirty.lock().unwrap().from(start);
+        for (i, is_data) in dirty {
+            if is_data && i <= last {
+                held.insert(i);
+            } else {
+                held.remove(&i);
+            }
+        }
+        let found = if data {
+            held.range(start..).next().copied()
+        } else {
+            let mut i = start;
+            while i <= last && held.contains(&i) {
+                i += 1;
+            }
+            (i <= last).then_some(i)
+        };
+        Ok(found.map(|i| (i * bs).max(offset)))
+    }
+
     async fn tree_leaves_from(
         &self,
         obj: &ObjTree,
@@ -1069,7 +1123,10 @@ impl<D: BlockDevice> FileSystem<D> {
             .collect();
         while let Some((ptr, level, base)) = stack.pop() {
             if level == 0 {
-                out.push((base, ptr));
+                // (A tree of no levels is just record 0.)
+                if base >= first {
+                    out.push((base, ptr));
+                }
                 continue;
             }
             let ind = self.load_indirect(obj, &ptr).await?;

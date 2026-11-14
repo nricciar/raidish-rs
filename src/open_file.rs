@@ -59,7 +59,27 @@ impl<D: BlockDevice> FileSystem<D> {
         if self.writer.is_some() {
             self.reload_root_index().await?;
         }
-        let (id, dnode) = self.stat_file(path).await?;
+        let (id, _) = self.stat_file(path).await?;
+        self.open_file_id(id, lease).await
+    }
+
+    /// `open_file` by object number. Opening an open file returns the same
+    /// one (with `lease`, if given).
+    pub async fn open_file_id(
+        &self,
+        id: FileId,
+        lease: Option<ObjLease>,
+    ) -> Result<Arc<OpenFile>, FileSystemError> {
+        if let Some(f) = self.files.lock().unwrap().get(&id).cloned() {
+            if lease.is_some() {
+                *f.lease.lock().unwrap() = lease;
+            }
+            return Ok(f);
+        }
+        let dnode = self.read_dnode(id).await?;
+        if !dnode.is_file() {
+            return Err(FileSystemError::NotAFile);
+        }
         let mut files = self.files.lock().unwrap();
         let f = files
             .entry(id)
@@ -118,6 +138,34 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
+    /// Zero `len` bytes at `offset` (within the file: it doesn't grow).
+    /// Whole records become holes and give their space back when synced.
+    pub async fn file_zero(
+        &self,
+        f: &OpenFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), FileSystemError> {
+        let size = f.size();
+        if offset >= size || len == 0 {
+            return Ok(());
+        }
+        let len = len.min(size - offset).min(usize::MAX as u64) as usize;
+        self.object_modify(&f.obj, offset, len, None).await?;
+        Ok(())
+    }
+
+    /// Where the next data (`data`) or hole is at or after `offset` (see
+    /// `object_seek`).
+    pub async fn file_seek(
+        &self,
+        f: &OpenFile,
+        offset: u64,
+        data: bool,
+    ) -> Result<Option<u64>, FileSystemError> {
+        self.object_seek(&f.obj, offset, data).await
+    }
+
     /// Return once everything written to `f` so far is committed. Fails
     /// with `Conflict` if its writes were dropped because the file was
     /// replaced or deleted meanwhile (`f` is closed then).
@@ -141,6 +189,11 @@ impl<D: BlockDevice> FileSystem<D> {
         let r = self.file_sync(f).await;
         self.files.lock().unwrap().remove(&f.id);
         r
+    }
+
+    /// The file `id`, if it's open here.
+    pub fn opened(&self, id: FileId) -> Option<Arc<OpenFile>> {
+        self.files.lock().unwrap().get(&id).cloned()
     }
 
     /// Forget an open file without syncing it (it was deleted).

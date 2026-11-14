@@ -443,6 +443,7 @@ pub async fn main() -> std::io::Result<()> {
         let slot: crate::committer::CommitterSlot = Default::default();
         let agent_state: crate::agent::AgentState = Default::default();
         let files: crate::files_api::WriterSlot = Default::default();
+        let mut nfs_backend = None;
         let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
@@ -489,6 +490,35 @@ pub async fn main() -> std::io::Result<()> {
                 files.clone(),
             );
             tokio::spawn(agent.run());
+            if let Some(nfs) = &config.nfs {
+                let slot = files.clone();
+                let leases = cluster::lease::LeaseClient::new(vec![me.clone()]);
+                let mut peers = crate::nfs::peers::ClusterPeers::new(node.clone(), leases.clone());
+                if nfs.reachable() {
+                    peers = peers.with_locations(nfs.advertised(), nfs.port.unwrap_or(2049));
+                }
+                let peers = std::sync::Arc::new(peers);
+                let backend = std::sync::Arc::new(
+                    crate::nfs::backend::Backend::new(
+                        std::sync::Arc::new(move || slot.read().unwrap().clone()),
+                        Some(std::sync::Arc::new(leases)),
+                        name.clone(),
+                    )
+                    .with_peers(peers.clone()),
+                );
+                match crate::nfs::start(&nfs.addr(), backend.clone(), Some(peers.clone())).await {
+                    Ok((addr, v4)) => {
+                        println!("nfs: serving NFSv3 and NFSv4.1 on {}", addr);
+                        tokio::spawn(crate::nfs::peers::own_v4_state(
+                            v4.clone(),
+                            peers,
+                            name.clone(),
+                        ));
+                        nfs_backend = Some((backend, v4));
+                    }
+                    Err(e) => fail(format!("nfs: {}: {}", nfs.addr(), e)),
+                }
+            }
         }
         let auth = crate::auth::AuthState(config.tls.as_ref().map(|t| {
             crate::auth::Verifier::from_config(t, &config.auth)
@@ -510,6 +540,7 @@ pub async fn main() -> std::io::Result<()> {
             files,
             config.tls.as_ref(),
             auth,
+            nfs_backend,
         )
         .await;
         return Ok(());

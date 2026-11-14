@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV18";
+pub const FS_ID: &str = "RAIDISHV20";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -480,8 +480,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }));
         let root = fs.alloc_object();
         debug_assert_eq!(root, ROOT_OBJECT);
-        fs.write_dnode(root, Some(Dnode::directory(fs.file_blksz())))
-            .await?;
+        let mut dir = Dnode::directory(fs.file_blksz());
+        dir.parent = ROOT_OBJECT;
+        fs.write_dnode(root, Some(dir)).await?;
         fs.commit_txg().await?;
 
         Ok(fs)
@@ -833,6 +834,149 @@ impl<D: BlockDevice> FileSystem<D> {
         let id = self.set_attrs_locked(path, set).await?;
         self.commit_locked().await?;
         Ok(id)
+    }
+
+    // ---- by object number (what NFS speaks) ----
+
+    /// Entry `name` of directory `dir`: its number and dnode (None: no such
+    /// entry).
+    pub async fn lookup_in(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<Option<(FileId, Dnode)>, FileSystemError> {
+        match self.lookup_at(dir, name).await?.entry {
+            Some(e) => Ok(Some((e.id, self.read_dnode(e.id).await?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Create file or directory `name` in `dir` (see `create_at_locked`).
+    pub async fn create_at(
+        &self,
+        dir: FileId,
+        name: &str,
+        kind: crate::inode::ObjType,
+        attrs: &crate::inode::SetAttrs,
+        exclusive: Option<u64>,
+    ) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let op = crate::writer::FsOp::CreateAt {
+                dir,
+                name: name.to_string(),
+                kind,
+                attrs: attrs.clone(),
+                exclusive,
+            };
+            return Ok(self.writer_commit_fs(&w, op, None).await?.file_id);
+        }
+        let _tx = self.begin_tx().await;
+        let (id, created) = self
+            .create_at_locked(dir, name, kind, attrs, exclusive)
+            .await?;
+        if created {
+            self.commit_locked().await?;
+        }
+        Ok(id)
+    }
+
+    /// Remove entry `name` of `dir` (a directory must be empty).
+    pub async fn remove_at(&self, dir: FileId, name: &str) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let _tx = self.begin_tx().await;
+            self.reload_root_index().await?;
+            let id = self
+                .lookup_at(dir, name)
+                .await?
+                .entry
+                .ok_or(FileSystemError::FileNotFound)?
+                .id;
+            let op = crate::writer::FsOp::RemoveAt {
+                dir,
+                name: name.to_string(),
+                id,
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(id);
+        }
+        let _tx = self.begin_tx().await;
+        let id = self.remove_at_locked(dir, name).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// `remove_at` under `begin_tx`, without committing.
+    pub(crate) async fn remove_at_locked(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<FileId, FileSystemError> {
+        let l = self.lookup_at(dir, name).await?;
+        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        if entry.kind == crate::inode::ObjType::Volume {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a volume (delete it with `volume delete`)",
+                name
+            )));
+        }
+        self.discard_file(entry.id);
+        self.unlink(l).await
+    }
+
+    /// Move entry `from_name` of `from_dir` to `to_name` in `to_dir` (see
+    /// `rename_at_locked`). Returns the moved object's number.
+    pub async fn rename_at(
+        &self,
+        from_dir: FileId,
+        from_name: &str,
+        to_dir: FileId,
+        to_name: &str,
+    ) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let _tx = self.begin_tx().await;
+            self.reload_root_index().await?;
+            let id = self
+                .lookup_at(from_dir, from_name)
+                .await?
+                .entry
+                .ok_or(FileSystemError::FileNotFound)?
+                .id;
+            let op = crate::writer::FsOp::RenameAt {
+                from_dir,
+                from_name: from_name.to_string(),
+                to_dir,
+                to_name: to_name.to_string(),
+                id,
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(id);
+        }
+        let _tx = self.begin_tx().await;
+        let src = self.lookup_at(from_dir, from_name).await?;
+        let dst = self.lookup_at(to_dir, to_name).await?;
+        let (id, _) = self.rename_at_locked(src, dst).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// Change object `id`'s mode, owner or modification time.
+    pub async fn set_attrs_id(
+        &self,
+        id: FileId,
+        set: &crate::inode::SetAttrs,
+    ) -> Result<(), FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let op = crate::writer::FsOp::SetAttrId {
+                id,
+                attrs: set.clone(),
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(());
+        }
+        let _tx = self.begin_tx().await;
+        self.set_attrs_id_locked(id, set).await?;
+        self.commit_locked().await?;
+        Ok(())
     }
 
     /// `delete` under `begin_tx`, without committing.

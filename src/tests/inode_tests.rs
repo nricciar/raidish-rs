@@ -138,3 +138,41 @@ async fn fsck_reports_namespace_damage() {
         report
     );
 }
+
+/// Every change to an object bumps its change counter, which never goes
+/// backwards (and survives a reload).
+#[tokio::test]
+async fn the_change_counter_goes_up_with_every_change() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    let change = |d: &Dnode| d.change;
+    let root0 = change(&fs.read_dnode(ROOT_OBJECT).await.unwrap());
+    fs.write_file(Path::new("/f"), b"one").await.unwrap();
+    let root1 = change(&fs.read_dnode(ROOT_OBJECT).await.unwrap());
+    assert!(root1 > root0, "creating an entry changes the directory");
+    let (id, d) = fs.stat(Path::new("/f")).await.unwrap();
+    let f1 = change(&d);
+
+    fs.write_file(Path::new("/f"), b"two").await.unwrap();
+    let f2 = change(&fs.read_dnode(id).await.unwrap());
+    assert!(f2 > f1, "contents");
+    fs.set_attrs(
+        Path::new("/f"),
+        &SetAttrs {
+            mode: Some(0o600),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let f3 = change(&fs.read_dnode(id).await.unwrap());
+    assert!(f3 > f2, "attributes");
+    // Replacing a file's contents doesn't change its directory.
+    assert_eq!(change(&fs.read_dnode(ROOT_OBJECT).await.unwrap()), root1);
+    drop(fs);
+
+    let fs = pool.load().await;
+    assert_eq!(change(&fs.read_dnode(id).await.unwrap()), f3);
+    fs.rename(Path::new("/f"), Path::new("/g")).await.unwrap();
+    assert!(change(&fs.read_dnode(id).await.unwrap()) > f3, "renamed");
+}

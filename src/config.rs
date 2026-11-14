@@ -45,6 +45,9 @@ pub struct Config {
     /// Who may do what once `tls` is on (see `crate::auth`).
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+    /// Serve the pool over NFS from `listen` (see `crate::nfs`). Absent: no
+    /// NFS server.
+    pub nfs: Option<crate::nfs::NfsConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
