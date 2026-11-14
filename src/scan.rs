@@ -23,7 +23,8 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError, LabelState, parse_label};
-use crate::fsck::{NoVisitor, Node, ObjKind};
+use crate::fsck::{Node, table_node};
+use crate::object::TreeRoot;
 use crate::vdev::StripeCheck;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -197,7 +198,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             };
             self.scan_hold.fetch_add(1, Ordering::SeqCst);
-            (self.root_ptr.lock().await.clone(), misses, since)
+            (self.objects.root(), misses, since)
         };
 
         let mut report = ScanReport {
@@ -250,17 +251,13 @@ impl<D: BlockDevice> FileSystem<D> {
     /// rewritten.
     async fn scan_tree(
         &self,
-        root: Vec<BlockPtr>,
+        root: TreeRoot,
         since: u64,
         repair: &(dyn Fn(&BlockPtr) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) -> Result<(), FileSystemError> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
-        let mut stack = vec![Node::Object {
-            ptrs: root,
-            kind: ObjKind::RootIndex,
-            path: "/".to_string(),
-        }];
+        let mut stack: Vec<Node> = table_node(&root).into_iter().collect();
 
         while let Some(node) = stack.pop() {
             if !self.read_only
@@ -270,69 +267,26 @@ impl<D: BlockDevice> FileSystem<D> {
                 report.aborted = Some("pool almost full (scan holds freed space)".into());
                 return Ok(());
             }
-            match node {
-                Node::Object { ptrs, kind, path } => {
-                    if ptrs.is_empty() {
-                        continue;
-                    }
-                    if ptrs.iter().all(|p| p.birth_txg < since) {
-                        report.pruned += ptrs.len() as u64;
-                        continue;
-                    }
-                    let mut data = Vec::new();
-                    let mut complete = true;
-                    for ptr in &ptrs {
-                        match self.scan_record(ptr, repair(ptr), report).await {
-                            Some(d) => data.extend_from_slice(&d),
-                            None => {
-                                report.errors.push(format!(
-                                    "{} ({:?}): record at {} unreadable",
-                                    path, kind, ptr.lba
-                                ));
-                                complete = false;
-                            }
-                        }
-                    }
-                    if complete {
-                        self.descend(kind, &path, &data, &mut stack, report);
-                    }
-                }
-                Node::Volume { ptr, level, path } => {
-                    if ptr.birth_txg < since {
-                        report.pruned += 1;
-                        continue;
-                    }
-                    let Some(data) = self.scan_record(&ptr, repair(&ptr), report).await else {
-                        report.errors.push(format!(
-                            "{} (volume L{}): record at {} unreadable",
-                            path, level, ptr.lba
-                        ));
-                        continue;
-                    };
-                    if level > 0 {
-                        match crate::fsck::expand_indirect(level, &path, &data) {
-                            Ok(children) => stack.extend(children),
-                            Err(e) => report.errors.push(e),
-                        }
-                    }
+            // Copy-on-write: nothing under a record is newer than it.
+            if node.ptr.birth_txg < since {
+                report.pruned += 1;
+                continue;
+            }
+            let Some(data) = self.scan_record(&node.ptr, repair(&node.ptr), report).await else {
+                report.errors.push(format!(
+                    "{} ({:?}): record at {} unreadable",
+                    node.owner, node.kind, node.ptr.lba
+                ));
+                continue;
+            };
+            if node.kind.is_metadata() {
+                match crate::fsck::expand(&node, &data) {
+                    Ok((children, _)) => stack.extend(children),
+                    Err(e) => report.errors.push(e),
                 }
             }
         }
         Ok(())
-    }
-
-    fn descend(
-        &self,
-        kind: ObjKind,
-        path: &str,
-        data: &[u8],
-        stack: &mut Vec<Node>,
-        report: &mut ScanReport,
-    ) {
-        match crate::fsck::expand(kind, path, data, &mut NoVisitor) {
-            Ok(children) => stack.extend(children),
-            Err(e) => report.errors.push(e),
-        }
     }
 
     /// Read one record (checksum verified, rebuilt from parity if needed),
@@ -401,7 +355,7 @@ impl<D: BlockDevice> FileSystem<D> {
             repair: true,
             ..Default::default()
         };
-        self.scan_tree(newest.root.clone(), since, &in_lent, &mut report)
+        self.scan_tree(newest.objects.clone(), since, &in_lent, &mut report)
             .await?;
         Ok(Some(report))
     }

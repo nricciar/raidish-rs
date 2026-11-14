@@ -622,7 +622,13 @@ async fn file_commits_are_compare_and_swap() {
     let stale_delete = FsCommit {
         op: FsOp::Delete {
             path: "f".into(),
-            base: Some(vec![]),
+            base: Some((
+                0,
+                crate::object::TreeRoot {
+                    ptr: None,
+                    levels: 0,
+                },
+            )),
         },
         ..first.clone()
     };
@@ -633,12 +639,12 @@ async fn file_commits_are_compare_and_swap() {
     // Space outside what was lent: refused.
     let mut wild = first.clone();
     if let FsOp::WriteFile {
-        path, blocks, base, ..
+        path, allocs, base, ..
     } = &mut wild.op
     {
         *path = "g".into();
         *base = None;
-        blocks[0].lba = s.committer.fs.layout.data_start;
+        allocs[0].0 = s.committer.fs.layout.data_start;
     }
     assert!(matches!(
         s.committer.commit_fs(&wild).await,
@@ -659,6 +665,77 @@ async fn file_commits_are_compare_and_swap() {
         pattern(2000, 2)
     );
     assert!(fs.read_file(Path::new("g")).await.is_err());
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Writes at an offset from a writer: the committer applies them with a
+/// compare-and-swap on the tree they were made on; a resend is
+/// acknowledged, a stale one refused, and the writer's own sync of writes
+/// made on a file replaced meanwhile fails with a conflict.
+#[tokio::test]
+async fn offset_writes_are_compare_and_swap() {
+    let s = setup(&[]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Recording {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource.clone(),
+            epoch,
+        },
+        last: Default::default(),
+        last_fs: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+        .await
+        .unwrap();
+    let mut expect = pattern(200_000, 1);
+    fs.write_file(Path::new("f"), &expect).await.unwrap();
+
+    let f = fs.open_file(Path::new("f"), None).await.unwrap();
+    fs.file_write(&f, 150_000, b"middle").await.unwrap();
+    fs.file_sync(&f).await.unwrap();
+    expect[150_000..150_006].copy_from_slice(b"middle");
+    let update = sink.last_fs.lock().unwrap().clone().unwrap();
+    assert!(matches!(update.op, FsOp::UpdateFile { .. }));
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        expect
+    );
+
+    // Resent: acknowledged, nothing changes.
+    s.committer.commit_fs(&update).await.unwrap();
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        expect
+    );
+
+    // Replaced by someone else: the old update is refused, and writes
+    // made on the old contents are dropped, not written over the new.
+    s.committer
+        .fs
+        .write_file(Path::new("f"), b"theirs")
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.committer.commit_fs(&update).await,
+        Err(CommitError::Refused(_))
+    ));
+    fs.file_write(&f, 0, b"mine").await.unwrap();
+    assert!(matches!(
+        fs.file_sync(&f).await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        b"theirs"
+    );
+
+    fs.return_metaslabs().await;
+    drop(fs);
+    let fs = s.pool.load().await;
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"theirs");
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }

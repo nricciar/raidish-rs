@@ -245,3 +245,180 @@ async fn uploads_are_refused_cleanly() {
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
+
+#[test]
+fn ranges_parse() {
+    use ByteRange::*;
+    let p = |h: &str| parse_range(Some(h), 1000);
+    assert_eq!(parse_range(None, 1000), All);
+    assert_eq!(p("bytes=0-99"), Part(0..100));
+    assert_eq!(p("bytes=900-"), Part(900..1000));
+    assert_eq!(p("bytes=-10"), Part(990..1000));
+    assert_eq!(p("bytes=-5000"), Part(0..1000));
+    assert_eq!(p("bytes=990-5000"), Part(990..1000));
+    assert_eq!(p("bytes=1000-"), Unsatisfiable);
+    assert_eq!(p("bytes=-0"), Unsatisfiable);
+    // Ignored: another unit, several ranges, garbage, reversed.
+    for h in [
+        "items=0-1",
+        "bytes=0-1,5-9",
+        "bytes=x-y",
+        "bytes=9-3",
+        "bytes",
+    ] {
+        assert_eq!(p(h), All, "{}", h);
+    }
+    assert_eq!(parse_range(Some("bytes=0-"), 0), Unsatisfiable);
+}
+
+async fn get_range(c: &Client, uri: &str, range: &str) -> (Status, Option<String>, Vec<u8>) {
+    let r = c
+        .get(uri.to_string())
+        .header(rocket::http::Header::new("Range", range.to_string()))
+        .dispatch()
+        .await;
+    let status = r.status();
+    let cr = r.headers().get_one("Content-Range").map(String::from);
+    (status, cr, r.into_bytes().await.unwrap_or_default())
+}
+
+async fn patch(c: &Client, path_query: &str, body: &[u8]) -> (Status, Option<Written>) {
+    let r = c
+        .patch(format!("/api/v1/files/{}", path_query))
+        .body(body)
+        .dispatch()
+        .await;
+    let status = r.status();
+    (status, r.into_json().await)
+}
+
+#[tokio::test]
+async fn range_reads() {
+    let s = setup().await;
+    let (a, _wa) = node(&s, "a", true).await;
+    let (b, _wb) = node(&s, "b", true).await;
+    let data = pattern(MB / 2 + 33, 3);
+    assert_eq!(put(&a, "/api/v1/files/f", &data).await, Status::Ok);
+    let n = data.len();
+
+    let r = b.get("/api/v1/files/f").dispatch().await;
+    assert_eq!(r.status(), Status::Ok);
+    assert_eq!(r.headers().get_one("Accept-Ranges"), Some("bytes"));
+
+    let (st, cr, body) = get_range(&b, "/api/v1/files/f", "bytes=100-199").await;
+    assert_eq!(st, Status::PartialContent);
+    assert_eq!(cr.as_deref(), Some(format!("bytes 100-199/{}", n).as_str()));
+    assert_eq!(body, data[100..200]);
+    // Across records, to the end, and the last few bytes.
+    let (_, _, body) = get_range(&b, "/api/v1/files/f", "bytes=120000-400000").await;
+    assert_eq!(body, data[120000..=400000]);
+    let (_, _, body) = get_range(&b, "/api/v1/files/f", "bytes=300000-").await;
+    assert_eq!(body, data[300000..]);
+    let (_, cr, body) = get_range(&b, "/api/v1/files/f", "bytes=-7").await;
+    assert_eq!(body, data[n - 7..]);
+    assert_eq!(
+        cr.as_deref(),
+        Some(format!("bytes {}-{}/{}", n - 7, n - 1, n).as_str())
+    );
+    let (st, _, _) = get_range(&b, "/api/v1/files/f", &format!("bytes={}-", n)).await;
+    assert_eq!(st, Status::RangeNotSatisfiable);
+}
+
+#[tokio::test]
+async fn partial_writes_rename_and_attributes() {
+    let s = setup().await;
+    let (a, wa) = node(&s, "a", true).await;
+    let (b, wb) = node(&s, "b", true).await;
+    let mut expect = pattern(300_000, 4);
+    assert_eq!(put(&a, "/api/v1/dir/d", b"").await, Status::Ok);
+    assert_eq!(put(&a, "/api/v1/files/d/f", &expect).await, Status::Ok);
+    let id = ls(&a, "/api/v1/dir/d").await[0].id;
+
+    // Write in the middle and past the end, from the other node.
+    let (st, _) = patch(&b, "d/f?offset=1000", b"hello").await;
+    assert_eq!(st, Status::Ok);
+    expect[1000..1005].copy_from_slice(b"hello");
+    let (_, w) = patch(&b, "d/f?offset=300000", &pattern(5000, 5)).await;
+    let w = w.unwrap();
+    assert_eq!((w.id, w.size), (id, 305_000));
+    expect.extend_from_slice(&pattern(5000, 5));
+    assert_eq!(
+        get(&a, "/api/v1/files/d/f").await,
+        (Status::Ok, expect.clone())
+    );
+
+    // Truncate (no body), then grow with zeros.
+    assert_eq!(patch(&a, "d/f?size=2000", b"").await.0, Status::Ok);
+    expect.truncate(2000);
+    assert_eq!(get(&b, "/api/v1/files/d/f").await.1, expect);
+    assert_eq!(
+        patch(&b, "d/f?offset=0&size=3000", b"AB").await.0,
+        Status::Ok
+    );
+    expect[..2].copy_from_slice(b"AB");
+    expect.resize(3000, 0);
+    assert_eq!(get(&a, "/api/v1/files/d/f").await.1, expect);
+    assert_eq!(patch(&a, "d/f?offset=0", b"x").await.0, Status::Ok);
+    expect[0] = b'x';
+    // Not there: nothing is created.
+    assert_eq!(patch(&b, "d/nope?offset=0", b"x").await.0, Status::NotFound);
+
+    // Rename (into a new directory), from either node.
+    assert_eq!(put(&b, "/api/v1/dir/e", b"").await, Status::Ok);
+    let r = b
+        .post("/api/v1/rename")
+        .json(&RenameRequest {
+            from: "d/f".into(),
+            to: "e/g".into(),
+        })
+        .dispatch()
+        .await;
+    assert_eq!(r.status(), Status::Ok);
+    assert_eq!(r.into_json::<FileId>().await, Some(id));
+    assert_eq!(get(&a, "/api/v1/files/d/f").await.0, Status::NotFound);
+    assert_eq!(get(&a, "/api/v1/files/e/g").await.1, expect);
+
+    // Attributes.
+    let status = a
+        .patch("/api/v1/attrs/e/g")
+        .json(&crate::inode::SetAttrs {
+            mode: Some(0o640),
+            uid: Some(33),
+            ..Default::default()
+        })
+        .dispatch()
+        .await
+        .status();
+    assert_eq!(status, Status::Ok);
+    let st: Stat = b
+        .get("/api/v1/stat/e/g")
+        .dispatch()
+        .await
+        .into_json()
+        .await
+        .unwrap();
+    assert_eq!((st.id, st.kind.as_str(), st.size), (id, "file", 3000));
+    assert_eq!((st.mode, st.uid, st.nlink), (0o640, 33, 1));
+    assert_eq!(ls(&b, "/api/v1/dir/e").await[0].mode, 0o640);
+
+    for w in [wa, wb].into_iter().flatten() {
+        w.return_metaslabs().await;
+    }
+    drop((a, b));
+    let fs = s.pool.load().await;
+    assert_eq!(fs.read_file(Path::new("e/g")).await.unwrap(), expect);
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// A partial write is refused while someone else holds the file's lease.
+#[tokio::test]
+async fn partial_writes_respect_object_leases() {
+    let s = setup().await;
+    let (a, _wa) = node(&s, "a", true).await;
+    assert_eq!(put(&a, "/api/v1/files/f", b"0123456789").await, Status::Ok);
+    let id = ls(&a, "/api/v1/dir").await[0].id;
+    lease(&s.auth, &crate::committer::object_resource(id), "someone").await;
+    assert_eq!(patch(&a, "f?offset=2", b"xx").await.0, Status::Conflict);
+    assert_eq!(get(&a, "/api/v1/files/f").await.1, b"0123456789");
+}

@@ -712,9 +712,8 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Inode { file } => {
             let fs = open_fs(raid, true, rewind).await;
-            let inode_ref = fs.file_index.read().await.files.get(&file).unwrap().clone();
-            let inode = fs.read_inode(&inode_ref).await.unwrap();
-            println!("inode: {:?}", inode);
+            let (id, dnode) = fs.stat(Path::new(&file)).await.unwrap();
+            println!("object {}: {:?}", id, dnode);
         }
         Commands::Write { source, dest } => {
             let fs = open_fs(raid, false, rewind).await;
@@ -758,7 +757,7 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Load => {
             let fs = open_fs(raid, true, rewind).await;
-            println!("index: {:?}", fs.file_index);
+            println!("root: {:?}", fs.ls(Path::new("")).await.unwrap());
         }
         Commands::Volume { command } => {
             let read_only = matches!(command, VolumeCommands::List);

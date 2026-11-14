@@ -47,6 +47,8 @@ mod mirror;
 mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
 mod nvme;
+mod object;
+pub mod open_file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pki;
 mod raidz;

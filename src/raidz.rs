@@ -88,8 +88,9 @@ impl BlockDevice for RaidZ {
 
             let mut stripe_buf = stripe_buf_arc.lock().await;
 
-            // Check if already flushed
-            if stripe_buf.flushed && !stripe_buf.dirty {
+            // Already written by a concurrent flush (or replaced by a full
+            // stripe write) while we waited for it.
+            if stripe_buf.retired || (stripe_buf.flushed && !stripe_buf.dirty) {
                 continue;
             }
 
@@ -125,12 +126,17 @@ impl BlockDevice for RaidZ {
             let data = stripe_buf.data.as_ref().expect("stripe without data");
             self.write_encoded(stripe_id, data).await.map_err(io_err)?;
 
+            // Retire it: a write that picked this buffer up before it
+            // leaves the map starts a new one instead of writing into this
+            // (whose contents are now on disk and never flushed again).
+            stripe_buf.retired = true;
             if let Some(buffer) = stripe_buf.take_buffer() {
                 let _ = self.stripe_pool.push(buffer);
             }
 
             drop(stripe_buf);
-            self.writes.remove(&stripe_id);
+            self.writes
+                .remove_if(&stripe_id, |_, v| Arc::ptr_eq(v, &stripe_buf_arc));
         }
 
         // Like stripe writes, flushing tolerates up to `parity` failed
@@ -178,35 +184,46 @@ impl BlockDevice for RaidZ {
         let stripe_id = lba / self.data as u64;
         let shard_idx = (lba % self.data as u64) as usize;
 
-        // Get or create stripe buffer
-        let stripe = if let Some(stripe_ref) = self.writes.get(&stripe_id) {
-            stripe_ref.value().clone()
-        } else {
-            let new_stripe = Arc::new(Mutex::new(match self.stripe_pool.pop() {
-                Some(b) => StripeBuffer::with_buffer(b, self.data),
-                None => StripeBuffer::new(self.data),
-            }));
+        loop {
+            // Get or create stripe buffer
+            let stripe = if let Some(stripe_ref) = self.writes.get(&stripe_id) {
+                stripe_ref.value().clone()
+            } else {
+                let new_stripe = Arc::new(Mutex::new(match self.stripe_pool.pop() {
+                    Some(b) => StripeBuffer::with_buffer(b, self.data),
+                    None => StripeBuffer::new(self.data),
+                }));
 
-            // Insert into map using Entry API to handle races safely
-            match self.writes.entry(stripe_id) {
-                dashmap::mapref::entry::Entry::Occupied(o) => {
-                    // We lost the race; another thread inserted the stripe
-                    // while we were getting the buffer. Return ours to the pool.
-                    let mut guard = new_stripe.try_lock().expect("Exclusive ownership expected");
-                    if let Some(buf) = guard.take_buffer() {
-                        let _ = self.stripe_pool.push(buf);
+                // Insert into map using Entry API to handle races safely
+                match self.writes.entry(stripe_id) {
+                    dashmap::mapref::entry::Entry::Occupied(o) => {
+                        // We lost the race; another thread inserted the stripe
+                        // while we were getting the buffer. Return ours to the pool.
+                        let mut guard =
+                            new_stripe.try_lock().expect("Exclusive ownership expected");
+                        if let Some(buf) = guard.take_buffer() {
+                            let _ = self.stripe_pool.push(buf);
+                        }
+                        o.get().clone()
                     }
-                    o.get().clone()
+                    dashmap::mapref::entry::Entry::Vacant(v) => {
+                        v.insert(new_stripe.clone());
+                        new_stripe
+                    }
                 }
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(new_stripe.clone());
-                    new_stripe
-                }
-            }
-        };
+            };
 
-        stripe.lock().await.set_shard(shard_idx, buf);
-        Ok(())
+            let mut guard = stripe.lock().await;
+            if guard.retired {
+                // Flushed (or replaced) since we found it: start a new one.
+                drop(guard);
+                self.writes
+                    .remove_if(&stripe_id, |_, v| Arc::ptr_eq(v, &stripe));
+                continue;
+            }
+            guard.set_shard(shard_idx, buf);
+            return Ok(());
+        }
     }
 
     /// Logical capacity: every stripe holds `data` data blocks.
@@ -455,10 +472,12 @@ impl RaidZ {
         // These stripes are being replaced wholesale; drop any buffered
         // partial writes so a later flush can't resurrect stale data.
         for s in first_stripe..first_stripe + stripes as u64 {
-            if let Some((_, buffered)) = self.writes.remove(&s)
-                && let Some(b) = buffered.lock().await.take_buffer()
-            {
-                let _ = self.stripe_pool.push(b);
+            if let Some((_, buffered)) = self.writes.remove(&s) {
+                let mut buffered = buffered.lock().await;
+                buffered.retired = true;
+                if let Some(b) = buffered.take_buffer() {
+                    let _ = self.stripe_pool.push(b);
+                }
             }
         }
 
@@ -836,6 +855,9 @@ pub struct StripeBuffer {
     shard_mask: u32,
     dirty: bool,
     flushed: bool, // For optimistic writes
+    /// Written out (or superseded) and out of the map, or about to be:
+    /// nothing may be added to it any more.
+    retired: bool,
 }
 
 impl StripeBuffer {
@@ -847,6 +869,7 @@ impl StripeBuffer {
             shard_mask: 0,
             dirty: false,
             flushed: false,
+            retired: false,
         }
     }
 

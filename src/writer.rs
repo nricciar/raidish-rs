@@ -21,7 +21,8 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Extent, FileInode, InodeType};
+use crate::inode::Extent;
+use crate::object::TreeRoot;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -80,14 +81,18 @@ pub struct Committed {
 /// they change the same directory entry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum FsOp {
-    /// Create or replace the file at `path` with records the writer wrote.
+    /// Create the file at `path`, or replace its contents, with a tree the
+    /// writer wrote.
     WriteFile {
         path: String,
         size_bytes: u64,
-        blocks: Vec<BlockPtr>,
-        /// The entry's inode as the writer saw it (None: absent). If it has
-        /// changed since, the op is refused (compare-and-swap).
-        base: Option<Vec<BlockPtr>>,
+        blksz: u32,
+        tree: TreeRoot,
+        /// Every extent (start, len) the tree's records and indirects take.
+        allocs: Vec<(u64, u64)>,
+        /// The file and its contents as the writer saw them (None: absent).
+        /// If they have changed since, the op is refused (compare-and-swap).
+        base: Option<(crate::disk::FileId, TreeRoot)>,
     },
     Mkdir {
         path: String,
@@ -95,7 +100,28 @@ pub enum FsOp {
     /// Delete the file or directory at `path`, if it is still `base`.
     Delete {
         path: String,
-        base: Option<Vec<BlockPtr>>,
+        base: Option<(crate::disk::FileId, TreeRoot)>,
+    },
+    /// Move object `id` from `from` to `to` (see `rename_locked`).
+    Rename {
+        from: String,
+        to: String,
+        id: crate::disk::FileId,
+    },
+    SetAttr {
+        path: String,
+        attrs: crate::inode::SetAttrs,
+    },
+    /// Point file `id`'s dnode at a tree the writer built on `base` (its
+    /// writes at any offset, see `crate::open_file`).
+    UpdateFile {
+        id: crate::disk::FileId,
+        base: TreeRoot,
+        tree: TreeRoot,
+        size: u64,
+        /// Extents (start, len) the new tree allocated / replaced.
+        allocs: Vec<(u64, u64)>,
+        frees: Vec<(u64, u64)>,
     },
 }
 
@@ -408,7 +434,7 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let (writer, writer_epoch) = w.sink.writer();
-        let root = vol.root_ptr();
+        let root = vol.obj.root_ptr();
         let commit = VolumeCommit {
             volume: name.to_string(),
             writer,
@@ -462,14 +488,12 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    /// Re-read the newest committed root index (a writer's view of the
+    /// Follow the newest committed object table (a writer's view of the
     /// pool goes stale as the committer commits).
     pub(crate) async fn reload_root_index(&self) -> Result<(), FileSystemError> {
         let ring = self.read_uberblock_ring().await;
         let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
-        let index: crate::inode::FileIndex = self.read_value(&newest.root).await?;
-        *self.file_index.write().await = index;
-        *self.root_ptr.lock().await = newest.root.clone();
+        self.objects.follow_root(newest.objects.clone());
         self.note_open_txg(newest.txg + 1).await;
         Ok(())
     }
@@ -484,12 +508,10 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let ring = self.read_uberblock_ring().await;
         let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
-        if *self.root_ptr.lock().await == newest.root {
+        if self.objects.root() == newest.objects {
             return Ok(());
         }
-        let index: crate::inode::FileIndex = self.read_value(&newest.root).await?;
-        *self.file_index.write().await = index;
-        *self.root_ptr.lock().await = newest.root.clone();
+        self.objects.follow_root(newest.objects.clone());
         self.note_open_txg(newest.txg + 1).await;
         Ok(())
     }
@@ -583,7 +605,8 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The writer's commit: sync every volume (each one a `VolumeCommit`),
     /// then give back full metaslabs.
     pub(crate) async fn writer_commit(&self, w: &WriterState) -> Result<u64, FileSystemError> {
-        let result = self.sync_volumes().await;
+        let volumes = self.sync_volumes().await;
+        let result = volumes.and(self.sync_files().await);
         self.return_full(w).await;
         result?;
         Ok(self.open_txg().await?.saturating_sub(1))
@@ -595,7 +618,7 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         w: &WriterState,
         vol: &crate::volume::Volume,
-        records: &std::collections::BTreeMap<u64, crate::volume::Dirty>,
+        records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
     ) -> Result<(), FileSystemError> {
         let (vol_owner, vol_epoch, lost, detaching) = w
@@ -645,11 +668,11 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         let birth_txg = self.open_txg().await?;
-        let base_root = vol.root_ptr();
+        let base_root = vol.obj.root_ptr();
         let mut allocated: Vec<BlockPtr> = Vec::new();
         let mut replaced: Vec<BlockPtr> = Vec::new();
         let new_root = match self
-            .build_tree(vol, records, &mut allocated, &mut replaced)
+            .build_tree(&vol.obj, records, &mut allocated, &mut replaced)
             .await
         {
             Ok(r) => r,
@@ -678,7 +701,7 @@ impl<D: BlockDevice> FileSystem<D> {
             vol_owner,
             vol_epoch,
             base_root,
-            new_root: new_root.clone(),
+            new_root: new_root.ptr.clone(),
             allocs,
             frees: replaced.iter().map(ext).collect(),
             missed: self.take_new_misses(),
@@ -698,7 +721,7 @@ impl<D: BlockDevice> FileSystem<D> {
         match outcome {
             Ok(c) => {
                 self.note_open_txg(c.txg + 1).await;
-                vol.set_root(new_root);
+                vol.obj.set_root(new_root);
                 self.set_volume_log(w, vol, new_log);
                 if new_region.is_some() {
                     self.set_cursor(vol, new_region);
@@ -752,18 +775,6 @@ impl<D: BlockDevice> FileSystem<D> {
         r
     }
 
-    /// `write_file` for a writer: the data goes into lent space, the
-    /// committer links it in.
-    pub(crate) async fn writer_write_file(
-        &self,
-        path: &std::path::Path,
-        data: &[u8],
-    ) -> Result<crate::disk::FileId, FileSystemError> {
-        let mut f = self.file_writer(path, None).await?;
-        f.write(data).await?;
-        f.finish().await
-    }
-
     pub(crate) async fn writer_mkdir(
         &self,
         w: &WriterState,
@@ -797,14 +808,59 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<crate::disk::FileId, FileSystemError> {
         let _tx = self.begin_tx().await;
         self.reload_root_index().await?;
-        let (_, entry) = self.get_maybe_inode_ref_at_path(path).await?;
-        let entry = entry.ok_or(FileSystemError::FileNotFound)?;
+        let entry = self
+            .lookup(path)
+            .await?
+            .entry
+            .ok_or(FileSystemError::FileNotFound)?;
+        let tree = self.read_dnode(entry.id).await?.tree;
         let op = FsOp::Delete {
             path: path_string(path)?,
-            base: Some(entry.inode),
+            base: Some((entry.id, tree)),
         };
         self.writer_commit_fs(w, op, lease).await?;
-        Ok(entry.file_id)
+        Ok(entry.id)
+    }
+
+    /// The object at `path`, if there is one.
+    async fn id_at(&self, path: &std::path::Path) -> Option<crate::disk::FileId> {
+        self.lookup(path)
+            .await
+            .ok()
+            .and_then(|l| l.entry)
+            .map(|e| e.id)
+    }
+
+    pub(crate) async fn writer_rename(
+        &self,
+        w: &WriterState,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<crate::disk::FileId, FileSystemError> {
+        let _tx = self.begin_tx().await;
+        self.reload_root_index().await?;
+        let id = self.file_id(from).await?;
+        let op = FsOp::Rename {
+            from: path_string(from)?,
+            to: path_string(to)?,
+            id,
+        };
+        self.writer_commit_fs(w, op, None).await?;
+        Ok(id)
+    }
+
+    pub(crate) async fn writer_set_attrs(
+        &self,
+        w: &WriterState,
+        path: &std::path::Path,
+        attrs: &crate::inode::SetAttrs,
+    ) -> Result<crate::disk::FileId, FileSystemError> {
+        let _tx = self.begin_tx().await;
+        let op = FsOp::SetAttr {
+            path: path_string(path)?,
+            attrs: attrs.clone(),
+        };
+        Ok(self.writer_commit_fs(w, op, None).await?.file_id)
     }
 
     // ---- the committer's side ----
@@ -885,39 +941,39 @@ impl<D: BlockDevice> FileSystem<D> {
             FsOp::WriteFile {
                 path,
                 size_bytes,
-                blocks,
+                blksz,
+                tree,
+                allocs,
                 base,
             } => {
                 let path = std::path::Path::new(path);
-                let (parent, current) = self
-                    .get_maybe_inode_ref_at_path(path)
+                let l = self
+                    .lookup(path)
                     .await
                     .map_err(|e| refuse(format!("{}: {}", path.display(), e)))?;
-                let current_inode = match &current {
-                    Some(r) => Some(self.read_inode(r).await.map_err(retry)?),
-                    None => None,
-                };
-                if let Some(i) = &current_inode {
-                    match &i.inode_type {
-                        // A resend of a write already applied.
-                        InodeType::File { blocks: b, .. }
-                            if b == blocks
-                                && current.as_ref().map(|r| &r.inode) != base.as_ref() =>
-                        {
-                            return Ok(i.id);
-                        }
-                        InodeType::File { .. } => {}
-                        _ => return Err(refuse(format!("{}: not a file", path.display()))),
+                let current = match self.current_file(&l).await {
+                    Ok(c) => c,
+                    Err(FileSystemError::NotAFile) => {
+                        return Err(refuse(format!("{}: not a file", path.display())));
                     }
+                    Err(e) => return Err(retry(e)),
+                };
+                let seen = current.as_ref().map(|(id, d)| (*id, d.tree.clone()));
+                if let Some((id, d)) = &current
+                    && d.tree == *tree
+                    && seen != *base
+                {
+                    // A resend of a write already applied.
+                    return Ok(*id);
                 }
-                if current.as_ref().map(|r| &r.inode) != base.as_ref() {
+                if seen != *base {
                     return Err(refuse(format!(
                         "{} changed since this write was prepared",
                         path.display()
                     )));
                 }
                 match &current {
-                    Some(r) => object_ok(r.file_id)?,
+                    Some((id, _)) => object_ok(*id)?,
                     None if c.lease.is_some() => {
                         return Err(refuse(format!(
                             "{}: a lease was given for a file that doesn't exist",
@@ -926,39 +982,20 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     None => {}
                 }
-                let allocs: Vec<(u64, u64)> = blocks
-                    .iter()
-                    .map(|p| {
-                        let e = p.extent();
-                        (e.start, e.len)
-                    })
-                    .collect();
-                self.claim_writer_allocs(&allocs, &c.writer, lent_to_writer)
+                self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
                     .await?;
-                let file_id = match &current {
-                    Some(r) => r.file_id,
-                    None => self.alloc_object(),
-                };
-                let inode = FileInode {
-                    id: file_id,
-                    inode_type: InodeType::File {
-                        size_bytes: *size_bytes,
-                        blocks: blocks.clone(),
-                    },
-                };
-                if let Err(e) = self
-                    .persist_directory_changes(path, parent, Some(inode))
+                match self
+                    .set_file_contents(l, current, *blksz, *size_bytes, tree.clone())
                     .await
                 {
-                    for &(start, len) in &allocs {
-                        self.unallocate(start, len).await;
+                    Ok(id) => id,
+                    Err(e) => {
+                        for &(start, len) in allocs {
+                            self.unallocate(start, len).await;
+                        }
+                        return Err(retry(e));
                     }
-                    return Err(retry(e));
                 }
-                if let Some(old) = current {
-                    self.free_inode(&old).await.map_err(retry)?;
-                }
-                file_id
             }
             FsOp::Mkdir { path } => self
                 .mkdir_locked(std::path::Path::new(path))
@@ -966,32 +1003,103 @@ impl<D: BlockDevice> FileSystem<D> {
                 .map_err(|e| refuse(format!("mkdir {}: {}", path, e)))?,
             FsOp::Delete { path, base } => {
                 let p = std::path::Path::new(path);
-                let (_, current) = self
-                    .get_maybe_inode_ref_at_path(p)
+                let l = self
+                    .lookup(p)
                     .await
                     .map_err(|e| refuse(format!("{}: {}", path, e)))?;
-                match current {
+                match l.entry {
                     // Already gone (a resend, or someone else deleted it).
                     None => 0,
-                    Some(r) => {
-                        if base.as_ref().is_some_and(|b| *b != r.inode) {
+                    Some(e) => {
+                        let d = self.read_dnode(e.id).await.map_err(retry)?;
+                        if base.as_ref().is_some_and(|b| *b != (e.id, d.tree.clone())) {
                             return Err(refuse(format!(
                                 "{} changed since this delete was prepared",
                                 path
                             )));
                         }
-                        object_ok(r.file_id)?;
-                        let inode = self.read_inode(&r).await.map_err(retry)?;
-                        if matches!(inode.inode_type, InodeType::Volume { .. }) {
+                        object_ok(e.id)?;
+                        if d.kind == crate::inode::ObjType::Volume {
                             return Err(refuse(format!(
                                 "{} is a volume (delete it with `volume delete`)",
                                 path
                             )));
                         }
-                        self.delete_locked(p).await.map_err(retry)?;
+                        self.delete_locked(p)
+                            .await
+                            .map_err(|e| refuse(format!("delete {}: {}", path, e)))?;
                         0
                     }
                 }
+            }
+            FsOp::Rename { from, to, id } => {
+                let (fp, tp) = (std::path::Path::new(from), std::path::Path::new(to));
+                if self.id_at(fp).await != Some(*id) {
+                    if self.id_at(tp).await == Some(*id) {
+                        // A resend of a rename already applied.
+                        return Ok(*id);
+                    }
+                    return Err(refuse(format!("{} isn't object {} any more", from, id)));
+                }
+                object_ok(*id)?;
+                if let Some(t) = self.id_at(tp).await {
+                    object_ok(t)?;
+                }
+                self.rename_locked(fp, tp)
+                    .await
+                    .map_err(|e| refuse(format!("rename {} to {}: {}", from, to, e)))?
+                    .0
+            }
+            FsOp::UpdateFile {
+                id,
+                base,
+                tree,
+                size,
+                allocs,
+                frees,
+            } => {
+                let mut dnode = match self.try_read_dnode(*id).await {
+                    Ok(Some(d)) if d.is_file() => d,
+                    Ok(_) => return Err(refuse(format!("object {} isn't a file any more", id))),
+                    Err(e) => return Err(retry(e)),
+                };
+                if dnode.tree == *tree && dnode.size == *size && base != tree {
+                    // A resend of an update already applied.
+                    return Ok(*id);
+                }
+                if dnode.tree != *base {
+                    return Err(refuse(format!(
+                        "file {} changed since these writes were made",
+                        id
+                    )));
+                }
+                object_ok(*id)?;
+                self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
+                    .await?;
+                dnode.tree = tree.clone();
+                dnode.size = *size;
+                dnode.attrs.touch();
+                if let Err(e) = self.write_dnode(*id, Some(dnode)).await {
+                    for &(start, len) in allocs {
+                        self.unallocate(start, len).await;
+                    }
+                    return Err(retry(e));
+                }
+                for &(start, len) in frees {
+                    let _ = self.free(start, len).await;
+                }
+                *id
+            }
+            FsOp::SetAttr { path, attrs } => {
+                let p = std::path::Path::new(path);
+                let id = self
+                    .file_id(p)
+                    .await
+                    .map_err(|e| refuse(format!("{}: {}", path, e)))?;
+                object_ok(id)?;
+                self.set_attrs_locked(p, attrs)
+                    .await
+                    .map_err(|e| refuse(format!("{}: {}", path, e)))?
             }
         };
         Ok(file_id)
@@ -1097,7 +1205,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .open_volume(&c.volume)
             .await
             .map_err(|e| refuse(format!("volume '{}': {}", c.volume, e)))?;
-        let current = vol.root_ptr();
+        let current = vol.obj.root_ptr();
         if current == c.new_root && c.new_root != c.base_root {
             // A resend of a commit already applied: just make sure it's durable.
             return Ok(());
@@ -1142,27 +1250,20 @@ impl<D: BlockDevice> FileSystem<D> {
             .await?;
         let old_log = std::mem::replace(&mut *vol.log.lock().unwrap(), c.log.clone());
 
-        let old_inode = match self.update_volume_inode(&vol, c.new_root.clone()).await {
-            Ok(old) => old,
-            Err(e) => {
-                for &(start, len) in &c.allocs {
-                    self.unallocate(start, len).await;
-                }
-                *vol.log.lock().unwrap() = old_log;
-                return Err(CommitError::Retry(e.to_string()));
+        if let Err(e) = self.update_volume_dnode(&vol, c.new_root.clone()).await {
+            for &(start, len) in &c.allocs {
+                self.unallocate(start, len).await;
             }
-        };
+            *vol.log.lock().unwrap() = old_log;
+            return Err(CommitError::Retry(e.to_string()));
+        }
         // Regions the new log no longer has are done with.
         for r in old_log.iter().flat_map(|l| &l.regions) {
             if !c.log.as_ref().is_some_and(|l| l.regions.contains(r)) {
                 let _ = self.free(r.start, r.len).await;
             }
         }
-        vol.set_root(c.new_root.clone());
-        for ptr in &old_inode {
-            let e = ptr.extent();
-            let _ = self.free(e.start, e.len).await;
-        }
+        vol.obj.set_root_ptr(c.new_root.clone());
         for &(start, len) in &c.frees {
             let _ = self.free(start, len).await;
         }

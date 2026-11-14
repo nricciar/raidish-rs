@@ -184,9 +184,8 @@ async fn deferred_blocks_are_never_reallocated_early() {
         .await
         .unwrap();
 
-    let old = fs.get_file_at_path(Path::new("/x")).await.unwrap();
-    let old_inode = fs.read_inode(&old).await.unwrap();
-    let old_data = fs.content_extents(&old_inode.inode_type).await.unwrap();
+    let (_, old) = fs.stat_file(Path::new("/x")).await.unwrap();
+    let old_data = fs.dnode_extents(&old).await.unwrap();
 
     fs.delete(Path::new("/x")).await.unwrap();
     // Allocate nearly everything that's free; none may overlap the deferred blocks.
@@ -246,12 +245,12 @@ async fn multi_block_root_index_loads() {
         let name = format!("/a-fairly-long-file-name-to-grow-the-index-{:04}", i);
         fs.write_file(Path::new(&name), b"x").await.unwrap();
     }
-    let root_bytes = crate::blkptr::object_size(&fs.root_ptr.lock().await);
-    assert!(root_bytes > BLOCK_SIZE as u64);
+    let root = fs.read_dnode(crate::inode::ROOT_OBJECT).await.unwrap();
+    assert!(root.size > BLOCK_SIZE as u64);
     drop(fs);
 
     let fs = pool.load().await;
-    assert_eq!(fs.file_index.read().await.files.len(), 120);
+    assert_eq!(fs.ls(Path::new("")).await.unwrap().files.len(), 120);
     assert!(fs.find_orphaned_blocks().await.unwrap().is_empty());
 }
 

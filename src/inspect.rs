@@ -6,7 +6,7 @@
 
 use crate::disk::{BlockDevice, IoStats};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
-use crate::inode::{FileIndex, InodeType};
+use crate::inode::{ObjType, ROOT_OBJECT};
 use crate::metaslab::SPACEMAP_SLOTS;
 use crate::vdev::Topology;
 
@@ -107,8 +107,10 @@ pub enum BlockKind {
     Superblock,
     Uberblock,
     SpaceMap,
-    FileIndex,
-    Inode,
+    /// The object table.
+    ObjectTable,
+    /// Directory contents.
+    Directory,
     Data,
     /// Allocated but not reached from the tree walk here (indirect blocks
     /// of deeper directories, leaks).
@@ -123,8 +125,8 @@ impl BlockKind {
         BlockKind::Superblock,
         BlockKind::Uberblock,
         BlockKind::SpaceMap,
-        BlockKind::FileIndex,
-        BlockKind::Inode,
+        BlockKind::ObjectTable,
+        BlockKind::Directory,
         BlockKind::Data,
         BlockKind::Other,
         BlockKind::Free,
@@ -136,8 +138,8 @@ impl BlockKind {
             BlockKind::Superblock => "Superblock",
             BlockKind::Uberblock => "Uberblocks",
             BlockKind::SpaceMap => "Space maps",
-            BlockKind::FileIndex => "Root index",
-            BlockKind::Inode => "Inodes",
+            BlockKind::ObjectTable => "Object table",
+            BlockKind::Directory => "Directories",
             BlockKind::Data => "Data",
             BlockKind::Other => "Other",
             BlockKind::Free => "Free",
@@ -151,8 +153,8 @@ impl BlockKind {
             BlockKind::Free | BlockKind::Slack => 0,
             BlockKind::Other => 1,
             BlockKind::Data => 2,
-            BlockKind::Inode => 3,
-            BlockKind::FileIndex => 4,
+            BlockKind::Directory => 3,
+            BlockKind::ObjectTable => 4,
             BlockKind::SpaceMap => 5,
             BlockKind::Uberblock => 6,
             BlockKind::Superblock => 7,
@@ -496,54 +498,51 @@ impl<D: BlockDevice> FileSystem<D> {
             BlockKind::SpaceMap,
             None,
         );
-        for p in self.root_ptr.lock().await.iter() {
-            let e = p.extent();
-            push(&mut spans, e.start(), e.len(), BlockKind::FileIndex, None);
+        for e in self
+            .tree_extents(&self.objects.root())
+            .await
+            .unwrap_or_default()
+        {
+            push(&mut spans, e.start(), e.len(), BlockKind::ObjectTable, None);
         }
 
-        // Walk the tree (directories breadth first).
-        let root = self.file_index.read().await.clone();
-        let mut dirs: Vec<(String, FileIndex)> = vec![(String::new(), root)];
-        while let Some((prefix, index)) = dirs.pop() {
-            for (name, inode_ref) in &index.files {
-                let path = format!("{}/{}", prefix, name);
-                let owner = owners.len() as u32;
-                owners.push(path.clone());
-                let mut allocated = 0;
-                for e in inode_ref.inode_extents() {
-                    allocated += e.len();
-                    push(
-                        &mut spans,
-                        e.start(),
-                        e.len(),
-                        BlockKind::Inode,
-                        Some(owner),
-                    );
+        // Walk the namespace from the root directory.
+        let mut dirs: Vec<(String, u64)> = vec![(String::new(), ROOT_OBJECT)];
+        while let Some((prefix, dir_id)) = dirs.pop() {
+            let Ok(dir) = self.read_dnode(dir_id).await else {
+                continue;
+            };
+            if dir_id == ROOT_OBJECT {
+                for e in self.dnode_extents(&dir).await.unwrap_or_default() {
+                    push(&mut spans, e.start(), e.len(), BlockKind::Directory, None);
                 }
-                let Ok(inode) = self.read_inode(inode_ref).await else {
+            }
+            let Ok(index) = self.read_dir(&dir).await else {
+                continue;
+            };
+            for (name, entry) in &index.files {
+                let path = format!("{}/{}", prefix, name);
+                let Ok(d) = self.read_dnode(entry.id).await else {
                     continue;
                 };
-                for e in self
-                    .content_extents(&inode.inode_type)
-                    .await
-                    .unwrap_or_default()
-                {
+                let owner = owners.len() as u32;
+                owners.push(path.clone());
+                let block_kind = match d.kind {
+                    ObjType::Directory => BlockKind::Directory,
+                    _ => BlockKind::Data,
+                };
+                let mut allocated = 0;
+                for e in self.dnode_extents(&d).await.unwrap_or_default() {
                     allocated += e.len();
-                    push(&mut spans, e.start(), e.len(), BlockKind::Data, Some(owner));
+                    push(&mut spans, e.start(), e.len(), block_kind, Some(owner));
                 }
-                let (kind, size, vbs) = match &inode.inode_type {
-                    InodeType::File { size_bytes, .. } => (ObjectKind::File, *size_bytes, None),
-                    InodeType::Directory { .. } => {
-                        if let Ok(sub) = self.read_file_index(&inode.inode_type).await {
-                            dirs.push((path.clone(), sub));
-                        }
+                let (kind, size, vbs) = match d.kind {
+                    ObjType::File => (ObjectKind::File, d.size, None),
+                    ObjType::Directory => {
+                        dirs.push((path.clone(), entry.id));
                         (ObjectKind::Directory, 0, None)
                     }
-                    InodeType::Volume {
-                        size_bytes,
-                        volblocksize,
-                        ..
-                    } => (ObjectKind::Volume, *size_bytes, Some(*volblocksize)),
+                    ObjType::Volume => (ObjectKind::Volume, d.size, Some(d.blksz)),
                 };
                 objects.push(ObjectReport {
                     path,

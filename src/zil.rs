@@ -39,7 +39,8 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{LogRegion, VolumeLog};
-use crate::volume::{Dirty, Volume};
+use crate::object::Dirty;
+use crate::volume::Volume;
 use crate::writer::WriterState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -150,7 +151,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
                     // The slot is spent: later records would follow a gap.
                     *p.vol.cursor.lock().unwrap() = None;
-                    p.vol.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                    p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
                     commit = true;
                 }
             }
@@ -170,7 +171,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 // nothing more here (flushes commit until the next fold
                 // starts a region).
                 *p.vol.cursor.lock().unwrap() = None;
-                p.vol.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
             }
             return Err(e.into());
         }
@@ -183,7 +184,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stale = None;
         for p in written {
             if !w.lease_fresh(&p.vol.name) {
-                p.vol.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
                 stale.get_or_insert(p.vol.name.clone());
             }
         }
@@ -201,7 +202,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// records stay unlogged; commit instead).
     fn plan_append(&self, vol: &Arc<Volume>) -> Result<Option<Planned>, ()> {
         let mut cursor = vol.cursor.lock().unwrap();
-        let mut d = vol.dirty.lock().unwrap();
+        let mut d = vol.obj.dirty.lock().unwrap();
         if d.unlogged.is_empty() {
             return Ok(None);
         }
@@ -278,7 +279,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The intent log of every volume in the root directory that has one.
     pub async fn volume_logs(&self) -> Result<Vec<(String, VolumeLog)>, FileSystemError> {
-        let names: Vec<String> = self.file_index.read().await.files.keys().cloned().collect();
+        let names: Vec<String> = self
+            .ls(std::path::Path::new(""))
+            .await?
+            .files
+            .into_keys()
+            .collect();
         let mut out = Vec::new();
         for name in names {
             if let Ok(vol) = self.open_volume(&name).await
@@ -369,7 +375,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let n = entries.len();
         {
-            let mut d = vol.dirty.lock().unwrap();
+            let mut d = vol.obj.dirty.lock().unwrap();
             for e in entries {
                 match e {
                     Entry::Data(i, b) => d.records.insert(i, Dirty::Data(b)),
@@ -379,12 +385,8 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         *vol.log.lock().unwrap() = None;
         if !vol.is_dirty() {
-            // Nothing to commit for the tree: rewrite the inode without the log.
-            let old = self.update_volume_inode(&vol, vol.root_ptr()).await?;
-            for p in &old {
-                let e = p.extent();
-                self.free(e.start, e.len).await?;
-            }
+            // Nothing to commit for the tree: rewrite the dnode without the log.
+            self.update_volume_dnode(&vol, vol.obj.root_ptr()).await?;
         }
         for r in &log.regions {
             self.free(r.start, r.len).await?;

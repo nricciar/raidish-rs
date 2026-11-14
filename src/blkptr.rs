@@ -77,8 +77,10 @@ pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
 }
 
 impl<D: BlockDevice> FileSystem<D> {
-    /// Allocate space for `data`, write it, and return the record pointers.
-    /// The records belong to the open TXG.
+    /// Allocate space for `data` (scattered if need be), write it, and
+    /// return the record pointers. The records belong to the open TXG.
+    /// (Objects are trees of records now; only tests still use this.)
+    #[cfg(test)]
     pub(crate) async fn write_object(&self, data: &[u8]) -> Result<Vec<BlockPtr>, FileSystemError> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -182,6 +184,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Read and verify a whole object.
+    #[cfg(test)]
     pub(crate) async fn read_object(&self, ptrs: &[BlockPtr]) -> Result<Vec<u8>, FileSystemError> {
         let mut out = Vec::with_capacity(object_size(ptrs) as usize);
         for data in self.read_records(ptrs).await? {
@@ -360,28 +363,6 @@ impl<D: BlockDevice> FileSystem<D> {
         }
 
         Err(FileSystemError::ChecksumMismatch)
-    }
-
-    /// Free every record of an object (deferred, see metaslab).
-    pub(crate) async fn free_object(&self, ptrs: &[BlockPtr]) -> Result<(), FileSystemError> {
-        for p in ptrs {
-            self.free(p.lba, p.asize as u64).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn write_value<T: Serialize>(
-        &self,
-        value: &T,
-    ) -> Result<Vec<BlockPtr>, FileSystemError> {
-        self.write_object(&bincode::serialize(value)?).await
-    }
-
-    pub(crate) async fn read_value<T: for<'a> Deserialize<'a>>(
-        &self,
-        ptrs: &[BlockPtr],
-    ) -> Result<T, FileSystemError> {
-        Ok(bincode::deserialize(&self.read_object(ptrs).await?)?)
     }
 }
 
