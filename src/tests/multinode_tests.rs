@@ -1133,3 +1133,249 @@ fn an_orphaned_log_is_replayed_only_once_its_lease_is_gone() {
     // Lapsed past the grace period: renewable until someone takes it.
     assert_eq!(at(Some(lease("o", 7, now - 60_000, false))), Orphan::Lapsed);
 }
+
+// ---- birth TXGs ----
+
+/// Let the committer commit a few TXGs without the writers hearing of it
+/// (their view of the TXG lags), then raise the birth floor to its open
+/// TXG, as a snapshot will. Returns the floor.
+async fn lag_and_raise(s: &Setup) -> u64 {
+    for _ in 0..3 {
+        s.committer.fs.sync().await.unwrap();
+    }
+    let floor = s.committer.fs.open_txg().await.unwrap();
+    s.committer.fs.raise_birth_floor(floor);
+    floor
+}
+
+/// The births of a tree's root and data records.
+async fn births(fs: &FileSystem<Pool>, tree: &crate::object::TreeRoot) -> Vec<u64> {
+    let mut out: Vec<u64> = tree.ptr.iter().map(|p| p.birth_txg).collect();
+    for (_, p) in fs.tree_leaves(tree).await.unwrap() {
+        out.push(p.birth_txg);
+    }
+    out
+}
+
+/// A volume sync stamped below the floor is rebuilt and sent again.
+#[tokio::test]
+async fn volume_syncs_are_restamped_above_the_birth_floor() {
+    let s = setup(&["vol"]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    attach(&s, &w, "vol", "o1").await;
+    w.fs.block_write("vol", 0, &pattern(200_000, 1))
+        .await
+        .unwrap();
+    w.fs.sync().await.unwrap();
+    let data = pattern(200_000, 2);
+    w.fs.block_write("vol", 0, &data).await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    assert!(
+        w.fs.open_txg().await.unwrap() < floor,
+        "the writer's view lags"
+    );
+
+    w.fs.sync().await.unwrap();
+    let vol = s.committer.fs.open_volume("vol").await.unwrap();
+    let b = births(&s.committer.fs, &vol.obj.root()).await;
+    assert!(
+        !b.is_empty() && b.iter().all(|&t| t >= floor),
+        "{:?} vs floor {}",
+        b,
+        floor
+    );
+    assert_eq!(read(&s.committer.fs, "vol", 0, data.len()).await, data);
+    w.fs.detach_volume("vol").await.unwrap();
+    w.fs.return_metaslabs().await;
+    drop(w);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// A streamed upload whose records were written before the floor rose:
+/// their pointers are restamped (the data isn't rewritten).
+#[tokio::test]
+async fn streamed_files_are_restamped_above_the_birth_floor() {
+    let s = setup(&[]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    let data = pattern(600_000, 3);
+    let mut f = w.fs.file_writer(Path::new("big"), None).await.unwrap();
+    f.write(&data).await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    f.finish().await.unwrap();
+
+    let (_, d) = s.committer.fs.stat_file(Path::new("big")).await.unwrap();
+    let b = births(&s.committer.fs, &d.tree).await;
+    assert!(
+        b.len() > 2 && b.iter().all(|&t| t >= floor),
+        "{:?} vs floor {}",
+        b,
+        floor
+    );
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("big")).await.unwrap(),
+        data
+    );
+    w.fs.return_metaslabs().await;
+    drop(w);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Writes at an offset (an open file's sync) too.
+#[tokio::test]
+async fn open_file_syncs_are_restamped_above_the_birth_floor() {
+    let s = setup(&[]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    w.fs.write_file(Path::new("of"), &pattern(300_000, 4))
+        .await
+        .unwrap();
+    let f = w.fs.open_file(Path::new("of"), None).await.unwrap();
+    w.fs.file_write(&f, 1000, b"changed").await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    w.fs.close_file(&f).await.unwrap();
+
+    let (_, d) = s.committer.fs.stat_file(Path::new("of")).await.unwrap();
+    let leaves = s.committer.fs.tree_leaves(&d.tree).await.unwrap();
+    assert!(leaves[0].1.birth_txg >= floor, "the rewritten record");
+    assert!(d.tree.ptr.as_ref().unwrap().birth_txg >= floor, "the root");
+    let mut want = pattern(300_000, 4);
+    want[1000..1007].copy_from_slice(b"changed");
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("of")).await.unwrap(),
+        want
+    );
+    w.fs.return_metaslabs().await;
+}
+
+/// The committer refuses births from the future, and asks for a restamp
+/// (with its open TXG) below the floor.
+#[tokio::test]
+async fn the_committer_checks_births() {
+    let s = setup(&[]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Recording {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource.clone(),
+            epoch,
+        },
+        last: Default::default(),
+        last_fs: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+        .await
+        .unwrap();
+    fs.write_file(Path::new("x"), &pattern(1000, 5))
+        .await
+        .unwrap();
+    let mut c = sink.last_fs.lock().unwrap().clone().unwrap();
+    let open = s.committer.fs.open_txg().await.unwrap();
+    if let FsOp::WriteFile {
+        path,
+        base,
+        min_birth,
+        ..
+    } = &mut c.op
+    {
+        *path = "y".into();
+        *base = None;
+        *min_birth = Some(open + 5);
+    }
+    assert!(matches!(
+        s.committer.commit_fs(&c).await,
+        Err(CommitError::Refused(_))
+    ));
+    s.committer.fs.raise_birth_floor(open);
+    if let FsOp::WriteFile { min_birth, .. } = &mut c.op {
+        *min_birth = Some(open - 1);
+    }
+    assert_eq!(
+        s.committer.commit_fs(&c).await,
+        Err(CommitError::Restamp(open))
+    );
+    fs.return_metaslabs().await;
+}
+
+/// A pool this process commits: an upload is restamped at finish too.
+#[tokio::test]
+async fn local_uploads_are_restamped_above_the_birth_floor() {
+    let pool = crate::test_util::TestPool::new().await;
+    let fs = pool.format().await;
+    let data = pattern(400_000, 6);
+    let mut f = fs.file_writer(Path::new("up"), None).await.unwrap();
+    f.write(&data).await.unwrap();
+    for _ in 0..3 {
+        fs.sync().await.unwrap();
+    }
+    let floor = fs.open_txg().await.unwrap();
+    fs.raise_birth_floor(floor);
+    f.finish().await.unwrap();
+    let (_, d) = fs.stat_file(Path::new("up")).await.unwrap();
+    let b = births(&fs, &d.tree).await;
+    assert!(b.iter().all(|&t| t >= floor), "{:?} vs floor {}", b, floor);
+    assert_eq!(fs.read_file(Path::new("up")).await.unwrap(), data);
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+// ---- snapshots of running volumes ----
+
+/// The committer snapshots a volume a writer runs: the snapshot is the
+/// volume as the writer last committed it, the writer's later commits
+/// (restamped above the snapshot) keep the snapshot's blocks, and
+/// destroying it frees what only it had.
+#[tokio::test]
+async fn snapshots_of_a_volume_a_writer_runs() {
+    let s = setup(&["vol"]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    attach(&s, &w, "vol", "o1").await;
+    let a = pattern(200_000, 1);
+    w.fs.block_write("vol", 0, &a).await.unwrap();
+    w.fs.sync().await.unwrap();
+    // Not yet committed by the writer: not in the snapshot.
+    let b = pattern(100_000, 2);
+    w.fs.block_write("vol", 0, &b).await.unwrap();
+    s.committer.fs.create_snapshot("vol", "s").await.unwrap();
+    w.fs.sync().await.unwrap();
+
+    let mut want = a.clone();
+    want[..b.len()].copy_from_slice(&b);
+    assert_eq!(read(&s.committer.fs, "vol", 0, want.len()).await, want);
+    let mut snap = vec![0u8; a.len()];
+    s.committer
+        .fs
+        .snapshot_read("vol", "s", 0, &mut snap)
+        .await
+        .unwrap();
+    assert_eq!(snap, a);
+    let c = pattern(200_000, 3);
+    w.fs.block_write("vol", 0, &c).await.unwrap();
+    w.fs.sync().await.unwrap();
+    s.committer
+        .fs
+        .snapshot_read("vol", "s", 0, &mut snap)
+        .await
+        .unwrap();
+    assert_eq!(snap, a);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+
+    s.committer.fs.destroy_snapshot("vol", "s").await.unwrap();
+    w.fs.detach_volume("vol").await.unwrap();
+    w.fs.return_metaslabs().await;
+    drop(w);
+    assert_eq!(read(&s.committer.fs, "vol", 0, c.len()).await, c);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// A new committer starts its birth floor at its open TXG: a writer whose
+/// view lags a snapshot the old committer took can't slip under it.
+#[tokio::test]
+async fn a_new_committer_raises_the_birth_floor() {
+    let s = setup(&[]).await;
+    let open = s.committer.fs.open_txg().await.unwrap();
+    assert!(s.committer.fs.birth_floor() >= open);
+}

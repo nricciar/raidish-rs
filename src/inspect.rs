@@ -542,7 +542,9 @@ impl<D: BlockDevice> FileSystem<D> {
                         dirs.push((path.clone(), entry.id));
                         (ObjectKind::Directory, 0, None)
                     }
-                    ObjType::Volume => (ObjectKind::Volume, d.size, Some(d.blksz)),
+                    ObjType::Volume | ObjType::Snapshot => {
+                        (ObjectKind::Volume, d.size, Some(d.blksz))
+                    }
                 };
                 objects.push(ObjectReport {
                     path,

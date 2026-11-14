@@ -56,6 +56,10 @@ pub struct VolumeCommit {
     /// Extents (start, len) the new tree allocated / replaced.
     pub allocs: Vec<(u64, u64)>,
     pub frees: Vec<(u64, u64)>,
+    /// The birth TXG of each of `frees` (a snapshot keeps blocks born at
+    /// or before it; missing: all kept).
+    #[serde(default)]
+    pub free_births: Vec<u64>,
     /// Pool disks the writer missed writes on since its last commit.
     pub missed: Vec<usize>,
     /// The TXG the new blocks were stamped with.
@@ -64,6 +68,9 @@ pub struct VolumeCommit {
     /// region (its extent is among `allocs`), or None. The one it replaces
     /// is freed.
     pub log: Option<crate::inode::VolumeLog>,
+    /// The lowest TXG any new block was stamped with (None: no new blocks).
+    #[serde(default)]
+    pub min_birth: Option<u64>,
 }
 
 /// The committer's answer to a commit.
@@ -93,6 +100,9 @@ pub enum FsOp {
         /// The file and its contents as the writer saw them (None: absent).
         /// If they have changed since, the op is refused (compare-and-swap).
         base: Option<(crate::disk::FileId, TreeRoot)>,
+        /// The lowest TXG any new block was stamped with.
+        #[serde(default)]
+        min_birth: Option<u64>,
     },
     Mkdir {
         path: String,
@@ -148,6 +158,9 @@ pub enum FsOp {
         /// Extents (start, len) the new tree allocated / replaced.
         allocs: Vec<(u64, u64)>,
         frees: Vec<(u64, u64)>,
+        /// The lowest TXG any new block was stamped with.
+        #[serde(default)]
+        min_birth: Option<u64>,
     },
 }
 
@@ -189,6 +202,10 @@ pub enum CommitError {
     Retry(String),
     /// Refused for good (lost the lease, root moved on, bad extents).
     Refused(String),
+    /// Refused because the new blocks were stamped with a TXG below the
+    /// birth floor (see `FileSystem::raise_birth_floor`): rebuild, stamped
+    /// with this open TXG, and send again.
+    Restamp(u64),
 }
 
 impl std::fmt::Display for CommitError {
@@ -196,6 +213,7 @@ impl std::fmt::Display for CommitError {
         match self {
             CommitError::Retry(m) => write!(f, "committer unavailable: {}", m),
             CommitError::Refused(m) => write!(f, "commit refused: {}", m),
+            CommitError::Restamp(t) => write!(f, "births below the floor; restamp at TXG {}", t),
         }
     }
 }
@@ -205,6 +223,7 @@ impl From<CommitError> for FileSystemError {
         match e {
             CommitError::Retry(_) => FileSystemError::Unavailable(e.to_string()),
             CommitError::Refused(_) => FileSystemError::InvalidArgument(e.to_string()),
+            CommitError::Restamp(t) => FileSystemError::Restamp(t),
         }
     }
 }
@@ -471,9 +490,11 @@ impl<D: BlockDevice> FileSystem<D> {
             new_root: root,
             allocs: Vec::new(),
             frees: Vec::new(),
+            free_births: Vec::new(),
             missed: self.take_new_misses(),
             birth_txg: self.open_txg().await?,
             log: None,
+            min_birth: None,
         };
         let c = w.sink.commit(commit).await?;
         self.note_open_txg(c.txg + 1).await;
@@ -631,8 +652,18 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The writer's commit: sync every volume (each one a `VolumeCommit`),
     /// then give back full metaslabs.
     pub(crate) async fn writer_commit(&self, w: &WriterState) -> Result<u64, FileSystemError> {
-        let volumes = self.sync_volumes().await;
-        let result = volumes.and(self.sync_files().await);
+        // A sync stamped below the birth floor is rebuilt (with the TXG
+        // the committer sent back) and sent again.
+        let mut attempts = 0;
+        let result = loop {
+            let volumes = self.sync_volumes().await;
+            let result = volumes.and(self.sync_files().await);
+            attempts += 1;
+            match result {
+                Err(FileSystemError::Restamp(_)) if attempts < 3 => continue,
+                r => break r,
+            }
+        };
         self.return_full(w).await;
         result?;
         Ok(self.open_txg().await?.saturating_sub(1))
@@ -730,9 +761,11 @@ impl<D: BlockDevice> FileSystem<D> {
             new_root: new_root.ptr.clone(),
             allocs,
             frees: replaced.iter().map(ext).collect(),
+            free_births: replaced.iter().map(|p| p.birth_txg).collect(),
             missed: self.take_new_misses(),
             birth_txg,
             log: new_log.clone(),
+            min_birth: allocated.iter().map(|p| p.birth_txg).min(),
         };
         let outcome = match lost {
             None => w.sink.commit(commit).await,
@@ -763,6 +796,14 @@ impl<D: BlockDevice> FileSystem<D> {
                     "commit refused: {}",
                     m
                 )))
+            }
+            Err(CommitError::Restamp(open)) => {
+                // Not applied either: rebuild (the records stay dirty)
+                // stamped with the committer's TXG.
+                self.release_ptrs(&allocated).await;
+                release_log(&new_region).await;
+                self.note_open_txg(open).await;
+                Err(FileSystemError::Restamp(open))
             }
             // Unknown outcome: keep the space out of use (if it was applied,
             // it's referenced; if not, the committer still has it as free),
@@ -891,6 +932,30 @@ impl<D: BlockDevice> FileSystem<D> {
 
     // ---- the committer's side ----
 
+    /// Check the TXGs a writer stamped its new blocks with: none from the
+    /// future (past the open TXG), and none below the birth floor (else
+    /// `Restamp`: rebuild with the open TXG).
+    async fn check_births(&self, min_birth: Option<u64>, stamped: u64) -> Result<(), CommitError> {
+        let Some(min) = min_birth else {
+            return Ok(());
+        };
+        let open = self
+            .open_txg()
+            .await
+            .map_err(|e| CommitError::Retry(e.to_string()))?;
+        if min > open || stamped > open {
+            return Err(CommitError::Refused(format!(
+                "blocks stamped with TXG {} past the open TXG {}",
+                stamped.max(min),
+                open
+            )));
+        }
+        if min < self.birth_floor() {
+            return Err(CommitError::Restamp(open));
+        }
+        Ok(())
+    }
+
     /// Check that every extent is free space in a metaslab lent to `writer`,
     /// then mark them allocated.
     async fn claim_writer_allocs(
@@ -971,6 +1036,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 tree,
                 allocs,
                 base,
+                min_birth,
             } => {
                 let path = std::path::Path::new(path);
                 let l = self
@@ -1008,6 +1074,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     None => {}
                 }
+                self.check_births(*min_birth, c.birth_txg).await?;
                 self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
                     .await?;
                 match self
@@ -1084,6 +1151,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 size,
                 allocs,
                 frees,
+                min_birth,
             } => {
                 let mut dnode = match self.try_read_dnode(*id).await {
                     Ok(Some(d)) if d.is_file() => d,
@@ -1101,6 +1169,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     )));
                 }
                 object_ok(*id)?;
+                self.check_births(*min_birth, c.birth_txg).await?;
                 self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
                     .await?;
                 dnode.tree = tree.clone();
@@ -1340,6 +1409,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
+        self.check_births(c.min_birth, c.birth_txg).await?;
         // Every allocation must be free space in a metaslab lent to this writer.
         self.claim_writer_allocs(&c.allocs, &c.writer, lent_to_writer)
             .await?;
@@ -1359,9 +1429,16 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         vol.obj.set_root_ptr(c.new_root.clone());
-        for &(start, len) in &c.frees {
-            let _ = self.free(start, len).await;
-        }
+        // What a snapshot still has stays (see `crate::snapshot`).
+        let held = self.held_txg_of(vol.id).await.unwrap_or(u64::MAX);
+        let births = c.free_births.iter().copied().chain(std::iter::repeat(0));
+        let frees: Vec<(u64, u64, u64)> = c
+            .frees
+            .iter()
+            .zip(births)
+            .map(|(&(s, l), b)| (s, l, b))
+            .collect();
+        let _ = self.free_unheld(frees, held).await;
         for &d in &c.missed {
             self.mark_degraded(d, c.birth_txg.saturating_sub(1));
         }

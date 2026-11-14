@@ -10,6 +10,8 @@ use crate::cluster::{Cluster, LeaseOp, now_ms};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::VolumeProps;
+use crate::send::StreamReport;
+use crate::snapshot::SnapshotInfo;
 use crate::volume::VolumeInfo;
 use crate::writer::{
     CommitError, CommitSink, Committed, FsCommit, FsCommitted, LentMetaslab, VolumeCommit,
@@ -182,6 +184,11 @@ impl<D: BlockDevice> Committer<D> {
             .filter_map(|(&i, g)| g.writer.clone().map(|w| (i, (w, g.writer_epoch))))
             .collect();
         fs.mark_lent(lends.keys().copied()).await;
+        // Writers' views of the TXG may lag a previous committer's: from
+        // here on, blocks are born after any snapshot it took.
+        if let Ok(t) = fs.open_txg().await {
+            fs.raise_birth_floor(t);
+        }
         Committer {
             fs,
             auth,
@@ -481,6 +488,75 @@ impl<D: BlockDevice> Committer<D> {
     pub async fn set_props(&self, name: &str, props: VolumeProps) -> Result<(), FileSystemError> {
         self.fs.set_volume_props(name, props).await
     }
+
+    // ---- snapshots (see `crate::snapshot`) ----
+
+    pub async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, FileSystemError> {
+        self.fs.list_snapshots(name).await
+    }
+
+    /// Snapshot `name` as last committed (a running volume's writes since
+    /// its writer's last commit aren't in it). Returns its TXG.
+    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<u64, FileSystemError> {
+        self.fs.create_snapshot(name, snap).await
+    }
+
+    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
+        self.fs.destroy_snapshot(name, snap).await
+    }
+
+    pub async fn clone_snapshot(
+        &self,
+        name: &str,
+        snap: &str,
+        new: &str,
+    ) -> Result<(), FileSystemError> {
+        self.fs.clone_snapshot(name, snap, new).await.map(|_| ())
+    }
+
+    /// Receive a send stream into volume `name` (see `crate::send`); it
+    /// must not be running.
+    pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        name: &str,
+        r: &mut R,
+        force: bool,
+    ) -> Result<StreamReport, FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.recv_snapshot(name, r, force).await
+    }
+
+    /// Whether a stream with `header` would be received into `name`.
+    pub async fn recv_check(
+        &self,
+        name: &str,
+        header: &crate::send::SendHeader,
+        force: bool,
+    ) -> Result<(), FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.recv_check(name, header, force).await
+    }
+
+    /// Roll `name` back to its newest snapshot (it must not be running).
+    pub async fn rollback(&self, name: &str) -> Result<(), FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.rollback_volume(name).await
+    }
 }
 
 // ---- writers talking to a committer ----
@@ -552,6 +628,12 @@ pub struct CreateVolume {
     pub size_bytes: u64,
 }
 
+/// A snapshot or clone to make.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NewName {
+    pub name: String,
+}
+
 /// Talks to whichever `listen` node is the committer.
 #[derive(Clone)]
 pub struct CommitClient {
@@ -606,6 +688,7 @@ impl CommitClient {
                     Ok(Ok(v)) => return Ok(v),
                     Ok(Err(CommitError::Refused(m))) => return Err(CommitError::Refused(m)),
                     Ok(Err(CommitError::Retry(m))) => why.push(format!("{}: {}", ep, m)),
+                    Ok(Err(e)) => return Err(e),
                     Err(e) => why.push(format!("{}: {}", ep, e)),
                 },
                 Err(e) => why.push(format!("{}: {}", ep, e)),
@@ -683,6 +766,102 @@ impl CommitClient {
     pub async fn set_props(&self, name: &str, props: &VolumeProps) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/props", name);
         self.call(reqwest::Method::PUT, &path, Some(props), Some(10))
+            .await
+    }
+
+    pub async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
+        self.call(reqwest::Method::GET, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<u64, CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
+        let body = NewName { name: snap.into() };
+        self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
+            .await
+    }
+
+    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots/{}", name, snap);
+        self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    pub async fn clone_snapshot(
+        &self,
+        name: &str,
+        snap: &str,
+        new: &str,
+    ) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots/{}/clone", name, snap);
+        let body = NewName { name: new.into() };
+        self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
+            .await
+    }
+
+    /// Stream `r` (a send stream) to the committer, received into volume
+    /// `name`. Not retried: a stream can't be sent twice.
+    pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+        &self,
+        name: &str,
+        force: bool,
+        mut r: R,
+    ) -> Result<StreamReport, CommitError> {
+        use tokio::io::AsyncReadExt;
+        // Asked first, so a refusal comes back as such (not as a stream
+        // cut off midway).
+        let (header, raw) = crate::send::peek_header(&mut r)
+            .await
+            .map_err(|e| CommitError::Refused(e.to_string()))?;
+        let check = format!("/api/v1/pool/volumes/{}/recv/check?force={}", name, force);
+        self.call::<()>(reqwest::Method::POST, &check, Some(&header), Some(10))
+            .await?;
+        let r = std::io::Cursor::new(raw).chain(r);
+        // Find the committer first: the stream goes to it alone.
+        let mut found = None;
+        for ep in &self.endpoints {
+            let url = format!("{}/api/v1/pool/committer", ep);
+            if let Ok(resp) = self.http.get(&url).send().await
+                && let Ok(Ok(_)) = resp.json::<Result<CommitterInfo, CommitError>>().await
+            {
+                found = Some(ep.clone());
+                break;
+            }
+        }
+        let ep = found.ok_or_else(|| CommitError::Retry("no committer found".into()))?;
+        let chunks = futures::stream::unfold(Some(r), |r| async move {
+            let mut r = r?;
+            let mut buf = vec![0u8; 1 << 20];
+            match r.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), Some(r)))
+                }
+                Err(e) => Some((Err(e), None)),
+            }
+        });
+        // No overall timeout: a stream takes as long as it takes.
+        let http = crate::tls::http_builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| CommitError::Retry(e.to_string()))?;
+        let url = format!("{}/api/v1/pool/volumes/{}/recv?force={}", ep, name, force);
+        let resp = http
+            .post(url)
+            .body(reqwest::Body::wrap_stream(chunks))
+            .send()
+            .await
+            .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?;
+        resp.json::<Result<StreamReport, CommitError>>()
+            .await
+            .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?
+    }
+
+    pub async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/rollback", name);
+        self.call(reqwest::Method::POST, &path, None::<&()>, Some(10))
             .await
     }
 }
@@ -907,9 +1086,120 @@ pub mod routes {
         }
     }
 
+    #[get("/api/v1/pool/volumes/<name>/snapshots")]
+    pub async fn snapshots(
+        _auth: crate::auth::CanRead,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<Vec<SnapshotInfo>, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.snapshots(name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/snapshots", data = "<req>")]
+    pub async fn snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        req: Json<NewName>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<u64, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.create_snapshot(name, &req.name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[delete("/api/v1/pool/volumes/<name>/snapshots/<snap>")]
+    pub async fn destroy_snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        snap: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.destroy_snapshot(name, snap).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/snapshots/<snap>/clone", data = "<req>")]
+    pub async fn clone_snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        snap: &str,
+        req: Json<NewName>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.clone_snapshot(name, snap, &req.name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/recv?<force>", data = "<data>")]
+    pub async fn recv(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        force: Option<bool>,
+        data: rocket::Data<'_>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<StreamReport, CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let mut stream = data.open(rocket::data::ByteUnit::max_value());
+                fs_err(c.recv(name, &mut stream, force.unwrap_or(false)).await)
+            }
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/recv/check?<force>", data = "<header>")]
+    pub async fn recv_check(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        force: Option<bool>,
+        header: Json<crate::send::SendHeader>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.recv_check(name, &header, force.unwrap_or(false)).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/rollback")]
+    pub async fn rollback(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.rollback(name).await),
+            None => not_committer(),
+        }
+    }
+
     pub fn routes() -> Vec<rocket::Route> {
         rocket::routes![
-            committer, lend, give_back, commit, commit_fs, claim, volumes, create, remove, props
+            committer,
+            lend,
+            give_back,
+            commit,
+            commit_fs,
+            claim,
+            volumes,
+            create,
+            remove,
+            props,
+            snapshots,
+            snapshot,
+            destroy_snapshot,
+            clone_snapshot,
+            rollback,
+            recv,
+            recv_check
         ]
     }
 }

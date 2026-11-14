@@ -20,10 +20,10 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, ObjType, ROOT_OBJECT, decode_leaf};
+use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Lineage, ObjType, ROOT_OBJECT, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
 use crate::object::{INDIRECT_FANOUT, TreeRoot};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
 /// What a record holds: a node of some tree, at a level (0 = data).
@@ -42,7 +42,7 @@ impl ObjKind {
         match t {
             ObjType::File => ObjKind::File(level),
             ObjType::Directory => ObjKind::Dir(level),
-            ObjType::Volume => ObjKind::Volume(level),
+            ObjType::Volume | ObjType::Snapshot => ObjKind::Volume(level),
         }
     }
 
@@ -439,6 +439,76 @@ impl std::fmt::Display for SalvageReport {
     }
 }
 
+/// Check volume `id`'s snapshots and origin against the objects they
+/// name; returns its snapshots that check out (object number, short name).
+fn check_lineage(
+    id: FileId,
+    d: &Dnode,
+    dnodes: &BTreeMap<FileId, Dnode>,
+    errors: &mut Vec<String>,
+) -> Vec<(FileId, String)> {
+    let Some(Lineage::Head { origin, snapshots }) = &d.lineage else {
+        if d.lineage.is_some() {
+            errors.push(format!("volume {}: lineage of a snapshot", id));
+        }
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut last = 0;
+    if let Some(o) = origin {
+        last = o.txg;
+        match dnodes.get(&o.id) {
+            Some(s) if s.kind == ObjType::Snapshot => match &s.lineage {
+                Some(Lineage::Snapshot { txg, clones, .. }) if *txg == o.txg => {
+                    if !clones.contains(&id) {
+                        errors.push(format!(
+                            "volume {}: its origin {} doesn't list it as a clone",
+                            id, o.name
+                        ));
+                    }
+                }
+                _ => errors.push(format!("volume {}: origin {} is inconsistent", id, o.name)),
+            },
+            _ => errors.push(format!("volume {}: origin {} doesn't exist", id, o.name)),
+        }
+    }
+    for r in snapshots {
+        let ok = match dnodes.get(&r.id) {
+            Some(s) if s.kind == ObjType::Snapshot && s.parent == id => {
+                matches!(&s.lineage, Some(Lineage::Snapshot { txg, guid, .. }) if *txg == r.txg && *guid == r.guid)
+            }
+            _ => false,
+        };
+        if !ok {
+            errors.push(format!(
+                "{}: snapshot object {} is missing or inconsistent",
+                r.name, r.id
+            ));
+            continue;
+        }
+        if r.txg < last {
+            errors.push(format!("{}: snapshots out of TXG order", r.name));
+        }
+        last = r.txg;
+        if let Some(Lineage::Snapshot { clones, .. }) = &dnodes[&r.id].lineage {
+            for c in clones {
+                let theirs = dnodes.get(c).and_then(|cd| match &cd.lineage {
+                    Some(Lineage::Head {
+                        origin: Some(o), ..
+                    }) => Some(o.id),
+                    _ => None,
+                });
+                if theirs != Some(r.id) {
+                    errors.push(format!("{}: clone {} doesn't name it as origin", r.name, c));
+                }
+            }
+        }
+        let short = r.name.split_once('@').map_or(r.name.as_str(), |(_, s)| s);
+        out.push((r.id, short.to_string()));
+    }
+    out
+}
+
 #[derive(Default)]
 struct Collect {
     dirs: Vec<String>,
@@ -471,7 +541,13 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut report = WalkReport::default();
         let mut dnodes: BTreeMap<FileId, Dnode> = BTreeMap::new();
         let mut stack: Vec<Node> = table_node(table).into_iter().collect();
+        // Snapshots, clones and their volumes share subtrees: each record
+        // once (a reused lba always has a newer birth).
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
         while let Some(node) = stack.pop() {
+            if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
+                continue;
+            }
             report.records += 1;
             v.record(&node.ptr, node.kind);
             // Directory data is read by the namespace walk below.
@@ -537,7 +613,15 @@ impl<D: BlockDevice> FileSystem<D> {
             let d = &dnodes[&id];
             match d.kind {
                 ObjType::File => v.file(&path, id, d),
-                ObjType::Volume => v.volume(&path, id, d),
+                ObjType::Volume => {
+                    v.volume(&path, id, d);
+                    for (sid, name) in check_lineage(id, d, dnodes, &mut report.errors) {
+                        reached.insert(sid);
+                        v.volume(&format!("{}@{}", path, name), sid, &dnodes[&sid]);
+                    }
+                }
+                // Reached from its volume.
+                ObjType::Snapshot => {}
                 ObjType::Directory => {
                     v.dir(&path);
                     let index = match self.read_dir(d).await {

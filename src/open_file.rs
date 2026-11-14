@@ -343,6 +343,7 @@ impl<D: BlockDevice> FileSystem<D> {
             size: f.obj.size(),
             allocs: allocated.iter().map(ext).collect(),
             frees: replaced.iter().map(ext).collect(),
+            min_birth: allocated.iter().map(|p| p.birth_txg).min(),
         };
         let lease = f.lease.lock().unwrap().clone();
         match self.writer_commit_fs(w, op, lease).await {
@@ -354,6 +355,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 // Definitely not applied: the space is ours to reuse.
                 self.release_ptrs(&allocated).await;
                 Err(FileSystemError::Conflict(m))
+            }
+            Err(CommitError::Restamp(open)) => {
+                // Not applied: rebuilt next round (the records stay dirty).
+                self.release_ptrs(&allocated).await;
+                self.note_open_txg(open).await;
+                Err(FileSystemError::Restamp(open))
             }
             // Unknown outcome: keep the space out of use (if it was applied,
             // it's referenced; if not, the committer still has it as free).

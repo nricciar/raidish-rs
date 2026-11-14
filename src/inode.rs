@@ -37,6 +37,9 @@ pub enum ObjType {
     Directory,
     /// Copy-on-write virtual block device (see `crate::volume`).
     Volume,
+    /// A volume as it was at some TXG, read-only (see `crate::snapshot`).
+    /// No directory links it: its volume's dnode does.
+    Snapshot,
 }
 
 impl ObjType {
@@ -45,6 +48,7 @@ impl ObjType {
             ObjType::File => "file",
             ObjType::Directory => "dir",
             ObjType::Volume => "volume",
+            ObjType::Snapshot => "snapshot",
         }
     }
 }
@@ -155,6 +159,44 @@ pub struct Dnode {
     /// attributes): NFS clients validate their caches on it. Unlike a
     /// time, it never goes backwards, whichever node's clock is involved.
     pub change: u64,
+    /// A volume's snapshots and origin, or a snapshot's place among them
+    /// (see `crate::snapshot`). None: a volume with neither.
+    pub lineage: Option<Lineage>,
+}
+
+/// A snapshot, as its volume (or a clone made from it) refers to it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SnapRef {
+    /// `volume@snapshot`.
+    pub name: String,
+    pub id: FileId,
+    /// The TXG it was taken in: every block it references was born at or
+    /// before it, and every block born after it is someone else's.
+    pub txg: u64,
+    /// Names these contents in any pool: a received snapshot keeps the
+    /// sender's (see `crate::send`).
+    pub guid: u64,
+}
+
+/// How copy-on-write volumes share blocks (see `crate::snapshot`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum Lineage {
+    /// A volume (`kind` Volume).
+    Head {
+        /// The snapshot it was cloned from: blocks born at or before it
+        /// are the origin's.
+        origin: Option<SnapRef>,
+        /// Its snapshots, oldest first.
+        snapshots: Vec<SnapRef>,
+    },
+    /// A snapshot (`kind` Snapshot) of the volume `parent`.
+    Snapshot {
+        txg: u64,
+        /// See `SnapRef::guid`.
+        guid: u64,
+        /// Volumes cloned from it (it can't be destroyed while they exist).
+        clones: Vec<FileId>,
+    },
 }
 
 impl Dnode {
@@ -172,6 +214,7 @@ impl Dnode {
             log: None,
             parent: 0,
             change: 0,
+            lineage: None,
         }
     }
 
@@ -623,7 +666,22 @@ impl<D: BlockDevice> FileSystem<D> {
                 l.name
             )));
         }
-        self.free_dnode(entry.id, &dnode).await?;
+        if dnode.kind == ObjType::Volume {
+            // Blocks a snapshot or the origin has stay theirs.
+            let held = self.unlink_volume_lineage(entry.id, &dnode).await?;
+            for p in self
+                .unique_blocks(&dnode.tree, dnode.blksz as usize, held, None)
+                .await?
+            {
+                self.free(p.lba, p.asize as u64).await?;
+            }
+            for r in dnode.log.iter().flat_map(|l| &l.regions) {
+                self.free(r.start, r.len).await?;
+            }
+            self.write_dnode(entry.id, None).await?;
+        } else {
+            self.free_dnode(entry.id, &dnode).await?;
+        }
         l.index.files.remove(&l.name);
         self.write_dir(l.parent_id, &mut l.parent, &l.index).await?;
         Ok(entry.id)
@@ -753,7 +811,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut dnode = match kind {
             ObjType::File => Dnode::file(self.file_blksz()),
             ObjType::Directory => Dnode::directory(self.file_blksz()),
-            ObjType::Volume => {
+            ObjType::Volume | ObjType::Snapshot => {
                 return Err(FileSystemError::InvalidArgument(
                     "volumes are made with `volume create`".into(),
                 ));

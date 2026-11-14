@@ -10,6 +10,8 @@ cluster:
 # Export volumes, but don't attach kernel devices (unprivileged containers).
 automount:
   helper: none
+  # Reachable from the compose network (the nfs-client container).
+  bind: 0.0.0.0
 # The certificate bundle `pki` made for this node (see docker-compose.yml).
 tls:
   dir: /etc/raidish/tls

@@ -323,40 +323,95 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         r
     }
 
+    /// The lowest TXG the records and indirects are stamped with.
+    fn min_birth(&self) -> Option<u64> {
+        self.leaves
+            .iter()
+            .chain(&self.indirects)
+            .map(|p| p.birth_txg)
+            .min()
+    }
+
+    /// Stamp the records with `txg` and rebuild the indirect blocks over
+    /// them. A record's birth is in the pointer to it, not in the record:
+    /// the data stays where it is.
+    async fn restamp(&mut self, txg: u64) -> Result<TreeRoot, FileSystemError> {
+        for p in &mut self.leaves {
+            p.birth_txg = txg;
+        }
+        let old = std::mem::take(&mut self.indirects);
+        self.fs.release_ptrs(&old).await;
+        let tree = self.build().await?;
+        self.fs.dev.flush().await?;
+        Ok(tree)
+    }
+
     async fn finish_writer(
         &mut self,
         w: &crate::writer::WriterState,
         tree: TreeRoot,
     ) -> Result<FileId, FileSystemError> {
-        let op = FsOp::WriteFile {
-            path: path_string(&self.path)?,
-            size_bytes: self.size,
-            blksz: self.blksz as u32,
-            tree,
-            allocs: self
-                .leaves
-                .iter()
-                .chain(&self.indirects)
-                .map(|p| (p.lba, p.asize as u64))
-                .collect(),
-            base: self.base.clone(),
-        };
-        match self.fs.writer_commit_fs(w, op, self.lease.clone()).await {
-            Ok(c) => Ok(c.file_id),
-            Err(CommitError::Refused(m)) => {
-                // Definitely not applied: the space is ours to reuse.
-                self.release().await;
-                Err(FileSystemError::Conflict(m))
+        let mut tree = tree;
+        let mut attempts = 0;
+        loop {
+            let op = FsOp::WriteFile {
+                path: path_string(&self.path)?,
+                size_bytes: self.size,
+                blksz: self.blksz as u32,
+                tree: tree.clone(),
+                allocs: self
+                    .leaves
+                    .iter()
+                    .chain(&self.indirects)
+                    .map(|p| (p.lba, p.asize as u64))
+                    .collect(),
+                base: self.base.clone(),
+                min_birth: self.min_birth(),
+            };
+            match self.fs.writer_commit_fs(w, op, self.lease.clone()).await {
+                Ok(c) => return Ok(c.file_id),
+                Err(CommitError::Refused(m)) => {
+                    // Definitely not applied: the space is ours to reuse.
+                    self.release().await;
+                    return Err(FileSystemError::Conflict(m));
+                }
+                Err(CommitError::Restamp(open)) if attempts < 3 => {
+                    // Stamped below the birth floor (a snapshot was taken
+                    // meanwhile): restamp and send again.
+                    attempts += 1;
+                    self.fs.note_open_txg(open).await;
+                    tree = match self.restamp(open).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.release().await;
+                            return Err(e);
+                        }
+                    };
+                }
+                // Unknown outcome: keep the space out of use (if it was
+                // applied, it's referenced; if not, the committer still has
+                // it as free).
+                Err(e) => return Err(e.into()),
             }
-            // Unknown outcome: keep the space out of use (if it was applied,
-            // it's referenced; if not, the committer still has it as free).
-            Err(e) => Err(e.into()),
         }
     }
 
     async fn finish_local(&mut self, tree: TreeRoot) -> Result<FileId, FileSystemError> {
         let fs = self.fs;
         let _tx = fs.begin_tx().await;
+        // Records written before a snapshot raised the birth floor are
+        // restamped (no commit can run now: the open TXG is final).
+        let mut tree = tree;
+        if self.min_birth().is_some_and(|b| b < fs.birth_floor()) {
+            let open = fs.open_txg().await?;
+            tree = match self.restamp(open).await {
+                Ok(t) => t,
+                Err(e) => {
+                    self.release().await;
+                    return Err(e);
+                }
+            };
+        }
         let l = fs.lookup(&self.path).await?;
         let current = fs.current_file(&l).await?;
         if current.as_ref().map(|(id, d)| (*id, d.tree.clone())) != self.base {

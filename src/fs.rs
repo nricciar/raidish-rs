@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV20";
+pub const FS_ID: &str = "RAIDISHV21";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -78,6 +78,9 @@ pub enum FileSystemError {
     Conflict(String),
     /// Can't be done right now (no committer reachable); may be retried.
     Unavailable(String),
+    /// A writer's blocks were stamped below the birth floor: rebuild them
+    /// stamped with this TXG.
+    Restamp(u64),
 }
 
 impl fmt::Display for FileSystemError {
@@ -101,6 +104,9 @@ impl fmt::Display for FileSystemError {
             FileSystemError::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
             FileSystemError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             FileSystemError::Unavailable(msg) => write!(f, "Unavailable: {}", msg),
+            FileSystemError::Restamp(t) => {
+                write!(f, "Stamped below the birth floor (now TXG {})", t)
+            }
         }
     }
 }
@@ -307,6 +313,11 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) next_object: Arc<AtomicU64>,
     /// Serializes a writer's intent log appends (see `crate::zil`).
     pub(crate) log_io: Arc<Mutex<()>>,
+    /// The lowest TXG new blocks may be stamped with (see
+    /// `raise_birth_floor`).
+    pub(crate) birth_floor: Arc<AtomicU64>,
+    /// Snapshots read so far, by object number (see `crate::snapshot`).
+    pub(crate) snap_trees: Arc<std::sync::Mutex<HashMap<FileId, Arc<ObjTree>>>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -343,6 +354,8 @@ impl<D: BlockDevice> FileSystem<D> {
             writer: None,
             next_object: Arc::new(AtomicU64::new(1)),
             log_io: Arc::new(Mutex::new(())),
+            birth_floor: Arc::new(AtomicU64::new(0)),
+            snap_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -362,6 +375,19 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) fn alloc_object(&self) -> FileId {
         debug_assert!(self.writer.is_none(), "writers don't assign object numbers");
         self.next_object.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// From now on, commits must stamp every new block with TXG `txg` or
+    /// later. A snapshot taken at TXG `t` raises it to `t + 1`, so every
+    /// block a later commit adds is born after the snapshot (and a block's
+    /// birth says whether a snapshot has it). Writers whose blocks are
+    /// stamped lower (their view of the TXG lags) are told to restamp.
+    pub(crate) fn raise_birth_floor(&self, txg: u64) {
+        self.birth_floor.fetch_max(txg, Ordering::SeqCst);
+    }
+
+    pub(crate) fn birth_floor(&self) -> u64 {
+        self.birth_floor.load(Ordering::SeqCst)
     }
 
     /// Leaf disks of the pool underneath (0 for a plain device).

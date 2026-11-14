@@ -258,8 +258,13 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<(), FileSystemError> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
         let mut stack: Vec<Node> = table_node(&root).into_iter().collect();
+        // Snapshots share subtrees with their volumes: each record once.
+        let mut seen: std::collections::HashSet<(u64, u64)> = Default::default();
 
         while let Some(node) = stack.pop() {
+            if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
+                continue;
+            }
             if !self.read_only
                 && report.records % 256 == 255
                 && self.allocatable_blocks().await < total / MIN_FREE_FRACTION

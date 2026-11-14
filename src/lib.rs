@@ -56,6 +56,9 @@ pub mod pki;
 mod raidz;
 mod rt;
 mod scan;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod send;
+pub mod snapshot;
 mod stripe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tls;

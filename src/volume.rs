@@ -155,7 +155,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// The volume `name`'s object number, from the root directory.
-    async fn volume_id(&self, name: &str) -> Result<FileId, FileSystemError> {
+    pub(crate) async fn volume_id(&self, name: &str) -> Result<FileId, FileSystemError> {
         let (_, _, root) = self.resolve_dir(&[]).await?;
         match root.files.get(name) {
             Some(e) if e.kind == ObjType::Volume => Ok(e.id),
@@ -373,11 +373,16 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         // Readers switch to the new tree only now (they see `syncing` until then).
         vol.obj.set_root(new_root);
-        for ptr in replaced.iter() {
-            let e = ptr.extent();
-            self.free(e.start, e.len).await?;
-        }
-        Ok(())
+        // What a snapshot still has stays (see `crate::snapshot`).
+        let held = self.held_txg_of(vol.id).await?;
+        self.free_unheld(
+            replaced
+                .iter()
+                .map(|p| (p.lba, p.asize as u64, p.birth_txg))
+                .collect(),
+            held,
+        )
+        .await
     }
 
     /// Rewrite `vol`'s dnode (in the open TXG) with tree root `root` and

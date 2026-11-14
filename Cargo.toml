@@ -43,7 +43,7 @@ serde_yaml = "0.9"
 rocket = { version = "0.5.1", features = ["json", "uuid", "tls", "mtls"] }
 ws = { package = "rocket_ws", version = "0.1.1" }
 openraft = { version = "=0.9.26", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 x509-parser = "0.16"

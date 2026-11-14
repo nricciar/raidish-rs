@@ -150,8 +150,35 @@ enum Commands {
 enum VolumeCommands {
     /// Create a volume of `size` bytes.
     Create { name: String, size: u64 },
-    /// Delete a volume (it must not be running).
+    /// Delete a volume (it must not be running), or a snapshot
+    /// (`volume@snapshot`).
     Delete { name: String },
+    /// Snapshot a volume as last committed: `volume@snapshot`.
+    Snapshot { name: String },
+    /// List a volume's snapshots.
+    Snapshots { name: String },
+    /// Make volume `name` from snapshot `snapshot` (`volume@snapshot`).
+    Clone { snapshot: String, name: String },
+    /// Roll a volume back to its newest snapshot, discarding every write
+    /// since (it must not be running).
+    Rollback { name: String },
+    /// Write snapshot `volume@snapshot` to stdout as a stream: all of it,
+    /// or (`--from`) what changed since an older snapshot of it.
+    Send {
+        snapshot: String,
+        /// The older snapshot (its short name) the receiver already has.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Receive a stream from stdin into volume `name`: a full stream makes
+    /// the volume, an incremental one goes onto its newest snapshot.
+    Recv {
+        name: String,
+        /// Roll the volume back to its newest snapshot first if it was
+        /// written since.
+        #[arg(long)]
+        force: bool,
+    },
     /// List volumes with their placement settings.
     List,
     /// Change where and how a volume runs.
@@ -198,7 +225,12 @@ impl Commands {
                 ..
             } => *repair || *rebuild_spacemaps,
             Commands::Defrag { check, .. } => !check,
-            Commands::Volume { command } => !matches!(command, VolumeCommands::List),
+            Commands::Volume { command } => !matches!(
+                command,
+                VolumeCommands::List
+                    | VolumeCommands::Snapshots { .. }
+                    | VolumeCommands::Send { .. }
+            ),
             _ => false,
         }
     }
@@ -575,6 +607,14 @@ pub async fn main() -> std::io::Result<()> {
                 | Commands::Nbd { .. }
                 | Commands::Nvme { .. }
         )
+        // Sending only reads (committed snapshots never change): any node
+        // can, straight from the disks.
+        && !matches!(
+            cli.command,
+            Commands::Volume {
+                command: VolumeCommands::Send { .. }
+            }
+        )
     {
         let client = crate::committer::CommitClient::new(endpoints.clone());
         if let Some(info) = client.committer().await {
@@ -791,9 +831,45 @@ pub async fn main() -> std::io::Result<()> {
             println!("root: {:?}", fs.ls(Path::new("")).await.unwrap());
         }
         Commands::Volume { command } => {
-            let read_only = matches!(command, VolumeCommands::List);
+            let read_only = matches!(
+                command,
+                VolumeCommands::List
+                    | VolumeCommands::Snapshots { .. }
+                    | VolumeCommands::Send { .. }
+            );
             let fs = open_fs(raid, read_only, rewind).await;
             match command {
+                VolumeCommands::Send { snapshot, from } => {
+                    send_to_stdout(&fs, &snapshot, from).await
+                }
+                VolumeCommands::Recv { name, force } => {
+                    let r = fs
+                        .recv_snapshot(&name, &mut tokio::io::stdin(), force)
+                        .await
+                        .unwrap_or_else(|e| fail(e));
+                    eprintln!("received {}", r);
+                }
+                VolumeCommands::Delete { name } if name.contains('@') => {
+                    let (v, s) = crate::snapshot::split_name(&name).unwrap_or_else(|e| fail(e));
+                    fs.destroy_snapshot(v, s).await.unwrap_or_else(|e| fail(e));
+                }
+                VolumeCommands::Snapshot { name } => {
+                    let (v, s) = crate::snapshot::split_name(&name).unwrap_or_else(|e| fail(e));
+                    let txg = fs.create_snapshot(v, s).await.unwrap_or_else(|e| fail(e));
+                    println!("{} at TXG {}", name, txg);
+                }
+                VolumeCommands::Snapshots { name } => {
+                    print_snapshots(&fs.list_snapshots(&name).await.unwrap_or_else(|e| fail(e)))
+                }
+                VolumeCommands::Clone { snapshot, name } => {
+                    let (v, s) = crate::snapshot::split_name(&snapshot).unwrap_or_else(|e| fail(e));
+                    fs.clone_snapshot(v, s, &name)
+                        .await
+                        .unwrap_or_else(|e| fail(e));
+                }
+                VolumeCommands::Rollback { name } => {
+                    fs.rollback_volume(&name).await.unwrap_or_else(|e| fail(e));
+                }
                 VolumeCommands::Create { name, size } => {
                     let vbs = fs.default_volblocksize();
                     fs.create_block(&name, size, vbs)
@@ -879,6 +955,86 @@ fn change_props(
     (name.clone(), props)
 }
 
+/// `volume send`: the stream to stdout (which mustn't be a terminal), the
+/// report to stderr.
+async fn send_to_stdout(fs: &FileSystem<crate::vdev::Pool>, snapshot: &str, from: Option<String>) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        fail("refusing to write a send stream to a terminal (redirect or pipe it)");
+    }
+    let (v, s) = crate::snapshot::split_name(snapshot).unwrap_or_else(|e| fail(e));
+    let from = from.map(|f| f.rsplit('@').next().unwrap_or_default().to_string());
+    let mut out = tokio::io::BufWriter::with_capacity(4 << 20, tokio::io::stdout());
+    let r = fs
+        .send_snapshot(v, s, from.as_deref(), &mut out)
+        .await
+        .unwrap_or_else(|e| fail(e));
+    eprintln!("sent {}", r);
+}
+
+fn print_snapshots(snaps: &[crate::snapshot::SnapshotInfo]) {
+    if snaps.is_empty() {
+        println!("no snapshots");
+        return;
+    }
+    println!(
+        "{:<32} {:>8} {:>10}  {:<20} CLONES",
+        "NAME", "TXG", "UNIQUE", "CREATED"
+    );
+    for s in snaps {
+        let created = chrono_like(s.created_ns);
+        println!(
+            "{:<32} {:>8} {:>10}  {:<20} {}",
+            s.name,
+            s.txg,
+            human_bytes(s.unique_bytes),
+            created,
+            if s.clones.is_empty() {
+                "-".into()
+            } else {
+                s.clones.join(",")
+            }
+        );
+    }
+}
+
+/// `bytes` as K/M/G.
+fn human_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= (1u64 << 30) as f64 {
+        format!("{:.1}G", b / (1u64 << 30) as f64)
+    } else if b >= (1u64 << 20) as f64 {
+        format!("{:.1}M", b / (1u64 << 20) as f64)
+    } else {
+        format!("{:.0}K", b / 1024.0)
+    }
+}
+
+/// ns since the epoch as `YYYY-MM-DD HH:MM:SS` (UTC).
+fn chrono_like(ns: u64) -> String {
+    let secs = ns / 1_000_000_000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::Status>) {
     if vols.is_empty() {
         println!("no volumes");
@@ -929,6 +1085,43 @@ async fn via_committer(
         | Commands::Volume {
             command: VolumeCommands::Create { name, size },
         } => ok(client.create_volume(name, *size).await),
+        Commands::Volume {
+            command: VolumeCommands::Delete { name },
+        } if name.contains('@') => {
+            let (v, s) = crate::snapshot::split_name(name).unwrap_or_else(|e| fail(e));
+            ok(client.destroy_snapshot(v, s).await)
+        }
+        Commands::Volume {
+            command: VolumeCommands::Snapshot { name },
+        } => {
+            let (v, s) = crate::snapshot::split_name(name).unwrap_or_else(|e| fail(e));
+            let txg = client
+                .create_snapshot(v, s)
+                .await
+                .unwrap_or_else(|e| fail(e));
+            println!("{} at TXG {}", name, txg);
+        }
+        Commands::Volume {
+            command: VolumeCommands::Snapshots { name },
+        } => print_snapshots(&client.snapshots(name).await.unwrap_or_else(|e| fail(e))),
+        Commands::Volume {
+            command: VolumeCommands::Clone { snapshot, name },
+        } => {
+            let (v, s) = crate::snapshot::split_name(snapshot).unwrap_or_else(|e| fail(e));
+            ok(client.clone_snapshot(v, s, name).await)
+        }
+        Commands::Volume {
+            command: VolumeCommands::Rollback { name },
+        } => ok(client.rollback(name).await),
+        Commands::Volume {
+            command: VolumeCommands::Recv { name, force },
+        } => {
+            let r = client
+                .recv(name, *force, tokio::io::stdin())
+                .await
+                .unwrap_or_else(|e| fail(e));
+            eprintln!("received {}", r);
+        }
         Commands::Delete { path: name }
         | Commands::Volume {
             command: VolumeCommands::Delete { name },
