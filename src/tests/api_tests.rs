@@ -114,3 +114,31 @@ fn old_protocol_headers_are_rejected() {
     req.truncate(23);
     assert!(WsRequest::parse(&req).is_none());
 }
+
+#[tokio::test]
+async fn readonly_connections_cannot_write_or_fence() {
+    let pool = TestPool::new().await;
+    let disks = local_disks(&pool).await;
+    let floor = EpochFloor::default();
+    let a = vec![0xAAu8; BLOCK_SIZE];
+    let ro = |op, block, epoch, data: Option<&[u8]>| {
+        let req = encode_request(op, 0, block, 1, 9, epoch, data);
+        let (disks, floor) = (&disks, &floor);
+        async move {
+            let resp = handle_ws_message_as(&req, disks, floor, false).await;
+            let (status, id) = decode_response(&resp).unwrap();
+            assert_eq!(id, 9);
+            WsStatus::try_from(status).unwrap()
+        }
+    };
+
+    let (s, _) = send(&disks, &floor, WsOp::Write, 7, 5, Some(&a)).await;
+    assert_eq!(s, WsStatus::Success);
+    assert_eq!(ro(WsOp::Write, 7, 99, Some(&a)).await, WsStatus::Forbidden);
+    assert_eq!(ro(WsOp::Flush, 0, 99, None).await, WsStatus::Forbidden);
+    // A read claiming a huge epoch doesn't raise the floor...
+    assert_eq!(ro(WsOp::Read, 7, 1_000, None).await, WsStatus::Success);
+    // ...so the real writer at epoch 5 is not fenced out.
+    let (s, _) = send(&disks, &floor, WsOp::Write, 7, 5, Some(&a)).await;
+    assert_eq!(s, WsStatus::Success);
+}

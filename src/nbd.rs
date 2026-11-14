@@ -582,7 +582,8 @@ where
             }
             NBD_CMD_FLUSH => {
                 tasks.spawn(async move {
-                    let error = match fs.sync().await {
+                    // Through the intent log on a writer (see `crate::zil`).
+                    let error = match fs.flush().await {
                         Ok(()) => 0,
                         Err(e) => {
                             eprintln!("nbd: flush: {}", e);

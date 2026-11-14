@@ -1,7 +1,7 @@
-use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
-use crate::inode::{FileIndex, FileInode, InodeType};
+use crate::inode::{Dnode, FileIndex, ROOT_OBJECT};
 use crate::metaslab::{MetaslabLayout, MetaslabState};
+use crate::object::{ObjTree, Sizing, TreeRoot};
 use crate::raidz::RaidZError;
 use crate::vdev::Topology;
 use crate::volume::Volume;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV15";
+pub const FS_ID: &str = "RAIDISHV21";
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -73,6 +73,14 @@ pub enum FileSystemError {
     InvalidArgument(String),
     /// The pool was formatted with a different layout than configured.
     TopologyMismatch(String),
+    /// Refused because the target changed meanwhile, or is open for writing
+    /// elsewhere (a compare-and-swap or object lease check failed).
+    Conflict(String),
+    /// Can't be done right now (no committer reachable); may be retried.
+    Unavailable(String),
+    /// A writer's blocks were stamped below the birth floor: rebuild them
+    /// stamped with this TXG.
+    Restamp(u64),
 }
 
 impl fmt::Display for FileSystemError {
@@ -94,6 +102,11 @@ impl fmt::Display for FileSystemError {
             FileSystemError::NotAFile => write!(f, "Not a file"),
             FileSystemError::AlreadyExists => write!(f, "Already exists"),
             FileSystemError::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
+            FileSystemError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            FileSystemError::Unavailable(msg) => write!(f, "Unavailable: {}", msg),
+            FileSystemError::Restamp(t) => {
+                write!(f, "Stamped below the birth floor (now TXG {})", t)
+            }
         }
     }
 }
@@ -162,11 +175,13 @@ pub struct Uberblock {
     pub version: u32,
     pub txg: u64,       // transaction group
     pub timestamp: u64, // optional but useful
-    /// The root directory's serialized `FileIndex`.
-    pub root: Vec<BlockPtr>,
+    /// The object table (see `crate::inode`).
+    pub objects: TreeRoot,
     /// Per member disk: the earliest TXG it may have missed writes from
     /// (None = in sync). Cleared by a successful resilver.
     pub degraded: Vec<Option<u64>>,
+    /// The next pool-wide object number (inode id). Never reused.
+    pub next_object: u64,
 }
 
 /// Identity of a member disk, stored (twice) in its label area outside the
@@ -266,11 +281,12 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) uberblock: Arc<Mutex<Option<Uberblock>>>,
     pub(crate) layout: MetaslabLayout,
     pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
-    pub(crate) file_index: Arc<RwLock<FileIndex>>,
-    /// Root file index location in the open TXG (committed by `commit_txg`).
-    pub(crate) root_ptr: Arc<Mutex<Vec<BlockPtr>>>,
+    /// The object table, with the open TXG's changes (see `crate::inode`).
+    pub(crate) objects: Arc<ObjTree>,
     /// Open copy-on-write volumes and their dirty records.
     pub(crate) volumes: Arc<std::sync::Mutex<HashMap<String, Arc<Volume>>>>,
+    /// Files open for writing at any offset (see `crate::open_file`).
+    pub(crate) files: Arc<std::sync::Mutex<HashMap<FileId, Arc<crate::open_file::OpenFile>>>>,
     commit_lock: Arc<Mutex<()>>,
     /// Commits that have begun (taken their snapshot) / finished successfully.
     /// Lets concurrent `sync` calls share one commit (group commit).
@@ -293,6 +309,15 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) scan_lock: Arc<Mutex<()>>,
     /// Set when opened as a volume writer (see `crate::writer`).
     pub(crate) writer: Option<Arc<crate::writer::WriterState>>,
+    /// Next pool-wide object number (persisted in every uberblock).
+    pub(crate) next_object: Arc<AtomicU64>,
+    /// Serializes a writer's intent log appends (see `crate::zil`).
+    pub(crate) log_io: Arc<Mutex<()>>,
+    /// The lowest TXG new blocks may be stamped with (see
+    /// `raise_birth_floor`).
+    pub(crate) birth_floor: Arc<AtomicU64>,
+    /// Snapshots read so far, by object number (see `crate::snapshot`).
+    pub(crate) snap_trees: Arc<std::sync::Mutex<HashMap<FileId, Arc<ObjTree>>>>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -305,9 +330,17 @@ impl<D: BlockDevice> FileSystem<D> {
             uberblock: Arc::new(Mutex::new(None)),
             layout: MetaslabLayout::default(),
             metaslabs: Arc::new(Vec::new()),
-            file_index: Arc::new(RwLock::new(FileIndex::new())),
-            root_ptr: Arc::new(Mutex::new(Vec::new())),
+            objects: Arc::new(ObjTree::new(
+                BLOCK_SIZE,
+                Sizing::Growable,
+                0,
+                TreeRoot {
+                    ptr: None,
+                    levels: 0,
+                },
+            )),
             volumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            files: Arc::new(std::sync::Mutex::new(HashMap::new())),
             commit_lock: Arc::new(Mutex::new(())),
             commits_started: Arc::new(AtomicU64::new(0)),
             commits_done: Arc::new(AtomicU64::new(0)),
@@ -319,6 +352,10 @@ impl<D: BlockDevice> FileSystem<D> {
             scan_hold: Arc::new(AtomicUsize::new(0)),
             scan_lock: Arc::new(Mutex::new(())),
             writer: None,
+            next_object: Arc::new(AtomicU64::new(1)),
+            log_io: Arc::new(Mutex::new(())),
+            birth_floor: Arc::new(AtomicU64::new(0)),
+            snap_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -331,6 +368,26 @@ impl<D: BlockDevice> FileSystem<D> {
                 self.layout,
             ));
         }
+    }
+
+    /// A new pool-wide object number. Only the process that commits the
+    /// pool (the committer, or a standalone pool holder) hands them out.
+    pub(crate) fn alloc_object(&self) -> FileId {
+        debug_assert!(self.writer.is_none(), "writers don't assign object numbers");
+        self.next_object.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// From now on, commits must stamp every new block with TXG `txg` or
+    /// later. A snapshot taken at TXG `t` raises it to `t + 1`, so every
+    /// block a later commit adds is born after the snapshot (and a block's
+    /// birth says whether a snapshot has it). Writers whose blocks are
+    /// stamped lower (their view of the TXG lags) are told to restamp.
+    pub(crate) fn raise_birth_floor(&self, txg: u64) {
+        self.birth_floor.fetch_max(txg, Ordering::SeqCst);
+    }
+
+    pub(crate) fn birth_floor(&self) -> u64 {
+        self.birth_floor.load(Ordering::SeqCst)
     }
 
     /// Leaf disks of the pool underneath (0 for a plain device).
@@ -386,8 +443,12 @@ impl<D: BlockDevice> FileSystem<D> {
             version: 0,
             txg: 0,
             timestamp: 0,
-            root: Vec::new(),
+            objects: TreeRoot {
+                ptr: None,
+                levels: 0,
+            },
             degraded: vec![None; fs.disk_count()],
+            next_object: 1,
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         // Disks that failed during format must not count as missed writes
@@ -439,20 +500,44 @@ impl<D: BlockDevice> FileSystem<D> {
             .collect();
         fs.metaslabs = Arc::new(metaslabs);
 
-        fs.persist_root_index().await?;
+        fs.objects = Arc::new(fs.table_tree(TreeRoot {
+            ptr: None,
+            levels: 0,
+        }));
+        let root = fs.alloc_object();
+        debug_assert_eq!(root, ROOT_OBJECT);
+        let mut dir = Dnode::directory(fs.file_blksz());
+        dir.parent = ROOT_OBJECT;
+        fs.write_dnode(root, Some(dir)).await?;
         fs.commit_txg().await?;
 
         Ok(fs)
     }
 
-    /// Write the root file index for the open TXG and free the previous one
-    /// (in the same TXG that stops referencing it, so a crash can't leak it).
-    /// Does not commit; callers finish with `commit_txg`.
-    pub(crate) async fn persist_root_index(&self) -> Result<(), FileSystemError> {
-        let index = self.file_index.read().await.clone();
-        let ptrs = self.write_value(&index).await?;
-        let old = std::mem::replace(&mut *self.root_ptr.lock().await, ptrs);
-        self.free_object(&old).await
+    /// The object table at `root`.
+    pub(crate) fn table_tree(&self, root: TreeRoot) -> ObjTree {
+        ObjTree::new(self.table_blksz(), Sizing::Growable, 0, root)
+    }
+
+    /// Whether the root directory of the object table at `root` reads.
+    async fn root_readable(&self, root: &TreeRoot) -> bool {
+        let table = self.table_tree(root.clone());
+        let Ok(Some(buf)) = self
+            .object_record(&table, ROOT_OBJECT / crate::inode::DNODES_PER_LEAF)
+            .await
+        else {
+            return false;
+        };
+        let Ok(slots) = crate::inode::decode_leaf(&buf) else {
+            return false;
+        };
+        let Some(Some(dir)) = slots
+            .get((ROOT_OBJECT % crate::inode::DNODES_PER_LEAF) as usize)
+            .cloned()
+        else {
+            return false;
+        };
+        self.read_dir(&dir).await.is_ok()
     }
 
     /// Read file system headers and load root file index
@@ -528,7 +613,7 @@ impl<D: BlockDevice> FileSystem<D> {
             Rewind::Readable => {
                 let mut pick = None;
                 for u in &ring {
-                    if fs.read_value::<FileIndex>(&u.root).await.is_ok() {
+                    if fs.root_readable(&u.objects).await {
                         pick = Some(u.clone());
                         break;
                     }
@@ -554,6 +639,12 @@ impl<D: BlockDevice> FileSystem<D> {
             txg: newest.txg,
             ..uber.clone()
         });
+        // Never hand out a number any TXG in the ring may have used, even
+        // one a rewind discards.
+        fs.next_object.store(
+            ring.iter().map(|u| u.next_object).max().unwrap_or(1).max(1),
+            Ordering::SeqCst,
+        );
 
         // Conservative: a disk degraded in any newer TXG stays degraded.
         let mut degraded = uber.degraded.clone();
@@ -585,22 +676,23 @@ impl<D: BlockDevice> FileSystem<D> {
                 .collect(),
         );
 
-        if let Some(p) = uber.root.iter().find(|p| p.birth_txg > uber.txg) {
+        if let Some(p) = uber.objects.ptr.as_ref().filter(|p| p.birth_txg > uber.txg) {
             eprintln!(
-                "WARNING: root index record born in TXG {} > uberblock TXG {}",
+                "WARNING: object table root born in TXG {} > uberblock TXG {}",
                 p.birth_txg, uber.txg
             );
             return Err(FileSystemError::ChecksumMismatch);
         }
-        let file_index: FileIndex = fs.read_value(&uber.root).await?;
-        fs.file_index = Arc::new(RwLock::new(file_index));
-        fs.root_ptr = Arc::new(Mutex::new(uber.root.clone()));
+        fs.objects = Arc::new(fs.table_tree(uber.objects.clone()));
+        // The root directory must read.
+        let root = fs.read_dnode(ROOT_OBJECT).await?;
+        fs.read_dir(&root).await?;
 
         if rewound && !fs.read_only {
-            let older: Vec<Vec<BlockPtr>> = ring
+            let older: Vec<TreeRoot> = ring
                 .iter()
                 .filter(|u| u.txg < uber.txg)
-                .map(|u| u.root.clone())
+                .map(|u| u.objects.clone())
                 .collect();
             let _tx = fs.begin_tx().await;
             // Never forced: freeing what an unreadable part of the chosen
@@ -639,11 +731,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The newest uberblock of `ring` whose whole tree verifies.
     async fn first_intact(&self, ring: &[Uberblock]) -> Result<Uberblock, FileSystemError> {
         for u in ring {
-            if u.root.iter().any(|p| p.birth_txg > u.txg) {
+            if u.objects.ptr.as_ref().is_some_and(|p| p.birth_txg > u.txg) {
                 eprintln!("rewind: TXG {}: root newer than its uberblock", u.txg);
                 continue;
             }
-            let walk = self.verify_tree(&u.root).await;
+            let walk = self.verify_tree(&u.objects).await;
             if walk.errors.is_empty() {
                 return Ok(u.clone());
             }
@@ -664,123 +756,264 @@ impl<D: BlockDevice> FileSystem<D> {
         self.read_uberblock_ring().await
     }
 
-    /// Read a files contents
+    /// Read a file's contents.
     pub async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileSystemError> {
-        let inode_ref = self.get_file_at_path(path).await?;
-        let inode = self.read_inode(&inode_ref).await?;
-
-        match inode.inode_type {
-            InodeType::File { size_bytes, blocks } => {
-                let mut out = self.read_object(&blocks).await?;
-                out.truncate(size_bytes as usize);
-                Ok(out)
-            }
-            _ => Err(FileSystemError::NotAFile),
-        }
+        let (_, dnode) = self.stat_file(path).await?;
+        self.read_tree(&dnode.tree, dnode.blksz as usize, dnode.size)
+            .await
     }
 
     /// List directory contents
     pub async fn ls(&self, path: &Path) -> Result<FileIndex, FileSystemError> {
-        let (index, _) = self.get_directory_at_path(path).await?;
+        let (_, _, index) = self
+            .resolve_dir(&crate::inode::path_components(path))
+            .await?;
         Ok(index)
     }
 
     pub async fn mkdir(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            return self.writer_mkdir(&w, path).await;
+        }
         let _tx = self.begin_tx().await;
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
+        let id = self.mkdir_locked(path).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
 
-        if let Some(ref inode_ref) = old_inode_ref {
-            let old_inode = self.read_inode(inode_ref).await?;
-            if !old_inode.inode_type.is_directory() {
+    /// `mkdir` under `begin_tx`, without committing (the committer applies
+    /// writers' mkdirs this way). An existing directory is fine.
+    pub(crate) async fn mkdir_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        let l = self.lookup(path).await?;
+        if let Some(e) = l.entry {
+            if e.kind != crate::inode::ObjType::Directory {
                 return Err(FileSystemError::NotADirectory);
             }
-            return Ok(old_inode.id);
+            return Ok(e.id);
         }
-
-        let blocks = self.write_value(&FileIndex::new()).await?;
-        let file_id = parent.next_file_id;
-        parent.next_file_id += 1;
-
-        let new_inode = FileInode {
-            id: file_id,
-            inode_type: InodeType::Directory { blocks },
-        };
-
-        self.persist_directory_changes(path, parent, Some(new_inode))
-            .await?;
-        self.commit_locked().await?;
-
-        Ok(file_id)
+        self.link_new(l, Dnode::directory(self.file_blksz())).await
     }
 
-    /// Write or overwrite a files contents
+    /// Create or replace a file with `data`. On a pool this process
+    /// commits, it is one transaction: no commit sees it half done.
     pub async fn write_file(&self, path: &Path, data: &[u8]) -> Result<FileId, FileSystemError> {
+        if self.writer.is_some() {
+            let mut f = self.file_writer(path, None).await?;
+            f.write(data).await?;
+            return f.finish().await;
+        }
         let _tx = self.begin_tx().await;
-        let (mut parent, old_inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
-
-        // If exists, ensure it's a file not a directory or virtual block device
-        if let Some(ref inode_ref) = old_inode_ref {
-            let old_inode = self.read_inode(inode_ref).await?;
-            if !old_inode.inode_type.is_file() {
-                return Err(FileSystemError::NotAFile);
+        let l = self.lookup(path).await?;
+        let current = self.current_file(&l).await?;
+        let blksz = self.file_blksz();
+        let mut allocated = Vec::new();
+        let written = match self.write_tree(blksz as usize, data, &mut allocated).await {
+            Ok(tree) => {
+                self.set_file_contents(l, current, blksz, data.len() as u64, tree)
+                    .await
             }
-        }
-
-        let blocks = self.write_object(data).await?;
-
-        let file_id = match &old_inode_ref {
-            Some(r) => r.file_id,
-            None => {
-                parent.next_file_id += 1;
-                parent.next_file_id - 1
+            Err(e) => Err(e),
+        };
+        let id = match written {
+            Ok(id) => id,
+            Err(e) => {
+                self.release_ptrs(&allocated).await;
+                return Err(e);
             }
         };
-
-        let new_inode = FileInode {
-            id: file_id,
-            inode_type: InodeType::File {
-                size_bytes: data.len() as u64,
-                blocks,
-            },
-        };
-
-        self.persist_directory_changes(path, parent, Some(new_inode))
-            .await?;
-
-        // Free the old version in the same TXG that drops it.
-        if let Some(old_ref) = old_inode_ref {
-            self.free_inode(&old_ref).await?;
-        }
-
         self.commit_locked().await?;
-
-        Ok(file_id)
+        Ok(id)
     }
 
-    /// Delete a virtual block device or file
+    /// Delete a file, an empty directory or a volume.
     pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
-        let _tx = self.begin_tx().await;
-        let (mut parent, inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
-        let inode_ref = inode_ref.ok_or(FileSystemError::FileNotFound)?;
-
-        let inode = self.read_inode(&inode_ref).await?;
-        if matches!(inode.inode_type, InodeType::Volume { .. })
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-        {
-            self.close_volume(name);
+        if let Some(w) = self.writer.clone() {
+            return self.writer_delete(&w, path, None).await;
         }
-        self.free_inode(&inode_ref).await?;
-
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(FileSystemError::FileNotFound)?;
-        parent.files.remove(filename);
-
-        self.persist_directory_changes(path, parent, None).await?;
+        let _tx = self.begin_tx().await;
+        let id = self.delete_locked(path).await?;
         self.commit_locked().await?;
+        Ok(id)
+    }
 
-        Ok(inode.id)
+    /// Move `from` to `to` (see `rename_locked`). Returns the object's number.
+    pub async fn rename(&self, from: &Path, to: &Path) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            return self.writer_rename(&w, from, to).await;
+        }
+        let _tx = self.begin_tx().await;
+        let (id, _) = self.rename_locked(from, to).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// Change `path`'s mode, owner or modification time.
+    pub async fn set_attrs(
+        &self,
+        path: &Path,
+        set: &crate::inode::SetAttrs,
+    ) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            return self.writer_set_attrs(&w, path, set).await;
+        }
+        let _tx = self.begin_tx().await;
+        let id = self.set_attrs_locked(path, set).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    // ---- by object number (what NFS speaks) ----
+
+    /// Entry `name` of directory `dir`: its number and dnode (None: no such
+    /// entry).
+    pub async fn lookup_in(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<Option<(FileId, Dnode)>, FileSystemError> {
+        match self.lookup_at(dir, name).await?.entry {
+            Some(e) => Ok(Some((e.id, self.read_dnode(e.id).await?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Create file or directory `name` in `dir` (see `create_at_locked`).
+    pub async fn create_at(
+        &self,
+        dir: FileId,
+        name: &str,
+        kind: crate::inode::ObjType,
+        attrs: &crate::inode::SetAttrs,
+        exclusive: Option<u64>,
+    ) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let op = crate::writer::FsOp::CreateAt {
+                dir,
+                name: name.to_string(),
+                kind,
+                attrs: attrs.clone(),
+                exclusive,
+            };
+            return Ok(self.writer_commit_fs(&w, op, None).await?.file_id);
+        }
+        let _tx = self.begin_tx().await;
+        let (id, created) = self
+            .create_at_locked(dir, name, kind, attrs, exclusive)
+            .await?;
+        if created {
+            self.commit_locked().await?;
+        }
+        Ok(id)
+    }
+
+    /// Remove entry `name` of `dir` (a directory must be empty).
+    pub async fn remove_at(&self, dir: FileId, name: &str) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let _tx = self.begin_tx().await;
+            self.reload_root_index().await?;
+            let id = self
+                .lookup_at(dir, name)
+                .await?
+                .entry
+                .ok_or(FileSystemError::FileNotFound)?
+                .id;
+            let op = crate::writer::FsOp::RemoveAt {
+                dir,
+                name: name.to_string(),
+                id,
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(id);
+        }
+        let _tx = self.begin_tx().await;
+        let id = self.remove_at_locked(dir, name).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// `remove_at` under `begin_tx`, without committing.
+    pub(crate) async fn remove_at_locked(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<FileId, FileSystemError> {
+        let l = self.lookup_at(dir, name).await?;
+        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        if entry.kind == crate::inode::ObjType::Volume {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a volume (delete it with `volume delete`)",
+                name
+            )));
+        }
+        self.discard_file(entry.id);
+        self.unlink(l).await
+    }
+
+    /// Move entry `from_name` of `from_dir` to `to_name` in `to_dir` (see
+    /// `rename_at_locked`). Returns the moved object's number.
+    pub async fn rename_at(
+        &self,
+        from_dir: FileId,
+        from_name: &str,
+        to_dir: FileId,
+        to_name: &str,
+    ) -> Result<FileId, FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let _tx = self.begin_tx().await;
+            self.reload_root_index().await?;
+            let id = self
+                .lookup_at(from_dir, from_name)
+                .await?
+                .entry
+                .ok_or(FileSystemError::FileNotFound)?
+                .id;
+            let op = crate::writer::FsOp::RenameAt {
+                from_dir,
+                from_name: from_name.to_string(),
+                to_dir,
+                to_name: to_name.to_string(),
+                id,
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(id);
+        }
+        let _tx = self.begin_tx().await;
+        let src = self.lookup_at(from_dir, from_name).await?;
+        let dst = self.lookup_at(to_dir, to_name).await?;
+        let (id, _) = self.rename_at_locked(src, dst).await?;
+        self.commit_locked().await?;
+        Ok(id)
+    }
+
+    /// Change object `id`'s mode, owner or modification time.
+    pub async fn set_attrs_id(
+        &self,
+        id: FileId,
+        set: &crate::inode::SetAttrs,
+    ) -> Result<(), FileSystemError> {
+        if let Some(w) = self.writer.clone() {
+            let op = crate::writer::FsOp::SetAttrId {
+                id,
+                attrs: set.clone(),
+            };
+            self.writer_commit_fs(&w, op, None).await?;
+            return Ok(());
+        }
+        let _tx = self.begin_tx().await;
+        self.set_attrs_id_locked(id, set).await?;
+        self.commit_locked().await?;
+        Ok(())
+    }
+
+    /// `delete` under `begin_tx`, without committing.
+    pub(crate) async fn delete_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
+        let l = self.lookup(path).await?;
+        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        if entry.kind == crate::inode::ObjType::Volume {
+            self.close_volume(&l.name);
+        }
+        self.discard_file(entry.id);
+        self.unlink(l).await
     }
 
     /// Make every write completed before this call durable.
@@ -840,7 +1073,11 @@ impl<D: BlockDevice> FileSystem<D> {
         // Volumes sync all-or-nothing each, so whatever did sync is safe to
         // commit; a failure is reported after the TXG is durable.
         let volumes = self.sync_volumes().await;
-        let root = self.root_ptr.lock().await.clone();
+        let files = self.sync_files().await;
+        let volumes = volumes.and(files);
+        // Then the object table, which now points at every new tree.
+        self.sync_table().await?;
+        let root = self.objects.root();
 
         let synced = self.sync_metaslabs(txg).await?;
 
@@ -858,6 +1095,33 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             Err(e) => {
                 self.abort_metaslab_sync(synced).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the object table's changed records into the open TXG. On
+    /// failure they stay dirty and nothing visible changes.
+    async fn sync_table(&self) -> Result<(), FileSystemError> {
+        let Some(taken) = self.objects.begin_sync() else {
+            return Ok(());
+        };
+        let (mut allocated, mut replaced) = (Vec::new(), Vec::new());
+        match self
+            .build_tree(&self.objects, &taken, &mut allocated, &mut replaced)
+            .await
+        {
+            Ok(root) => {
+                self.objects.set_root(root);
+                self.objects.end_sync(&taken, Some(&taken));
+                for p in &replaced {
+                    self.free(p.lba, p.asize as u64).await?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.release_ptrs(&allocated).await;
+                self.objects.end_sync(&taken, None);
                 Err(e)
             }
         }
@@ -997,7 +1261,7 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn write_uberblock(
         &self,
         txg: u64,
-        root: Vec<BlockPtr>,
+        objects: TreeRoot,
         degraded: Vec<Option<u64>>,
     ) -> Result<Uberblock, FileSystemError> {
         // Everything the uberblock points at must be durable first.
@@ -1008,8 +1272,9 @@ impl<D: BlockDevice> FileSystem<D> {
             version: 1,
             txg,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            root,
+            objects,
             degraded,
+            next_object: self.next_object.load(Ordering::SeqCst),
         };
 
         // Rotate through the ring; one copy per block of the slot.
@@ -1041,8 +1306,12 @@ impl<D: BlockDevice> FileSystem<D> {
             version: 0,
             txg: 0,
             timestamp: 0,
-            root: Vec::new(),
+            objects: TreeRoot {
+                ptr: None,
+                levels: 0,
+            },
             degraded: Vec::new(),
+            next_object: 0,
         };
         let mut buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;

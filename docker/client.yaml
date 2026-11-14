@@ -2,6 +2,9 @@
 # URL, so commands go through the disk servers (fenced) like any client.
 pool:
   raidz1:
-    - http://node0:8881/api/v1/disks/0
-    - http://node1:8882/api/v1/disks/1
-    - http://node2:8883/api/v1/disks/2
+    - https://node0:8881/api/v1/disks/0
+    - https://node1:8882/api/v1/disks/1
+    - https://node2:8883/api/v1/disks/2
+# An admin certificate bundle, mounted where a container needs the CLI.
+tls:
+  dir: /etc/raidish/tls

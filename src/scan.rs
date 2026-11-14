@@ -23,7 +23,8 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError, LabelState, parse_label};
-use crate::fsck::{NoVisitor, Node, ObjKind};
+use crate::fsck::{Node, table_node};
+use crate::object::TreeRoot;
 use crate::vdev::StripeCheck;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -197,7 +198,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             };
             self.scan_hold.fetch_add(1, Ordering::SeqCst);
-            (self.root_ptr.lock().await.clone(), misses, since)
+            (self.objects.root(), misses, since)
         };
 
         let mut report = ScanReport {
@@ -205,7 +206,7 @@ impl<D: BlockDevice> FileSystem<D> {
             repair,
             ..Default::default()
         };
-        let walked = self.scan_tree(root, since, repair, &mut report).await;
+        let walked = self.scan_tree(root, since, &|_| repair, &mut report).await;
         {
             let _tx = self.begin_tx().await;
             self.scan_labels(repair, &mut report).await;
@@ -245,21 +246,25 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(report)
     }
 
+    /// Walk the tree from `root`, checking records born at or after
+    /// `since`; `repair(ptr)` says whether bad shards of that record may be
+    /// rewritten.
     async fn scan_tree(
         &self,
-        root: Vec<BlockPtr>,
+        root: TreeRoot,
         since: u64,
-        repair: bool,
+        repair: &(dyn Fn(&BlockPtr) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) -> Result<(), FileSystemError> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
-        let mut stack = vec![Node::Object {
-            ptrs: root,
-            kind: ObjKind::RootIndex,
-            path: "/".to_string(),
-        }];
+        let mut stack: Vec<Node> = table_node(&root).into_iter().collect();
+        // Snapshots share subtrees with their volumes: each record once.
+        let mut seen: std::collections::HashSet<(u64, u64)> = Default::default();
 
         while let Some(node) = stack.pop() {
+            if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
+                continue;
+            }
             if !self.read_only
                 && report.records % 256 == 255
                 && self.allocatable_blocks().await < total / MIN_FREE_FRACTION
@@ -267,69 +272,26 @@ impl<D: BlockDevice> FileSystem<D> {
                 report.aborted = Some("pool almost full (scan holds freed space)".into());
                 return Ok(());
             }
-            match node {
-                Node::Object { ptrs, kind, path } => {
-                    if ptrs.is_empty() {
-                        continue;
-                    }
-                    if ptrs.iter().all(|p| p.birth_txg < since) {
-                        report.pruned += ptrs.len() as u64;
-                        continue;
-                    }
-                    let mut data = Vec::new();
-                    let mut complete = true;
-                    for ptr in &ptrs {
-                        match self.scan_record(ptr, repair, report).await {
-                            Some(d) => data.extend_from_slice(&d),
-                            None => {
-                                report.errors.push(format!(
-                                    "{} ({:?}): record at {} unreadable",
-                                    path, kind, ptr.lba
-                                ));
-                                complete = false;
-                            }
-                        }
-                    }
-                    if complete {
-                        self.descend(kind, &path, &data, &mut stack, report);
-                    }
-                }
-                Node::Volume { ptr, level, path } => {
-                    if ptr.birth_txg < since {
-                        report.pruned += 1;
-                        continue;
-                    }
-                    let Some(data) = self.scan_record(&ptr, repair, report).await else {
-                        report.errors.push(format!(
-                            "{} (volume L{}): record at {} unreadable",
-                            path, level, ptr.lba
-                        ));
-                        continue;
-                    };
-                    if level > 0 {
-                        match crate::fsck::expand_indirect(level, &path, &data) {
-                            Ok(children) => stack.extend(children),
-                            Err(e) => report.errors.push(e),
-                        }
-                    }
+            // Copy-on-write: nothing under a record is newer than it.
+            if node.ptr.birth_txg < since {
+                report.pruned += 1;
+                continue;
+            }
+            let Some(data) = self.scan_record(&node.ptr, repair(&node.ptr), report).await else {
+                report.errors.push(format!(
+                    "{} ({:?}): record at {} unreadable",
+                    node.owner, node.kind, node.ptr.lba
+                ));
+                continue;
+            };
+            if node.kind.is_metadata() {
+                match crate::fsck::expand(&node, &data) {
+                    Ok((children, _)) => stack.extend(children),
+                    Err(e) => report.errors.push(e),
                 }
             }
         }
         Ok(())
-    }
-
-    fn descend(
-        &self,
-        kind: ObjKind,
-        path: &str,
-        data: &[u8],
-        stack: &mut Vec<Node>,
-        report: &mut ScanReport,
-    ) {
-        match crate::fsck::expand(kind, path, data, &mut NoVisitor) {
-            Ok(children) => stack.extend(children),
-            Err(e) => report.errors.push(e),
-        }
     }
 
     /// Read one record (checksum verified, rebuilt from parity if needed),
@@ -357,6 +319,50 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         Some(data)
+    }
+
+    /// On a writer: rebuild what degraded disks missed in the metaslabs lent
+    /// to it. The committer's resilver can't write there (its writes are
+    /// fenced out while they're lent; a running volume's intent log keeps
+    /// one lent for as long as it runs), so the writer does, under its own
+    /// fencing epoch. Committed blocks in lent space can't be reallocated
+    /// meanwhile (only this writer allocates there, and only what it was
+    /// lent as free). Once they're fixed, the committer's next resilver finds
+    /// them good and clears the disk. None: nothing to do.
+    pub async fn heal_lent(&self) -> Result<Option<ScanReport>, FileSystemError> {
+        let (Some(w), Some(pool)) = (self.writer.clone(), self.dev.pool()) else {
+            return Ok(None);
+        };
+        let lent: std::collections::HashSet<u32> = w.lent.lock().unwrap().iter().copied().collect();
+        if lent.is_empty() {
+            return Ok(None);
+        }
+        let ring = self.read_uberblock_ring().await;
+        let Some(newest) = ring.first() else {
+            return Ok(None);
+        };
+        let Some(since) = (0..newest.degraded.len())
+            .filter(|&d| pool.disks.is_online(d))
+            .filter_map(|d| newest.degraded[d])
+            .min()
+        else {
+            return Ok(None);
+        };
+        let _one = self.scan_lock.lock().await;
+        let layout = self.layout;
+        let in_lent = move |p: &BlockPtr| {
+            layout
+                .metaslab_for_block(p.lba)
+                .is_some_and(|i| lent.contains(&(i as u32)))
+        };
+        let mut report = ScanReport {
+            since,
+            repair: true,
+            ..Default::default()
+        };
+        self.scan_tree(newest.objects.clone(), since, &in_lent, &mut report)
+            .await?;
+        Ok(Some(report))
     }
 
     /// Verify the fixed label regions: superblock, uberblock ring and space

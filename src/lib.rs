@@ -16,9 +16,13 @@ extern crate rocket;
 pub mod agent;
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auth;
 pub mod blkptr;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
 mod cluster;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,6 +34,9 @@ mod dashboard;
 pub mod disk;
 pub mod disks;
 pub mod fence;
+pub mod file_writer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod files_api;
 pub mod fs;
 mod fsck;
 pub mod inode;
@@ -39,17 +46,29 @@ mod mirror;
 #[cfg(not(target_arch = "wasm32"))]
 mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod nfs;
+#[cfg(not(target_arch = "wasm32"))]
 mod nvme;
+mod object;
+pub mod open_file;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pki;
 mod raidz;
 mod rt;
 mod scan;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod send;
+pub mod snapshot;
 mod stripe;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
 pub mod vdev;
 mod volume;
 pub mod websocket;
 pub mod writer;
+pub mod zil;
 
 #[cfg(test)]
 #[path = "tests/util.rs"]

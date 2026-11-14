@@ -27,7 +27,7 @@ impl LeaseClient {
                 .into_iter()
                 .map(|e| e.trim_end_matches('/').to_string())
                 .collect(),
-            http: reqwest::Client::builder()
+            http: crate::tls::http_builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -91,6 +91,9 @@ pub struct HeldLease {
     pub epoch: u64,
     /// Set by `release`: the renew loop stops quietly.
     released: std::sync::atomic::AtomicBool,
+    /// When the last successful grant or renewal was *sent* (the lease is
+    /// good for a TTL from then, at the earliest).
+    renewed: std::sync::Mutex<Instant>,
 }
 
 impl HeldLease {
@@ -101,6 +104,7 @@ impl HeldLease {
         desc: &str,
     ) -> Result<HeldLease, String> {
         let owner = owner_id();
+        let sent = Instant::now();
         let op = LeaseOp::Acquire {
             resource: resource.into(),
             owner: owner.clone(),
@@ -114,6 +118,7 @@ impl HeldLease {
                 owner,
                 epoch,
                 released: Default::default(),
+                renewed: std::sync::Mutex::new(sent),
             }),
             Response::Held {
                 owner,
@@ -151,7 +156,10 @@ impl HeldLease {
                     ttl_ms: ttl.as_millis() as u64,
                 };
                 match me.client.call(&op).await {
-                    Ok(Response::Granted { epoch, .. }) if epoch == me.epoch => valid_from = sent,
+                    Ok(Response::Granted { epoch, .. }) if epoch == me.epoch => {
+                        valid_from = sent;
+                        *me.renewed.lock().unwrap() = sent;
+                    }
                     Ok(_) if me.released.load(std::sync::atomic::Ordering::SeqCst) => return,
                     Ok(other) => {
                         on_lost(format!("lease on {} lost ({:?})", me.resource, other));
@@ -170,6 +178,14 @@ impl HeldLease {
                 }
             }
         });
+    }
+
+    /// Is the lease provably still held? True while the last renewal is
+    /// well within a TTL old, leaving a third of it as margin for clock rate
+    /// differences and in-flight writes: whatever this holder does while
+    /// it's true happens before anyone else can be granted the lease.
+    pub fn fresh(&self) -> bool {
+        self.renewed.lock().unwrap().elapsed() < LEASE_TTL * 2 / 3
     }
 
     pub async fn release(&self) {

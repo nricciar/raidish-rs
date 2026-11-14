@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot, watch};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 pub use tungstenite::Bytes;
 use tungstenite::Message;
 
@@ -82,9 +82,12 @@ impl Drop for WsConn {
 
 impl WsConn {
     async fn connect(url: &str, opts: DiskOptions) -> Result<Arc<Self>, DiskError> {
-        let (ws, _) = tokio::time::timeout(opts.connect_timeout, connect_async(url))
-            .await
-            .map_err(|_| DiskError::Timeout)??;
+        let (ws, _) = tokio::time::timeout(
+            opts.connect_timeout,
+            connect_async_tls_with_config(url, None, false, crate::tls::ws_connector()),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)??;
         let (sink, mut stream) = ws.split();
         let state = Arc::new(ConnState {
             pending: DashMap::new(),

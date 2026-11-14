@@ -1,22 +1,74 @@
-use crate::blkptr::BlockPtr;
-use crate::disk::{BlockDevice, FileId};
+//! The namespace: objects, the object table, and directories.
+//!
+//! Every object (file, directory, volume) is a *dnode* in the pool's
+//! object table, indexed by its object number. A dnode holds the object's
+//! tree of records (see `crate::object`), its size and attributes:
+//!
+//! ```text
+//!   uberblock ──► object table (a tree of dnode leaves, by object number)
+//!                   └─ dnode ──► the object's own tree ──► data records
+//! ```
+//!
+//! A directory is an object whose contents are its entries, name → object
+//! number. Changing a file's contents rewrites only its dnode (and the
+//! table's path to it), never a directory; changing a directory rewrites
+//! only that directory. The root directory is object `ROOT_OBJECT`.
+//!
+//! Object numbers are pool-wide and never reused.
+
+use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
+use crate::object::{Dirty, TreeRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// The root directory's object number.
+pub const ROOT_OBJECT: FileId = 1;
+/// Dnodes per object table record.
+pub const DNODES_PER_LEAF: u64 = 32;
+/// Target size of an object table record, in blocks (rounded up to the
+/// pool's alignment).
+const TABLE_LEAF_BLOCKS: u64 = 8;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjType {
+    File,
+    Directory,
+    /// Copy-on-write virtual block device (see `crate::volume`).
+    Volume,
+    /// A volume as it was at some TXG, read-only (see `crate::snapshot`).
+    /// No directory links it: its volume's dnode does.
+    Snapshot,
+}
+
+impl ObjType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ObjType::File => "file",
+            ObjType::Directory => "dir",
+            ObjType::Volume => "volume",
+            ObjType::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// A directory entry.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirEntry {
+    pub id: FileId,
+    pub kind: ObjType,
+}
+
+/// A directory's contents.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct FileIndex {
-    pub next_file_id: FileId,
-    pub files: BTreeMap<String, InodeRef>,
+    pub files: BTreeMap<String, DirEntry>,
 }
 
 impl FileIndex {
     pub fn new() -> Self {
-        FileIndex {
-            next_file_id: 1,
-            files: BTreeMap::new(),
-        }
+        Self::default()
     }
 }
 
@@ -35,24 +87,198 @@ impl Extent {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum InodeType {
-    File {
-        size_bytes: u64,
-        blocks: Vec<BlockPtr>,
+/// An object's attributes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Attrs {
+    /// Permission bits.
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    /// Directory entries naming it.
+    pub nlink: u32,
+    /// Last content change / last change of anything, ns since the epoch.
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+}
+
+impl Attrs {
+    pub fn new(mode: u16) -> Self {
+        let now = now_ns();
+        Attrs {
+            mode,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            mtime_ns: now,
+            ctime_ns: now,
+        }
+    }
+
+    /// The contents changed.
+    pub fn touch(&mut self) {
+        let now = now_ns();
+        self.mtime_ns = now;
+        self.ctime_ns = now;
+    }
+}
+
+/// Attributes to change (None: leave as is).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetAttrs {
+    pub mode: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mtime_ns: Option<u64>,
+}
+
+pub(crate) fn now_ns() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// An object as the object table stores it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Dnode {
+    pub kind: ObjType,
+    /// Bytes per data record.
+    pub blksz: u32,
+    /// Logical size in bytes.
+    pub size: u64,
+    pub tree: TreeRoot,
+    pub attrs: Attrs,
+    /// A volume's placement settings.
+    pub props: Option<VolumeProps>,
+    /// A volume's intent log, if a writer runs it (see `crate::zil`):
+    /// writes acknowledged since the tree was committed.
+    pub log: Option<VolumeLog>,
+    /// The directory it is linked from (the root's is itself): a
+    /// directory's `..`.
+    pub parent: FileId,
+    /// Bumped by every change to the object (contents, entries,
+    /// attributes): NFS clients validate their caches on it. Unlike a
+    /// time, it never goes backwards, whichever node's clock is involved.
+    pub change: u64,
+    /// A volume's snapshots and origin, or a snapshot's place among them
+    /// (see `crate::snapshot`). None: a volume with neither.
+    pub lineage: Option<Lineage>,
+}
+
+/// A snapshot, as its volume (or a clone made from it) refers to it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SnapRef {
+    /// `volume@snapshot`.
+    pub name: String,
+    pub id: FileId,
+    /// The TXG it was taken in: every block it references was born at or
+    /// before it, and every block born after it is someone else's.
+    pub txg: u64,
+    /// Names these contents in any pool: a received snapshot keeps the
+    /// sender's (see `crate::send`).
+    pub guid: u64,
+}
+
+/// How copy-on-write volumes share blocks (see `crate::snapshot`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum Lineage {
+    /// A volume (`kind` Volume).
+    Head {
+        /// The snapshot it was cloned from: blocks born at or before it
+        /// are the origin's.
+        origin: Option<SnapRef>,
+        /// Its snapshots, oldest first.
+        snapshots: Vec<SnapRef>,
     },
-    Directory {
-        /// The directory's serialized `FileIndex`.
-        blocks: Vec<BlockPtr>,
+    /// A snapshot (`kind` Snapshot) of the volume `parent`.
+    Snapshot {
+        txg: u64,
+        /// See `SnapRef::guid`.
+        guid: u64,
+        /// Volumes cloned from it (it can't be destroyed while they exist).
+        clones: Vec<FileId>,
     },
-    /// Copy-on-write virtual block device (see `crate::volume`).
-    Volume {
-        size_bytes: u64,
-        volblocksize: u32,
-        levels: u8,
-        root: Option<BlockPtr>,
-        props: VolumeProps,
-    },
+}
+
+impl Dnode {
+    fn new(kind: ObjType, blksz: u32, mode: u16) -> Self {
+        Dnode {
+            kind,
+            blksz,
+            size: 0,
+            tree: TreeRoot {
+                ptr: None,
+                levels: 0,
+            },
+            attrs: Attrs::new(mode),
+            props: None,
+            log: None,
+            parent: 0,
+            change: 0,
+            lineage: None,
+        }
+    }
+
+    pub fn directory(blksz: u32) -> Self {
+        Self::new(ObjType::Directory, blksz, 0o755)
+    }
+
+    pub fn file(blksz: u32) -> Self {
+        Self::new(ObjType::File, blksz, 0o644)
+    }
+
+    pub fn volume(volblocksize: u32, size: u64, levels: u8) -> Self {
+        let mut d = Self::new(ObjType::Volume, volblocksize, 0o600);
+        d.size = size;
+        d.tree.levels = levels;
+        d.props = Some(VolumeProps::default());
+        d
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.kind == ObjType::File
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.kind == ObjType::Directory
+    }
+}
+
+/// A volume's intent log: the regions its writer appends flushed writes
+/// to, until a commit folds them into the tree. Registered (and its space
+/// claimed) by a commit; replayed by the committer if the writer goes away
+/// first.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct VolumeLog {
+    /// Oldest first (at most two: the one a commit was taken from, and the
+    /// one started by that commit).
+    pub regions: Vec<LogRegion>,
+    /// Records of `regions[0]` before this one are already in the tree.
+    pub from_seq: u64,
+    /// The writer lease (`writer/...`) whose lent space holds it.
+    pub writer: String,
+    pub writer_epoch: u64,
+    /// The `vol/<name>` lease it was written under: once that's gone, no
+    /// more records can be acknowledged, and it may be replayed.
+    pub vol_owner: String,
+    pub vol_epoch: u64,
+}
+
+/// A run of blocks holding intent log records.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LogRegion {
+    pub start: u64,
+    pub len: u64,
+    /// Tells this region's records from anything else ever written there.
+    pub guid: u64,
+}
+
+impl LogRegion {
+    pub fn extent(&self) -> Extent {
+        Extent {
+            start: self.start,
+            len: self.len,
+        }
+    }
 }
 
 /// How a volume is exported to the kernel when it is auto-mounted.
@@ -111,55 +337,34 @@ impl Default for VolumeProps {
     }
 }
 
-impl InodeType {
-    pub fn is_file(&self) -> bool {
-        matches!(self, InodeType::File { .. })
+/// An object table record: `DNODES_PER_LEAF` slots, length-prefixed (the
+/// record is zero-padded to its block size).
+fn encode_leaf(slots: &[Option<Dnode>]) -> Result<Vec<u8>, FileSystemError> {
+    let body = bincode::serialize(slots)?;
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+pub(crate) fn decode_leaf(buf: &[u8]) -> Result<Vec<Option<Dnode>>, FileSystemError> {
+    let bad = || FileSystemError::InvalidArgument("malformed object table record".into());
+    let len = u32::from_le_bytes(buf.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
+    let body = buf.get(4..4 + len).ok_or_else(bad)?;
+    let mut slots: Vec<Option<Dnode>> = bincode::deserialize(body)?;
+    slots.resize(DNODES_PER_LEAF as usize, None);
+    Ok(slots)
+}
+
+/// Decode a directory's contents (`size` bytes of its tree).
+pub(crate) fn decode_dir(data: &[u8]) -> Result<FileIndex, FileSystemError> {
+    if data.is_empty() {
+        return Ok(FileIndex::new());
     }
-
-    pub fn is_directory(&self) -> bool {
-        matches!(self, InodeType::Directory { .. })
-    }
+    Ok(bincode::deserialize(data)?)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FileInode {
-    pub id: FileId,
-    pub inode_type: InodeType,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InodeRef {
-    pub file_id: FileId,
-    /// Where the serialized `FileInode` is stored.
-    pub inode: Vec<BlockPtr>,
-    pub permissions: Permissions,
-}
-
-impl InodeRef {
-    /// Every on-disk extent holding the inode itself.
-    pub fn inode_extents(&self) -> Vec<Extent> {
-        self.inode.iter().map(BlockPtr::extent).collect()
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Permissions {
-    pub mode: u16,
-    pub uid: u32,
-    pub gid: u32,
-}
-
-impl Default for Permissions {
-    fn default() -> Permissions {
-        Permissions {
-            mode: 0o600,
-            uid: 0,
-            gid: 0,
-        }
-    }
-}
-
-fn path_components(path: &Path) -> Vec<String> {
+pub(crate) fn path_components(path: &Path) -> Vec<String> {
     use std::path::Component;
     path.components()
         .filter_map(|c| match c {
@@ -169,181 +374,515 @@ fn path_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Where a path leads: its parent directory and the entry, if any.
+pub(crate) struct Lookup {
+    pub parent_id: FileId,
+    pub parent: Dnode,
+    pub index: FileIndex,
+    pub name: String,
+    pub entry: Option<DirEntry>,
+}
+
+/// Refuse names a directory can't hold.
+pub(crate) fn check_name(name: &str) -> Result<(), FileSystemError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+    {
+        return Err(FileSystemError::InvalidArgument(format!(
+            "bad name '{}'",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// Longest name in a directory, in bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+
 impl<D: BlockDevice> FileSystem<D> {
-    pub async fn read_inode(&self, inode_ref: &InodeRef) -> Result<FileInode, FileSystemError> {
-        self.read_value(&inode_ref.inode).await
+    /// Bytes per object table record.
+    pub(crate) fn table_blksz(&self) -> usize {
+        (self
+            .align_blocks(TABLE_LEAF_BLOCKS)
+            .min(self.max_record_blocks()) as usize)
+            * BLOCK_SIZE
     }
 
-    pub async fn read_file_index(
-        &self,
-        inode_type: &InodeType,
-    ) -> Result<FileIndex, FileSystemError> {
-        match inode_type {
-            InodeType::Directory { blocks } => self.read_value(blocks).await,
-            _ => Err(FileSystemError::DirectoryNotFound),
+    /// Bytes per record of files and directories (the largest record).
+    pub fn file_blksz(&self) -> u32 {
+        (self.max_record_blocks() as usize * BLOCK_SIZE) as u32
+    }
+
+    async fn table_leaf(&self, leaf: u64) -> Result<Vec<Option<Dnode>>, FileSystemError> {
+        match self.object_record(&self.objects, leaf).await? {
+            Some(buf) => decode_leaf(&buf),
+            None => Ok(vec![None; DNODES_PER_LEAF as usize]),
         }
     }
 
-    /// Every on-disk extent an inode's contents occupy (not the inode itself).
-    pub(crate) async fn content_extents(
+    /// Object `id`'s dnode, if it exists (uncommitted changes included).
+    pub async fn try_read_dnode(&self, id: FileId) -> Result<Option<Dnode>, FileSystemError> {
+        let mut leaf = self.table_leaf(id / DNODES_PER_LEAF).await?;
+        Ok(leaf.swap_remove((id % DNODES_PER_LEAF) as usize))
+    }
+
+    pub async fn read_dnode(&self, id: FileId) -> Result<Dnode, FileSystemError> {
+        self.try_read_dnode(id)
+            .await?
+            .ok_or(FileSystemError::FileNotFound)
+    }
+
+    /// Set (or, with None, remove) object `id`'s dnode in the open TXG.
+    /// Only the process that commits the pool changes the table, under
+    /// `begin_tx`.
+    pub(crate) async fn write_dnode(
         &self,
-        inode_type: &InodeType,
+        id: FileId,
+        dnode: Option<Dnode>,
+    ) -> Result<(), FileSystemError> {
+        debug_assert!(
+            self.writer.is_none(),
+            "writers don't change the object table"
+        );
+        let leaf = id / DNODES_PER_LEAF;
+        let mut slots = self.table_leaf(leaf).await?;
+        let slot = &mut slots[(id % DNODES_PER_LEAF) as usize];
+        let mut dnode = dnode;
+        if let Some(d) = &mut dnode {
+            // Every rewrite is a change (callers only rewrite to change it).
+            d.change = slot.as_ref().map_or(0, |old| old.change) + 1;
+        }
+        *slot = dnode;
+        if slots.iter().all(Option::is_none) {
+            self.objects.put_record(leaf, Dirty::Hole);
+            return Ok(());
+        }
+        let buf = encode_leaf(&slots)?;
+        if buf.len() > self.objects.blksz {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "object {}: its table record would be {} bytes (at most {})",
+                id,
+                buf.len(),
+                self.objects.blksz
+            )));
+        }
+        self.objects.put_record(leaf, Dirty::Data(buf));
+        Ok(())
+    }
+
+    /// Every on-disk extent an object occupies (its tree and log regions).
+    pub(crate) async fn dnode_extents(
+        &self,
+        dnode: &Dnode,
     ) -> Result<Vec<Extent>, FileSystemError> {
-        match inode_type {
-            InodeType::File { blocks, .. } | InodeType::Directory { blocks } => {
-                Ok(blocks.iter().map(BlockPtr::extent).collect())
-            }
-            InodeType::Volume { root, levels, .. } => self.volume_tree_extents(root, *levels).await,
-        }
+        let mut out = self.tree_extents(&dnode.tree).await?;
+        out.extend(
+            dnode
+                .log
+                .iter()
+                .flat_map(|l| l.regions.iter().map(LogRegion::extent)),
+        );
+        Ok(out)
     }
 
-    /// Free an inode and everything its contents occupy.
-    pub(crate) async fn free_inode(&self, inode_ref: &InodeRef) -> Result<(), FileSystemError> {
-        let inode = self.read_inode(inode_ref).await?;
-        for e in self.content_extents(&inode.inode_type).await? {
+    /// Free an object's space and remove it from the table.
+    pub(crate) async fn free_dnode(
+        &self,
+        id: FileId,
+        dnode: &Dnode,
+    ) -> Result<(), FileSystemError> {
+        for e in self.dnode_extents(dnode).await? {
             self.free(e.start, e.len).await?;
         }
-        self.free_object(&inode_ref.inode).await
+        self.write_dnode(id, None).await
     }
 
-    /// Navigate to directory at path
-    pub async fn get_directory_at_path(
+    /// Free a tree that nothing references any more (in the open TXG).
+    pub(crate) async fn free_tree(&self, tree: &TreeRoot) -> Result<(), FileSystemError> {
+        for e in self.tree_extents(tree).await? {
+            self.free(e.start, e.len).await?;
+        }
+        Ok(())
+    }
+
+    /// A directory's contents.
+    pub(crate) async fn read_dir(&self, dnode: &Dnode) -> Result<FileIndex, FileSystemError> {
+        if !dnode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
+        let data = self
+            .read_tree(&dnode.tree, dnode.blksz as usize, dnode.size)
+            .await?;
+        decode_dir(&data)
+    }
+
+    /// Replace directory `id`'s contents with `index` (in the open TXG;
+    /// `dnode` is updated to match).
+    pub(crate) async fn write_dir(
         &self,
-        path: &Path,
-    ) -> Result<(FileIndex, Option<InodeRef>), FileSystemError> {
-        let mut current_index = self.file_index.read().await.clone();
-        let mut current_inode_ref = None;
+        id: FileId,
+        dnode: &mut Dnode,
+        index: &FileIndex,
+    ) -> Result<(), FileSystemError> {
+        let data = if index.files.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(index)?
+        };
+        let mut allocated = Vec::new();
+        let tree = match self
+            .write_tree(dnode.blksz as usize, &data, &mut allocated)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                self.release_ptrs(&allocated).await;
+                return Err(e);
+            }
+        };
+        let mut new = dnode.clone();
+        new.tree = tree;
+        new.size = data.len() as u64;
+        new.attrs.touch();
+        if let Err(e) = self.write_dnode(id, Some(new.clone())).await {
+            self.release_ptrs(&allocated).await;
+            return Err(e);
+        }
+        let old = std::mem::replace(dnode, new);
+        self.free_tree(&old.tree).await
+    }
 
-        for component in path_components(path) {
-            let inode_ref = current_index
+    /// The directory at `components` (from the root): its object number,
+    /// dnode and contents.
+    pub(crate) async fn resolve_dir(
+        &self,
+        components: &[String],
+    ) -> Result<(FileId, Dnode, FileIndex), FileSystemError> {
+        let mut id = ROOT_OBJECT;
+        let mut dnode = self.read_dnode(id).await?;
+        let mut index = self.read_dir(&dnode).await?;
+        for name in components {
+            let entry = *index
                 .files
-                .get(&component)
-                .ok_or(FileSystemError::DirectoryNotFound)?
-                .clone();
-
-            let inode = self.read_inode(&inode_ref).await?;
-            if !inode.inode_type.is_directory() {
+                .get(name)
+                .ok_or(FileSystemError::DirectoryNotFound)?;
+            if entry.kind != ObjType::Directory {
                 return Err(FileSystemError::NotADirectory);
             }
-
-            current_index = self.read_file_index(&inode.inode_type).await?;
-            current_inode_ref = Some(inode_ref);
+            id = entry.id;
+            dnode = self.read_dnode(id).await?;
+            index = self.read_dir(&dnode).await?;
         }
-
-        Ok((current_index, current_inode_ref))
+        Ok((id, dnode, index))
     }
 
-    /// Navigate to a file at path and return its InodeRef
-    pub async fn get_file_at_path(&self, path: &Path) -> Result<InodeRef, FileSystemError> {
-        let (_, inode_ref) = self.get_maybe_inode_ref_at_path(path).await?;
-        let inode_ref = inode_ref.ok_or(FileSystemError::FileNotFound)?;
+    /// Find `path`'s parent directory and its entry (if any).
+    pub(crate) async fn lookup(&self, path: &Path) -> Result<Lookup, FileSystemError> {
+        let components = path_components(path);
+        let (name, parents) = components
+            .split_last()
+            .ok_or(FileSystemError::FileNotFound)?;
+        let (parent_id, parent, index) = self.resolve_dir(parents).await?;
+        let entry = index.files.get(name).copied();
+        Ok(Lookup {
+            parent_id,
+            parent,
+            index,
+            name: name.clone(),
+            entry,
+        })
+    }
 
-        let inode = self.read_inode(&inode_ref).await?;
-        if !inode.inode_type.is_file() {
+    /// Entry `name` of directory `dir`.
+    pub(crate) async fn lookup_at(
+        &self,
+        dir: FileId,
+        name: &str,
+    ) -> Result<Lookup, FileSystemError> {
+        let parent = self.read_dnode(dir).await?;
+        let index = self.read_dir(&parent).await?;
+        let entry = index.files.get(name).copied();
+        Ok(Lookup {
+            parent_id: dir,
+            parent,
+            index,
+            name: name.to_string(),
+            entry,
+        })
+    }
+
+    /// What `path` names: its object number and dnode.
+    pub async fn stat(&self, path: &Path) -> Result<(FileId, Dnode), FileSystemError> {
+        let entry = self
+            .lookup(path)
+            .await?
+            .entry
+            .ok_or(FileSystemError::FileNotFound)?;
+        Ok((entry.id, self.read_dnode(entry.id).await?))
+    }
+
+    /// The file at `path`.
+    pub async fn stat_file(&self, path: &Path) -> Result<(FileId, Dnode), FileSystemError> {
+        let (id, dnode) = self.stat(path).await?;
+        if !dnode.is_file() {
             return Err(FileSystemError::NotAFile);
         }
-
-        Ok(inode_ref)
+        Ok((id, dnode))
     }
 
-    /// Returns the parent directory's index and the entry at `path`, if any.
-    pub(crate) async fn get_maybe_inode_ref_at_path(
+    /// Create a new object at `l` (from `lookup`, under `begin_tx`) and
+    /// link it into its parent. Returns its object number.
+    pub(crate) async fn link_new(
+        &self,
+        mut l: Lookup,
+        mut dnode: Dnode,
+    ) -> Result<FileId, FileSystemError> {
+        if l.entry.is_some() {
+            return Err(FileSystemError::AlreadyExists);
+        }
+        check_name(&l.name)?;
+        let id = self.alloc_object();
+        dnode.parent = l.parent_id;
+        let kind = dnode.kind;
+        self.write_dnode(id, Some(dnode)).await?;
+        l.index.files.insert(l.name.clone(), DirEntry { id, kind });
+        self.write_dir(l.parent_id, &mut l.parent, &l.index).await?;
+        Ok(id)
+    }
+
+    /// Remove `l`'s entry from its parent and free the object (under
+    /// `begin_tx`). A directory must be empty.
+    pub(crate) async fn unlink(&self, mut l: Lookup) -> Result<FileId, FileSystemError> {
+        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        let dnode = self.read_dnode(entry.id).await?;
+        if dnode.is_directory() && dnode.size > 0 && !self.read_dir(&dnode).await?.files.is_empty()
+        {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "directory '{}' isn't empty",
+                l.name
+            )));
+        }
+        if dnode.kind == ObjType::Volume {
+            // Blocks a snapshot or the origin has stay theirs.
+            let held = self.unlink_volume_lineage(entry.id, &dnode).await?;
+            for p in self
+                .unique_blocks(&dnode.tree, dnode.blksz as usize, held, None)
+                .await?
+            {
+                self.free(p.lba, p.asize as u64).await?;
+            }
+            for r in dnode.log.iter().flat_map(|l| &l.regions) {
+                self.free(r.start, r.len).await?;
+            }
+            self.write_dnode(entry.id, None).await?;
+        } else {
+            self.free_dnode(entry.id, &dnode).await?;
+        }
+        l.index.files.remove(&l.name);
+        self.write_dir(l.parent_id, &mut l.parent, &l.index).await?;
+        Ok(entry.id)
+    }
+
+    /// Move `from` to `to` (under `begin_tx`); see `rename_at_locked`.
+    pub(crate) async fn rename_locked(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(FileId, Option<FileId>), FileSystemError> {
+        let src = self.lookup(from).await?;
+        let dst = self.lookup(to).await?;
+        self.rename_at_locked(src, dst).await
+    }
+
+    /// Move `src`'s entry to `dst` (both from `lookup`, under `begin_tx`).
+    /// `dst` may replace a file with a file or an empty directory with a
+    /// directory (it is freed). Returns the moved object's number, and the
+    /// replaced one's.
+    pub(crate) async fn rename_at_locked(
+        &self,
+        src: Lookup,
+        mut dst: Lookup,
+    ) -> Result<(FileId, Option<FileId>), FileSystemError> {
+        let moved = src.entry.ok_or(FileSystemError::FileNotFound)?;
+        if moved.kind == ObjType::Volume {
+            return Err(FileSystemError::InvalidArgument(
+                "volumes can't be renamed".into(),
+            ));
+        }
+        if src.parent_id == dst.parent_id && src.name == dst.name {
+            return Ok((moved.id, None));
+        }
+        check_name(&dst.name)?;
+        if moved.kind == ObjType::Directory {
+            // Not into itself: walk up from the destination.
+            let mut at = dst.parent_id;
+            for _ in 0..4096 {
+                if at == moved.id {
+                    return Err(FileSystemError::InvalidArgument(format!(
+                        "can't move '{}' inside itself",
+                        src.name
+                    )));
+                }
+                if at == ROOT_OBJECT {
+                    break;
+                }
+                at = self.read_dnode(at).await?.parent;
+            }
+        }
+        let replaced = match dst.entry {
+            None => None,
+            Some(t) if t.id == moved.id => return Ok((moved.id, None)),
+            Some(t) => {
+                let target = self.read_dnode(t.id).await?;
+                match (moved.kind, t.kind) {
+                    (_, ObjType::Volume) => {
+                        return Err(FileSystemError::InvalidArgument(format!(
+                            "'{}' is a volume",
+                            dst.name
+                        )));
+                    }
+                    (ObjType::File, ObjType::File) => {}
+                    (ObjType::Directory, ObjType::Directory) => {
+                        if !self.read_dir(&target).await?.files.is_empty() {
+                            return Err(FileSystemError::InvalidArgument(format!(
+                                "directory '{}' isn't empty",
+                                dst.name
+                            )));
+                        }
+                    }
+                    (ObjType::File, _) => return Err(FileSystemError::NotAFile),
+                    _ => return Err(FileSystemError::NotADirectory),
+                }
+                self.free_dnode(t.id, &target).await?;
+                Some(t.id)
+            }
+        };
+        if src.parent_id == dst.parent_id {
+            let mut index = src.index;
+            index.files.remove(&src.name);
+            index.files.insert(dst.name, moved);
+            let mut parent = src.parent;
+            self.write_dir(src.parent_id, &mut parent, &index).await?;
+        } else {
+            let mut from_index = src.index;
+            from_index.files.remove(&src.name);
+            let mut from_parent = src.parent;
+            self.write_dir(src.parent_id, &mut from_parent, &from_index)
+                .await?;
+            dst.index.files.insert(dst.name.clone(), moved);
+            self.write_dir(dst.parent_id, &mut dst.parent, &dst.index)
+                .await?;
+        }
+        let mut d = self.read_dnode(moved.id).await?;
+        d.parent = dst.parent_id;
+        d.attrs.ctime_ns = now_ns();
+        self.write_dnode(moved.id, Some(d)).await?;
+        Ok((moved.id, replaced))
+    }
+
+    /// Create a file or directory `name` in directory `dir` (under
+    /// `begin_tx`) with attributes `attrs` (mode, owner; unset: defaults). An existing one of the same
+    /// kind is fine, unless `exclusive`: then only if it was created with
+    /// the same `verifier` (a retransmitted exclusive create). Returns its
+    /// number and whether it is new.
+    pub(crate) async fn create_at_locked(
+        &self,
+        dir: FileId,
+        name: &str,
+        kind: ObjType,
+        attrs: &SetAttrs,
+        exclusive: Option<u64>,
+    ) -> Result<(FileId, bool), FileSystemError> {
+        let l = self.lookup_at(dir, name).await?;
+        if let Some(e) = l.entry {
+            let d = self.read_dnode(e.id).await?;
+            if d.kind != kind {
+                return Err(FileSystemError::AlreadyExists);
+            }
+            return match exclusive {
+                Some(v) if d.attrs.mtime_ns != v => Err(FileSystemError::AlreadyExists),
+                _ => Ok((e.id, false)),
+            };
+        }
+        let mut dnode = match kind {
+            ObjType::File => Dnode::file(self.file_blksz()),
+            ObjType::Directory => Dnode::directory(self.file_blksz()),
+            ObjType::Volume | ObjType::Snapshot => {
+                return Err(FileSystemError::InvalidArgument(
+                    "volumes are made with `volume create`".into(),
+                ));
+            }
+        };
+        if let Some(m) = attrs.mode {
+            dnode.attrs.mode = m & 0o7777;
+        }
+        dnode.attrs.uid = attrs.uid.unwrap_or(0);
+        dnode.attrs.gid = attrs.gid.unwrap_or(0);
+        if let Some(t) = attrs.mtime_ns {
+            dnode.attrs.mtime_ns = t;
+        }
+        if let Some(v) = exclusive {
+            // Where an exclusive create's verifier is kept (NFS does this
+            // too): the caller sets the real times afterwards.
+            dnode.attrs.mtime_ns = v;
+        }
+        Ok((self.link_new(l, dnode).await?, true))
+    }
+
+    /// Change `path`'s attributes (under `begin_tx`). Returns its number.
+    pub(crate) async fn set_attrs_locked(
         &self,
         path: &Path,
-    ) -> Result<(FileIndex, Option<InodeRef>), FileSystemError> {
-        let components = path_components(path);
-        let (file_name, parents) = components
-            .split_last()
-            .ok_or(FileSystemError::FileNotFound)?;
-
-        let parent_path: PathBuf = parents.iter().collect();
-        let (parent_index, _) = self.get_directory_at_path(&parent_path).await?;
-        let inode_ref = parent_index.files.get(file_name).cloned();
-
-        Ok((parent_index, inode_ref))
+        set: &SetAttrs,
+    ) -> Result<FileId, FileSystemError> {
+        let (id, _) = self.stat(path).await?;
+        self.set_attrs_id_locked(id, set).await?;
+        Ok(id)
     }
 
-    /// Copy-on-write the directory chain from `file_path`'s parent up to the root.
-    ///
-    /// `updated_index` is the new contents of the parent directory. If
-    /// `updated_inode` is given, it is written and linked under the file name.
-    /// Every rewritten directory frees its previous inode and index. Does not
-    /// commit; callers finish with `commit_txg`.
-    pub async fn persist_directory_changes(
+    /// Change object `id`'s attributes (under `begin_tx`).
+    pub(crate) async fn set_attrs_id_locked(
         &self,
-        file_path: &Path,
-        mut updated_index: FileIndex,
-        updated_inode: Option<FileInode>,
+        id: FileId,
+        set: &SetAttrs,
     ) -> Result<(), FileSystemError> {
-        let components = path_components(file_path);
-        let (file_name, dir_components) = components
-            .split_last()
-            .ok_or(FileSystemError::FileNotFound)?;
-
-        if let Some(inode) = updated_inode {
-            let permissions = updated_index
-                .files
-                .get(file_name)
-                .map(|r| r.permissions.clone())
-                .unwrap_or_default();
-            let inode_ptrs = self.write_value(&inode).await?;
-            updated_index.files.insert(
-                file_name.clone(),
-                InodeRef {
-                    file_id: inode.id,
-                    inode: inode_ptrs,
-                    permissions,
-                },
-            );
+        let mut d = self.read_dnode(id).await?;
+        if let Some(m) = set.mode {
+            d.attrs.mode = m & 0o7777;
         }
-
-        // ancestors[i] is the index of the directory at dir_components[..i].
-        let mut ancestors = vec![self.file_index.read().await.clone()];
-        for (i, name) in dir_components.iter().enumerate() {
-            let dir_ref = ancestors[i]
-                .files
-                .get(name)
-                .ok_or(FileSystemError::DirectoryNotFound)?;
-            let dir_inode = self.read_inode(dir_ref).await?;
-            if !dir_inode.inode_type.is_directory() {
-                return Err(FileSystemError::NotADirectory);
-            }
-            if i + 1 < dir_components.len() {
-                ancestors.push(self.read_file_index(&dir_inode.inode_type).await?);
-            }
+        if let Some(u) = set.uid {
+            d.attrs.uid = u;
         }
-
-        let mut current_index = updated_index;
-        for depth in (0..dir_components.len()).rev() {
-            let name = &dir_components[depth];
-            let mut parent_index = ancestors.pop().unwrap();
-            let old_ref = parent_index
-                .files
-                .get(name)
-                .cloned()
-                .ok_or(FileSystemError::DirectoryNotFound)?;
-
-            let index_ptrs = self.write_value(&current_index).await?;
-            let new_inode = FileInode {
-                id: old_ref.file_id,
-                inode_type: InodeType::Directory { blocks: index_ptrs },
-            };
-            let inode_ptrs = self.write_value(&new_inode).await?;
-
-            self.free_inode(&old_ref).await?;
-
-            parent_index.files.insert(
-                name.clone(),
-                InodeRef {
-                    file_id: old_ref.file_id,
-                    inode: inode_ptrs,
-                    permissions: old_ref.permissions,
-                },
-            );
-            current_index = parent_index;
+        if let Some(g) = set.gid {
+            d.attrs.gid = g;
         }
+        if let Some(t) = set.mtime_ns {
+            d.attrs.mtime_ns = t;
+        }
+        d.attrs.ctime_ns = now_ns();
+        self.write_dnode(id, Some(d)).await
+    }
 
-        *self.file_index.write().await = current_index;
-        self.persist_root_index().await
+    /// Point file `id` at new contents (under `begin_tx`), freeing the old.
+    pub(crate) async fn replace_file_contents(
+        &self,
+        id: FileId,
+        mut dnode: Dnode,
+        size: u64,
+        tree: TreeRoot,
+    ) -> Result<(), FileSystemError> {
+        let old = std::mem::replace(&mut dnode.tree, tree);
+        dnode.size = size;
+        dnode.attrs.touch();
+        self.write_dnode(id, Some(dnode)).await?;
+        self.free_tree(&old).await
     }
 }
+
+#[cfg(test)]
+#[path = "tests/inode_tests.rs"]
+mod tests;

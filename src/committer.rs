@@ -10,8 +10,12 @@ use crate::cluster::{Cluster, LeaseOp, now_ms};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::VolumeProps;
+use crate::send::StreamReport;
+use crate::snapshot::SnapshotInfo;
 use crate::volume::VolumeInfo;
-use crate::writer::{CommitError, CommitSink, Committed, LentMetaslab, VolumeCommit};
+use crate::writer::{
+    CommitError, CommitSink, Committed, FsCommit, FsCommitted, LentMetaslab, VolumeCommit,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -63,15 +67,78 @@ fn check_lease(
         return Ok(());
     }
     match state.leases.get(resource) {
-        Some(l) if l.epoch > epoch || l.released || owner.is_some_and(|o| o != l.owner) => Err(
-            CommitError::Refused(format!("{} lease lost (epoch {})", resource, epoch)),
-        ),
+        // Taken over since, or this very grant released / someone else's.
+        Some(l)
+            if l.epoch > epoch
+                || (l.epoch == epoch && (l.released || owner.is_some_and(|o| o != l.owner))) =>
+        {
+            Err(CommitError::Refused(format!(
+                "{} lease lost (epoch {})",
+                resource, epoch
+            )))
+        }
+        // An older grant (whoever's, released or not): this view hasn't
+        // caught up with this one yet. Or it lapsed but may be renewed.
         _ => Err(CommitError::Retry(format!("{} lease not live", resource))),
     }
 }
 
 pub fn volume_resource(name: &str) -> String {
     format!("vol/{}", name)
+}
+
+/// The lease held on a file while it is open for writing.
+pub fn object_resource(id: crate::disk::FileId) -> String {
+    format!("obj/{}", id)
+}
+
+/// May `c` change object `id`? With an `obj/<id>` lease: only if it's
+/// held. Without one: only if no one else holds it.
+fn object_lease_ok(
+    state: &ClusterState,
+    c: &FsCommit,
+    id: crate::disk::FileId,
+) -> Result<(), CommitError> {
+    let resource = object_resource(id);
+    if let Some(l) = &c.lease {
+        return check_lease(state, &resource, Some(&l.owner), l.epoch);
+    }
+    match state.leases.get(&resource) {
+        Some(l) if !l.released && l.expires_ms > now_ms() => Err(CommitError::Refused(format!(
+            "object {} is open for writing ({})",
+            id, l.desc
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Where an intent log's `vol/<name>` lease stands, for replaying it.
+#[derive(Debug, PartialEq, Eq)]
+enum Orphan {
+    /// Held (or this view hasn't caught up with its grant yet): keep it.
+    Live,
+    /// Taken over or released: nothing more can be acknowledged; replay.
+    Gone,
+    /// Expired, but its holder could still renew it: fence it, then replay.
+    Lapsed,
+}
+
+/// Like `check_lease`: an older epoch in this view means the view lags (a
+/// committer on a Raft follower, or just after a failover), not that the
+/// log's holder is gone.
+fn orphan_state(
+    lease: Option<&crate::cluster::state::Lease>,
+    l: &crate::inode::VolumeLog,
+    now: u64,
+) -> Orphan {
+    match lease {
+        None => Orphan::Live,
+        Some(lease) if lease.epoch < l.vol_epoch => Orphan::Live,
+        Some(lease) if lease.epoch > l.vol_epoch => Orphan::Gone,
+        Some(lease) if lease.owner != l.vol_owner || lease.released => Orphan::Gone,
+        Some(lease) if lease.expires_ms + RECLAIM_GRACE_MS < now => Orphan::Lapsed,
+        Some(_) => Orphan::Live,
+    }
 }
 
 pub struct Committer<D: BlockDevice> {
@@ -117,6 +184,11 @@ impl<D: BlockDevice> Committer<D> {
             .filter_map(|(&i, g)| g.writer.clone().map(|w| (i, (w, g.writer_epoch))))
             .collect();
         fs.mark_lent(lends.keys().copied()).await;
+        // Writers' views of the TXG may lag a previous committer's: from
+        // here on, blocks are born after any snapshot it took.
+        if let Ok(t) = fs.open_txg().await {
+            fs.raise_birth_floor(t);
+        }
         Committer {
             fs,
             auth,
@@ -246,9 +318,125 @@ impl<D: BlockDevice> Committer<D> {
         Ok(Committed { txg })
     }
 
+    /// Apply a writer's file or directory change.
+    pub async fn commit_fs(&self, c: &FsCommit) -> Result<FsCommitted, CommitError> {
+        let state = self.auth.state();
+        check_lease(&state, &c.writer, None, c.writer_epoch)?;
+        let lends = self.lends.lock().unwrap().clone();
+        self.fs
+            .apply_fs_commit(
+                c,
+                |idx| {
+                    lends
+                        .get(&idx)
+                        .is_some_and(|(w, e)| *w == c.writer && *e == c.writer_epoch)
+                },
+                |id| object_lease_ok(&state, c, id),
+            )
+            .await
+    }
+
+    /// Get `volume` ready for the holder of its `vol/<name>` lease: replay
+    /// whatever intent log an earlier holder left (it can't add to it any
+    /// more: its lease is gone).
+    pub async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        check_lease(
+            &self.auth.state(),
+            &volume_resource(volume),
+            Some(vol_owner),
+            vol_epoch,
+        )?;
+        let vol = self
+            .fs
+            .open_volume(volume)
+            .await
+            .map_err(|e| CommitError::Refused(format!("volume '{}': {}", volume, e)))?;
+        let log = vol.log.lock().unwrap().clone();
+        if let Some(l) = log
+            && (l.vol_owner != vol_owner || l.vol_epoch != vol_epoch)
+        {
+            self.fs
+                .replay_volume_log(volume, &l)
+                .await
+                .map_err(|e| CommitError::Retry(format!("replaying '{}': {}", volume, e)))?;
+        }
+        Ok(())
+    }
+
+    /// Replay the intent logs of volumes whose writer's lease is gone.
+    async fn replay_orphaned_logs(&self) {
+        let Ok(logs) = self.fs.volume_logs().await else {
+            return;
+        };
+        let state = self.auth.state();
+        let now = now_ms();
+        for (name, l) in logs {
+            let resource = volume_resource(&name);
+            let fence = match orphan_state(state.leases.get(&resource), &l, now) {
+                Orphan::Live => continue,
+                Orphan::Gone => None,
+                Orphan::Lapsed => match self.fence_lapsed(&resource, &l).await {
+                    Some(f) => Some(f),
+                    None => continue,
+                },
+            };
+            if let Err(e) = self.fs.replay_volume_log(&name, &l).await {
+                eprintln!("committer: replaying the log of '{}': {}", name, e);
+            }
+            // The log's holder is superseded either way (a failed replay is
+            // retried next time as `Gone`); let the next node have it.
+            if let Some(epoch) = fence {
+                let op = LeaseOp::Release {
+                    resource: resource.clone(),
+                    owner: self.replay_owner(),
+                    epoch,
+                };
+                if let Err(e) = self.auth.propose(op).await {
+                    eprintln!("committer: releasing {}: {}", resource, e);
+                }
+            }
+        }
+    }
+
+    /// Who holds a `vol/<name>` lease while the committer replays its log.
+    fn replay_owner(&self) -> String {
+        format!("{} (log replay)", self.owner)
+    }
+
+    /// Take over a lapsed `vol/<name>` lease, so its holder can't renew it
+    /// (a lapsed lease can be renewed until someone else is granted it) and
+    /// go on acknowledging flushes into a log that's been replayed. Returns
+    /// the epoch granted, or None if the lease is live again.
+    async fn fence_lapsed(&self, resource: &str, l: &crate::inode::VolumeLog) -> Option<u64> {
+        let op = LeaseOp::Acquire {
+            resource: resource.to_string(),
+            owner: self.replay_owner(),
+            desc: format!("committer: replaying {}'s intent log", l.writer),
+            ttl_ms: crate::cluster::lease::LEASE_TTL.as_millis() as u64,
+        };
+        match self.auth.propose(op).await {
+            // A newer epoch than the log's: its holder's renewals fail from
+            // now on, and its last one was sent over a TTL ago (the lease
+            // had expired when this was granted), so it can't be
+            // acknowledging anything any more.
+            Ok(Response::Granted { epoch, .. }) if epoch > l.vol_epoch => Some(epoch),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("committer: fencing {}: {}", resource, e);
+                None
+            }
+        }
+    }
+
     /// Take back metaslabs whose writer is gone (its lease taken over,
-    /// released, or expired).
+    /// released, or expired), after replaying any intent log it left.
     pub async fn reclaim(&self) {
+        self.replay_orphaned_logs().await;
         let state = self.auth.state();
         let now = now_ms();
         let lends = self.lends.lock().unwrap().clone();
@@ -300,6 +488,75 @@ impl<D: BlockDevice> Committer<D> {
     pub async fn set_props(&self, name: &str, props: VolumeProps) -> Result<(), FileSystemError> {
         self.fs.set_volume_props(name, props).await
     }
+
+    // ---- snapshots (see `crate::snapshot`) ----
+
+    pub async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, FileSystemError> {
+        self.fs.list_snapshots(name).await
+    }
+
+    /// Snapshot `name` as last committed (a running volume's writes since
+    /// its writer's last commit aren't in it). Returns its TXG.
+    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<u64, FileSystemError> {
+        self.fs.create_snapshot(name, snap).await
+    }
+
+    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
+        self.fs.destroy_snapshot(name, snap).await
+    }
+
+    pub async fn clone_snapshot(
+        &self,
+        name: &str,
+        snap: &str,
+        new: &str,
+    ) -> Result<(), FileSystemError> {
+        self.fs.clone_snapshot(name, snap, new).await.map(|_| ())
+    }
+
+    /// Receive a send stream into volume `name` (see `crate::send`); it
+    /// must not be running.
+    pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        name: &str,
+        r: &mut R,
+        force: bool,
+    ) -> Result<StreamReport, FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.recv_snapshot(name, r, force).await
+    }
+
+    /// Whether a stream with `header` would be received into `name`.
+    pub async fn recv_check(
+        &self,
+        name: &str,
+        header: &crate::send::SendHeader,
+        force: bool,
+    ) -> Result<(), FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.recv_check(name, header, force).await
+    }
+
+    /// Roll `name` back to its newest snapshot (it must not be running).
+    pub async fn rollback(&self, name: &str) -> Result<(), FileSystemError> {
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is running ({}); disable or stop it first",
+                name, by
+            )));
+        }
+        self.fs.rollback_volume(name).await
+    }
 }
 
 // ---- writers talking to a committer ----
@@ -329,6 +586,19 @@ impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
     async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
         self.committer.commit(&c).await
     }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.committer.commit_fs(&c).await
+    }
+    async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        self.committer
+            .claim_volume(volume, vol_owner, vol_epoch)
+            .await
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -346,9 +616,22 @@ pub struct ReturnRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClaimRequest {
+    pub volume: String,
+    pub vol_owner: String,
+    pub vol_epoch: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateVolume {
     pub name: String,
     pub size_bytes: u64,
+}
+
+/// A snapshot or clone to make.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NewName {
+    pub name: String,
 }
 
 /// Talks to whichever `listen` node is the committer.
@@ -370,7 +653,7 @@ impl CommitClient {
                 .into_iter()
                 .map(|e| e.trim_end_matches('/').to_string())
                 .collect(),
-            http: reqwest::Client::builder()
+            http: crate::tls::http_builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -405,6 +688,7 @@ impl CommitClient {
                     Ok(Ok(v)) => return Ok(v),
                     Ok(Err(CommitError::Refused(m))) => return Err(CommitError::Refused(m)),
                     Ok(Err(CommitError::Retry(m))) => why.push(format!("{}: {}", ep, m)),
+                    Ok(Err(e)) => return Err(e),
                     Err(e) => why.push(format!("{}: {}", ep, e)),
                 },
                 Err(e) => why.push(format!("{}: {}", ep, e)),
@@ -484,6 +768,102 @@ impl CommitClient {
         self.call(reqwest::Method::PUT, &path, Some(props), Some(10))
             .await
     }
+
+    pub async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
+        self.call(reqwest::Method::GET, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<u64, CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
+        let body = NewName { name: snap.into() };
+        self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
+            .await
+    }
+
+    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots/{}", name, snap);
+        self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    pub async fn clone_snapshot(
+        &self,
+        name: &str,
+        snap: &str,
+        new: &str,
+    ) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/snapshots/{}/clone", name, snap);
+        let body = NewName { name: new.into() };
+        self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
+            .await
+    }
+
+    /// Stream `r` (a send stream) to the committer, received into volume
+    /// `name`. Not retried: a stream can't be sent twice.
+    pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+        &self,
+        name: &str,
+        force: bool,
+        mut r: R,
+    ) -> Result<StreamReport, CommitError> {
+        use tokio::io::AsyncReadExt;
+        // Asked first, so a refusal comes back as such (not as a stream
+        // cut off midway).
+        let (header, raw) = crate::send::peek_header(&mut r)
+            .await
+            .map_err(|e| CommitError::Refused(e.to_string()))?;
+        let check = format!("/api/v1/pool/volumes/{}/recv/check?force={}", name, force);
+        self.call::<()>(reqwest::Method::POST, &check, Some(&header), Some(10))
+            .await?;
+        let r = std::io::Cursor::new(raw).chain(r);
+        // Find the committer first: the stream goes to it alone.
+        let mut found = None;
+        for ep in &self.endpoints {
+            let url = format!("{}/api/v1/pool/committer", ep);
+            if let Ok(resp) = self.http.get(&url).send().await
+                && let Ok(Ok(_)) = resp.json::<Result<CommitterInfo, CommitError>>().await
+            {
+                found = Some(ep.clone());
+                break;
+            }
+        }
+        let ep = found.ok_or_else(|| CommitError::Retry("no committer found".into()))?;
+        let chunks = futures::stream::unfold(Some(r), |r| async move {
+            let mut r = r?;
+            let mut buf = vec![0u8; 1 << 20];
+            match r.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), Some(r)))
+                }
+                Err(e) => Some((Err(e), None)),
+            }
+        });
+        // No overall timeout: a stream takes as long as it takes.
+        let http = crate::tls::http_builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| CommitError::Retry(e.to_string()))?;
+        let url = format!("{}/api/v1/pool/volumes/{}/recv?force={}", ep, name, force);
+        let resp = http
+            .post(url)
+            .body(reqwest::Body::wrap_stream(chunks))
+            .send()
+            .await
+            .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?;
+        resp.json::<Result<StreamReport, CommitError>>()
+            .await
+            .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?
+    }
+
+    pub async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/volumes/{}/rollback", name);
+        self.call(reqwest::Method::POST, &path, None::<&()>, Some(10))
+            .await
+    }
 }
 
 #[async_trait]
@@ -527,6 +907,37 @@ impl CommitSink for CommitClient {
         self.call(reqwest::Method::POST, "/api/v1/pool/commit", Some(&c), None)
             .await
     }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        // A namespace op is a single call from a client: give up after a
+        // while instead of hanging it (the outcome is then unknown, and a
+        // resend is acknowledged if it was applied).
+        self.call(
+            reqwest::Method::POST,
+            "/api/v1/pool/commit_fs",
+            Some(&c),
+            Some(20),
+        )
+        .await
+    }
+    async fn claim_volume(
+        &self,
+        volume: &str,
+        vol_owner: &str,
+        vol_epoch: u64,
+    ) -> Result<(), CommitError> {
+        let body = ClaimRequest {
+            volume: volume.into(),
+            vol_owner: vol_owner.into(),
+            vol_epoch,
+        };
+        self.call(
+            reqwest::Method::POST,
+            "/api/v1/pool/claim",
+            Some(&body),
+            Some(20),
+        )
+        .await
+    }
 }
 
 // ---- HTTP routes, served by every `listen` node ----
@@ -555,6 +966,7 @@ pub mod routes {
 
     #[get("/api/v1/pool/committer")]
     pub async fn committer(
+        _auth: crate::auth::CanRead,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<CommitterInfo, CommitError>> {
         match current(slot).await {
@@ -565,6 +977,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/lend", data = "<req>")]
     pub async fn lend(
+        _auth: crate::auth::CanWrite,
         req: Json<LendRequest>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<LentMetaslab, CommitError>> {
@@ -576,6 +989,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/return", data = "<req>")]
     pub async fn give_back(
+        _auth: crate::auth::CanWrite,
         req: Json<ReturnRequest>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
@@ -587,6 +1001,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/commit", data = "<req>")]
     pub async fn commit(
+        _auth: crate::auth::CanWrite,
         req: Json<VolumeCommit>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<Committed, CommitError>> {
@@ -596,8 +1011,36 @@ pub mod routes {
         }
     }
 
+    #[post("/api/v1/pool/commit_fs", data = "<req>")]
+    pub async fn commit_fs(
+        _auth: crate::auth::CanWrite,
+        req: Json<FsCommit>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<FsCommitted, CommitError>> {
+        match current(slot).await {
+            Some(c) => Json(c.commit_fs(&req).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/claim", data = "<req>")]
+    pub async fn claim(
+        _auth: crate::auth::CanWrite,
+        req: Json<ClaimRequest>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => Json(
+                c.claim_volume(&req.volume, &req.vol_owner, req.vol_epoch)
+                    .await,
+            ),
+            None => not_committer(),
+        }
+    }
+
     #[get("/api/v1/pool/volumes")]
     pub async fn volumes(
+        _auth: crate::auth::CanRead,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<Vec<VolumeInfo>, CommitError>> {
         match current(slot).await {
@@ -608,6 +1051,7 @@ pub mod routes {
 
     #[post("/api/v1/pool/volumes", data = "<req>")]
     pub async fn create(
+        _auth: crate::auth::CanWrite,
         req: Json<CreateVolume>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
@@ -618,7 +1062,11 @@ pub mod routes {
     }
 
     #[delete("/api/v1/pool/volumes/<name>")]
-    pub async fn remove(name: &str, slot: &State<CommitterSlot>) -> Json<Result<(), CommitError>> {
+    pub async fn remove(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
             Some(c) => fs_err(c.delete_volume(name).await),
             None => not_committer(),
@@ -627,6 +1075,7 @@ pub mod routes {
 
     #[put("/api/v1/pool/volumes/<name>/props", data = "<props>")]
     pub async fn props(
+        _auth: crate::auth::CanWrite,
         name: &str,
         props: Json<VolumeProps>,
         slot: &State<CommitterSlot>,
@@ -637,9 +1086,120 @@ pub mod routes {
         }
     }
 
+    #[get("/api/v1/pool/volumes/<name>/snapshots")]
+    pub async fn snapshots(
+        _auth: crate::auth::CanRead,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<Vec<SnapshotInfo>, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.snapshots(name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/snapshots", data = "<req>")]
+    pub async fn snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        req: Json<NewName>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<u64, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.create_snapshot(name, &req.name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[delete("/api/v1/pool/volumes/<name>/snapshots/<snap>")]
+    pub async fn destroy_snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        snap: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.destroy_snapshot(name, snap).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/snapshots/<snap>/clone", data = "<req>")]
+    pub async fn clone_snapshot(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        snap: &str,
+        req: Json<NewName>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.clone_snapshot(name, snap, &req.name).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/recv?<force>", data = "<data>")]
+    pub async fn recv(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        force: Option<bool>,
+        data: rocket::Data<'_>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<StreamReport, CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let mut stream = data.open(rocket::data::ByteUnit::max_value());
+                fs_err(c.recv(name, &mut stream, force.unwrap_or(false)).await)
+            }
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/recv/check?<force>", data = "<header>")]
+    pub async fn recv_check(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        force: Option<bool>,
+        header: Json<crate::send::SendHeader>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.recv_check(name, &header, force.unwrap_or(false)).await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/volumes/<name>/rollback")]
+    pub async fn rollback(
+        _auth: crate::auth::CanWrite,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.rollback(name).await),
+            None => not_committer(),
+        }
+    }
+
     pub fn routes() -> Vec<rocket::Route> {
         rocket::routes![
-            committer, lend, give_back, commit, volumes, create, remove, props
+            committer,
+            lend,
+            give_back,
+            commit,
+            commit_fs,
+            claim,
+            volumes,
+            create,
+            remove,
+            props,
+            snapshots,
+            snapshot,
+            destroy_snapshot,
+            clone_snapshot,
+            rollback,
+            recv,
+            recv_check
         ]
     }
 }

@@ -84,6 +84,12 @@ pub enum LeaseOp {
         pool_owner: String,
         pool_epoch: u64,
     },
+    NfsClient {
+        client: String,
+        present: bool,
+        nfs_owner: String,
+        nfs_epoch: u64,
+    },
 }
 
 impl LeaseOp {
@@ -146,6 +152,18 @@ impl LeaseOp {
                 pool_epoch,
                 now_ms,
             },
+            LeaseOp::NfsClient {
+                client,
+                present,
+                nfs_owner,
+                nfs_epoch,
+            } => Request::NfsClient {
+                client,
+                present,
+                nfs_owner,
+                nfs_epoch,
+                now_ms,
+            },
         }
     }
 }
@@ -200,7 +218,7 @@ impl Cluster {
         let config = Arc::new(config.validate().map_err(|e| e.to_string())?);
         let store = Store::open(&data_dir, fence)?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
-        let http = reqwest::Client::builder()
+        let http = crate::tls::http_builder()
             .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| e.to_string())?;
@@ -318,6 +336,16 @@ impl Cluster {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// The NFSv4 client records (owner strings, hex) as this node has them.
+    pub fn nfs_clients(&self) -> Vec<String> {
+        self.store.nfs_clients()
+    }
+
+    /// Lease `resource` as this node's applied state has it.
+    pub fn lease_state(&self, resource: &str) -> Option<state::Lease> {
+        self.store.lease(resource)
     }
 
     pub fn status(&self) -> Status {
