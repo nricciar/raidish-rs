@@ -72,6 +72,7 @@ pub fn set_token(token: Option<&str>) {
             None => s.remove_item(TOKEN_KEY),
         };
     }
+    #[cfg(target_arch = "wasm32")]
     raidish::disk::set_access_token(token.map(str::to_string));
 }
 
