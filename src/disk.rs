@@ -430,7 +430,9 @@ impl BlockDevice for Disk {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
+                let span = crate::trace::Span::new("disk.fdatasync");
                 tokio::task::spawn_blocking(move || file.sync_data()).await??;
+                drop(span);
             }
             DiskBackend::WebSocket(r) => {
                 r.request(WsOp::Flush, 0, 0, None).await?;

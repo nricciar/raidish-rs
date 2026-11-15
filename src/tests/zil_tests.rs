@@ -674,3 +674,228 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
     drop(fresh);
     assert_clean(&s).await;
 }
+
+/// A tiny deterministic generator (no rand dependency in tests).
+fn lcg(seed: &mut u64) -> u64 {
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *seed >> 33
+}
+
+#[tokio::test]
+async fn small_writes_log_only_the_bytes_that_changed() {
+    let s = setup().await;
+    let w = writer(&s, "1", None).await;
+    let bs = w.fs.open_volume("a").await.unwrap().volblocksize;
+    let size = 3 * MB;
+    let mut want = vec![0u8; size];
+
+    // A committed base, and a registered log.
+    want[..MB].copy_from_slice(&pattern(MB, 1));
+    w.fs.block_write("a", 0, &want[..MB]).await.unwrap();
+    w.fs.flush().await.unwrap();
+    let before = txg(&s).await;
+
+    // Small writes, each flushed: over committed data, overlapping each
+    // other, and into records that were never written (zeros under them).
+    let mut seed = 7u64;
+    let flushes = 60;
+    for i in 0..flushes {
+        let len = 1 + (lcg(&mut seed) as usize % 2000);
+        let off = match i % 3 {
+            0 => lcg(&mut seed) as usize % (MB - len),
+            1 => 2 * MB + lcg(&mut seed) as usize % (MB - len),
+            // Overlaps the previous write's record.
+            _ => (lcg(&mut seed) as usize % (MB / bs)) * bs + bs / 3,
+        };
+        let data = pattern(len, i as u8 + 10);
+        w.fs.block_write("a", off as u64, &data).await.unwrap();
+        want[off..off + len].copy_from_slice(&data);
+        w.fs.flush().await.unwrap();
+    }
+    // A record zeroed whole, then written into: a hole, then bytes over it.
+    w.fs.block_zero("a", (4 * bs) as u64, bs).await.unwrap();
+    want[4 * bs..5 * bs].fill(0);
+    w.fs.block_write("a", (4 * bs + 100) as u64, &pattern(300, 99))
+        .await
+        .unwrap();
+    want[4 * bs + 100..4 * bs + 400].copy_from_slice(&pattern(300, 99));
+    // Most of a record: logged whole.
+    w.fs.block_write("a", (8 * bs + 10) as u64, &pattern(bs - 20, 98))
+        .await
+        .unwrap();
+    want[8 * bs + 10..9 * bs - 10].copy_from_slice(&pattern(bs - 20, 98));
+    w.fs.flush().await.unwrap();
+    assert_eq!(txg(&s).await, before, "every flush went to the log");
+
+    // Whole records would take at least a record's blocks per flush.
+    let used = cursor(&w.fs).await.unwrap().used;
+    let record_blocks = bs.div_ceil(crate::disk::BLOCK_SIZE) as u64;
+    assert!(
+        used < flushes * record_blocks / 3,
+        "log used {} blocks for {} small flushes",
+        used,
+        flushes
+    );
+    assert_eq!(read(&w.fs, 0, size).await, want);
+
+    w.die(&s).await;
+    s.committer.reclaim().await;
+    assert!(s.committer.fs.volume_logs().await.unwrap().is_empty());
+    let fresh = s.pool.load().await;
+    assert_eq!(read(&fresh, 0, size).await, want);
+    drop(fresh);
+    assert_clean(&s).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_patch_written_during_a_stuck_commit_applies_over_what_it_synced() {
+    let s = setup().await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (open_tx, open_rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(Gate {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource,
+            epoch,
+        },
+        open: open_rx,
+        waiting: Default::default(),
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink.clone())
+            .await
+            .unwrap(),
+    );
+    let vol_epoch = lease(&s.auth, &volume_resource("a"), "o1").await;
+    fs.attach_volume("a", "o1", vol_epoch).await.unwrap();
+    let mut want = pattern(100_000, 1);
+    fs.block_write("a", 0, &want).await.unwrap();
+    fs.flush().await.unwrap(); // commits: log registered
+
+    // B: a few bytes, logged as a patch; then a commit takes the record
+    // and gets stuck.
+    fs.block_write("a", 1000, &pattern(10, 2)).await.unwrap();
+    want[1000..1010].copy_from_slice(&pattern(10, 2));
+    fs.flush().await.unwrap();
+    open_tx.send_replace(false);
+    let folding = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.sync().await })
+    };
+    while sink.waiting.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // C: more bytes of the same record, over the copy being synced.
+    fs.block_write("a", 3000, &pattern(20, 3)).await.unwrap();
+    want[3000..3020].copy_from_slice(&pattern(20, 3));
+    fs.flush().await.unwrap();
+
+    open_tx.send_replace(true);
+    folding.await.unwrap().unwrap();
+
+    // The writer dies with C only in the log: replay patches it onto the
+    // committed record (which has B).
+    drop(fs);
+    release(&s.auth, &volume_resource("a"), "o1", vol_epoch).await;
+    release(&s.auth, "writer/1", "1", epoch).await;
+    s.committer.reclaim().await;
+    let fresh = s.pool.load().await;
+    assert_eq!(read(&fresh, 0, want.len()).await, want);
+    drop(fresh);
+    assert_clean(&s).await;
+}
+
+#[test]
+fn unlogged_ranges_merge() {
+    use crate::object::Unlogged;
+    let mut u = Unlogged::Ranges(Vec::new());
+    u.add(10, 20);
+    u.add(30, 40);
+    u.add(20, 25); // touches the first
+    assert_eq!(u, Unlogged::Ranges(vec![(10, 25), (30, 40)]));
+    u.add(5, 35); // swallows both
+    assert_eq!(u, Unlogged::Ranges(vec![(5, 40)]));
+    u.add(0, 1);
+    assert_eq!(u, Unlogged::Ranges(vec![(0, 1), (5, 40)]));
+    assert_eq!(u.bytes(), Some(36));
+    u.merge(&Unlogged::Ranges(vec![(100, 110)]));
+    assert_eq!(u, Unlogged::Ranges(vec![(0, 1), (5, 40), (100, 110)]));
+    // Too many pieces: the whole record.
+    for i in 0..20 {
+        u.add(200 + i * 10, 201 + i * 10);
+    }
+    assert_eq!(u, Unlogged::Whole);
+    u.add(0, 1);
+    assert_eq!(u, Unlogged::Whole);
+    let mut v = Unlogged::Ranges(vec![(1, 2)]);
+    v.merge(&Unlogged::Whole);
+    assert_eq!(v, Unlogged::Whole);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filling_log_is_folded_early_by_the_sync_loop() {
+    let s = setup().await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(DirectSink {
+        committer: s.committer.clone(),
+        writer: resource,
+        epoch,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let vol_epoch = lease(&s.auth, &volume_resource("a"), "o1").await;
+    fs.attach_volume("a", "o1", vol_epoch).await.unwrap();
+    fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    fs.flush().await.unwrap(); // commits: log registered
+    // The loop's first tick runs at once; the next would be SYNC_INTERVAL
+    // away, far longer than this test waits.
+    crate::nbd::ensure_sync_loop(&fs, "test");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let first = cursor(&fs).await.unwrap().region;
+
+    // Flushes, each logged whole, until the region passes the mark.
+    let chunk = 256 * 1024;
+    let mut want = vec![0u8; 8 * MB];
+    want[..1000].copy_from_slice(&pattern(1000, 1));
+    let mut i = 0usize;
+    let before = txg(&s).await;
+    loop {
+        let c = cursor(&fs).await.unwrap();
+        if c.region != first {
+            break; // already folded
+        }
+        if c.used * 100 >= c.region.len * crate::zil::FOLD_AT_PERCENT {
+            break;
+        }
+        let off = (i * chunk) % (8 * MB);
+        let data = pattern(chunk, i as u8 + 2);
+        fs.block_write("a", off as u64, &data).await.unwrap();
+        want[off..off + chunk].copy_from_slice(&data);
+        fs.flush().await.unwrap();
+        assert_eq!(txg(&s).await, before, "a flush fell back to a commit");
+        i += 1;
+        assert!(i < 10_000, "the log never filled");
+    }
+
+    // The sync loop folds without waiting for its next tick.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while cursor(&fs).await.unwrap().region == first {
+        assert!(std::time::Instant::now() < deadline, "no early fold");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(read(&fs, 0, want.len()).await, want);
+    fs.detach_volume("a").await.unwrap();
+    fs.return_metaslabs().await;
+    drop(fs);
+    release(&s.auth, &volume_resource("a"), "o1", vol_epoch).await;
+    release(&s.auth, "writer/1", "1", epoch).await;
+    assert_clean(&s).await;
+}

@@ -62,6 +62,7 @@ pub mod snapshot;
 mod stripe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tls;
+mod trace;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
 pub mod vdev;

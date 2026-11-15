@@ -141,7 +141,22 @@ impl BlockDevice for RaidZ {
 
         // Like stripe writes, flushing tolerates up to `parity` failed
         // disks: the data is still recoverable from the rest.
-        let flushes = self.members.iter().map(|&d| self.disks.flush_disk(d));
+        let traced = crate::trace::enabled();
+        let flushes = self.members.iter().map(|&d| async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            if traced {
+                let t = std::time::Instant::now();
+                let r = self.disks.flush_disk(d).await;
+                eprintln!(
+                    "trace disk.flush d{} {:.2}ms",
+                    d,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+                return r;
+            }
+            let _ = traced;
+            self.disks.flush_disk(d).await
+        });
         let results = futures::future::join_all(flushes).await;
         let failures = results.iter().filter(|r| r.is_err()).count();
         if failures > self.parity {

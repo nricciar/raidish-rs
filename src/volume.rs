@@ -267,7 +267,10 @@ impl<D: BlockDevice> FileSystem<D> {
             .object_modify(&vol.obj, offset, data.len(), Some(data))
             .await?;
         if self.volumes_dirty_bytes() > DIRTY_LIMIT_BYTES {
-            self.commit_txg().await?;
+            // Writers that piled up behind a commit (one per request in
+            // flight) don't each run another one once it has drained.
+            self.commit_if(|| self.volumes_dirty_bytes() > DIRTY_LIMIT_BYTES)
+                .await?;
         }
         Ok(done)
     }

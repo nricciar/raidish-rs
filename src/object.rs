@@ -82,11 +82,92 @@ pub(crate) struct DirtyState {
     /// Records taken by an in-progress sync (readable until it finishes).
     pub(crate) syncing: Option<Arc<BTreeMap<u64, Dirty>>>,
     /// Dirty records changed since they were last written to the intent
-    /// log (a writer's flush logs exactly these, see `crate::zil`).
-    pub(crate) unlogged: std::collections::BTreeSet<u64>,
+    /// log, and which bytes of each (a writer's flush logs exactly these,
+    /// see `crate::zil`).
+    pub(crate) unlogged: BTreeMap<u64, Unlogged>,
+}
+
+/// Most byte ranges tracked per unlogged record; past it, the whole record.
+const MAX_UNLOGGED_RANGES: usize = 16;
+
+/// What of a dirty record changed since it was last logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Unlogged {
+    Whole,
+    /// Sorted, disjoint, non-adjacent byte ranges `[start, end)`.
+    Ranges(Vec<(u32, u32)>),
+}
+
+impl Unlogged {
+    /// Add `other`'s changes to these.
+    pub(crate) fn merge(&mut self, other: &Unlogged) {
+        let Unlogged::Ranges(theirs) = other else {
+            *self = Unlogged::Whole;
+            return;
+        };
+        for &(s, e) in theirs {
+            self.add(s, e);
+        }
+    }
+
+    /// Add bytes `[start, end)`.
+    pub(crate) fn add(&mut self, start: u32, end: u32) {
+        let Unlogged::Ranges(rs) = self else {
+            return;
+        };
+        let (mut s, mut e) = (start, end);
+        // Absorb every range overlapping or touching [s, e).
+        rs.retain(|&(a, b)| {
+            if b < s || a > e {
+                true
+            } else {
+                s = s.min(a);
+                e = e.max(b);
+                false
+            }
+        });
+        let at = rs.partition_point(|&(a, _)| a < s);
+        rs.insert(at, (s, e));
+        if rs.len() > MAX_UNLOGGED_RANGES {
+            *self = Unlogged::Whole;
+        }
+    }
+
+    /// Bytes covered (None: the whole record).
+    pub(crate) fn bytes(&self) -> Option<usize> {
+        match self {
+            Unlogged::Whole => None,
+            Unlogged::Ranges(rs) => Some(rs.iter().map(|&(s, e)| (e - s) as usize).sum()),
+        }
+    }
 }
 
 impl DirtyState {
+    /// Record `idx` changed as a whole (replaced, or became a hole).
+    pub(crate) fn mark_whole(&mut self, idx: u64) {
+        self.unlogged.insert(idx, Unlogged::Whole);
+    }
+
+    /// Bytes `[start, end)` of record `idx` changed.
+    pub(crate) fn mark_range(&mut self, idx: u64, start: usize, end: usize) {
+        self.unlogged
+            .entry(idx)
+            .or_insert_with(|| Unlogged::Ranges(Vec::new()))
+            .add(start as u32, end as u32);
+    }
+
+    /// Put back changes taken for a log append that didn't make it.
+    pub(crate) fn restore_unlogged(&mut self, taken: BTreeMap<u64, Unlogged>) {
+        for (idx, ch) in taken {
+            match self.unlogged.get_mut(&idx) {
+                Some(cur) => cur.merge(&ch),
+                None => {
+                    self.unlogged.insert(idx, ch);
+                }
+            }
+        }
+    }
+
     pub(crate) fn get(&self, idx: u64) -> Option<&Dirty> {
         self.records
             .get(&idx)
@@ -264,7 +345,7 @@ impl ObjTree {
         };
         let mut d = self.dirty.lock().unwrap();
         d.records.insert(idx, rec);
-        d.unlogged.insert(idx);
+        d.mark_whole(idx);
     }
 
     /// Point at a different committed tree, dropping nothing else: for a
@@ -306,7 +387,7 @@ impl ObjTree {
         let DirtyState {
             records, unlogged, ..
         } = &mut *d;
-        unlogged.retain(|k| records.contains_key(k));
+        unlogged.retain(|k, _| records.contains_key(k));
     }
 }
 
@@ -515,14 +596,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 };
                 let mut d = obj.dirty.lock().unwrap();
                 d.records.insert(idx, rec);
-                d.unlogged.insert(idx);
+                d.mark_whole(idx);
             } else {
                 loop {
                     {
                         let mut d = obj.dirty.lock().unwrap();
                         if let Some(Dirty::Data(buf)) = d.records.get_mut(&idx) {
                             apply(buf);
-                            d.unlogged.insert(idx);
+                            d.mark_range(idx, at, at + n);
                             break;
                         }
                         // Base on what's being synced, if anything.
@@ -534,7 +615,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         if let Some(mut buf) = base {
                             apply(&mut buf);
                             d.records.insert(idx, Dirty::Data(buf));
-                            d.unlogged.insert(idx);
+                            d.mark_range(idx, at, at + n);
                             break;
                         }
                     }
@@ -549,7 +630,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     apply(&mut buf);
                     d.records.insert(idx, Dirty::Data(buf));
-                    d.unlogged.insert(idx);
+                    d.mark_range(idx, at, at + n);
                     break;
                 }
             }
@@ -594,7 +675,7 @@ impl<D: BlockDevice> FileSystem<D> {
             gone.extend(committed.into_iter().map(|(i, _)| i));
             for idx in gone {
                 d.records.insert(idx, Dirty::Hole);
-                d.unlogged.insert(idx);
+                d.mark_whole(idx);
             }
         }
         obj.size.store(new_size, Ordering::SeqCst);
@@ -716,6 +797,8 @@ impl<D: BlockDevice> FileSystem<D> {
         allocated: &mut Vec<BlockPtr>,
         replaced: &mut Vec<BlockPtr>,
     ) -> Result<TreeRoot, FileSystemError> {
+        let mut span = crate::trace::Span::new("build_tree");
+        span.note("records", records.len());
         // 0. Make room for the highest index (growable objects only).
         let committed = obj.root();
         let levels = target_levels(committed.levels, records);
@@ -811,6 +894,8 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
 
+        span.note("jobs", jobs.len());
+        span.mark("alloc");
         // (Futures are boxed explicitly: a combinator chain over borrowed
         // records trips rustc's higher-ranked Send inference, #100013.)
         type Job<'a> = Pin<
@@ -864,10 +949,16 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(e);
         }
 
+        span.mark("data");
         // 2. Indirect blocks, bottom up.
         let changes: BTreeMap<u64, Option<BlockPtr>> = leaves.into_iter().collect();
-        self.build_indirects(obj, &old_root, changes, allocated, replaced)
-            .await
+        let before = allocated.len();
+        let r = self
+            .build_indirects(obj, &old_root, changes, allocated, replaced)
+            .await;
+        span.note("indirects", allocated.len().saturating_sub(before));
+        span.mark("indirects");
+        r
     }
 
     /// Rewrite the indirect blocks of `old_root` above `changes` (data

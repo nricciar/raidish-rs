@@ -687,12 +687,15 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
+        let mut span = crate::trace::Span::new("writer.sync_volume");
+        span.note("records", records.len());
         let log_blocks = if detaching {
             0
         } else {
             self.log_region_blocks()
         };
         self.lease_space(w, need + log_blocks).await?;
+        span.mark("lease_space");
         // The log from now on (see `crate::zil`): what was appended after
         // the cut this sync took its records at, then a new region flushes
         // go to once it's committed. Without one (no contiguous space, or
@@ -703,6 +706,7 @@ impl<D: BlockDevice> FileSystem<D> {
             true => None,
             false => self.new_log_region().await.ok(),
         };
+        span.mark("log_region");
         let mut regions: Vec<crate::inode::LogRegion> = Vec::new();
         let mut from_seq = 0;
         if let Some((r, k)) = from {
@@ -739,8 +743,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 return Err(e);
             }
         };
+        span.mark("build_tree");
         // The records must be on disk before the committer points at them.
-        if let Err(e) = self.dev.flush().await {
+        let flushed = self.dev.flush().await;
+        span.mark("dev_flush");
+        if let Err(e) = flushed {
             self.release_ptrs(&allocated).await;
             release_log(&new_region).await;
             return Err(e.into());
@@ -777,6 +784,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 ))),
             },
         };
+        span.mark("commit_rpc");
         match outcome {
             Ok(c) => {
                 self.note_open_txg(c.txg + 1).await;
@@ -1350,12 +1358,17 @@ impl<D: BlockDevice> FileSystem<D> {
         c: &VolumeCommit,
         lent_to_writer: impl Fn(u32) -> bool,
     ) -> Result<u64, CommitError> {
+        let mut span = crate::trace::Span::new("committer.apply");
         {
             let _tx = self.begin_tx().await;
+            span.mark("begin_tx");
             self.stage_volume_commit(c, &lent_to_writer).await?;
+            span.mark("stage");
         }
         // A resend after a failure here is acknowledged by the root check.
-        self.group_commit().await
+        let r = self.group_commit().await;
+        span.mark("group_commit");
+        r
     }
 
     /// Apply `c` in memory, in the open TXG (the caller holds `begin_tx`).

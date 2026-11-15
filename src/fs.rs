@@ -274,6 +274,33 @@ pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
     None
 }
 
+/// An early-fold request: raised by a flush, taken by the sync loop.
+#[derive(Default)]
+pub(crate) struct FoldWanted {
+    raised: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl FoldWanted {
+    /// Ask for a fold, unless one is already asked for (and not yet taken).
+    pub(crate) fn raise(&self) {
+        if !self.raised.swap(true, Ordering::SeqCst) {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Wait for a request.
+    pub(crate) async fn wait(&self) {
+        self.notify.notified().await
+    }
+
+    /// Clear the request once a fold has run; later flushes may raise a
+    /// new one.
+    pub(crate) fn take(&self) -> bool {
+        self.raised.swap(false, Ordering::SeqCst)
+    }
+}
+
 pub struct FileSystem<D: BlockDevice> {
     pub dev: D,
     superblock: Arc<RwLock<Option<Superblock>>>,
@@ -313,6 +340,10 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) next_object: Arc<AtomicU64>,
     /// Serializes a writer's intent log appends (see `crate::zil`).
     pub(crate) log_io: Arc<Mutex<()>>,
+    /// A volume's intent log is filling up: the background sync loop (see
+    /// `crate::nbd::ensure_sync_loop`) folds early, so the next region is
+    /// registered before flushes would have to fall back to a commit.
+    pub(crate) fold_wanted: Arc<FoldWanted>,
     /// The lowest TXG new blocks may be stamped with (see
     /// `raise_birth_floor`).
     pub(crate) birth_floor: Arc<AtomicU64>,
@@ -354,6 +385,7 @@ impl<D: BlockDevice> FileSystem<D> {
             writer: None,
             next_object: Arc::new(AtomicU64::new(1)),
             log_io: Arc::new(Mutex::new(())),
+            fold_wanted: Arc::new(FoldWanted::default()),
             birth_floor: Arc::new(AtomicU64::new(0)),
             snap_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -1045,6 +1077,20 @@ impl<D: BlockDevice> FileSystem<D> {
         self.commit_locked().await
     }
 
+    /// Commit only if `still_needed()` holds once the commit lock is ours:
+    /// callers that queued behind a commit which already did the work
+    /// return without running another one.
+    pub(crate) async fn commit_if(
+        &self,
+        still_needed: impl Fn() -> bool,
+    ) -> Result<(), FileSystemError> {
+        let _guard = self.commit_lock.lock().await;
+        if still_needed() {
+            self.commit_locked().await?;
+        }
+        Ok(())
+    }
+
     /// Start a metadata transaction: excludes commits (and other metadata
     /// operations) until dropped, so no commit can capture a half-done
     /// operation. Finish with `commit_locked` while holding it.
@@ -1069,25 +1115,32 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
 
+        let mut span = crate::trace::Span::new("commit");
         let txg = self.open_txg().await?;
         // Volumes sync all-or-nothing each, so whatever did sync is safe to
         // commit; a failure is reported after the TXG is durable.
         let volumes = self.sync_volumes().await;
         let files = self.sync_files().await;
         let volumes = volumes.and(files);
+        span.mark("objects");
         // Then the object table, which now points at every new tree.
         self.sync_table().await?;
+        span.mark("table");
         let root = self.objects.root();
 
         let synced = self.sync_metaslabs(txg).await?;
+        span.mark("metaslabs");
 
         // The uberblock-carrying flush below is the last write of this TXG;
         // misses from it are caught by the next commit (as `txg`).
         let degraded = self.account_misses(txg);
-        match self.write_uberblock(txg, root, degraded).await {
+        let written = self.write_uberblock(txg, root, degraded).await;
+        span.mark("uberblock");
+        match written {
             Ok(uberblock) => {
                 *self.uberblock.lock().await = Some(uberblock);
                 self.finish_metaslab_sync(txg, synced).await;
+                span.mark("finish");
                 if volumes.is_ok() {
                     self.commits_done.fetch_max(id, Ordering::SeqCst);
                 }

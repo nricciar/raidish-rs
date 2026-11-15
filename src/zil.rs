@@ -39,11 +39,11 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{LogRegion, VolumeLog};
-use crate::object::Dirty;
+use crate::object::{Dirty, Unlogged};
 use crate::volume::Volume;
 use crate::writer::WriterState;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const LOG_MAGIC: u64 = 0x5241_4944_5a49_4c31; // "RAIDZIL1"
@@ -51,6 +51,9 @@ const LOG_MAGIC: u64 = 0x5241_4944_5a49_4c31; // "RAIDZIL1"
 const HEADER_BYTES: usize = 128;
 /// Preferred log region size: 16 MiB (at most a quarter of a metaslab).
 pub const LOG_REGION_BLOCKS: u64 = 4096;
+/// Ask for an early fold once a region is this full (percent), so its
+/// successor is registered before it runs out.
+pub const FOLD_AT_PERCENT: u64 = 75;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct Header {
@@ -61,10 +64,18 @@ struct Header {
     payload_sum: [u8; 32],
 }
 
+/// One change to a volume record. Entries apply in log order, on top of
+/// the tree the log was registered with.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 enum Entry {
+    /// The whole record.
     Data(u64, Vec<u8>),
     Hole(u64),
+    /// Bytes at an offset into the record, over what it held before (the
+    /// earlier entries, else the committed record, else zeros). Added after
+    /// `Data` and `Hole`, so logs written before it still decode; a log
+    /// with patches needs a replayer that knows them.
+    Patch(u64, u32, Vec<u8>),
 }
 
 /// A writer's place in a volume's log: the region it appends to.
@@ -111,7 +122,7 @@ struct Planned {
     vol: Arc<Volume>,
     lba: u64,
     bytes: Vec<u8>,
-    idxs: BTreeSet<u64>,
+    idxs: BTreeMap<u64, Unlogged>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -131,8 +142,10 @@ impl<D: BlockDevice> FileSystem<D> {
         let Some(w) = self.writer.clone() else {
             return self.sync().await;
         };
+        let mut span = crate::trace::Span::new("zil.flush");
         // One flush appends at a time: a record must never follow a gap.
         let io = self.log_io.lock().await;
+        span.mark("lock");
         let vols: Vec<Arc<Volume>> = self.volumes.lock().unwrap().values().cloned().collect();
         let mut planned: Vec<Planned> = Vec::new();
         let mut commit = false;
@@ -140,9 +153,21 @@ impl<D: BlockDevice> FileSystem<D> {
             match self.plan_append(&vol) {
                 Ok(Some(p)) => planned.push(p),
                 Ok(None) => {}
-                Err(()) => commit = true,
+                Err(()) => {
+                    let why = match vol.cursor.lock().unwrap().as_ref() {
+                        None => "no_log",
+                        Some(_) => "log_full",
+                    };
+                    span.note("fallback", why);
+                    commit = true
+                }
             }
         }
+        span.note(
+            "bytes",
+            planned.iter().map(|p| p.bytes.len()).sum::<usize>(),
+        );
+        span.mark("plan");
         let mut written: Vec<Planned> = Vec::new();
         for p in planned {
             match self.write_record_blocks(p.lba, &p.bytes).await {
@@ -151,31 +176,47 @@ impl<D: BlockDevice> FileSystem<D> {
                     eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
                     // The slot is spent: later records would follow a gap.
                     *p.vol.cursor.lock().unwrap() = None;
-                    p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                    p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
                     commit = true;
                 }
             }
         }
+        span.mark("log_write");
         if commit {
             drop(io);
             // Commits what was logged too.
-            return self.sync().await;
+            let r = self.sync().await;
+            span.mark("commit");
+            return r;
         }
         if written.is_empty() {
             return Ok(());
         }
-        if let Err(e) = self.dev.flush().await {
+        let flushed = self.dev.flush().await;
+        span.mark("dev_flush");
+        if let Err(e) = flushed {
             for p in written {
                 // These records may or may not be on disk. One that isn't
                 // would be a gap, hiding every later record from replay: log
                 // nothing more here (flushes commit until the next fold
                 // starts a region).
                 *p.vol.cursor.lock().unwrap() = None;
-                p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
             }
             return Err(e.into());
         }
         drop(io);
+        if written.iter().any(|p| {
+            p.vol
+                .cursor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.used * 100 >= c.region.len * FOLD_AT_PERCENT)
+        }) {
+            span.note("fold", "wanted");
+            self.fold_wanted.raise();
+        }
         // Acknowledge only under a lease nobody can have taken over yet (a
         // replay after it lapses then sees every acknowledged record).
         // A record that isn't acknowledged stays unlogged, so a retried
@@ -184,7 +225,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stale = None;
         for p in written {
             if !w.lease_fresh(&p.vol.name) {
-                p.vol.obj.dirty.lock().unwrap().unlogged.extend(p.idxs);
+                p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
                 stale.get_or_insert(p.vol.name.clone());
             }
         }
@@ -210,17 +251,24 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(());
         };
         // Records a sync in progress took count too: until it commits,
-        // only the log has them.
-        let entries: Vec<Entry> = d
-            .unlogged
-            .iter()
-            .filter_map(|&i| {
-                d.get(i).map(|r| match r {
-                    Dirty::Data(b) => Entry::Data(i, b.clone()),
-                    Dirty::Hole => Entry::Hole(i),
-                })
-            })
-            .collect();
+        // only the log has them. A record mostly unchanged logs just the
+        // bytes that changed.
+        let mut entries: Vec<Entry> = Vec::new();
+        for (&i, changed) in &d.unlogged {
+            match (d.get(i), changed) {
+                (Some(Dirty::Data(b)), Unlogged::Ranges(rs))
+                    if changed.bytes().is_some_and(|n| n * 2 <= b.len()) =>
+                {
+                    entries.extend(
+                        rs.iter()
+                            .map(|&(s, e)| Entry::Patch(i, s, b[s as usize..e as usize].to_vec())),
+                    );
+                }
+                (Some(Dirty::Data(b)), _) => entries.push(Entry::Data(i, b.clone())),
+                (Some(Dirty::Hole), _) => entries.push(Entry::Hole(i)),
+                (None, _) => {}
+            }
+        }
         let bytes = encode(c.region.guid, c.seq, &entries).map_err(|_| ())?;
         let blocks = self.align_blocks(bytes.len().div_ceil(BLOCK_SIZE) as u64);
         if c.used + blocks > c.region.len {
@@ -374,13 +422,60 @@ impl<D: BlockDevice> FileSystem<D> {
             entries.extend(self.read_region(r, from).await);
         }
         let n = entries.len();
-        {
-            let mut d = vol.obj.dirty.lock().unwrap();
-            for e in entries {
-                match e {
-                    Entry::Data(i, b) => d.records.insert(i, Dirty::Data(b)),
-                    Entry::Hole(i) => d.records.insert(i, Dirty::Hole),
+        let bs = vol.obj.blksz;
+        for e in entries {
+            let (i, at, bytes) = match e {
+                Entry::Data(i, b) => {
+                    vol.obj
+                        .dirty
+                        .lock()
+                        .unwrap()
+                        .records
+                        .insert(i, Dirty::Data(b));
+                    continue;
+                }
+                Entry::Hole(i) => {
+                    vol.obj.dirty.lock().unwrap().records.insert(i, Dirty::Hole);
+                    continue;
+                }
+                Entry::Patch(i, at, bytes) => (i, at as usize, bytes),
+            };
+            if at + bytes.len() > bs {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "volume '{}': intent log patch past the end of record {}",
+                    name, i
+                )));
+            }
+            // Over what the record holds so far: an earlier entry, else
+            // the committed record, else zeros.
+            let applied = {
+                let mut d = vol.obj.dirty.lock().unwrap();
+                match d.records.get_mut(&i) {
+                    Some(Dirty::Data(buf)) => {
+                        buf[at..at + bytes.len()].copy_from_slice(&bytes);
+                        true
+                    }
+                    Some(Dirty::Hole) => {
+                        let mut buf = vec![0u8; bs];
+                        buf[at..at + bytes.len()].copy_from_slice(&bytes);
+                        d.records.insert(i, Dirty::Data(buf));
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if !applied {
+                let mut buf = match self.read_committed_record(&vol.obj, i).await? {
+                    Some(c) => c.as_ref().clone(),
+                    None => vec![0u8; bs],
                 };
+                buf[at..at + bytes.len()].copy_from_slice(&bytes);
+                vol.obj
+                    .dirty
+                    .lock()
+                    .unwrap()
+                    .records
+                    .insert(i, Dirty::Data(buf));
             }
         }
         *vol.log.lock().unwrap() = None;
