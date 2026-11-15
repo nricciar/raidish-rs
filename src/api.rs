@@ -81,6 +81,13 @@ pub async fn listen(
             port
         )])),
     };
+    // Volume management is done by the committer: ask every node for it.
+    let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
+    let mut endpoints = vec![me];
+    endpoints.extend(cluster.members.peers.values().cloned());
+    let volumes = crate::volumes_api::VolumesState {
+        client: crate::committer::CommitClient::new(endpoints),
+    };
     let server = DiskServer { disks, floor };
 
     let mut figment = rocket::Config::figment()
@@ -107,6 +114,7 @@ pub async fn listen(
         .manage(auth)
         .manage(server)
         .manage(files)
+        .manage(volumes)
         .manage(cluster)
         .manage(committer)
         .manage(agent)
@@ -132,6 +140,7 @@ pub async fn listen(
         .mount("/", crate::cluster::routes::routes())
         .mount("/", crate::committer::routes::routes())
         .mount("/", crate::files_api::routes())
+        .mount("/", crate::volumes_api::routes())
         .mount("/", crate::nfs::peers::routes())
         .mount("/", crate::dashboard::routes())
         .launch()

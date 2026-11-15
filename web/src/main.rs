@@ -5,13 +5,18 @@
 // Only the wasm build runs; the native build just type-checks.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
+mod api;
 mod app;
 mod blockmap;
 mod cluster;
+mod dialog;
+mod files;
 mod fmt;
 mod login;
 mod panels;
 mod session;
+mod upload;
+mod volumes;
 
 fn main() {
     #[cfg(target_arch = "wasm32")]

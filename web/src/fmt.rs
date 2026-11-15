@@ -97,3 +97,31 @@ pub fn owner_color(owner: u32) -> String {
     let hue = (owner as f64 * 137.508) % 360.0;
     format!("hsl({:.0} 65% 55%)", hue)
 }
+
+/// Local date and time of a ns-since-the-epoch timestamp.
+pub fn date_ns(ns: u64) -> String {
+    if ns == 0 {
+        return "—".into();
+    }
+    let d = js_sys::Date::new(&((ns / 1_000_000) as f64).into());
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        d.get_full_year(),
+        d.get_month() + 1,
+        d.get_date(),
+        d.get_hours(),
+        d.get_minutes()
+    )
+}
+
+/// "42 s", "3 min 5 s", "1 h 12 min".
+pub fn duration(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{} s", s)
+    } else if s < 3600 {
+        format!("{} min {} s", s / 60, s % 60)
+    } else {
+        format!("{} h {} min", s / 3600, (s % 3600) / 60)
+    }
+}

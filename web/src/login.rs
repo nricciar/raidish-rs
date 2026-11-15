@@ -87,6 +87,7 @@ impl Component for Root {
                 <App
                     user={(!who.open()).then(|| format!("{} ({})", who.name, who.role))}
                     on_sign_out={ctx.link().callback(|_| Msg::SignOut)}
+                    can_write={who.role != "readonly"}
                 />
             },
             State::Login(error) => {

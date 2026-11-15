@@ -4,7 +4,7 @@
 use raidish::disk::{DiskOptions, IoStats};
 use raidish::disks::DiskSet;
 use raidish::fs::FileSystem;
-use raidish::inspect::{Layout, MetaslabReport, ObjectReport, PoolMap, PoolReport};
+use raidish::inspect::{Layout, MetaslabReport, PoolMap, PoolReport};
 use raidish::vdev::{Pool, Topology};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,7 +24,6 @@ pub struct Snapshot {
 
 pub struct LayoutData {
     pub layout: Layout,
-    pub objects: Vec<ObjectReport>,
     pub txg: u64,
 }
 
@@ -206,10 +205,9 @@ impl Session {
 
 impl Snapshot {
     pub async fn layout(&self) -> LayoutData {
-        let (layout, objects) = self.fs.layout().await;
+        let (layout, _objects) = self.fs.layout().await;
         LayoutData {
             layout,
-            objects,
             txg: self.report.txg,
         }
     }

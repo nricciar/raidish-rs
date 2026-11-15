@@ -66,6 +66,8 @@ pub mod tls;
 mod ui;
 pub mod vdev;
 mod volume;
+#[cfg(not(target_arch = "wasm32"))]
+mod volumes_api;
 pub mod websocket;
 pub mod writer;
 pub mod zil;
