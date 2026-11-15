@@ -147,6 +147,22 @@ impl Store {
         })
     }
 
+    /// The NFSv4 client records of the applied state.
+    pub fn nfs_clients(&self) -> Vec<String> {
+        self.view
+            .read()
+            .unwrap()
+            .nfs_clients
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// One lease of the applied state (cheaper than `state()`).
+    pub fn lease(&self, resource: &str) -> Option<super::state::Lease> {
+        self.view.read().unwrap().leases.get(resource).cloned()
+    }
+
     /// The applied cluster state.
     pub fn state(&self) -> ClusterState {
         self.view.read().unwrap().clone()

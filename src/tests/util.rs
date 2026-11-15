@@ -137,12 +137,20 @@ impl TestPool {
 pub struct FaultyDev<D> {
     inner: D,
     remaining: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    flush_fails: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
-pub struct FaultSwitch(std::sync::Arc<std::sync::atomic::AtomicI64>);
+pub struct FaultSwitch(
+    std::sync::Arc<std::sync::atomic::AtomicI64>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 
 impl FaultSwitch {
+    /// Make every flush fail (`true`) or pass through again.
+    pub fn fail_flushes(&self, fail: bool) {
+        self.1.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
     pub fn fail_after(&self, writes: i64) {
         self.0.store(writes, std::sync::atomic::Ordering::SeqCst);
     }
@@ -161,12 +169,14 @@ impl FaultSwitch {
 impl<D> FaultyDev<D> {
     pub fn new(inner: D) -> (Self, FaultSwitch) {
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let flush_fails = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         (
             FaultyDev {
                 inner,
                 remaining: remaining.clone(),
+                flush_fails: flush_fails.clone(),
             },
-            FaultSwitch(remaining),
+            FaultSwitch(remaining, flush_fails),
         )
     }
 
@@ -189,6 +199,11 @@ impl<D> FaultyDev<D> {
 #[async_trait]
 impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
     async fn flush(&self) -> Result<(), crate::disk::DiskError> {
+        if self.flush_fails.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::disk::DiskError::IoError(std::io::Error::other(
+                "injected flush failure",
+            )));
+        }
         self.inner.flush().await
     }
     async fn read_block(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {

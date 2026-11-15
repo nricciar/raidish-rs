@@ -54,6 +54,7 @@ impl<'r> FromRequest<'r> for SameLayout {
 
 #[post("/api/v1/raft/append", data = "<rpc>")]
 pub async fn append(
+    _auth: crate::auth::IsNode,
     rpc: Json<AppendEntriesRequest<TypeConfig>>,
     _layout: SameLayout,
     cluster: &State<Shared>,
@@ -63,6 +64,7 @@ pub async fn append(
 
 #[post("/api/v1/raft/vote", data = "<rpc>")]
 pub async fn vote(
+    _auth: crate::auth::IsNode,
     rpc: Json<VoteRequest<NodeId>>,
     _layout: SameLayout,
     cluster: &State<Shared>,
@@ -72,6 +74,7 @@ pub async fn vote(
 
 #[post("/api/v1/raft/snapshot", data = "<rpc>")]
 pub async fn snapshot(
+    _auth: crate::auth::IsNode,
     rpc: Json<InstallSnapshotRequest<TypeConfig>>,
     _layout: SameLayout,
     cluster: &State<Shared>,
@@ -81,6 +84,7 @@ pub async fn snapshot(
 
 #[post("/api/v1/cluster/lease?<forwarded>", data = "<op>")]
 pub async fn lease(
+    _auth: crate::auth::CanWrite,
     op: Json<LeaseOp>,
     forwarded: Option<bool>,
     cluster: &State<Shared>,
@@ -89,7 +93,7 @@ pub async fn lease(
 }
 
 #[get("/api/v1/cluster/status")]
-pub async fn status(cluster: &State<Shared>) -> Json<super::Status> {
+pub async fn status(_auth: crate::auth::CanRead, cluster: &State<Shared>) -> Json<super::Status> {
     Json(cluster.status())
 }
 

@@ -57,7 +57,7 @@ impl Status {
 }
 
 pub async fn fetch() -> Result<Status, String> {
-    let resp = gloo_net::http::Request::get("/api/v1/cluster/status")
+    let resp = crate::session::get("/api/v1/cluster/status")
         .send()
         .await
         .map_err(|e| e.to_string())?;

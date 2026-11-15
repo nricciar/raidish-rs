@@ -18,6 +18,26 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
+/// The dashboard's token (see `crate::auth`), sent with every websocket
+/// connection: browsers can't set headers on websockets.
+static ACCESS_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_access_token(token: Option<String>) {
+    *ACCESS_TOKEN.lock().unwrap() = token;
+}
+
+fn with_token(url: &str) -> String {
+    match ACCESS_TOKEN.lock().unwrap().as_deref() {
+        Some(t) => format!(
+            "{}{}access_token={}",
+            url,
+            if url.contains('?') { '&' } else { '?' },
+            String::from(js_sys::encode_uri_component(t))
+        ),
+        None => url.to_string(),
+    }
+}
+
 /// What the socket task returns to a caller: (status, payload).
 type Reply = (u8, Vec<u8>);
 
@@ -200,7 +220,7 @@ enum SocketEvent {
 
 /// Open the socket, wait for it to connect, and install its request queue.
 async fn connect(disk: &Arc<RemoteDisk>) -> Result<(), String> {
-    let ws = WebSocket::new(&disk.url).map_err(|e| format!("{:?}", e))?;
+    let ws = WebSocket::new(&with_token(&disk.url)).map_err(|e| format!("{:?}", e))?;
     ws.set_binary_type(BinaryType::Arraybuffer);
     let (opened_tx, opened_rx) = oneshot::channel::<Result<(), String>>();
     let (jobs_tx, jobs_rx) = mpsc::unbounded::<Job>();

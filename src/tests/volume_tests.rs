@@ -1,4 +1,5 @@
 use super::*;
+use crate::object::INDIRECT_FANOUT;
 use crate::test_util::TestPool;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
@@ -37,7 +38,7 @@ async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
 
 #[test]
 fn levels_cover_the_volume() {
-    assert_eq!(levels_for(1), 1);
+    assert_eq!(levels_for(1), 0);
     assert_eq!(levels_for(INDIRECT_FANOUT), 1);
     assert_eq!(levels_for(INDIRECT_FANOUT + 1), 2);
     assert_eq!(levels_for(INDIRECT_FANOUT * INDIRECT_FANOUT), 2);
@@ -180,7 +181,7 @@ async fn overwrites_are_copy_on_write_and_free_old_space() {
 
     let vol = fs.open_volume("vol").await.unwrap();
     let old_leaf = fs
-        .tree_lookup(&vol, vol.root(), 0, 3)
+        .tree_lookup(&vol.obj, &vol.obj.root(), 0, 3)
         .await
         .unwrap()
         .unwrap();
@@ -193,7 +194,7 @@ async fn overwrites_are_copy_on_write_and_free_old_space() {
     fs.block_write("vol", 0, &second).await.unwrap();
     fs.sync().await.unwrap();
     let new_leaf = fs
-        .tree_lookup(&vol, vol.root(), 0, 3)
+        .tree_lookup(&vol.obj, &vol.obj.root(), 0, 3)
         .await
         .unwrap()
         .unwrap();
@@ -247,7 +248,7 @@ async fn multi_level_trees() {
     // > FANOUT^2 records -> 3 levels, all sparse.
     let size = (INDIRECT_FANOUT * INDIRECT_FANOUT + 10) * vbs;
     fs.create_block("vol", size, VOLBLOCK_ALIGN).await.unwrap();
-    assert_eq!(fs.open_volume("vol").await.unwrap().levels, 3);
+    assert_eq!(fs.open_volume("vol").await.unwrap().obj.levels(), 3);
 
     let records = [
         0,
@@ -367,7 +368,7 @@ async fn corrupted_volume_record_self_heals() {
     fs.sync().await.unwrap();
     let vol = fs.open_volume("vol").await.unwrap();
     let leaf = fs
-        .tree_lookup(&vol, vol.root(), 0, 0)
+        .tree_lookup(&vol.obj, &vol.obj.root(), 0, 0)
         .await
         .unwrap()
         .unwrap();
@@ -492,22 +493,6 @@ async fn concurrent_flushes_share_commits() {
     }
 }
 
-#[test]
-fn record_cache_is_bounded() {
-    let mut c = RecordCache::default();
-    let rec = Arc::new(vec![0u8; 48 * 1024]);
-    let n = RECORD_CACHE_BYTES / rec.len() * 2;
-    for i in 0..n as u64 {
-        c.insert((i, 1), rec.clone());
-    }
-    assert!(c.bytes <= RECORD_CACHE_BYTES);
-    assert_eq!(c.map.len(), c.order.len());
-    assert!(c.get((0, 1)).is_none(), "oldest evicted");
-    assert!(c.get((n as u64 - 1, 1)).is_some(), "newest kept");
-    // Same lba, newer birth TXG: a different entry, never a stale hit.
-    assert!(c.get((n as u64 - 1, 2)).is_none());
-}
-
 /// A sync that fails after caching new indirect blocks hands their space
 /// back, and the retry (same TXG, so same birth_txg) reuses those LBAs for
 /// different contents. That is safe only because every indirect written
@@ -522,7 +507,7 @@ async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
     let vbs = VOLBLOCK_ALIGN as usize;
 
     // Two levels: record 600 needs an L1 indirect and the root indirect.
-    assert_eq!(fs.open_volume("vol").await.unwrap().levels, 2);
+    assert_eq!(fs.open_volume("vol").await.unwrap().obj.levels(), 2);
     let rec = 600u64;
     fs.block_write("vol", rec * vbs as u64, &pattern(vbs, 1))
         .await

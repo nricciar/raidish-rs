@@ -53,6 +53,8 @@ pub enum WsStatus {
     InvalidRequest = 2,
     /// A write or flush from a writer whose lease epoch is out of date.
     StaleEpoch = 3,
+    /// The connection's role may not write (see `crate::auth`).
+    Forbidden = 4,
 }
 
 impl TryFrom<u8> for WsStatus {
@@ -64,6 +66,7 @@ impl TryFrom<u8> for WsStatus {
             1 => Ok(WsStatus::ErrorNotFound),
             2 => Ok(WsStatus::InvalidRequest),
             3 => Ok(WsStatus::StaleEpoch),
+            4 => Ok(WsStatus::Forbidden),
             _ => Err(()),
         }
     }

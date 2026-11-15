@@ -548,3 +548,45 @@ fn metaslab_lend_and_return() {
     assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 5);
     assert!(s.lent_to(3).is_none());
 }
+
+/// NFSv4 client records are written only by the `nfs4` lease holder.
+#[test]
+fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
+    use super::state::NFS4;
+    let mut s = ClusterState::default();
+    let grant = s.apply(&Request::Acquire {
+        resource: NFS4.into(),
+        owner: "n1".into(),
+        desc: "nfs4 node-1".into(),
+        ttl_ms: 10_000,
+        now_ms: 1000,
+    });
+    let Response::Granted { epoch, .. } = grant else {
+        panic!("{:?}", grant)
+    };
+    let rec = |owner: &str, epoch: u64, present: bool, now_ms: u64| Request::NfsClient {
+        client: "6162".into(),
+        present,
+        nfs_owner: owner.into(),
+        nfs_epoch: epoch,
+        now_ms,
+    };
+    assert_eq!(s.apply(&rec("n1", epoch, true, 2000)), Response::Recorded);
+    assert!(s.nfs_clients.contains_key("6162"));
+    // Not the holder, an old epoch, or after the lease ran out: refused.
+    assert!(matches!(
+        s.apply(&rec("n2", epoch, false, 2000)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&rec("n1", epoch - 1, false, 2000)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&rec("n1", epoch, false, 20_000)),
+        Response::Refused(_)
+    ));
+    assert!(s.nfs_clients.contains_key("6162"));
+    assert_eq!(s.apply(&rec("n1", epoch, false, 3000)), Response::Recorded);
+    assert!(s.nfs_clients.is_empty());
+}

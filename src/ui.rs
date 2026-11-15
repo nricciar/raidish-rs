@@ -8,8 +8,8 @@ fn color(k: BlockKind) -> &'static str {
         BlockKind::Superblock => "\x1b[48;5;196m", // Bright red background
         BlockKind::Uberblock => "\x1b[48;5;208m",  // Orange background
         BlockKind::SpaceMap => "\x1b[48;5;220m",   // Gold background
-        BlockKind::FileIndex => "\x1b[48;5;39m",   // Bright blue background
-        BlockKind::Inode => "\x1b[48;5;51m",       // Cyan background
+        BlockKind::ObjectTable => "\x1b[48;5;39m", // Bright blue background
+        BlockKind::Directory => "\x1b[48;5;51m",   // Cyan background
         BlockKind::Data => "\x1b[48;5;34m",        // Green background
         BlockKind::Other => "\x1b[48;5;65m",       // Dull green background
         BlockKind::Free => "\x1b[48;5;240m",       // Dark gray background
@@ -22,8 +22,8 @@ fn symbol(k: BlockKind) -> &'static str {
         BlockKind::Superblock => "S",
         BlockKind::Uberblock => "U",
         BlockKind::SpaceMap => "M",
-        BlockKind::FileIndex => "I",
-        BlockKind::Inode => "N",
+        BlockKind::ObjectTable => "I",
+        BlockKind::Directory => "N",
         BlockKind::Data => "D",
         BlockKind::Other => "o",
         BlockKind::Free => "·",

@@ -3,10 +3,19 @@
 pool:
   raidz1:
     - /data/disk
-    - http://node1:8882/api/v1/disks/1
-    - http://node2:8883/api/v1/disks/2
+    - https://node1:8882/api/v1/disks/1
+    - https://node2:8883/api/v1/disks/2
 cluster:
   data_dir: /data/raft
 # Export volumes, but don't attach kernel devices (unprivileged containers).
 automount:
   helper: none
+  # Reachable from the compose network (the nfs-client container).
+  bind: 0.0.0.0
+# The certificate bundle `pki` made for this node (see docker-compose.yml).
+tls:
+  dir: /etc/raidish/tls
+# NFS (3 and 4.1) for the compose network (try it with: docker compose
+# --profile nfs-test up -d nfs-client; see the README).
+nfs:
+  bind: 0.0.0.0

@@ -4,7 +4,7 @@
 use raidish::disk::{DiskOptions, IoStats};
 use raidish::disks::DiskSet;
 use raidish::fs::FileSystem;
-use raidish::inspect::{Layout, MetaslabReport, ObjectReport, PoolMap, PoolReport};
+use raidish::inspect::{Layout, MetaslabReport, PoolMap, PoolReport};
 use raidish::vdev::{Pool, Topology};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,7 +24,6 @@ pub struct Snapshot {
 
 pub struct LayoutData {
     pub layout: Layout,
-    pub objects: Vec<ObjectReport>,
     pub txg: u64,
 }
 
@@ -49,6 +48,76 @@ impl<T> std::ops::Deref for Shared<T> {
     fn deref(&self) -> &T {
         &self.0
     }
+}
+
+const TOKEN_KEY: &str = "raidish.token";
+
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// The saved login token, if any.
+pub fn token() -> Option<String> {
+    storage()
+        .and_then(|s| s.get_item(TOKEN_KEY).ok().flatten())
+        .filter(|t| !t.is_empty())
+}
+
+/// Save (or, with None, forget) the login token; websockets use it too.
+pub fn set_token(token: Option<&str>) {
+    if let Some(s) = storage() {
+        let _ = match token {
+            Some(t) => s.set_item(TOKEN_KEY, t),
+            None => s.remove_item(TOKEN_KEY),
+        };
+    }
+    #[cfg(target_arch = "wasm32")]
+    raidish::disk::set_access_token(token.map(str::to_string));
+}
+
+/// A GET to this node, with the token if there is one.
+pub fn get(url: &str) -> gloo_net::http::RequestBuilder {
+    let req = gloo_net::http::Request::get(url);
+    match token() {
+        Some(t) => req.header("Authorization", &format!("Bearer {}", t)),
+        None => req,
+    }
+}
+
+/// Who this node says we are.
+#[derive(serde::Deserialize, Clone, PartialEq, Debug)]
+pub struct Whoami {
+    pub name: String,
+    pub role: String,
+    /// "open" when the node has no TLS (no logins at all).
+    pub via: serde_json::Value,
+}
+
+impl Whoami {
+    pub fn open(&self) -> bool {
+        self.via == serde_json::Value::String("open".into())
+    }
+}
+
+/// Ok(who) if we're let in, Err(Some(reason)) if not, Err(None) if the node
+/// couldn't be asked.
+pub async fn whoami() -> Result<Whoami, Option<String>> {
+    let resp = get("/api/v1/auth/whoami")
+        .send()
+        .await
+        .map_err(|e| Some(format!("can't reach the node: {}", e)))?;
+    if resp.status() == 401 {
+        return Err(Some(resp.text().await.unwrap_or_default()));
+    }
+    if !resp.ok() {
+        // An older node without the endpoint: no auth.
+        return Ok(Whoami {
+            name: "anonymous".into(),
+            role: "admin".into(),
+            via: serde_json::Value::String("open".into()),
+        });
+    }
+    resp.json().await.map_err(|e| Some(e.to_string()))
 }
 
 pub fn origin() -> String {
@@ -76,7 +145,7 @@ pub fn tab_hidden() -> bool {
 impl Session {
     /// Ask this node where the disks are, and connect to all of them.
     pub async fn open() -> Result<Session, String> {
-        let resp = gloo_net::http::Request::get("/api/v1/pool")
+        let resp = get("/api/v1/pool")
             .send()
             .await
             .map_err(|e| format!("asking the node for its pool: {}", e))?;
@@ -136,10 +205,9 @@ impl Session {
 
 impl Snapshot {
     pub async fn layout(&self) -> LayoutData {
-        let (layout, objects) = self.fs.layout().await;
+        let (layout, _objects) = self.fs.layout().await;
         LayoutData {
             layout,
-            objects,
             txg: self.report.txg,
         }
     }

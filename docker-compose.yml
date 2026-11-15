@@ -2,9 +2,13 @@
 # dashboard. See "Try it with Docker" in the README.
 #
 #   docker compose up --build
-#   open http://node0:8881/   (after: echo "127.0.0.1 node0 node1 node2" | sudo tee -a /etc/hosts)
+#   open https://node0:8881/   (after: echo "127.0.0.1 node0 node1 node2" | sudo tee -a /etc/hosts,
+#                               and importing docker/pki/ca.pem as a trusted CA in the browser)
 #
-# Ports are published on 127.0.0.1 only: the disk servers have no auth.
+# Everything is TLS with client certificates: the `pki` service creates a
+# CA and certificates in ./docker/pki on first start. Sign in to the
+# dashboard with the token `init` prints (docker compose logs init).
+# Ports are still published on 127.0.0.1 only.
 
 x-node: &node
   image: raidish
@@ -15,17 +19,29 @@ x-node: &node
     ROCKET_ADDRESS: 0.0.0.0
 
 services:
+  # Creates the CA, a certificate per node and an admin certificate in
+  # ./docker/pki on first start (a no-op once ca.key exists).
+  pki:
+    image: raidish
+    build: .
+    entrypoint: ["sh", "/pki.sh"]
+    volumes:
+      - ./docker/pki.sh:/pki.sh:ro
+      - ./docker/pki:/pki
+
   node0:
     <<: *node
-    build: .
+    depends_on:
+      pki: { condition: service_completed_successfully }
     hostname: node0
     command: --config /etc/raidish/node.yaml listen --port 8881
     ports: ["127.0.0.1:8881:8881"]
     volumes:
       - ./docker/node0.yaml:/etc/raidish/node.yaml:ro
+      - ./docker/pki/node0:/etc/raidish/tls:ro
       - node0:/data
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8881/api/v1/cluster/status"]
+      test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8881/api/v1/cluster/status"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -33,14 +49,16 @@ services:
   node1:
     <<: *node
     hostname: node1
-    depends_on: [node0]
+    depends_on:
+      node0: { condition: service_started }
     command: --config /etc/raidish/node.yaml listen --port 8882
     ports: ["127.0.0.1:8882:8882"]
     volumes:
       - ./docker/node1.yaml:/etc/raidish/node.yaml:ro
+      - ./docker/pki/node1:/etc/raidish/tls:ro
       - node1:/data
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8882/api/v1/cluster/status"]
+      test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8882/api/v1/cluster/status"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -48,14 +66,16 @@ services:
   node2:
     <<: *node
     hostname: node2
-    depends_on: [node0]
+    depends_on:
+      node0: { condition: service_started }
     command: --config /etc/raidish/node.yaml listen --port 8883
     ports: ["127.0.0.1:8883:8883"]
     volumes:
       - ./docker/node2.yaml:/etc/raidish/node.yaml:ro
+      - ./docker/pki/node2:/etc/raidish/tls:ro
       - node2:/data
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8883/api/v1/cluster/status"]
+      test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8883/api/v1/cluster/status"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -66,10 +86,26 @@ services:
     entrypoint: ["sh", "/init.sh"]
     volumes:
       - ./docker/init.sh:/init.sh:ro
+      - ./docker/pki/admin:/etc/raidish/tls:ro
     depends_on:
       node0: { condition: service_healthy }
       node1: { condition: service_healthy }
       node2: { condition: service_healthy }
+
+  # Optional (`docker compose --profile nfs-test up -d nfs-client`): a
+  # privileged container with the NFS client tools, to mount the nodes'
+  # NFS servers, e.g.
+  #   docker compose exec nfs-client mount -t nfs \
+  #     -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock node0:/ /mnt
+  nfs-client:
+    profiles: ["nfs-test"]
+    build:
+      context: docker
+      dockerfile: nfs-client.Dockerfile
+    privileged: true
+    entrypoint: ["sleep", "infinity"]
+    depends_on:
+      init: { condition: service_completed_successfully }
 
 volumes:
   node0:

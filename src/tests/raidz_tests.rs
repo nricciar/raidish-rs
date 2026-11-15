@@ -306,3 +306,42 @@ async fn full_stripe_writes_have_valid_parity() {
         }
     }
 }
+
+/// Single-block writes racing concurrent flushes on the same stripes: no
+/// flush may trip over a stripe another one already wrote out, and no write
+/// may land in a buffer that was already written out (and be lost).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_flushes_and_block_writes_lose_nothing() {
+    let (raidz, _temp_files) = create_test_raidz().await;
+    let raidz = std::sync::Arc::new(raidz);
+    const BLOCKS: u64 = 12; // four stripes of three data shards
+    for round in 0..40u8 {
+        let mut tasks = Vec::new();
+        for lba in 0..BLOCKS {
+            let r = raidz.clone();
+            tasks.push(tokio::spawn(async move {
+                let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
+                r.write_block(lba, &[fill; BLOCK_SIZE]).await.unwrap();
+            }));
+            if lba % 3 == 0 {
+                let r = raidz.clone();
+                tasks.push(tokio::spawn(async move { r.flush().await.unwrap() }));
+            }
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        raidz.flush().await.unwrap();
+        for lba in 0..BLOCKS {
+            let mut buf = [0u8; BLOCK_SIZE];
+            raidz.read_block(lba, &mut buf).await.unwrap();
+            let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
+            assert!(buf.iter().all(|&b| b == fill), "round {round}, block {lba}");
+        }
+        // Everything reached the disks: nothing is left buffered.
+        assert!(
+            raidz.writes.is_empty(),
+            "round {round}: stripes left buffered"
+        );
+    }
+}

@@ -333,6 +333,7 @@ impl MetaslabState {
     }
 
     /// Carve out a single stripe-aligned extent of at most `want` blocks.
+    #[cfg(test)]
     fn take_aligned(&mut self, want: u64) -> Option<Extent> {
         if self.lent {
             return None;
@@ -592,6 +593,8 @@ impl<D: BlockDevice> FileSystem<D> {
         Err(FileSystemError::UnableToAllocateBlocks(want))
     }
 
+    // Only tests still allocate scattered space (records are contiguous).
+    #[cfg(test)]
     pub(crate) async fn allocate_blocks_stripe_aligned(
         &self,
         blocks_needed: u64,

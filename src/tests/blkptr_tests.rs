@@ -10,11 +10,9 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 async fn file_ptrs<D: BlockDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
-    let r = fs.get_file_at_path(Path::new(path)).await.unwrap();
-    match fs.read_inode(&r).await.unwrap().inode_type {
-        crate::inode::InodeType::File { blocks, .. } => blocks,
-        _ => panic!("not a file"),
-    }
+    let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
+    let leaves = fs.tree_leaves(&d.tree).await.unwrap();
+    leaves.into_iter().map(|(_, p)| p).collect()
 }
 
 #[tokio::test]
@@ -140,11 +138,11 @@ async fn corrupted_metadata_heals_on_load() {
     let fs = pool.format().await;
     fs.mkdir(Path::new("/d")).await.unwrap();
     fs.write_file(Path::new("/d/f"), b"nested").await.unwrap();
-    let root = fs.root_ptr.lock().await.clone();
+    let root = fs.objects.root().ptr.unwrap();
     drop(fs);
 
-    // Corrupt the root index itself.
-    let (disk, off) = TestPool::locate(root[0].lba);
+    // Corrupt the object table's root itself.
+    let (disk, off) = TestPool::locate(root.lba);
     pool.corrupt(disk, off);
 
     let fs = pool.load().await;

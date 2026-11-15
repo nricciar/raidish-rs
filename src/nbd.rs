@@ -108,16 +108,26 @@ where
         loops.push(Arc::downgrade(&any));
     }
     let weak = Arc::downgrade(fs);
+    let fold = fs.fold_wanted.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SYNC_INTERVAL);
         loop {
-            tick.tick().await;
+            // Every SYNC_INTERVAL, or early when an intent log fills up.
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = fold.wait() => {}
+            }
             let Some(fs) = weak.upgrade() else { return };
             if fs.has_dirty_volumes()
                 && let Err(e) = fs.sync().await
             {
                 eprintln!("{}: background sync failed: {}", who, e);
             }
+            // Only now: flushes still appending to the old region while the
+            // fold ran don't ask for another one. If the fold didn't move
+            // the log on, the next flush asks again.
+            fold.take();
+            drop(fs);
         }
     });
 }
@@ -582,7 +592,8 @@ where
             }
             NBD_CMD_FLUSH => {
                 tasks.spawn(async move {
-                    let error = match fs.sync().await {
+                    // Through the intent log on a writer (see `crate::zil`).
+                    let error = match fs.flush().await {
                         Ok(()) => 0,
                         Err(e) => {
                             eprintln!("nbd: flush: {}", e);

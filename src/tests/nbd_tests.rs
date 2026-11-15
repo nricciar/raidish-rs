@@ -339,7 +339,7 @@ async fn trim_and_write_zeroes_accept_huge_ranges() {
     }
     let vol = fs.open_volume("vol").await.unwrap();
     let used: u64 = fs
-        .volume_tree_extents(&vol.root_for_test(), vol.levels)
+        .tree_extents(&vol.obj.root())
         .await
         .unwrap()
         .iter()

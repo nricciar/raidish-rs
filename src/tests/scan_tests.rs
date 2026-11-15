@@ -1,5 +1,4 @@
 use super::*;
-use crate::inode::InodeType;
 use crate::test_util::{TOTAL_BLOCKS, TestDiskServer, TestPool, wait_until};
 use crate::vdev::Pool;
 use std::path::Path;
@@ -42,11 +41,8 @@ async fn check_files(fs: &FileSystem<Pool>, prefix: &str, generation: u8, n: usi
 
 /// First record of a file.
 async fn first_record(fs: &FileSystem<Pool>, path: &str) -> crate::blkptr::BlockPtr {
-    let r = fs.get_file_at_path(Path::new(path)).await.unwrap();
-    match fs.read_inode(&r).await.unwrap().inode_type {
-        InodeType::File { blocks, .. } => blocks[0].clone(),
-        _ => unreachable!(),
-    }
+    let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
+    fs.tree_leaves(&d.tree).await.unwrap()[0].1.clone()
 }
 
 async fn format_remote(

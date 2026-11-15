@@ -20,11 +20,9 @@ fn content(name: &str, generation: u8, len: usize) -> Vec<u8> {
 }
 
 async fn file_blocks<D: BlockDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
-    let r = fs.get_file_at_path(Path::new(path)).await.unwrap();
-    match fs.read_inode(&r).await.unwrap().inode_type {
-        InodeType::File { blocks, .. } => blocks,
-        _ => unreachable!(),
-    }
+    let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
+    let leaves = fs.tree_leaves(&d.tree).await.unwrap();
+    leaves.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Make the stripe holding `lba` unrecoverable: three of the five raidz2
@@ -282,24 +280,25 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     fs.mkdir(Path::new("/d")).await.unwrap();
-    let a = content("/d/a", 1, 60_000);
+    // Several records: the file's tree has an indirect block.
+    let a = content("/d/a", 1, 300_000);
     fs.write_file(Path::new("/d/a"), &a).await.unwrap();
     let txg = fs.uberblock().await.unwrap().txg;
     fs.write_file(Path::new("/top"), b"top").await.unwrap();
-    // /d's index is shared by both TXGs; destroy it.
-    let dir = fs.file_index.read().await.files.get("d").cloned().unwrap();
-    let InodeType::Directory { blocks } = fs.read_inode(&dir).await.unwrap().inode_type else {
-        unreachable!()
-    };
+    // /d/a's indirect block is shared by both TXGs; destroy it.
+    let (_, d) = fs.stat_file(Path::new("/d/a")).await.unwrap();
+    assert!(d.tree.levels > 0);
+    let indirect = d.tree.ptr.clone().unwrap();
     let a_blocks = file_blocks(&fs, "/d/a").await;
     drop(fs);
-    destroy_stripe(&pool, blocks[0].lba);
+    destroy_stripe(&pool, indirect.lba);
 
     let opts = |read_only| LoadOptions {
         read_only,
         rewind: Rewind::Txg(txg),
     };
-    // Writable: refused, rather than freeing /d's contents.
+    // Writable: refused, rather than freeing /d/a's records (which nothing
+    // readable references any more).
     assert!(
         FileSystem::load_with(pool.dev().await, opts(false))
             .await
@@ -309,9 +308,45 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     let fs = FileSystem::load_with(pool.dev().await, opts(true))
         .await
         .unwrap();
-    assert!(fs.ls(Path::new("/d")).await.is_err());
+    assert!(fs.read_file(Path::new("/d/a")).await.is_err());
     drop(fs);
     let fs = pool.load().await;
+    for p in &a_blocks {
+        let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
+        assert!(
+            !fs.metaslabs[ms]
+                .read()
+                .await
+                .released_map()
+                .contains_key(&p.lba),
+            "/d/a's blocks were freed"
+        );
+    }
+}
+
+/// The object table lists every object, so an unreadable directory hides
+/// no space: a writable rewind past one is safe and frees nothing live.
+#[tokio::test]
+async fn damaged_directory_hides_no_space() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.mkdir(Path::new("/d")).await.unwrap();
+    let a = content("/d/a", 1, 60_000);
+    fs.write_file(Path::new("/d/a"), &a).await.unwrap();
+    let (_, dir) = fs.stat(Path::new("/d")).await.unwrap();
+    let dir_record = fs.tree_leaves(&dir.tree).await.unwrap()[0].1.clone();
+    let a_blocks = file_blocks(&fs, "/d/a").await;
+    drop(fs);
+    // A one-block record may sit on any disk: wipe that stripe on all.
+    for disk in 0..crate::test_util::DISKS {
+        pool.corrupt(disk, TestPool::stripe_offset(dir_record.lba));
+    }
+
+    let fs = pool.load().await;
+    let report = fs.fsck(true).await.unwrap();
+    assert!(!report.incomplete, "{}", report);
+    assert!(report.leaks.is_empty() && report.referenced_free.is_empty());
+    assert!(!report.errors.is_empty(), "the directory is reported");
     for p in &a_blocks {
         let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
         assert!(
@@ -485,11 +520,7 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
     let ptr = {
         let fs = pool.load().await;
         let vol = fs.open_volume("vol").await.unwrap();
-        fs.volume_leaves(&vol.root_for_test(), vol.levels)
-            .await
-            .unwrap()[30]
-            .1
-            .clone()
+        fs.tree_leaves(&vol.obj.root()).await.unwrap()[30].1.clone()
     };
     let (disk, offset) = TestPool::locate(ptr.lba + 1);
     pool.corrupt(disk, offset);

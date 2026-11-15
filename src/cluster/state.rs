@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 /// The resource a pool writer (the committer) leases.
 pub const POOL: &str = "pool";
 
+/// The resource the NFSv4 state owner leases (see `crate::nfs::v4`).
+pub const NFS4: &str = "nfs4";
+
 pub use crate::fence::Domain;
 
 /// Who may write a metaslab's data, and since which epoch.
@@ -52,6 +55,17 @@ pub enum Request {
         resource: String,
         owner: String,
         epoch: u64,
+    },
+    /// The NFSv4 state owner (the `nfs4` lease holder at `nfs_epoch`)
+    /// records that NFSv4 client `client` (its owner string, hex) has
+    /// state that may be reclaimed after a failover, or (`present: false`)
+    /// that it hasn't any more.
+    NfsClient {
+        client: String,
+        present: bool,
+        nfs_owner: String,
+        nfs_epoch: u64,
+        now_ms: u64,
     },
     /// The committer (current `pool` holder) lends metaslab `idx` to the
     /// holder of `writer` at `writer_epoch`.
@@ -95,6 +109,8 @@ pub enum Response {
     },
     /// A lend/return was refused (not the committer, writer not live, ...).
     Refused(String),
+    /// An NFSv4 client record was written.
+    Recorded,
     /// Raft-internal entries (blank, membership).
     #[default]
     None,
@@ -125,6 +141,10 @@ pub struct ClusterState {
     /// Metaslabs ever lent, by index. Never forgotten, like leases.
     #[serde(default)]
     pub metaslabs: BTreeMap<u32, MetaslabGrant>,
+    /// NFSv4 clients that may reclaim state after a state owner failover:
+    /// owner string (hex) → when recorded.
+    #[serde(default)]
+    pub nfs_clients: BTreeMap<String, u64>,
 }
 
 impl ClusterState {
@@ -285,6 +305,23 @@ impl ClusterState {
                 }
                 _ => Response::Lost,
             },
+            Request::NfsClient {
+                client,
+                present,
+                nfs_owner,
+                nfs_epoch,
+                now_ms,
+            } => {
+                if !self.holds(NFS4, Some(nfs_owner), *nfs_epoch, *now_ms) {
+                    return Response::Refused("not the NFSv4 state owner".into());
+                }
+                if *present {
+                    self.nfs_clients.insert(client.clone(), *now_ms);
+                } else {
+                    self.nfs_clients.remove(client);
+                }
+                Response::Recorded
+            }
         }
     }
 }

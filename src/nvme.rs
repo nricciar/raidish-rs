@@ -984,7 +984,8 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                 },
             }
         }
-        IO_FLUSH => match fs.sync().await {
+        // Through the intent log on a writer (see `crate::zil`).
+        IO_FLUSH => match fs.flush().await {
             Ok(()) => Completion::ok(),
             Err(e) => fail("flush", e),
         },

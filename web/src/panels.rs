@@ -3,11 +3,11 @@
 use crate::app::Sample;
 use crate::cluster::Status;
 use crate::fmt;
-use crate::session::{LayoutData, Shared, Snapshot, hostname};
+use crate::session::{Shared, Snapshot};
 use raidish::fs::LabelState;
-use raidish::inspect::{DiskReport, Health, ObjectKind};
+use raidish::inspect::{DiskReport, Health};
 use raidish::vdev::Topology;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use yew::prelude::*;
 
@@ -483,99 +483,3 @@ pub fn Timeline(p: &TimelineProps) -> Html {
 }
 
 // ------------------------------------------------------------- objects ----
-
-/// Volume name → (records, discontiguities), or why not (yet).
-pub type FragResults = HashMap<String, Result<(u64, u64), String>>;
-
-#[derive(Properties, PartialEq)]
-pub struct ObjectsProps {
-    pub layout: Shared<LayoutData>,
-    pub frag: Rc<FragResults>,
-    pub on_frag: Callback<String>,
-}
-
-#[function_component]
-pub fn Objects(p: &ObjectsProps) -> Html {
-    let sort_by_size = use_state(|| true);
-    let mut objects: Vec<_> = p.layout.objects.iter().collect();
-    if *sort_by_size {
-        objects.sort_by_key(|o| std::cmp::Reverse(o.allocated_blocks));
-    }
-    let host = hostname();
-    let toggle = {
-        let s = sort_by_size.clone();
-        Callback::from(move |_| s.set(!*s))
-    };
-    let volumes = objects
-        .iter()
-        .filter(|o| o.kind == ObjectKind::Volume)
-        .count();
-    html! {
-        <section class="card">
-            <div class="card-head">
-                <h2>{ "Files & volumes" }</h2>
-                <button class="btn ghost" onclick={toggle}>
-                    { if *sort_by_size { "sorted by size" } else { "sorted by path" } }
-                </button>
-            </div>
-            if objects.is_empty() {
-                <p class="muted">{ "The pool is empty. Create a volume with `raidish block <name> <bytes>`." }</p>
-            } else {
-                <div class="table-wrap">
-                <table class="objects">
-                    <thead><tr>
-                        <th>{ "Path" }</th><th>{ "Kind" }</th>
-                        <th class="num">{ "Size" }</th><th class="num">{ "On disk" }</th><th>{ "" }</th>
-                    </tr></thead>
-                    <tbody>
-                    { for objects.iter().map(|o| {
-                        let name = o.path.trim_start_matches('/').to_string();
-                        let kind = match o.kind {
-                            ObjectKind::File => "file",
-                            ObjectKind::Directory => "dir",
-                            ObjectKind::Volume => "volume",
-                        };
-                        let action = if o.kind == ObjectKind::Volume {
-                            let on_frag = p.on_frag.clone();
-                            let n = name.clone();
-                            match p.frag.get(&name) {
-                                Some(Ok((records, breaks))) => html! {
-                                    <span class="small">{ format!("{} records, {:.1}% fragmented", records,
-                                        if *records > 1 { *breaks as f64 * 100.0 / (*records - 1) as f64 } else { 0.0 }) }</span>
-                                },
-                                Some(Err(e)) => html! { <span class="small muted">{ e.clone() }</span> },
-                                None => html! {
-                                    <button class="btn ghost small" onclick={Callback::from(move |_| on_frag.emit(n.clone()))}>
-                                        { "check fragmentation" }
-                                    </button>
-                                },
-                            }
-                        } else {
-                            Html::default()
-                        };
-                        html! {
-                            <>
-                            <tr>
-                                <td class="mono">{ o.path.clone() }</td>
-                                <td><span class={classes!("kind", kind)}>{ kind }</span></td>
-                                <td class="num">{ if o.kind == ObjectKind::Directory { "—".to_string() } else { fmt::bytes(o.size_bytes) } }</td>
-                                <td class="num">{ fmt::blocks(o.allocated_blocks) }</td>
-                                <td>{ action }</td>
-                            </tr>
-                            if o.kind == ObjectKind::Volume {
-                                <tr class="cmds"><td colspan="5">
-                                    <code>{ format!("raidish nbd {}  →  sudo nbd-client {} 10809 /dev/nbd0", name, host) }</code>
-                                    <code>{ format!("raidish nvme {}  →  sudo nvme connect -t tcp -a {} -s 4420 -n nqn.2024-01.com.raidish:nvme:{}", name, host, name) }</code>
-                                </td></tr>
-                            }
-                            </>
-                        }
-                    }) }
-                    </tbody>
-                </table>
-                </div>
-                <p class="muted small">{ format!("{} objects, {} volumes. Commands assume the server runs on this host.", objects.len(), volumes) }</p>
-            }
-        </section>
-    }
-}

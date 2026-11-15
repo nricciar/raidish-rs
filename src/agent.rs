@@ -32,6 +32,9 @@ const DESC_PREFIX: &str = "agent ";
 /// How often the agent looks at what should run where.
 pub const TICK: Duration = Duration::from_secs(2);
 
+/// How often a node checks whether space lent to it needs a resilver.
+const HEAL_INTERVAL: Duration = Duration::from_secs(10);
+
 pub fn node_resource(node: &str) -> String {
     format!("node/{}", node)
 }
@@ -150,6 +153,8 @@ pub struct Agent {
     config: AutomountConfig,
     state: AgentState,
     writer: Option<NodeWriter>,
+    /// Where this node's file API finds the writer.
+    files: crate::files_api::WriterSlot,
     running: BTreeMap<String, Running>,
 }
 
@@ -161,6 +166,7 @@ impl Agent {
         access: PoolAccess,
         config: AutomountConfig,
         state: AgentState,
+        files: crate::files_api::WriterSlot,
     ) -> Self {
         state.write().unwrap().node = node.clone();
         Agent {
@@ -173,6 +179,7 @@ impl Agent {
             config,
             state,
             writer: None,
+            files,
             running: BTreeMap::new(),
         }
     }
@@ -237,11 +244,17 @@ impl Agent {
                 self.stop(&name, false).await;
             }
             self.writer = None;
+            *self.files.write().unwrap() = None;
         }
 
         let Ok(volumes) = self.committer.volumes().await else {
             return Ok(()); // no committer (yet): nothing to decide
         };
+        // The file API writes through this node's writer: have one whether
+        // or not a volume runs here.
+        if let Err(e) = self.ensure_writer().await {
+            eprintln!("agent: opening the pool as a writer: {}", e);
+        }
         let state = self.cluster.status().state;
         let now = crate::cluster::now_ms();
         let live: BTreeSet<String> = state
@@ -340,8 +353,23 @@ impl Agent {
                     eprintln!("agent: NVMe/TCP target: {}", e);
                 }
             }));
-            // No health monitor: a writer opens the pool read-only, so it
-            // couldn't repair anything (the committer's monitor does).
+            // The committer's health monitor resilvers the pool, except the
+            // space lent here: its writes are fenced out of it. This node
+            // repairs that itself (see `FileSystem::heal_lent`).
+            let healer = fs.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEAL_INTERVAL).await;
+                    match healer.heal_lent().await {
+                        Ok(Some(r)) if r.repaired() > 0 || !r.is_clean() => {
+                            eprintln!("agent: lent space: {}", r);
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("agent: healing lent space: {}", e),
+                    }
+                }
+            }));
+            *self.files.write().unwrap() = Some(fs.clone());
             self.writer = Some(NodeWriter {
                 _lease: lease,
                 lost,
@@ -363,9 +391,16 @@ impl Agent {
         let lost = hold(&lease, None);
         let started = async {
             let w = self.ensure_writer().await?;
-            w.fs.attach_volume_until(&v.name, &lease.owner, lease.epoch, Some(lost.watch()))
-                .await
-                .map_err(|e| e.to_string())?;
+            let l = lease.clone();
+            w.fs.attach_volume_leased(
+                &v.name,
+                &lease.owner,
+                lease.epoch,
+                Some(lost.watch()),
+                Some(Arc::new(move || l.fresh())),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             match transport {
                 Transport::Nbd => w.nbd.add_export(&v.name).await,
                 Transport::Nvme => w.nvme.add_export(&v.name).await,
