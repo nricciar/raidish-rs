@@ -294,9 +294,6 @@ pub fn parse_size(s: &str) -> Option<u64> {
 
 pub use raidish::vm_def::{NewVm, VmHardware};
 
-/// Where VM definitions live in the pool (`raidish::vm::VM_DIR`).
-pub const VM_DIR: &str = "vms";
-
 /// A valid VM name (as `raidish::vm::valid_name`).
 pub fn valid_vm_name(name: &str) -> bool {
     !name.is_empty()
@@ -350,14 +347,47 @@ impl Vm {
     pub fn memory_kib(&self) -> Option<u64> {
         self.memory_kib.or(self.hw.memory_kib)
     }
-    /// Where its definition lives in the pool.
-    pub fn xml_path(&self) -> String {
-        vm_xml_path(&self.name)
-    }
 }
 
-pub fn vm_xml_path(name: &str) -> String {
-    format!("{}/{}.xml", VM_DIR, name)
+/// A VM's stored definition (`GET /api/v1/vms/<name>/definition`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct VmDef {
+    pub xml: String,
+    /// Its change number: storing an edit of it names this, so an edit of
+    /// an older one is refused rather than undoing someone's change.
+    pub change: u64,
+}
+
+pub async fn vm_definition(name: &str) -> Result<VmDef, String> {
+    json(
+        send(Request::get(&format!(
+            "/api/v1/vms/{}/definition",
+            enc(name)
+        )))
+        .await?,
+    )
+    .await
+}
+
+/// Store VM `name`'s definition. `create`: refuse if there is one;
+/// `change`: refuse unless the stored one is that change. The server
+/// checks it (disks are raidish volumes no other VM uses, nothing that
+/// reaches the host) and says why it refuses.
+pub async fn vm_put(
+    name: &str,
+    xml: &str,
+    create: bool,
+    change: Option<u64>,
+) -> Result<VmDef, String> {
+    let mut url = format!("/api/v1/vms/{}?create={}", enc(name), create);
+    if let Some(c) = change {
+        url.push_str(&format!("&change={}", c));
+    }
+    let req = auth(Request::put(&url))
+        .header("Content-Type", "application/xml")
+        .body(xml.to_string())
+        .map_err(|e| e.to_string())?;
+    json(check(req.send().await.map_err(|e| e.to_string())?).await?).await
 }
 
 pub async fn vms() -> Result<Vec<Vm>, String> {
@@ -389,33 +419,7 @@ pub async fn vm_move(name: &str, node: &str) -> Result<(), String> {
     .map(drop)
 }
 
-/// A (small) file's text.
-pub async fn get_text(path: &str) -> Result<String, String> {
-    send(Request::get(&format!(
-        "/api/v1/files/{}",
-        encode_path(path)
-    )))
-    .await?
-    .text()
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// Write a (small) file, replacing it: the file manager's upload.
-pub async fn put_text(path: &str, body: &str) -> Result<(), String> {
-    let req = auth(Request::put(&format!(
-        "/api/v1/files/{}",
-        encode_path(path)
-    )))
-    .header("Content-Type", "application/octet-stream")
-    .body(body.to_string())
-    .map_err(|e| e.to_string())?;
-    check(req.send().await.map_err(|e| e.to_string())?)
-        .await
-        .map(drop)
-}
-
-/// Store a new VM's XML as `/vms/<name>.xml` (refusing to replace one).
+/// Define a new VM (refusing to replace one).
 pub async fn vm_create(name: &str, xml: &str) -> Result<(), String> {
     if !valid_vm_name(name) {
         return Err(format!(
@@ -423,17 +427,7 @@ pub async fn vm_create(name: &str, xml: &str) -> Result<(), String> {
             name
         ));
     }
-    match list_dir(VM_DIR).await {
-        Ok(entries) => {
-            let file = format!("{}.xml", name);
-            if entries.iter().any(|e| e.name == file) {
-                return Err(format!("there is already a VM '{}'", name));
-            }
-        }
-        // No /vms yet.
-        Err(_) => mkdir(VM_DIR).await?,
-    }
-    put_text(&vm_xml_path(name), xml).await
+    vm_put(name, xml, true, None).await.map(drop)
 }
 
 /// Create a VM from the simple form: its disk volume, then its XML (and
@@ -463,7 +457,7 @@ pub async fn vm_create_simple(new: NewVm, disk_bytes: u64) -> Result<(), String>
 
 /// Delete a VM's definition, then the volumes `disks`.
 pub async fn vm_delete(name: &str, disks: &[String]) -> Result<(), String> {
-    delete(&vm_xml_path(name)).await?;
+    send(Request::delete(&format!("/api/v1/vms/{}", enc(name)))).await?;
     for d in disks {
         delete_volume(d)
             .await

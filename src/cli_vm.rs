@@ -1,6 +1,6 @@
 //! `raidish vm ...`: VMs through any `listen` node's API (see `crate::vms_api`).
 
-use crate::vm::{VmSpec, spec_path, valid_name};
+use crate::vm::{VmSpec, valid_name};
 use crate::vms_api::VmView;
 use clap::Subcommand;
 use std::time::Duration;
@@ -11,8 +11,19 @@ pub enum VmCommands {
     List,
     /// Store a libvirt domain XML (`virsh dumpxml` output) as VM `name`.
     /// Its disks that are raidish volumes say so: `<source
-    /// file='raidish:VOLUME'/>`.
-    Import { name: String, xml: String },
+    /// file='raidish:VOLUME'/>`. It's checked as it's stored: every disk
+    /// a raidish volume no other VM uses, nothing that reaches the host.
+    Import {
+        name: String,
+        xml: String,
+        /// Replace VM `name`'s definition (default: refuse if there is one).
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Print VM `name`'s definition (the XML).
+    Show { name: String },
+    /// Delete VM `name`'s definition (and stop it). Its volumes stay.
+    Delete { name: String },
     /// It should run: the node with its disks starts it.
     Start { name: String },
     /// It should not run: shut it down (destroyed after the timeout).
@@ -87,7 +98,24 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
                 .map_err(|e| e.to_string())?;
             print_vms(&vms);
         }
-        VmCommands::Import { name, xml } => {
+        VmCommands::Show { name } => {
+            let def: crate::vm_store::VmDef = api
+                .send(|c, b| c.get(format!("{}/api/v1/vms/{}/definition", b, name)))
+                .await?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            print!("{}", def.xml);
+            if !def.xml.ends_with('\n') {
+                println!();
+            }
+        }
+        VmCommands::Delete { name } => {
+            api.send(|c, b| c.delete(format!("{}/api/v1/vms/{}", b, name)))
+                .await?;
+            println!("VM '{}' deleted (its volumes stay)", name);
+        }
+        VmCommands::Import { name, xml, replace } => {
             if !valid_name(name) {
                 return Err(format!(
                     "bad VM name '{}' (letters, digits, '-', '_', '.')",
@@ -99,19 +127,19 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
             if let Some(e) = &spec.error {
                 return Err(e.clone());
             }
-            // An existing /vms is fine.
-            let _ = api
-                .send(|c, b| c.put(format!("{}/api/v1/dir/{}", b, crate::vm::VM_DIR)))
-                .await;
-            let path = spec_path(name).to_string_lossy().into_owned();
-            api.send(|c, b| {
-                c.put(format!("{}/api/v1/files/{}", b, path))
-                    .body(body.clone())
-            })
-            .await?;
+            let def: crate::vm_store::VmDef = api
+                .send(|c, b| {
+                    c.put(format!("{}/api/v1/vms/{}?create={}", b, name, !replace))
+                        .body(body.clone())
+                })
+                .await?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
             println!(
-                "/{}: anchor volume '{}', volumes {}",
-                path,
+                "VM '{}' defined (change {}): anchor volume '{}', volumes {}",
+                name,
+                def.change,
                 spec.anchor,
                 spec.volumes.join(", ")
             );
@@ -151,10 +179,7 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
 
 fn print_vms(vms: &[VmView]) {
     if vms.is_empty() {
-        println!(
-            "no VMs (put libvirt XML in /{}/<name>.xml, or `vm import`)",
-            crate::vm::VM_DIR
-        );
+        println!("no VMs (`vm import <name> <xml>` defines one)");
         return;
     }
     println!(

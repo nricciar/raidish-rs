@@ -531,6 +531,16 @@ impl<D: BlockDevice> FileSystem<D> {
             };
             return Err(FileSystemError::InvalidArgument(why));
         }
+        // Acknowledged writes of a writer that's gone, still only in its
+        // intent log: the log would be replayed over whatever this
+        // receives (rolling back with --force refuses it too).
+        if head.log.is_some() {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' has an intent log (it's running, or its writer's log \
+                 is yet to be replayed)",
+                name
+            )));
+        }
         let snap = self.read_dnode(newest.id).await?;
         let dirty = self
             .open_datasets

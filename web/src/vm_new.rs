@@ -1,6 +1,6 @@
 //! The New VM dialog: a VM from a few settings (its disk volume and XML are
-//! made here), or an imported libvirt domain XML. Either way it ends up as
-//! `/vms/<name>.xml`, uploaded like any file.
+//! made here), or an imported libvirt domain XML. Either way it's stored
+//! through the VM API, which checks it.
 
 use crate::api::{self, NewVm, Volume};
 use crate::app::Route;
@@ -292,8 +292,8 @@ impl NewVmDialog {
                 </label>
                 { self.text(ctx, "network", "Network", &self.network, "default",
                     "A libvirt network on every node that may run it. Leave it empty for no network.") }
-                <p class="muted small">{ format!("Creates volume {} and /{}. Start it from its page.", disk,
-                    api::vm_xml_path(if name.is_empty() { "<name>" } else { name })) }</p>
+                <p class="muted small">{ format!("Creates volume {} and VM {}. Start it from its page.", disk,
+                    if name.is_empty() { "<name>" } else { name }) }</p>
             </>
         }
     }
@@ -323,7 +323,7 @@ impl NewVmDialog {
                 <p class="muted small">
                     { "From " }<code>{ "virsh dumpxml" }</code>{ ". Disks that are raidish volumes say so: " }
                     <code>{ "<source file='raidish:VOLUME'/>" }</code>
-                    { ". If libvirt still has the domain defined on some host, undefine it there (raidish runs VMs as transient domains)." }
+                    { "; every disk must be one (no other VM's), and nothing may reach the host. If libvirt still has the domain defined on some host, undefine it there (raidish runs VMs as transient domains)." }
                 </p>
             </>
         }

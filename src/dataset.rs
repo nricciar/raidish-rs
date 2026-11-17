@@ -13,8 +13,8 @@
 //! Every dataset's objects live in the one pool-wide object table (object
 //! numbers stay pool-wide and never reused); a dataset is where a namespace
 //! starts and how its contents are laid out. A pool is formatted with one
-//! posix dataset, [`DEFAULT_FS`]: what `/` means to the file manager, NFS
-//! and `/vms`.
+//! posix dataset, [`DEFAULT_FS`]: what `/` means to the file manager and
+//! NFS.
 //!
 //! ## Tree datasets
 //!
@@ -70,6 +70,10 @@ pub enum DatasetFormat {
     /// The cluster's activity log (see `crate::events`): one per pool,
     /// written by the committer only, in a B+tree.
     Events,
+    /// The cluster's VM definitions (see `crate::vm_store`): one per
+    /// pool, written by the committer only (each one checked as it's
+    /// stored), in a B+tree.
+    Vms,
 }
 
 impl DatasetFormat {
@@ -82,6 +86,7 @@ impl DatasetFormat {
             DatasetFormat::S3 => "s3",
             DatasetFormat::Queue => "queue",
             DatasetFormat::Events => "events",
+            DatasetFormat::Vms => "vms",
         }
     }
 
@@ -94,6 +99,7 @@ impl DatasetFormat {
                 | DatasetFormat::S3
                 | DatasetFormat::Queue
                 | DatasetFormat::Events
+                | DatasetFormat::Vms
         )
     }
 
@@ -108,7 +114,7 @@ impl DatasetFormat {
     /// Whether the pool keeps it for itself (not listed, made or deleted
     /// by users).
     pub fn is_system(&self) -> bool {
-        matches!(self, DatasetFormat::Events)
+        matches!(self, DatasetFormat::Events | DatasetFormat::Vms)
     }
 
     /// Whether its contents are its root object's tree, run as a whole by

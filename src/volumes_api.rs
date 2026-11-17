@@ -31,14 +31,16 @@ pub struct VolumesState {
 
 type ApiError = (Status, String);
 
-fn api_err(e: CommitError) -> ApiError {
+pub(crate) fn api_err(e: CommitError) -> ApiError {
     match e {
         CommitError::Retry(m) => (
             Status::ServiceUnavailable,
             format!("no committer reachable: {}", m),
         ),
         CommitError::Refused(m) => {
-            let status = if m.contains("not found") || m.contains("No such") {
+            let status = if m.starts_with("Conflict:") {
+                Status::Conflict
+            } else if m.contains("not found") || m.contains("No such") {
                 Status::NotFound
             } else if m.contains("exists") {
                 Status::Conflict

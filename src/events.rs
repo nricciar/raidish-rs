@@ -473,6 +473,7 @@ pub fn format_label(f: DatasetFormat) -> &'static str {
         DatasetFormat::Kv => "Kv",
         DatasetFormat::Posix => "Filesystem",
         DatasetFormat::Events => "Events",
+        DatasetFormat::Vms => "VM definitions",
     }
 }
 

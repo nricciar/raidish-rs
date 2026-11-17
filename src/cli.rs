@@ -530,7 +530,10 @@ pub async fn main() -> std::io::Result<()> {
                 virsh: c.virsh(),
                 shutdown_timeout: c.shutdown_timeout(),
                 poke: Default::default(),
-                nbd: crate::agent::Agent::nbd_target(&config.automount),
+                nbd: c.nbd(crate::agent::Agent::nbd_target(&config.automount)),
+                console: c.console_listen(),
+                node: name.clone(),
+                pool: Default::default(),
                 restart: Default::default(),
             })
         });

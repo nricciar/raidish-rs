@@ -31,15 +31,48 @@ const DUMPXML: &str = r#"<domain type='kvm'>
       </source>
       <target dev='vdb' bus='virtio'/>
     </disk>
-    <disk type='file' device='disk'>
-      <source file='/var/lib/libvirt/images/scratch.qcow2'/>
-      <target dev='vdc' bus='virtio'/>
+    <disk type='file' device='cdrom'>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
     </disk>
+    <serial type='pty'><source path='/dev/pts/3'/><target port='0'/></serial>
     <interface type='network'><source network='default'/><model type='virtio'/></interface>
     <graphics type='spice' autoport='yes'><listen type='address'/></graphics>
     <video><model type='virtio'/></video>
   </devices>
 </domain>"#;
+
+fn ident() -> VmIdent {
+    VmIdent {
+        pool: "00ff".into(),
+        node: "node-0".into(),
+    }
+}
+
+#[test]
+fn a_domain_is_its_pools_and_nodes() {
+    let s = VmSpec::parse("web", DUMPXML, 7);
+    let xml = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
+    let root = parse_domain(&xml).unwrap();
+    let meta = root.child("metadata").unwrap();
+    let m = parse_meta(&to_string(meta.elements().next().unwrap())).unwrap();
+    assert!(ident().owns(&m));
+    for other in [
+        VmIdent {
+            pool: "00ff".into(),
+            node: "node-1".into(),
+        },
+        VmIdent {
+            pool: "1234".into(),
+            node: "node-0".into(),
+        },
+    ] {
+        assert!(!other.owns(&m));
+    }
+    // One started before domains said whose they are: nobody's.
+    let old = parse_meta("<raidish:vm xmlns:raidish='x' anchor='a' owner='o'/>").unwrap();
+    assert!(!ident().owns(&old));
+}
 
 #[test]
 fn finds_raidish_disks_anchor_first() {
@@ -63,7 +96,7 @@ fn no_raidish_disk_is_an_error() {
 #[test]
 fn renders_disks_console_name_and_metadata() {
     let s = VmSpec::parse("web", DUMPXML, 7);
-    let xml = render(&s, ("127.0.0.1", 10809), "host:1:2").unwrap();
+    let xml = render(&s, ("127.0.0.1", 10809), "127.0.0.1", "host:1:2", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     assert_eq!(
         to_string(root.child("name").unwrap()),
@@ -80,6 +113,8 @@ fn renders_disks_console_name_and_metadata() {
             volumes: vec!["vm1".into(), "data".into(), "iso".into()],
             change: 7,
             owner: "host:1:2".into(),
+            pool: "00ff".into(),
+            node: "node-0".into(),
         }
     );
     let devices = root.child("devices").unwrap();
@@ -99,8 +134,12 @@ fn renders_disks_console_name_and_metadata() {
     assert_eq!(disks[0].attr("device"), Some("cdrom"));
     assert!(disks[0].child("readonly").is_some());
     assert!(disks[1].child("boot").is_some());
-    // Not ours: untouched.
+    // An empty drive: untouched.
     assert_eq!(disks[3].attr("type"), Some("file"));
+    assert!(disks[3].child("source").is_none());
+    // libvirt's choices: no emulator, no pty path.
+    assert!(devices.child("emulator").is_none());
+    assert!(devices.child("serial").unwrap().child("source").is_none());
     // One console, VNC on localhost.
     let g: Vec<&El> = devices
         .elements()
@@ -123,7 +162,7 @@ fn escapes_survive_a_round_trip() {
     let xml = "<domain><name>a</name><description>x &amp; y &lt;z&gt;</description>\
                <devices><disk device='disk'><source file='raidish:v'/></disk></devices></domain>";
     let s = VmSpec::parse("a", xml, 1);
-    let out = render(&s, ("127.0.0.1", 1), "o").unwrap();
+    let out = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
     assert!(out.contains("x &amp; y &lt;z&gt;"), "{}", out);
 }
 
@@ -173,10 +212,7 @@ fn reads_the_hardware() {
     assert_eq!(hw.disks[1].bus.as_deref(), Some("virtio"));
     assert_eq!(hw.disks[2].volume.as_deref(), Some("data"));
     assert_eq!(hw.disks[3].volume, None);
-    assert_eq!(
-        hw.disks[3].source.as_deref(),
-        Some("/var/lib/libvirt/images/scratch.qcow2")
-    );
+    assert_eq!(hw.disks[3].source, None);
     assert_eq!(hw.nics.len(), 1);
     assert_eq!(hw.nics[0].kind, "network");
     assert_eq!(hw.nics[0].source.as_deref(), Some("default"));
@@ -222,7 +258,7 @@ fn a_new_vms_template_is_a_usable_vm() {
     assert_eq!(s.hw.disks[1].device, "cdrom");
     assert_eq!(s.hw.nics[0].source.as_deref(), Some("default"));
     // It renders (gets its console etc.) like any other.
-    let xml = render(&s, ("127.0.0.1", 10809), "o").unwrap();
+    let xml = render(&s, ("127.0.0.1", 10809), "127.0.0.1", "o", &ident()).unwrap();
     assert!(xml.contains("<graphics type=\"vnc\""));
 
     let bare = NewVm {
@@ -234,4 +270,157 @@ fn a_new_vms_template_is_a_usable_vm() {
     assert_eq!(s.error, None);
     assert_eq!(s.volumes, vec!["web1-disk0"]);
     assert!(s.hw.nics.is_empty());
+}
+
+/// A domain with `devices` (and `extra` at the top), around a raidish disk.
+fn with(extra: &str, devices: &str) -> VmSpec {
+    VmSpec::parse(
+        "x",
+        &format!(
+            "<domain type='kvm'><name>x</name>{}<devices>\
+             <disk type='file' device='disk'><source file='raidish:v'/>\
+             <target dev='vda' bus='virtio'/></disk>{}</devices></domain>",
+            extra, devices
+        ),
+        1,
+    )
+}
+
+#[test]
+fn refuses_what_reaches_the_host() {
+    for (extra, devices) in [
+        (
+            "",
+            "<disk type='block' device='disk'><source dev='/dev/sda'/><target dev='vdb'/></disk>",
+        ),
+        (
+            "",
+            "<disk type='file' device='cdrom'><source file='/etc/shadow'/><target dev='sda'/></disk>",
+        ),
+        ("", "<hostdev mode='subsystem' type='pci'/>"),
+        (
+            "",
+            "<filesystem type='mount'><source dir='/'/><target dir='host'/></filesystem>",
+        ),
+        (
+            "",
+            "<serial type='file'><source path='/etc/cron.d/x'/></serial>",
+        ),
+        (
+            "",
+            "<console type='pty'><log file='/root/.bashrc'/></console>",
+        ),
+        (
+            "",
+            "<interface type='ethernet'><script path='/tmp/x'/></interface>",
+        ),
+        (
+            "",
+            "<interface type='network'><source network='default'/><script path='/tmp/x'/></interface>",
+        ),
+        (
+            "",
+            "<interface type='network'><rom file='/etc/shadow'/></interface>",
+        ),
+        (
+            "",
+            "<input type='passthrough'><source evdev='/dev/input/event0'/></input>",
+        ),
+        (
+            "",
+            "<rng model='virtio'><backend model='random'>/dev/sda</backend></rng>",
+        ),
+        (
+            "",
+            "<tpm model='tpm-tis'><backend type='passthrough'/></tpm>",
+        ),
+        ("", "<smartcard mode='host'/>"),
+        ("", "<audio id='1' type='file' path='/root/x'/>"),
+        (
+            "",
+            "<disk type='file' device='disk'><source file='raidish:w'/><backingStore type='file'><source file='/etc/shadow'/></backingStore></disk>",
+        ),
+        (
+            "<qemu:commandline xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'><qemu:arg value='-x'/></qemu:commandline>",
+            "",
+        ),
+        (
+            "<commandline xmlns='http://libvirt.org/schemas/domain/qemu/1.0'/>",
+            "",
+        ),
+        (
+            "<os><type>hvm</type><kernel>/boot/vmlinuz</kernel><initrd>/etc/shadow</initrd></os>",
+            "",
+        ),
+        ("<os><type>hvm</type><loader>/etc/shadow</loader></os>", ""),
+        (
+            "<os><type>hvm</type><loader>/usr/share/../../etc/shadow</loader></os>",
+            "",
+        ),
+        ("<os><type>hvm</type><nvram>/etc/passwd</nvram></os>", ""),
+        (
+            "<sysinfo type='fwcfg'><entry name='opt/x' file='/etc/shadow'/></sysinfo>",
+            "",
+        ),
+    ] {
+        let s = with(extra, devices);
+        assert!(!s.usable(), "allowed: {} {}", extra, devices);
+        assert!(render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).is_err());
+    }
+    let s = VmSpec::parse(
+        "x",
+        "<domain type='lxc'><devices><disk device='disk'><source file='raidish:v'/></disk></devices></domain>",
+        1,
+    );
+    assert!(!s.usable());
+}
+
+#[test]
+fn allows_what_stays_in_the_guest() {
+    let s = with(
+        "<os firmware='efi'><type>hvm</type><loader readonly='yes' type='pflash'>\
+         /usr/share/OVMF/OVMF_CODE.fd</loader><nvram template='/usr/share/OVMF/OVMF_VARS.fd'/></os>\
+         <seclabel type='none'/><resource><partition>/machine</partition></resource>",
+        "<emulator>/usr/bin/evil</emulator>\
+         <interface type='bridge'><source bridge='br0'/><model type='virtio'/></interface>\
+         <channel type='unix'><source mode='bind' path='/etc/x.sock'/><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\
+         <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>\
+         <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>\
+         <audio id='1' type='none'/><controller type='usb'/><memballoon model='virtio'/>",
+    );
+    assert_eq!(s.error, None);
+    let xml = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
+    for gone in ["seclabel", "resource", "/usr/bin/evil", "/etc/x.sock"] {
+        assert!(!xml.contains(gone), "{} in {}", gone, xml);
+    }
+    assert!(xml.contains("OVMF_CODE.fd"));
+}
+
+#[test]
+fn a_volume_belongs_to_one_vm() {
+    let mut specs = BTreeMap::new();
+    for (name, vols) in [("a", "v"), ("b", "v"), ("c", "w")] {
+        let xml = format!(
+            "<domain><devices><disk device='disk'><source file='raidish:{}'/></disk></devices></domain>",
+            vols
+        );
+        specs.insert(name.to_string(), VmSpec::parse(name, &xml, 1));
+    }
+    mark_conflicts(&mut specs);
+    assert!(specs["a"].usable());
+    assert!(specs["b"].error.as_ref().unwrap().contains("VM 'a'"));
+    assert!(specs["c"].usable());
+}
+
+#[test]
+fn consoles_listen_where_configured() {
+    let s = VmSpec::parse("web", DUMPXML, 7);
+    let xml = render(&s, ("127.0.0.1", 10809), "172.31.250.1", "o", &ident()).unwrap();
+    let root = parse_domain(&xml).unwrap();
+    let g = root.child("devices").unwrap().child("graphics").unwrap();
+    assert_eq!(g.attr("listen"), Some("172.31.250.1"));
+    assert_eq!(
+        g.child("listen").unwrap().attr("address"),
+        Some("172.31.250.1")
+    );
 }

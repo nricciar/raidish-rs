@@ -87,6 +87,8 @@ pub mod vdev;
 pub mod vm;
 pub mod vm_def;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod vm_store;
+#[cfg(not(target_arch = "wasm32"))]
 mod vms_api;
 mod volume;
 #[cfg(not(target_arch = "wasm32"))]

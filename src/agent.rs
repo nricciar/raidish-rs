@@ -403,13 +403,25 @@ impl Agent {
         if let Err(e) = self.ensure_writer().await {
             eprintln!("agent: opening the pool as a writer: {}", e);
         }
+        // Which libvirt domains are this node's: those started for this
+        // pool (by its GUID) by this node.
+        if let (Some(vm), Some(w)) = (&self.vm, &self.writer)
+            && let Some(sb) = w.fs.superblock().await
+        {
+            *vm.pool.write().unwrap() = Some(format!("{:016x}", sb.pool_guid));
+        }
         // VM definitions. On a read error keep the last ones read: losing
         // them would look like every VM was deleted.
-        if self.vm.is_some()
-            && let Some(w) = &self.writer
-            && let Err(e) = crate::vm::load_specs(&w.fs, &mut self.specs).await
-        {
-            eprintln!("agent: reading VM definitions: {}", e);
+        if self.vm.is_some() {
+            match self.committer.vms().await {
+                Ok(defs) => {
+                    let mut specs: BTreeMap<String, crate::vm::VmSpec> =
+                        defs.into_iter().map(|(n, d)| (n, d.spec())).collect();
+                    crate::vm::mark_conflicts(&mut specs);
+                    self.specs = specs;
+                }
+                Err(e) => eprintln!("agent: reading VM definitions: {}", e),
+            }
         }
         let state = self.cluster.status().state;
         let now = crate::cluster::now_ms();
@@ -465,17 +477,21 @@ impl Agent {
 
         // What libvirt runs here. Unknown (libvirt down): leave VM volumes
         // where they are, they may be in use.
+        // Not knowing which are ours yet counts as unknown too.
         let doms = match &self.vm {
+            Some(vm) if vm.ident().is_none() => Err("the pool's GUID isn't known yet".to_string()),
             Some(vm) => vm.virsh.list().await.map_err(|e| {
                 eprintln!("agent: {}", e);
                 e
             }),
             None => Ok(Vec::new()),
         };
+        // Only this node's: whatever else shares its libvirt (other nodes,
+        // other clusters, domains nobody stamped) is left alone.
         let mut ours: Vec<crate::vm::LocalVm> = Vec::new();
         if let (Some(vm), Ok(doms)) = (&self.vm, &doms) {
             for d in doms.iter().filter(|d| d.id.is_some()) {
-                if let Some(v) = vm.virsh.local_vm(d.clone()).await {
+                if let Some(v) = vm.our_vm(d.clone()).await {
                     ours.push(v);
                 }
             }
@@ -665,7 +681,10 @@ impl Agent {
             }
             if let Some(d) = doms.iter().find(|d| d.name == spec.name && d.id.is_some()) {
                 if !ours.iter().any(|v| v.domain.name == d.name) {
-                    let e = format!("a domain '{}' not run by raidish is running here", d.name);
+                    let e = format!(
+                        "a domain '{}' this node didn't start is running on its libvirt",
+                        d.name
+                    );
                     self.events.once(
                         &format!("vm/{}", spec.name),
                         Level::Warn,
@@ -683,7 +702,12 @@ impl Agent {
                 continue; // its disks aren't all here yet
             }
             let owner = self.running[&spec.anchor].lease.owner.clone();
-            let started = match crate::vm::render(spec, (&vm.nbd.0, vm.nbd.1), &owner) {
+            let Some(ident) = vm.ident() else {
+                continue;
+            };
+            let rendered =
+                crate::vm::render(spec, (&vm.nbd.0, vm.nbd.1), &vm.console, &owner, &ident);
+            let started = match rendered {
                 Ok(xml) => vm.virsh.create(&spec.name, &xml).await,
                 Err(e) => Err(e),
             };
@@ -720,7 +744,7 @@ impl Agent {
         let Some(vm) = self.vm.clone() else {
             return;
         };
-        let Ok(vms) = vm.virsh.local_vms().await else {
+        let Ok(vms) = vm.local_vms().await else {
             return;
         };
         for v in vms.iter().filter(|v| v.domain.id.is_some()) {

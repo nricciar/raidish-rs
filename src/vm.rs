@@ -1,13 +1,25 @@
 //! Virtual machines whose disks are raidish volumes, run through libvirt.
 //!
-//! A VM is a libvirt domain XML at `/vms/<name>.xml` in the pool (edit it
-//! over NFS or the file manager; `raidish vm import` writes one from `virsh
-//! dumpxml`). A disk is a raidish volume when its `<source>` says so:
+//! A VM is a libvirt domain XML kept in the pool's `.vms` dataset (see
+//! `crate::vm_store`), stored and changed only through the VM API
+//! (`PUT /api/v1/vms/<name>`, `raidish vm import`, the dashboard), which
+//! checks each one as it's stored. A disk is a raidish volume when its
+//! `<source>` says so:
 //!
 //! ```xml
 //! <source file='raidish:vm1'/>                 <!-- or dev=, or -->
 //! <source protocol='nbd' name='vm1'/>
 //! ```
+//!
+//! **What a definition may hold.** Whoever can store one gets libvirt (as
+//! root, on every node that runs VMs) to do what it says, so it may only
+//! say what keeps a guest inside its VM (`check_domain`): every disk is a
+//! raidish volume (or an empty cdrom), and nothing reaches the host (host
+//! files or devices, passthrough, host scripts, file-backed character
+//! devices, the qemu command line, direct kernel boot, firmware from
+//! outside `/usr/share`). What `virsh dumpxml` adds that raidish decides
+//! itself (the emulator, security labels, graphics, pty paths) is
+//! dropped when the domain is rendered.
 //!
 //! Nothing about a VM lives in `/etc/libvirt` on any host. The node that
 //! runs a VM's disks renders the XML (disks pointed at its own NBD export,
@@ -16,22 +28,17 @@
 //!
 //! Where a VM runs follows its **anchor**, the first raidish disk: that
 //! volume's placement settings (`DatasetProps`: nodes, `move_to`, enabled)
-//! place the VM, and its other disks go wherever the anchor goes. Whether
-//! it *should* run is one replicated bit (`ClusterState::vms`). Whether it
-//! *does* is never stored: it is what libvirt on the anchor's node says.
+//! place the VM, and its other disks go wherever the anchor goes. A volume
+//! belongs to one VM at most. Whether it *should* run is one replicated bit
+//! (`ClusterState::vms`). Whether it *does* is never stored: it is what
+//! libvirt on the anchor's node says.
 
-use crate::disk::BlockDevice;
-use crate::fs::{FileSystem, FileSystemError};
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use crate::vm_def::{VmDisk, VmHardware, VmNic};
-
-/// Where VM definitions live in the pool.
-pub const VM_DIR: &str = "vms";
 
 /// The XML namespace of the metadata raidish puts on the domains it runs.
 pub const META_NS: &str = "https://raidish.dev/xmlns/vm/1";
@@ -45,9 +52,31 @@ pub struct VmConfig {
     pub virsh: Option<String>,
     /// How long a guest gets to shut down before it's destroyed (default 60).
     pub shutdown_timeout_s: Option<u64>,
+    /// Where qemu reaches this node's NBD exports (default: the
+    /// `automount` bind address and port, 127.0.0.1 for a wildcard). For
+    /// a libvirt that isn't on this machine's network stack: raidish in a
+    /// container with its NBD port published, say.
+    pub nbd_host: Option<String>,
+    pub nbd_port: Option<u16>,
+    /// The address a VM's VNC console listens on, and this node connects
+    /// to for the dashboard's console (default 127.0.0.1). Unpassworded:
+    /// keep it on an address only this node can reach.
+    pub console_listen: Option<String>,
 }
 
 impl VmConfig {
+    /// Where qemu reaches this node's NBD exports, given the default.
+    pub fn nbd(&self, default: (String, u16)) -> (String, u16) {
+        (
+            self.nbd_host.clone().unwrap_or(default.0),
+            self.nbd_port.unwrap_or(default.1),
+        )
+    }
+    pub fn console_listen(&self) -> String {
+        self.console_listen
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".into())
+    }
     pub fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.shutdown_timeout_s.unwrap_or(60))
     }
@@ -67,9 +96,60 @@ pub struct VmRuntime {
     pub poke: tokio::sync::Notify,
     /// Where qemu finds this node's NBD exports.
     pub nbd: (String, u16),
+    /// Where VNC consoles listen (see `VmConfig::console_listen`).
+    pub console: String,
+    /// This node's name.
+    pub node: String,
+    /// The pool's GUID (hex), once the agent has read it: until then no
+    /// domain is this node's.
+    pub pool: std::sync::RwLock<Option<String>>,
     /// VMs to shut down (destroyed after the timeout) and start again from
     /// their current XML.
     pub restart: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// Whose domains are whose (see `DomMeta::pool`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmIdent {
+    pub pool: String,
+    pub node: String,
+}
+
+impl VmIdent {
+    pub fn owns(&self, m: &DomMeta) -> bool {
+        m.pool == self.pool && m.node == self.node
+    }
+}
+
+impl VmRuntime {
+    /// Who this node is to libvirt; None until the pool's GUID is known.
+    pub fn ident(&self) -> Option<VmIdent> {
+        Some(VmIdent {
+            pool: self.pool.read().unwrap().clone()?,
+            node: self.node.clone(),
+        })
+    }
+
+    /// `d`, if this node started it.
+    pub async fn our_vm(&self, d: Domain) -> Option<LocalVm> {
+        let me = self.ident()?;
+        self.virsh.local_vm(d).await.filter(|v| me.owns(&v.meta))
+    }
+
+    /// Every domain this node started. Err: libvirt can't be asked, or
+    /// the pool's GUID isn't known yet (which domains are ours is unknown).
+    pub async fn local_vms(&self) -> Result<Vec<LocalVm>, String> {
+        let me = self
+            .ident()
+            .ok_or("the pool isn't open here yet: which domains are this node's is unknown")?;
+        Ok(self
+            .virsh
+            .local_vms()
+            .await?
+            .into_iter()
+            .filter(|v| me.owns(&v.meta))
+            .collect())
+    }
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -81,16 +161,12 @@ pub fn valid_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
-pub fn spec_path(name: &str) -> PathBuf {
-    Path::new(VM_DIR).join(format!("{}.xml", name))
-}
-
 /// A VM as its XML defines it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VmSpec {
     pub name: String,
-    /// The XML file's change counter: a running VM started from an older
-    /// one has a restart pending.
+    /// The definition's change number (see `crate::vm_store`): a running
+    /// VM started from an older one has a restart pending.
     pub change: u64,
     /// The volume that places the VM (its first raidish disk).
     pub anchor: String,
@@ -223,7 +299,10 @@ impl VmSpec {
         if let Ok(root) = &root {
             spec.hw = hardware(root);
         }
-        match root.and_then(|root| raidish_disks(&root)) {
+        match root.and_then(|root| {
+            check_domain(&root)?;
+            raidish_disks(&root)
+        }) {
             Ok(vols) if vols.is_empty() => {
                 spec.error = Some("no raidish disk (<source file='raidish:VOLUME'/>)".into())
             }
@@ -241,44 +320,33 @@ impl VmSpec {
     }
 }
 
-/// Read every `/vms/*.xml` as of the newest committed root, reusing
-/// `cache` entries whose file hasn't changed. No `/vms`: no VMs.
-pub async fn load_specs<D: BlockDevice>(
-    fs: &FileSystem<D>,
-    cache: &mut BTreeMap<String, VmSpec>,
-) -> Result<(), FileSystemError> {
-    fs.refresh_root().await?;
-    let index = match fs.ls(Path::new(VM_DIR)).await {
-        Ok(i) => i,
-        Err(FileSystemError::FileNotFound | FileSystemError::DirectoryNotFound) => {
-            cache.clear();
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    let mut seen = BTreeMap::new();
-    for (file, entry) in &index.files {
-        let Some(name) = file.strip_suffix(".xml") else {
-            continue;
-        };
-        if !valid_name(name) {
+/// Mark each VM that uses a volume an earlier one (by name) already uses
+/// as unusable: two guests writing one disk corrupt it. The store refuses
+/// such definitions (`crate::vm_store`); this keeps any that got past it
+/// from being started.
+pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    for spec in specs.values_mut() {
+        if !spec.usable() {
             continue;
         }
-        let dnode = fs.read_dnode(entry.id).await?;
-        if dnode.kind != crate::inode::ObjType::File {
+        let taken: Vec<String> = spec
+            .volumes
+            .iter()
+            .filter_map(|v| {
+                owner
+                    .get(v)
+                    .map(|o| format!("volume '{}' is VM '{}''s", v, o))
+            })
+            .collect();
+        if !taken.is_empty() {
+            spec.error = Some(taken.join("; "));
             continue;
         }
-        let spec = match cache.remove(name) {
-            Some(s) if s.change == dnode.change => s,
-            _ => {
-                let bytes = fs.read_file(&spec_path(name)).await?;
-                VmSpec::parse(name, &String::from_utf8_lossy(&bytes), dnode.change)
-            }
-        };
-        seen.insert(name.to_string(), spec);
+        for v in &spec.volumes {
+            owner.insert(v.clone(), spec.name.clone());
+        }
     }
-    *cache = seen;
-    Ok(())
 }
 
 // ---- a tiny XML tree, enough to rewrite a domain --------------------------
@@ -441,6 +509,278 @@ fn disk_volume(disk: &El) -> Option<String> {
     None
 }
 
+// ---- what a definition may hold ---------------------------------------------
+
+/// Elements a `<domain>` may have. Each says what it is about the guest
+/// (the host decides the rest).
+const DOMAIN_KIDS: &[&str] = &[
+    "name",
+    "uuid",
+    "genid",
+    "title",
+    "description",
+    "metadata",
+    "maxMemory",
+    "memory",
+    "currentMemory",
+    "memoryBacking",
+    "memtune",
+    "vcpu",
+    "vcpus",
+    "iothreads",
+    "iothreadids",
+    "cputune",
+    "numatune",
+    "os",
+    "features",
+    "cpu",
+    "clock",
+    "on_poweroff",
+    "on_reboot",
+    "on_crash",
+    "on_lockfailure",
+    "pm",
+    "perf",
+    "sysinfo",
+    "devices",
+    "keywrap",
+    // Dropped by `render` (raidish decides these).
+    "seclabel",
+    "resource",
+];
+
+/// What `<os>` may have: no direct kernel boot (`kernel`, `initrd`, `dtb`
+/// are host files), no ACPI tables from host files.
+const OS_KIDS: &[&str] = &[
+    "type", "boot", "bootmenu", "smbios", "bios", "loader", "nvram", "firmware",
+];
+
+/// What a raidish disk may have besides what `render` replaces.
+const DISK_KIDS: &[&str] = &[
+    "driver",
+    "source",
+    "auth",
+    "target",
+    "boot",
+    "readonly",
+    "shareable",
+    "serial",
+    "address",
+    "alias",
+    "iotune",
+    "blockio",
+    "geometry",
+    "wwn",
+    "vendor",
+    "product",
+    "backingStore",
+];
+
+/// What an `<interface>` may have: no host scripts, option ROM files or
+/// tap/vhost device paths.
+const NIC_KIDS: &[&str] = &[
+    "mac",
+    "source",
+    "model",
+    "address",
+    "boot",
+    "alias",
+    "mtu",
+    "link",
+    "driver",
+    "virtualport",
+    "vlan",
+    "filterref",
+    "bandwidth",
+    "coalesce",
+    "target",
+];
+
+/// Devices that stay inside the guest whatever their settings.
+const PLAIN_DEVICES: &[&str] = &[
+    "controller",
+    "video",
+    "sound",
+    "memballoon",
+    "watchdog",
+    "panic",
+    "hub",
+    "iommu",
+    "vsock",
+    // Dropped by `render`.
+    "emulator",
+    "graphics",
+];
+
+fn refuse(what: impl std::fmt::Display) -> Result<(), String> {
+    Err(format!("{} isn't allowed in a VM definition", what))
+}
+
+fn kids_in(el: &El, allowed: &[&str]) -> Result<(), String> {
+    match el.elements().find(|k| !allowed.contains(&k.name.as_str())) {
+        Some(k) => refuse(format!("<{}> in <{}>", k.name, el.name)),
+        None => Ok(()),
+    }
+}
+
+fn type_in(el: &El, allowed: &[&str]) -> Result<(), String> {
+    let t = el.attr("type").unwrap_or("");
+    if allowed.contains(&t) {
+        Ok(())
+    } else {
+        refuse(format!("<{} type='{}'>", el.name, t))
+    }
+}
+
+/// A firmware file libvirt may read: one shipped by the host's packages.
+fn shipped_file(path: &str) -> bool {
+    path.starts_with("/usr/share/") && !path.split('/').any(|c| c == "..")
+}
+
+/// No element from another XML namespace (`qemu:commandline` and the
+/// like: libvirt hands those to the hypervisor as they are) and no
+/// namespace declarations below the root, whatever the prefix.
+fn no_foreign(el: &El, root: bool) -> Result<(), String> {
+    if el.name.contains(':') {
+        return refuse(format!("<{}>", el.name));
+    }
+    for (k, _) in &el.attrs {
+        if k == "xmlns" || (!root && k.starts_with("xmlns:")) {
+            return refuse(format!("a namespace declaration ({}) on <{}>", k, el.name));
+        }
+    }
+    for k in el.elements() {
+        if root && k.name == "metadata" {
+            continue; // replaced by `render`
+        }
+        no_foreign(k, false)?;
+    }
+    Ok(())
+}
+
+fn check_device(d: &El) -> Result<(), String> {
+    match d.name.as_str() {
+        "disk" => {
+            if disk_volume(d).is_some() {
+                kids_in(d, DISK_KIDS)?;
+                // `virsh dumpxml` of a running domain says `<backingStore/>`
+                // (none); one with anything in it is a host file.
+                if let Some(b) = d.child("backingStore")
+                    && (!b.attrs.is_empty() || !b.kids.is_empty())
+                {
+                    return refuse("a disk's <backingStore>");
+                }
+                return Ok(());
+            }
+            let removable = matches!(d.attr("device"), Some("cdrom" | "floppy"));
+            if removable && d.child("source").is_none() {
+                // An empty drive.
+                return kids_in(d, &["driver", "target", "readonly", "address", "alias"]);
+            }
+            Err(format!(
+                "disk {} isn't a raidish volume (<source file='raidish:VOLUME'/>): \
+                 host files and devices can't be given to a VM",
+                d.child("target")
+                    .and_then(|t| t.attr("dev"))
+                    .map_or_else(|| "?".to_string(), |t| format!("'{}'", t))
+            ))
+        }
+        "interface" => {
+            type_in(d, &["network", "bridge", "direct", "user"])?;
+            kids_in(d, NIC_KIDS)
+        }
+        "input" => type_in(d, &["tablet", "mouse", "keyboard"]),
+        "audio" => type_in(d, &["none", "spice"]),
+        // A pty is the guest's console; anything else is a host file,
+        // device or socket.
+        "serial" | "console" | "parallel" => {
+            type_in(d, &["pty"])?;
+            kids_in(d, &["source", "target", "alias", "address"])
+        }
+        "channel" => {
+            type_in(d, &["unix", "spicevmc", "pty", "qemu-vdagent"])?;
+            kids_in(d, &["source", "target", "alias", "address"])
+        }
+        "rng" => {
+            kids_in(d, &["backend", "rate", "alias", "address", "driver"])?;
+            for b in d.elements().filter(|e| e.name == "backend") {
+                match b.attr("model") {
+                    Some("builtin") => {}
+                    Some("random")
+                        if matches!(
+                            text(b).as_str(),
+                            "" | "/dev/urandom" | "/dev/random" | "/dev/hwrng"
+                        ) => {}
+                    _ => return refuse("an <rng> backend other than the host's random device"),
+                }
+            }
+            Ok(())
+        }
+        "tpm" => {
+            kids_in(d, &["backend", "alias", "address"])?;
+            match d.child("backend") {
+                Some(b) if b.attr("type") == Some("emulator") => Ok(()),
+                _ => refuse("a <tpm> other than an emulated one"),
+            }
+        }
+        "redirdev" => type_in(d, &["spicevmc"]),
+        n if PLAIN_DEVICES.contains(&n) => Ok(()),
+        n => Err(format!(
+            "<{}> devices aren't allowed in a VM definition (they reach the host)",
+            n
+        )),
+    }
+}
+
+/// Refuse a domain that would reach beyond its VM (see the module docs).
+fn check_domain(root: &El) -> Result<(), String> {
+    no_foreign(root, true)?;
+    if let Some(t) = root.attr("type")
+        && !matches!(t, "kvm" | "qemu")
+    {
+        return refuse(format!("<domain type='{}'>", t));
+    }
+    kids_in(root, DOMAIN_KIDS)?;
+    if let Some(si) = root.child("sysinfo")
+        && si.attr("type").is_some_and(|t| t != "smbios")
+    {
+        // fwcfg entries are host files.
+        return refuse(format!(
+            "<sysinfo type='{}'>",
+            si.attr("type").unwrap_or("")
+        ));
+    }
+    if let Some(os) = root.child("os") {
+        kids_in(os, OS_KIDS)?;
+        for l in os.elements().filter(|e| e.name == "loader") {
+            if !text(l).is_empty() && !shipped_file(&text(l)) {
+                return refuse(format!("firmware from '{}' (only /usr/share/...)", text(l)));
+            }
+        }
+        for n in os.elements().filter(|e| e.name == "nvram") {
+            // Where the variables go is libvirt's choice: a path would
+            // have it write wherever that says.
+            if !text(n).is_empty() || n.elements().next().is_some() {
+                return refuse("an <nvram> path (leave it empty: libvirt picks one)");
+            }
+            if let Some(t) = n.attr("template")
+                && !shipped_file(t)
+            {
+                return refuse(format!(
+                    "an nvram template from '{}' (only /usr/share/...)",
+                    t
+                ));
+            }
+        }
+    }
+    if let Some(devices) = root.child("devices") {
+        for d in devices.elements() {
+            check_device(d)?;
+        }
+    }
+    Ok(())
+}
+
 /// Every raidish volume in the domain's disks, the anchor (first non-cdrom
 /// one) first.
 fn raidish_disks(root: &El) -> Result<Vec<String>, String> {
@@ -450,7 +790,7 @@ fn raidish_disks(root: &El) -> Result<Vec<String>, String> {
     let mut disks: Vec<(bool, String)> = Vec::new();
     for d in devices.elements().filter(|e| e.name == "disk") {
         if let Some(v) = disk_volume(d) {
-            if v.is_empty() || v.contains('/') {
+            if crate::dataset::check_dataset_name(&v).is_err() || v.starts_with('.') {
                 return Err(format!("bad volume name '{}'", v));
             }
             if disks.iter().any(|(_, x)| *x == v) {
@@ -466,13 +806,25 @@ fn raidish_disks(root: &El) -> Result<Vec<String>, String> {
 
 /// The domain XML libvirt is given: the VM's XML with its name forced,
 /// raidish disks pointed at `nbd` (host, port), any graphics replaced by a
-/// VNC console on 127.0.0.1, and raidish's metadata in place of any other.
+/// VNC console on `console` (an address), and raidish's metadata in place of any other.
 /// `owner` is the anchor's `ds/` lease owner: a domain whose owner isn't
 /// the lease's current one is an orphan of an earlier raidish (its disks'
 /// NBD connections go nowhere).
-pub fn render(spec: &VmSpec, nbd: (&str, u16), owner: &str) -> Result<String, String> {
+pub fn render(
+    spec: &VmSpec,
+    nbd: (&str, u16),
+    console: &str,
+    owner: &str,
+    ident: &VmIdent,
+) -> Result<String, String> {
     let mut root = parse_domain(&spec.xml)?;
+    // Checked when it was stored; checked again here, so nothing that got
+    // past that (or predates it) reaches libvirt.
+    check_domain(&root)?;
     let port = nbd.1.to_string();
+    // libvirt's defaults: confined, in its own cgroup partition.
+    root.remove("seclabel");
+    root.remove("resource");
 
     // Name.
     let name_el = El {
@@ -498,6 +850,8 @@ pub fn render(spec: &VmSpec, nbd: (&str, u16), owner: &str) -> Result<String, St
             ("volumes", &spec.volumes.join(",")),
             ("change", &spec.change.to_string()),
             ("owner", owner),
+            ("pool", &ident.pool),
+            ("node", &ident.node),
         ],
     )));
     let at = root
@@ -542,12 +896,32 @@ pub fn render(spec: &VmSpec, nbd: (&str, u16), owner: &str) -> Result<String, St
         new.kids.push(Node::El(src));
         for kid in &disk.kids {
             match kid {
-                Node::El(e) if matches!(e.name.as_str(), "driver" | "source" | "auth") => {}
+                Node::El(e)
+                    if matches!(
+                        e.name.as_str(),
+                        "driver" | "source" | "auth" | "backingStore"
+                    ) => {}
                 Node::El(e) => new.kids.push(Node::El(e.clone())),
                 Node::Raw(_) => {}
             }
         }
         *disk = new;
+    }
+    // libvirt's own emulator for the domain's type.
+    devices.remove("emulator");
+    // Character devices: where a pty or socket goes is libvirt's choice
+    // (`virsh dumpxml` of a running domain says where it went).
+    for k in devices.kids.iter_mut() {
+        let Node::El(d) = k else { continue };
+        match (d.name.as_str(), d.attr("type")) {
+            ("serial" | "console" | "parallel" | "channel", Some("pty")) => d.remove("source"),
+            ("channel", Some("unix")) => {
+                if let Some(src) = d.child_mut("source") {
+                    src.attrs.retain(|(k, _)| k != "path");
+                }
+            }
+            _ => {}
+        }
     }
     // Console.
     devices.remove("graphics");
@@ -557,12 +931,12 @@ pub fn render(spec: &VmSpec, nbd: (&str, u16), owner: &str) -> Result<String, St
             ("type", "vnc"),
             ("port", "-1"),
             ("autoport", "yes"),
-            ("listen", "127.0.0.1"),
+            ("listen", console),
         ],
     );
     g.kids.push(Node::El(El::new(
         "listen",
-        &[("type", "address"), ("address", "127.0.0.1")],
+        &[("type", "address"), ("address", console)],
     )));
     devices.kids.push(Node::El(g));
     Ok(to_string(&root))
@@ -577,6 +951,13 @@ pub struct DomMeta {
     /// The anchor's lease owner when it was started (see `render`).
     #[serde(default)]
     pub owner: String,
+    /// The pool (its GUID, hex) and node that started it: a node acts only
+    /// on its own domains, whatever else shares its libvirt (another
+    /// node, another cluster's).
+    #[serde(default)]
+    pub pool: String,
+    #[serde(default)]
+    pub node: String,
 }
 
 fn parse_meta(xml: &str) -> Option<DomMeta> {
@@ -595,6 +976,8 @@ fn parse_meta(xml: &str) -> Option<DomMeta> {
             .collect(),
         change: el.attr("change").and_then(|c| c.parse().ok()).unwrap_or(0),
         owner: el.attr("owner").unwrap_or_default().to_string(),
+        pool: el.attr("pool").unwrap_or_default().to_string(),
+        node: el.attr("node").unwrap_or_default().to_string(),
     })
 }
 
@@ -695,7 +1078,8 @@ impl Virsh {
         5900u16.checked_add(display)
     }
 
-    /// The domain with its details, if it is one of ours.
+    /// The domain with its details, if raidish started it (any node, any
+    /// pool: see `VmRuntime::our_vm`).
     pub async fn local_vm(&self, d: Domain) -> Option<LocalVm> {
         let meta = self.meta(&d.name).await?;
         let info = self.run(&["dominfo", &d.name]).await.unwrap_or_default();
@@ -720,7 +1104,8 @@ impl Virsh {
         })
     }
 
-    /// Every domain of ours on this node.
+    /// Every domain raidish started on this libvirt (any node's, any
+    /// pool's: see `VmRuntime::local_vms`).
     pub async fn local_vms(&self) -> Result<Vec<LocalVm>, String> {
         let mut out = Vec::new();
         for d in self.list().await? {

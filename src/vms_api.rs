@@ -1,11 +1,17 @@
 //! VM management (see `crate::vm`), served by every `listen` node.
 //!
-//! Nothing here is remembered: what a VM is comes from its XML in the pool,
+//! Nothing here is remembered: what a VM is comes from its definition (see
+//! `crate::vm_store`, through the committer),
 //! where it runs from its anchor volume's lease, whether it should run from
 //! the cluster state, and what it's doing from libvirt on that node, asked
 //! each time.
 //!
 //! * `GET /api/v1/vms`: every VM, joined with its node's live state.
+//! * `GET /api/v1/vms/<name>/definition`: its XML and change number.
+//! * `PUT /api/v1/vms/<name>[?create=true][&change=N]` (the XML as the
+//!   body): define or change it; checked as it's stored.
+//! * `DELETE /api/v1/vms/<name>[?change=N]`: delete its definition (and
+//!   stop it); its volumes stay.
 //! * `POST /api/v1/vms/<name>/start` / `stop`: should (not) run; the node
 //!   with its disks acts on it.
 //! * `POST /api/v1/vms/<name>/move` (`{"node"}`): move its disks, and so the
@@ -20,13 +26,15 @@
 //!   node's libvirt, for the above.
 
 use crate::cluster::{Cluster, LeaseOp};
+use crate::committer::PutVm;
 use crate::committer::dataset_resource;
 use crate::vm::{LocalVm, VmRuntime, VmSpec};
+use crate::vm_store::VmDef;
 use crate::volumes_api::VolumesState;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
 use rocket::serde::json::Json;
-use rocket::{State, get, post};
+use rocket::{State, delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -126,7 +134,7 @@ async fn local_view(
         ..Default::default()
     };
     if let Some(rt) = &st.runtime {
-        match rt.virsh.local_vms().await {
+        match rt.local_vms().await {
             Ok(vms) => view.vms = vms.into_iter().filter(|v| v.domain.id.is_some()).collect(),
             Err(e) => view.error = Some(e),
         }
@@ -154,7 +162,12 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
         rt.poke.notify_one();
         return Ok(());
     }
-    if rt.virsh.meta(name).await.is_none() {
+    // Only a domain this node started (see `crate::vm::DomMeta::pool`).
+    let ours = match (rt.ident(), rt.virsh.meta(name).await) {
+        (Some(me), Some(m)) => me.owns(&m),
+        _ => false,
+    };
+    if !ours {
         return Err((Status::NotFound, format!("no VM '{}' runs here", name)));
     }
     let r = match action {
@@ -211,11 +224,11 @@ async fn on_node(
 async fn list(
     _auth: crate::auth::CanRead,
     st: &State<VmsState>,
-    files: &State<crate::files_api::FilesState>,
+    volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
     agent: &State<crate::agent::AgentState>,
 ) -> Result<Json<Vec<VmView>>, ApiError> {
-    let specs = files.vm_specs().await?;
+    let specs = specs(volumes).await?;
     let intent = cluster.status().state.vms;
     // Ask each node with a VM's disks once.
     let mut views: BTreeMap<String, Result<LocalView, String>> = BTreeMap::new();
@@ -295,13 +308,115 @@ async fn list(
     Ok(Json(out))
 }
 
-async fn spec(files: &crate::files_api::FilesState, name: &str) -> Result<VmSpec, ApiError> {
-    files.vm_specs().await?.remove(name).ok_or_else(|| {
-        (
-            Status::NotFound,
-            format!("no VM '{}' (/vms/{}.xml)", name, name),
-        )
-    })
+/// Every VM definition, as the committer has them (one sharing a volume
+/// with an earlier one is unusable, see `crate::vm::mark_conflicts`).
+async fn specs(volumes: &VolumesState) -> Result<BTreeMap<String, VmSpec>, ApiError> {
+    let mut specs: BTreeMap<String, VmSpec> = volumes
+        .client
+        .vms()
+        .await
+        .map_err(crate::volumes_api::api_err)?
+        .into_iter()
+        .map(|(n, d)| (n, d.spec()))
+        .collect();
+    crate::vm::mark_conflicts(&mut specs);
+    Ok(specs)
+}
+
+async fn spec(volumes: &VolumesState, name: &str) -> Result<VmSpec, ApiError> {
+    specs(volumes)
+        .await?
+        .remove(name)
+        .ok_or_else(|| (Status::NotFound, format!("no VM '{}'", name)))
+}
+
+// ---- definitions ------------------------------------------------------------
+
+/// GET /api/v1/vms/<name>/definition: its XML and change number.
+#[get("/api/v1/vms/<name>/definition")]
+async fn definition(
+    _auth: crate::auth::CanRead,
+    name: &str,
+    volumes: &State<VolumesState>,
+) -> Result<Json<VmDef>, ApiError> {
+    volumes
+        .client
+        .vms()
+        .await
+        .map_err(crate::volumes_api::api_err)?
+        .remove(name)
+        .map(Json)
+        .ok_or_else(|| (Status::NotFound, format!("no VM '{}'", name)))
+}
+
+/// PUT /api/v1/vms/<name>[?create=true][&change=N], the domain XML as the
+/// body: store it, once it checks out (see `crate::vm_store`). `create`:
+/// refuse if there is one; `change`: refuse unless the one there is that
+/// change.
+#[put("/api/v1/vms/<name>?<create>&<change>", data = "<body>")]
+async fn put_definition(
+    auth: crate::auth::CanWrite,
+    name: &str,
+    create: Option<bool>,
+    change: Option<u64>,
+    body: rocket::Data<'_>,
+    volumes: &State<VolumesState>,
+) -> Result<Json<VmDef>, ApiError> {
+    use rocket::data::ToByteUnit;
+    let xml = body
+        .open((crate::vm_store::MAX_XML + 1).bytes())
+        .into_string()
+        .await
+        .map_err(|e| bad(e.to_string()))?;
+    if !xml.is_complete() {
+        return Err((
+            Status::PayloadTooLarge,
+            format!(
+                "a VM definition is at most {} bytes",
+                crate::vm_store::MAX_XML
+            ),
+        ));
+    }
+    let req = PutVm {
+        name: name.to_string(),
+        xml: xml.into_inner(),
+        create: create.unwrap_or(false),
+        change,
+    };
+    volumes
+        .client
+        .on_behalf(&auth.0)
+        .put_vm(&req)
+        .await
+        .map(Json)
+        .map_err(crate::volumes_api::api_err)
+}
+
+/// DELETE /api/v1/vms/<name>[?change=N]: delete its definition (its
+/// volumes stay). A running VM is stopped by its node, as for any VM that
+/// has no definition.
+#[delete("/api/v1/vms/<name>?<change>")]
+async fn delete_definition(
+    auth: crate::auth::CanWrite,
+    name: &str,
+    change: Option<u64>,
+    st: &State<VmsState>,
+    cluster: &State<Arc<Cluster>>,
+    volumes: &State<VolumesState>,
+) -> Result<Json<()>, ApiError> {
+    let spec = spec(volumes, name).await.ok();
+    volumes
+        .client
+        .on_behalf(&auth.0)
+        .delete_vm(name, change)
+        .await
+        .map_err(crate::volumes_api::api_err)?;
+    // Nothing should run it any more.
+    set_intent(cluster, name, false).await?;
+    if let Some(spec) = spec {
+        poke(st, cluster, &spec).await;
+    }
+    Ok(Json(()))
 }
 
 async fn set_intent(cluster: &Cluster, name: &str, running: bool) -> Result<(), ApiError> {
@@ -336,11 +451,10 @@ async fn move_vm(
     to: Json<MoveTo>,
     events: &State<crate::events::EventSink>,
     st: &State<VmsState>,
-    files: &State<crate::files_api::FilesState>,
     cluster: &State<Arc<Cluster>>,
     volumes: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
-    let spec = spec(files, name).await?;
+    let spec = spec(volumes, name).await?;
     if !spec.usable() {
         return Err(bad(spec.error.unwrap_or_default()));
     }
@@ -382,10 +496,10 @@ async fn action(
     action: &str,
     events: &State<crate::events::EventSink>,
     st: &State<VmsState>,
-    files: &State<crate::files_api::FilesState>,
+    volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
 ) -> Result<Json<()>, ApiError> {
-    let spec = spec(files, name).await?;
+    let spec = spec(volumes, name).await?;
     match action {
         "start" => {
             if let Some(e) = &spec.error {
@@ -436,10 +550,10 @@ async fn console(
     name: &str,
     ws: ws::WebSocket,
     st: &State<VmsState>,
-    files: &State<crate::files_api::FilesState>,
+    volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
 ) -> Result<ws::Channel<'static>, ApiError> {
-    let spec = spec(files, name).await?;
+    let spec = spec(volumes, name).await?;
     let node = holder(cluster, &spec.anchor)
         .ok_or_else(|| (Status::Conflict, format!("'{}' isn't running", name)))?;
     match peer_url(cluster, &node)? {
@@ -453,7 +567,8 @@ async fn console(
                 .vnc_port(name)
                 .await
                 .ok_or_else(|| (Status::Conflict, format!("'{}' has no console", name)))?;
-            Ok(ws.channel(move |stream| Box::pin(bridge_tcp(stream, port))))
+            let host = rt.console.clone();
+            Ok(ws.channel(move |stream| Box::pin(bridge_tcp(stream, host, port))))
         }
         Some(base) => {
             let url = format!(
@@ -467,10 +582,14 @@ async fn console(
     }
 }
 
-/// Browser ⇄ the VNC server on 127.0.0.1:`port`.
+/// Browser ⇄ the VNC server on `host`:`port`.
 #[allow(clippy::result_large_err)] // rocket_ws's error type
-async fn bridge_tcp(stream: ws::stream::DuplexStream, port: u16) -> ws::result::Result<()> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+async fn bridge_tcp(
+    stream: ws::stream::DuplexStream,
+    host: String,
+    port: u16,
+) -> ws::result::Result<()> {
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true)?;
     let (mut rd, mut wr) = tcp.into_split();
     let (mut sink, mut source) = stream.split();
@@ -550,5 +669,15 @@ async fn bridge_ws(stream: ws::stream::DuplexStream, url: String) -> ws::result:
 }
 
 pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![local, local_action, list, move_vm, action, console]
+    rocket::routes![
+        local,
+        local_action,
+        list,
+        definition,
+        put_definition,
+        delete_definition,
+        move_vm,
+        action,
+        console
+    ]
 }

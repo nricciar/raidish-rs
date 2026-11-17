@@ -306,3 +306,42 @@ async fn received_snapshots_keep_their_dates() {
         src.list_snapshots("vol").await.unwrap()[0].created_ns
     );
 }
+
+/// An incremental isn't received over an intent log still to be replayed:
+/// the replay would put the gone writer's writes back over it.
+#[tokio::test]
+async fn no_incremental_over_a_pending_intent_log() {
+    let (_sp, src) = source().await;
+    let full = send(&src, "s1", None).await;
+    let incr = send(&src, "s2", Some("s1")).await;
+    let dp = TestPool::new().await;
+    let dst = dp.format().await;
+    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+        .await
+        .unwrap();
+    // A writer ran it and went away, its log not replayed yet.
+    {
+        let vol = dst.open_dataset("vol").await.unwrap();
+        *vol.log.lock().unwrap() = Some(crate::inode::DatasetLog {
+            regions: Vec::new(),
+            from_seq: 0,
+            writer: "writer/1".into(),
+            writer_epoch: 1,
+            ds_owner: "gone".into(),
+            ds_epoch: 1,
+        });
+        let _tx = dst.begin_tx().await;
+        dst.update_dataset_dnode(&vol, vol.obj.root_ptr())
+            .await
+            .unwrap();
+    }
+    dst.sync().await.unwrap();
+    for force in [false, true] {
+        let e = dst
+            .recv_snapshot("vol", &mut incr.as_slice(), force)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("intent log"), "{}", e);
+    }
+    assert_eq!(read(&dst, "vol").await, read(&src, "vol@s1").await);
+}

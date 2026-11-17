@@ -54,7 +54,7 @@ pub enum Msg {
     Console(bool),
     Menu(bool),
     Tab(Tab),
-    Xml(u64, Result<String, String>),
+    Xml(Result<api::VmDef, String>),
     Edit(bool),
     XmlInput(String),
     SaveXml,
@@ -159,9 +159,9 @@ impl Component for VmPage {
                         if let Some(vm) = vm
                             && self.xml.as_ref().is_none_or(|(c, _)| *c != vm.change)
                         {
-                            let (change, path) = (vm.change, vm.xml_path());
+                            let name = vm.name.clone();
                             ctx.link().send_future(async move {
-                                Msg::Xml(change, api::get_text(&path).await)
+                                Msg::Xml(api::vm_definition(&name).await)
                             });
                         }
                     }
@@ -247,9 +247,9 @@ impl Component for VmPage {
             }
             Msg::Menu(open) => self.menu = open,
             Msg::Tab(t) => self.tab = t,
-            Msg::Xml(change, r) => match r {
-                Ok(x) => {
-                    self.xml = Some((change, x));
+            Msg::Xml(r) => match r {
+                Ok(d) => {
+                    self.xml = Some((d.change, d.xml));
                     self.xml_error = None;
                 }
                 Err(e) => self.xml_error = Some(e),
@@ -267,9 +267,11 @@ impl Component for VmPage {
                     return false;
                 };
                 self.saving = true;
-                let path = api::vm_xml_path(&name);
-                ctx.link()
-                    .send_future(async move { Msg::Saved(api::put_text(&path, &text).await) });
+                // An edit of the definition as it was read.
+                let change = self.xml.as_ref().map(|x| x.0);
+                ctx.link().send_future(async move {
+                    Msg::Saved(api::vm_put(&name, &text, false, change).await.map(drop))
+                });
             }
             Msg::Saved(r) => {
                 self.saving = false;
@@ -303,7 +305,7 @@ impl Component for VmPage {
                     { back }
                     if self.missing {
                         <h2>{ format!("No VM '{}'", name) }</h2>
-                        <p class="muted">{ format!("There's no /{}.", api::vm_xml_path(name)) }</p>
+                        <p class="muted">{ "There's no VM by that name." }</p>
                     } else if let Some(e) = &self.error {
                         <div class="banner">{ e }</div>
                     } else {
@@ -552,9 +554,11 @@ impl VmPage {
         let disks = self.own_disks();
         let delete = {
             let spec = Spec::new(&format!("Delete {}?", vm.name), "Delete")
-                .message(html! { <p>{ format!("Deletes its definition, /{}. This can't be undone.", vm.xml_path()) }</p> })
+                .message(html! { <p>{ "Deletes its definition. This can't be undone." }</p> })
                 .field(
-                    Field::check("disks", "Also delete its disk volumes", false).hint(&if disks.is_empty() {
+                    Field::check("disks", "Also delete its disk volumes", false).hint(&if disks
+                        .is_empty()
+                    {
                         "(it has none)".to_string()
                     } else {
                         format!("{}: gone for good, snapshots too", disks.join(", "))
@@ -798,8 +802,7 @@ impl VmPage {
             <div class="definition">
                 <div class="def-head">
                     <span class="muted small">
-                        <code>{ format!("/{}", vm.xml_path()) }</code>
-                        { " — libvirt domain XML. raidish fills in the disks' NBD sources, the VNC console and its metadata when it starts the VM." }
+                        { "libvirt domain XML. Every disk must be a raidish volume no other VM uses, and nothing may reach the host (host files or devices, passthrough, scripts). raidish fills in the disks' NBD sources, the VNC console and its metadata when it starts the VM." }
                     </span>
                     if can_write && self.draft.is_none() && self.xml.is_some() {
                         <button class="btn" onclick={link.callback(|_| Msg::Edit(true))}>{ "Edit" }</button>

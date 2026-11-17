@@ -244,6 +244,8 @@ pub struct Committer<D: BlockDevice> {
     lends: std::sync::Mutex<std::collections::HashMap<u32, (String, u64)>>,
     /// The activity log (opened, or made, on first use).
     events: tokio::sync::OnceCell<Arc<EventLog<D>>>,
+    /// The VM definitions (opened, or made, on first use).
+    vms: tokio::sync::OnceCell<Arc<crate::vm_store::VmStore<D>>>,
     /// What `observe` last saw (outer None: not read from the log yet).
     seen: tokio::sync::Mutex<Option<Option<Observed>>>,
     /// Which pool disks were online at the last `observe` (in memory: a
@@ -294,6 +296,7 @@ impl<D: BlockDevice> Committer<D> {
             node,
             lends: std::sync::Mutex::new(lends),
             events: Default::default(),
+            vms: Default::default(),
             seen: Default::default(),
             disks_online: Default::default(),
         }
@@ -305,6 +308,14 @@ impl<D: BlockDevice> Committer<D> {
     pub async fn events(&self) -> Result<Arc<EventLog<D>>, FileSystemError> {
         self.events
             .get_or_try_init(|| EventLog::open(self.fs.clone()))
+            .await
+            .cloned()
+    }
+
+    /// The pool's VM definitions (see `crate::vm_store`).
+    pub async fn vm_store(&self) -> Result<Arc<crate::vm_store::VmStore<D>>, FileSystemError> {
+        self.vms
+            .get_or_try_init(|| crate::vm_store::VmStore::open(self.fs.clone()))
             .await
             .cloned()
     }
@@ -714,6 +725,12 @@ impl<D: BlockDevice> Committer<D> {
                 name, by
             )));
         }
+        if let Some(vm) = self.vm_store().await?.user_of(name).await? {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "volume '{}' is VM '{}''s disk; delete the VM (or take the disk out of it) first",
+                name, vm
+            )));
+        }
         self.fs.delete_volume(name).await?;
         self.fs.sync().await
     }
@@ -1015,6 +1032,19 @@ pub struct NewName {
     pub name: String,
 }
 
+/// A VM definition to store (`PUT /api/v1/pool/vms`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PutVm {
+    pub name: String,
+    pub xml: String,
+    /// Refuse if there is one.
+    #[serde(default)]
+    pub create: bool,
+    /// Refuse unless the one there is this change.
+    #[serde(default)]
+    pub change: Option<u64>,
+}
+
 /// Talks to whichever `listen` node is the committer.
 #[derive(Clone)]
 pub struct CommitClient {
@@ -1179,6 +1209,40 @@ impl CommitClient {
 
     pub async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}", name);
+        self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    /// Every VM definition.
+    pub async fn vms(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::vm_store::VmDef>, CommitError> {
+        self.call(
+            reqwest::Method::GET,
+            "/api/v1/pool/vms",
+            None::<&()>,
+            Some(10),
+        )
+        .await
+    }
+
+    /// Store VM `req.name`'s definition (see `crate::vm_store::VmStore::put`).
+    pub async fn put_vm(&self, req: &PutVm) -> Result<crate::vm_store::VmDef, CommitError> {
+        self.call(
+            reqwest::Method::PUT,
+            "/api/v1/pool/vms",
+            Some(req),
+            Some(10),
+        )
+        .await
+    }
+
+    /// Delete VM `name`'s definition (`change`: only if it's that one).
+    pub async fn delete_vm(&self, name: &str, change: Option<u64>) -> Result<(), CommitError> {
+        let mut path = format!("/api/v1/pool/vms/{}", name);
+        if let Some(c) = change {
+            path.push_str(&format!("?change={}", c));
+        }
         self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
             .await
     }
@@ -1640,6 +1704,70 @@ pub mod routes {
         }
     }
 
+    #[get("/api/v1/pool/vms")]
+    pub async fn vms(
+        _auth: crate::auth::CanRead,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<std::collections::BTreeMap<String, crate::vm_store::VmDef>, CommitError>> {
+        match current(slot).await {
+            Some(c) => match c.vm_store().await {
+                Ok(st) => fs_err(st.list().await),
+                Err(e) => fs_err(Err(e)),
+            },
+            None => not_committer(),
+        }
+    }
+
+    #[put("/api/v1/pool/vms", data = "<req>")]
+    pub async fn put_vm(
+        _auth: crate::auth::CanWrite,
+        by: Actor,
+        req: Json<PutVm>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<crate::vm_store::VmDef, CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let r = match c.vm_store().await {
+                    Ok(st) => st.put(&req.name, &req.xml, req.create, req.change).await,
+                    Err(e) => Err(e),
+                };
+                let kind = if req.create {
+                    "vm.defined"
+                } else {
+                    "vm.changed"
+                };
+                noted(&c, r, by, kind, format!("vm/{}", req.name), |d| {
+                    format!("VM '{}' definition stored (change {})", d.name, d.change)
+                })
+                .await
+            }
+            None => not_committer(),
+        }
+    }
+
+    #[delete("/api/v1/pool/vms/<name>?<change>")]
+    pub async fn delete_vm(
+        _auth: crate::auth::CanWrite,
+        by: Actor,
+        name: &str,
+        change: Option<u64>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let r = match c.vm_store().await {
+                    Ok(st) => st.delete(name, change).await,
+                    Err(e) => Err(e),
+                };
+                noted(&c, r, by, "vm.deleted", format!("vm/{}", name), |_| {
+                    format!("VM '{}' deleted", name)
+                })
+                .await
+            }
+            None => not_committer(),
+        }
+    }
+
     #[get("/api/v1/pool/datasets")]
     pub async fn datasets(
         _auth: crate::auth::CanRead,
@@ -1874,7 +2002,10 @@ pub mod routes {
             recv,
             recv_check,
             events,
-            report_events
+            report_events,
+            vms,
+            put_vm,
+            delete_vm
         ]
     }
 }
