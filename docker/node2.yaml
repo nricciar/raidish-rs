@@ -19,3 +19,9 @@ tls:
 # --profile nfs-test up -d nfs-client; see the README).
 nfs:
   bind: 0.0.0.0
+# S3 (9000) and SQS (9324) over HTTPS, and etcd datasets (their own
+# ports, TLS with client certificates), on every node: a dataset runs on one
+# node and the others forward to it. S3/SQS access keys are made from tokens
+# (`raidish token s3-key`); see "Services" in the README.
+services:
+  advertise: node2

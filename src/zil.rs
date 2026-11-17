@@ -1,12 +1,14 @@
-//! The volume intent log: how a writer acknowledges a volume flush (NBD
-//! FLUSH, NVMe FLUSH) without waiting for the committer.
+//! The dataset intent log: how a writer acknowledges a flush of a tree
+//! dataset (a volume's NBD FLUSH / NVMe FLUSH) without waiting for the
+//! committer. It logs dirty records, whatever the dataset's format makes
+//! of them, so it serves every tree dataset alike.
 //!
-//! A volume a writer runs has a log of one or two *regions*: runs of blocks
+//! A dataset a writer runs has a log of one or two *regions*: runs of blocks
 //! in the writer's lent space, recorded in the volume's inode by a commit
 //! (which also claims their space). A flush appends one record holding
 //! every dirty record changed since the last flush, flushes the disks, and
 //! is done. The committer only hears about the data when the writer next
-//! *folds*: its regular volume commit (`writer_sync_volume`), which builds
+//! *folds*: its regular volume commit (`writer_sync_dataset`), which builds
 //! the tree as before and starts a new region.
 //!
 //! ```text
@@ -18,6 +20,17 @@
 //! header itself), then the payload. Replay reads records in order until one
 //! doesn't verify; parity rebuilds bad blocks on the way, as for any record.
 //!
+//! **Keyed datasets log operations, not records.** A `kv` put changes a
+//! leaf (and maybe its ancestors, the header, a split's new node...),
+//! whole records of a B+tree; logging them would cost a node or more per
+//! acknowledged write. Instead each operation queues its effect
+//! ([`KeyedOp`]) with its records, under the same lock, and a flush logs
+//! the queued operations. Replay runs them through the B+tree again, over
+//! the tree the log was registered with. The records of such a dataset
+//! are never logged as records (a receive's are durable when the receive
+//! commits), so a log never mixes record images with operations, which
+//! would replay into a different tree than the one the images came from.
+//!
 //! **Flushes don't wait for folds.** A fold takes the dirty records at a cut:
 //! the current region and its next sequence number `k`, read under the
 //! cursor lock that log appends plan under, so each append is wholly before
@@ -27,8 +40,17 @@
 //! stays part of the log, and flushes carry on into the current region
 //! until the fold returns. The next fold drops that region.
 //!
+//! **Only whole records are acknowledged.** A record some disk missed is
+//! as safe as the disks that have it, and only its writer knows that disk
+//! missed it; a replay after losing the writer's node (often holding a
+//! disk too) could find it unreadable and take it for the end of the log.
+//! So a flush whose records any disk missed commits instead: the commit
+//! reports the miss (the disk is degraded from then on, which replay and
+//! resilver both see) as it makes the writes durable. While a disk is
+//! missing, flushes cost a commit.
+//!
 //! **Who replays.** A writer may only acknowledge a flush while its
-//! `vol/<name>` lease is provably live (renewed well within its TTL). The
+//! `ds/<name>` lease is provably live (renewed well within its TTL). The
 //! log is replayed by the committer once that lease is gone, so everything
 //! acknowledged is already on disk when it reads the log: when a new writer
 //! claims the volume (before opening it), or when the committer notices the
@@ -36,11 +58,11 @@
 //! by its holder, so the committer takes it over first (a newer epoch) and
 //! lets go of it once the log is replayed.
 
+use crate::dataset::Dataset;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{LogRegion, VolumeLog};
+use crate::inode::{DatasetLog, LogRegion};
 use crate::object::{Dirty, Unlogged};
-use crate::volume::Volume;
 use crate::writer::WriterState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -76,6 +98,26 @@ enum Entry {
     /// `Data` and `Hole`, so logs written before it still decode; a log
     /// with patches needs a replayer that knows them.
     Patch(u64, u32, Vec<u8>),
+    /// A keyed operation, replayed through the dataset's format (a `kv`
+    /// dataset's B+tree) rather than as the records it changed.
+    Keyed(KeyedOp),
+}
+
+/// A change to a keyed dataset, as its intent log carries it: the effect
+/// of an operation (what a conditional one did, not what it asked), so a
+/// replay redoes exactly it, whatever the tree looks like underneath.
+///
+/// Each is a blind assignment to one key, so a run of them can be replayed
+/// over a tree that already has some of them: those a fold committed but
+/// whose log records follow its cut (see the module docs). Redoing a prefix
+/// of the operations before the rest leaves every key as the last of them
+/// set it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyedOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+    /// Several, atomically (one transaction: replayed all or none).
+    Batch(Vec<KeyedOp>),
 }
 
 /// A writer's place in a volume's log: the region it appends to.
@@ -119,10 +161,11 @@ fn parse_header(data: &[u8], guid: u64, seq: u64) -> Option<Header> {
 
 /// A log append planned under the cursor lock, to be written.
 struct Planned {
-    vol: Arc<Volume>,
+    vol: Arc<Dataset>,
     lba: u64,
     bytes: Vec<u8>,
     idxs: BTreeMap<u64, Unlogged>,
+    ops: Vec<(u64, KeyedOp)>,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -146,7 +189,13 @@ impl<D: BlockDevice> FileSystem<D> {
         // One flush appends at a time: a record must never follow a gap.
         let io = self.log_io.lock().await;
         span.mark("lock");
-        let vols: Vec<Arc<Volume>> = self.volumes.lock().unwrap().values().cloned().collect();
+        let vols: Vec<Arc<Dataset>> = self
+            .open_datasets
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         let mut planned: Vec<Planned> = Vec::new();
         let mut commit = false;
         for vol in vols {
@@ -176,7 +225,12 @@ impl<D: BlockDevice> FileSystem<D> {
                     eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
                     // The slot is spent: later records would follow a gap.
                     *p.vol.cursor.lock().unwrap() = None;
-                    p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
+                    p.vol
+                        .obj
+                        .dirty
+                        .lock()
+                        .unwrap()
+                        .restore_unlogged(p.idxs, p.ops);
                     commit = true;
                 }
             }
@@ -201,9 +255,44 @@ impl<D: BlockDevice> FileSystem<D> {
                 // nothing more here (flushes commit until the next fold
                 // starts a region).
                 *p.vol.cursor.lock().unwrap() = None;
-                p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
+                p.vol
+                    .obj
+                    .dirty
+                    .lock()
+                    .unwrap()
+                    .restore_unlogged(p.idxs, p.ops);
             }
             return Err(e.into());
+        }
+        // A disk that missed these records (unreachable, or failing) leaves
+        // them only as safe as the disks that have them, and nobody but this
+        // writer knows: the committer counts that disk healthy until a commit
+        // reports the miss. Lose this node (and its disk) and a replay would
+        // read a record it can't rebuild, take it for the end of the log and
+        // drop what was acknowledged. So acknowledge only records every disk
+        // has; otherwise commit, which reports the miss as it makes the
+        // writes durable (the log records stay, harmless: replay redoes them).
+        if self.unaccounted_misses().iter().any(|&m| m) {
+            span.note("fallback", "missed");
+            let vol = written[0].vol.clone();
+            for p in written {
+                p.vol
+                    .obj
+                    .dirty
+                    .lock()
+                    .unwrap()
+                    .restore_unlogged(p.idxs, p.ops);
+            }
+            drop(io);
+            let r = self.sync().await;
+            span.mark("commit");
+            // The commit reported the misses, unless nothing was left for it
+            // to commit (a commit in progress took the records).
+            let r = match r {
+                Ok(()) => self.writer_report_misses(&w, &vol).await,
+                e => e,
+            };
+            return r;
         }
         drop(io);
         if written.iter().any(|p| {
@@ -225,7 +314,12 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stale = None;
         for p in written {
             if !w.lease_fresh(&p.vol.name) {
-                p.vol.obj.dirty.lock().unwrap().restore_unlogged(p.idxs);
+                p.vol
+                    .obj
+                    .dirty
+                    .lock()
+                    .unwrap()
+                    .restore_unlogged(p.idxs, p.ops);
                 stale.get_or_insert(p.vol.name.clone());
             }
         }
@@ -241,10 +335,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Take `vol`'s unlogged records and reserve the next slot of its log
     /// for them. `Ok(None)`: nothing to log; `Err`: no room or no log (the
     /// records stay unlogged; commit instead).
-    fn plan_append(&self, vol: &Arc<Volume>) -> Result<Option<Planned>, ()> {
+    fn plan_append(&self, vol: &Arc<Dataset>) -> Result<Option<Planned>, ()> {
         let mut cursor = vol.cursor.lock().unwrap();
         let mut d = vol.obj.dirty.lock().unwrap();
-        if d.unlogged.is_empty() {
+        if d.unlogged.is_empty() && d.ops.is_empty() {
             return Ok(None);
         }
         let Some(c) = cursor.as_mut() else {
@@ -269,6 +363,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 (None, _) => {}
             }
         }
+        // (Only keyed datasets queue operations, and their records are
+        // never unlogged: one or the other.)
+        debug_assert!(d.ops.is_empty() || entries.is_empty());
+        entries.extend(d.ops.iter().map(|(_, op)| Entry::Keyed(op.clone())));
         let bytes = encode(c.region.guid, c.seq, &entries).map_err(|_| ())?;
         let blocks = self.align_blocks(bytes.len().div_ceil(BLOCK_SIZE) as u64);
         if c.used + blocks > c.region.len {
@@ -278,11 +376,13 @@ impl<D: BlockDevice> FileSystem<D> {
         c.used += blocks;
         c.seq += 1;
         let idxs = std::mem::take(&mut d.unlogged);
+        let ops = std::mem::take(&mut d.ops);
         Ok(Some(Planned {
             vol: vol.clone(),
             lba,
             bytes,
             idxs,
+            ops,
         }))
     }
 
@@ -298,7 +398,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Record that `vol`'s registered log is now `log`, keeping the
     /// metaslabs its regions are in from being given back meanwhile.
-    pub(crate) fn set_volume_log(&self, w: &WriterState, vol: &Volume, log: Option<VolumeLog>) {
+    pub(crate) fn set_dataset_log(&self, w: &WriterState, vol: &Dataset, log: Option<DatasetLog>) {
         let ms = |r: &LogRegion| self.layout.metaslab_for_block(r.start).map(|i| i as u32);
         let mut cur = vol.log.lock().unwrap();
         for r in cur.iter().flat_map(|l| &l.regions) {
@@ -315,7 +415,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Append to `region` from now on (None: nowhere; flushes commit).
-    pub(crate) fn set_cursor(&self, vol: &Volume, region: Option<LogRegion>) {
+    pub(crate) fn set_cursor(&self, vol: &Dataset, region: Option<LogRegion>) {
         *vol.cursor.lock().unwrap() = region.map(|region| LogCursor {
             region,
             used: 0,
@@ -325,17 +425,19 @@ impl<D: BlockDevice> FileSystem<D> {
 
     // ---- the committer's side ----
 
-    /// The intent log of every volume in the root directory that has one.
-    pub async fn volume_logs(&self) -> Result<Vec<(String, VolumeLog)>, FileSystemError> {
+    /// The intent log of every tree dataset that has one.
+    pub async fn dataset_logs(&self) -> Result<Vec<(String, DatasetLog)>, FileSystemError> {
         let names: Vec<String> = self
-            .ls(std::path::Path::new(""))
+            .datasets()
             .await?
-            .files
-            .into_keys()
+            .datasets
+            .into_iter()
+            .filter(|(_, e)| e.format.is_tree())
+            .map(|(n, _)| n)
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(vol) = self.open_volume(&name).await
+            if let Ok(vol) = self.open_dataset(&name).await
                 && let Some(log) = vol.log.lock().unwrap().clone()
             {
                 out.push((name, log));
@@ -393,10 +495,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Apply volume `name`'s intent log `log` and commit, dropping the log
     /// (its writer's lease must be gone). Returns how many record writes it
     /// replayed. A no-op if the volume no longer has that log.
-    pub async fn replay_volume_log(
+    pub async fn replay_dataset_log(
         &self,
         name: &str,
-        log: &VolumeLog,
+        log: &DatasetLog,
     ) -> Result<usize, FileSystemError> {
         // A record that can't be read looks just like the end of the log: on
         // a pool with more disks missing or stale (awaiting a resilver) than
@@ -412,7 +514,7 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let _tx = self.begin_tx().await;
-        let vol = self.open_volume(name).await?;
+        let vol = self.open_dataset(name).await?;
         if vol.log.lock().unwrap().as_ref() != Some(log) {
             return Ok(0);
         }
@@ -423,8 +525,16 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let n = entries.len();
         let bs = vol.obj.blksz;
+        // Keyed operations go through the tree, one at a time.
+        let _ops = vol.ops.write().await;
         for e in entries {
             let (i, at, bytes) = match e {
+                Entry::Keyed(op) => {
+                    let mut t = crate::btree::Txn::begin(self, &vol.obj).await?;
+                    t.redo(&op).await?;
+                    t.apply(None)?;
+                    continue;
+                }
                 Entry::Data(i, b) => {
                     vol.obj
                         .dirty
@@ -481,7 +591,7 @@ impl<D: BlockDevice> FileSystem<D> {
         *vol.log.lock().unwrap() = None;
         if !vol.is_dirty() {
             // Nothing to commit for the tree: rewrite the dnode without the log.
-            self.update_volume_dnode(&vol, vol.obj.root_ptr()).await?;
+            self.update_dataset_dnode(&vol, vol.obj.root_ptr()).await?;
         }
         for r in &log.regions {
             self.free(r.start, r.len).await?;

@@ -1,20 +1,22 @@
 //! The committer: the `pool` lease holder in a multi-writer pool (see
-//! `crate::writer`). It lends metaslabs to volume writers, applies their
-//! commits, and does the pool's metadata operations (create, delete, set
-//! volume settings). `listen` runs one on whichever node wins the `pool`
+//! `crate::writer`). It lends metaslabs to writers, applies their commits,
+//! and does the pool's metadata operations (create and delete datasets,
+//! change their settings, snapshots). `listen` runs one on whichever node wins the `pool`
 //! lease; the others keep trying, so it fails over.
 
 use crate::cluster::lease::{HeldLease, LeaseClient};
 use crate::cluster::state::{ClusterState, POOL, Response};
 use crate::cluster::{Cluster, LeaseOp, now_ms};
+use crate::dataset::DatasetInfo;
 use crate::disk::BlockDevice;
+use crate::events::{EventLog, Held, Level, NewEvent, Observed};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::VolumeProps;
+use crate::inode::DatasetProps;
 use crate::send::StreamReport;
 use crate::snapshot::SnapshotInfo;
 use crate::volume::VolumeInfo;
 use crate::writer::{
-    CommitError, CommitSink, Committed, FsCommit, FsCommitted, LentMetaslab, VolumeCommit,
+    CommitError, CommitSink, Committed, DatasetCommit, FsCommit, FsCommitted, LentMetaslab,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,14 @@ pub trait Authority: Send + Sync {
     async fn propose(&self, op: LeaseOp) -> Result<Response, String>;
     /// This node's applied cluster state.
     fn state(&self) -> ClusterState;
+    /// The Raft leader's id.
+    fn leader(&self) -> Option<u64> {
+        None
+    }
+    /// Which node serves each pool disk (by name).
+    fn disk_nodes(&self) -> std::collections::BTreeMap<usize, String> {
+        Default::default()
+    }
 }
 
 #[async_trait]
@@ -37,6 +47,20 @@ impl Authority for Cluster {
     }
     fn state(&self) -> ClusterState {
         self.status().state
+    }
+    fn leader(&self) -> Option<u64> {
+        self.status().leader
+    }
+    fn disk_nodes(&self) -> std::collections::BTreeMap<usize, String> {
+        self.members
+            .disks
+            .iter()
+            .flat_map(|(id, disks)| {
+                disks
+                    .iter()
+                    .map(move |d| (*d, crate::cluster::members::node_name(*id)))
+            })
+            .collect()
     }
 }
 
@@ -83,8 +107,74 @@ fn check_lease(
     }
 }
 
-pub fn volume_resource(name: &str) -> String {
-    format!("vol/{}", name)
+fn reserved(name: &str) -> FileSystemError {
+    FileSystemError::InvalidArgument(format!("'{}' is the pool's own", name))
+}
+
+/// Names starting with `.` are the pool's (see `crate::events`).
+fn check_not_reserved(name: &str) -> Result<(), FileSystemError> {
+    if name.starts_with('.') {
+        return Err(FileSystemError::InvalidArgument(format!(
+            "bad name '{}': names starting with '.' are reserved",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// A settings change, described ("disabled, moving to node-2"); empty if
+/// nothing an admin would care about changed (a node clearing a move it
+/// made).
+pub fn describe_props(old: &DatasetProps, new: &DatasetProps) -> String {
+    let mut out = Vec::new();
+    if old.enabled != new.enabled {
+        out.push(if new.enabled { "enabled" } else { "disabled" }.to_string());
+    }
+    if new.move_to.is_some() && new.move_to != old.move_to {
+        out.push(format!(
+            "moving to {}",
+            new.move_to.as_deref().unwrap_or("")
+        ));
+    }
+    if old.nodes != new.nodes {
+        out.push(if new.nodes.is_empty() {
+            "may run on any node".to_string()
+        } else {
+            format!("nodes {}", new.nodes.join(", "))
+        });
+    }
+    if old.automount != new.automount {
+        out.push(match new.automount {
+            Some(t) => format!("automount {}", t),
+            None => "automount off".to_string(),
+        });
+    }
+    if old.port != new.port {
+        out.push(match new.port {
+            Some(p) => format!("port {}", p),
+            None => "no port".to_string(),
+        });
+    }
+    out.join(", ")
+}
+
+/// `Disk 2 (node1)`, from a pool disk's path (`https://node1:7000/...`);
+/// the committer reaches its own node's disks over loopback (`me`).
+fn disk_label(d: usize, path: &str, me: &str) -> String {
+    match path.split_once("://") {
+        Some((_, rest)) => {
+            let host = match rest.split([':', '/']).next().unwrap_or(rest) {
+                "127.0.0.1" | "localhost" | "[" => me,
+                h => h,
+            };
+            format!("Disk {} ({})", d, host)
+        }
+        None => format!("Disk {} ({})", d, me),
+    }
+}
+
+pub fn dataset_resource(name: &str) -> String {
+    format!("ds/{}", name)
 }
 
 /// The lease held on a file while it is open for writing.
@@ -112,7 +202,7 @@ fn object_lease_ok(
     }
 }
 
-/// Where an intent log's `vol/<name>` lease stands, for replaying it.
+/// Where an intent log's `ds/<name>` lease stands, for replaying it.
 #[derive(Debug, PartialEq, Eq)]
 enum Orphan {
     /// Held (or this view hasn't caught up with its grant yet): keep it.
@@ -128,14 +218,14 @@ enum Orphan {
 /// log's holder is gone.
 fn orphan_state(
     lease: Option<&crate::cluster::state::Lease>,
-    l: &crate::inode::VolumeLog,
+    l: &crate::inode::DatasetLog,
     now: u64,
 ) -> Orphan {
     match lease {
         None => Orphan::Live,
-        Some(lease) if lease.epoch < l.vol_epoch => Orphan::Live,
-        Some(lease) if lease.epoch > l.vol_epoch => Orphan::Gone,
-        Some(lease) if lease.owner != l.vol_owner || lease.released => Orphan::Gone,
+        Some(lease) if lease.epoch < l.ds_epoch => Orphan::Live,
+        Some(lease) if lease.epoch > l.ds_epoch => Orphan::Gone,
+        Some(lease) if lease.owner != l.ds_owner || lease.released => Orphan::Gone,
         Some(lease) if lease.expires_ms + RECLAIM_GRACE_MS < now => Orphan::Lapsed,
         Some(_) => Orphan::Live,
     }
@@ -152,6 +242,13 @@ pub struct Committer<D: BlockDevice> {
     /// record is authoritative: this node's view of the cluster may not show
     /// a lend it just made yet.
     lends: std::sync::Mutex<std::collections::HashMap<u32, (String, u64)>>,
+    /// The activity log (opened, or made, on first use).
+    events: tokio::sync::OnceCell<Arc<EventLog<D>>>,
+    /// What `observe` last saw (outer None: not read from the log yet).
+    seen: tokio::sync::Mutex<Option<Option<Observed>>>,
+    /// Which pool disks were online at the last `observe` (in memory: a
+    /// new committer reports the ones offline once).
+    disks_online: std::sync::Mutex<Option<Vec<bool>>>,
 }
 
 /// A writer's lease must have lapsed this long before its metaslabs are
@@ -196,7 +293,143 @@ impl<D: BlockDevice> Committer<D> {
             epoch,
             node,
             lends: std::sync::Mutex::new(lends),
+            events: Default::default(),
+            seen: Default::default(),
+            disks_online: Default::default(),
         }
+    }
+
+    // ---- the activity log (see `crate::events`) ----
+
+    /// The pool's activity log.
+    pub async fn events(&self) -> Result<Arc<EventLog<D>>, FileSystemError> {
+        self.events
+            .get_or_try_init(|| EventLog::open(self.fs.clone()))
+            .await
+            .cloned()
+    }
+
+    /// Add events reported by nodes.
+    pub async fn record(&self, events: Vec<NewEvent>) -> Result<Vec<u64>, FileSystemError> {
+        self.events().await?.append(events, None).await
+    }
+
+    /// Record something that happened here (a change asked of the
+    /// committer, by `by`). A log that can't be written isn't the
+    /// change's failure: it's only reported.
+    pub async fn note(
+        &self,
+        level: Level,
+        kind: &str,
+        subject: String,
+        message: String,
+        by: Option<String>,
+    ) {
+        let e = NewEvent {
+            ts_ms: now_ms(),
+            node: self.node.clone(),
+            level,
+            kind: kind.into(),
+            subject: Some(subject),
+            message,
+            by,
+        };
+        if let Err(err) = self.record(vec![e]).await {
+            eprintln!("committer: recording an event: {}", err);
+        }
+    }
+
+    /// Look at the cluster and the pool's disks, and record what changed
+    /// since the last look (see `crate::events::diff`).
+    pub async fn observe(&self) -> Result<(), FileSystemError> {
+        let log = self.events().await?;
+        let mut seen = self.seen.lock().await;
+        if seen.is_none() {
+            *seen = Some(log.seen().await?);
+        }
+        let state = self.auth.state();
+        let now = now_ms();
+        let me = Held {
+            node: self.node.clone(),
+            epoch: self.epoch,
+        };
+        let new = crate::events::observe(&state, now, me, self.auth.leader());
+        let old = seen.as_ref().and_then(|s| s.as_ref());
+        let mut noticed = Vec::new();
+        if old != Some(&new) {
+            let formats: std::collections::HashMap<String, crate::dataset::DatasetFormat> = self
+                .fs
+                .datasets()
+                .await?
+                .datasets
+                .into_iter()
+                .map(|(n, e)| (n, e.format))
+                .collect();
+            let label = |d: &str| {
+                formats
+                    .get(d)
+                    .map_or("Dataset", |f| crate::events::format_label(*f))
+                    .to_string()
+            };
+            noticed = crate::events::diff(old, &new, &state, &label);
+        }
+        noticed.extend(self.disk_changes());
+        let changed = old != Some(&new);
+        if noticed.is_empty() && !changed {
+            return Ok(());
+        }
+        let events = noticed
+            .into_iter()
+            .map(|(level, kind, subject, message)| NewEvent {
+                ts_ms: now,
+                node: self.node.clone(),
+                level,
+                kind: kind.into(),
+                subject: Some(subject),
+                message,
+                by: None,
+            })
+            .collect();
+        log.append(events, changed.then_some(&new)).await?;
+        *seen = Some(Some(new));
+        Ok(())
+    }
+
+    /// Pool disks that went offline or came back since the last look.
+    fn disk_changes(&self) -> Vec<crate::events::Noticed> {
+        let Some(pool) = self.fs.dev.pool() else {
+            return Vec::new();
+        };
+        let now: Vec<bool> = (0..pool.disks.len())
+            .map(|d| pool.disks.is_online(d))
+            .collect();
+        let nodes = self.auth.disk_nodes();
+        let mut last = self.disks_online.lock().unwrap();
+        let mut out = Vec::new();
+        for (d, &online) in now.iter().enumerate() {
+            let before = last.as_ref().and_then(|l| l.get(d).copied());
+            let name = match nodes.get(&d) {
+                Some(n) => format!("Disk {} ({})", d, n),
+                None => disk_label(d, pool.disks.disks[d].path(), &self.node),
+            };
+            match (before, online) {
+                (Some(true), false) | (None, false) => out.push((
+                    Level::Error,
+                    "disk.offline",
+                    format!("disk/{}", d),
+                    format!("{} is offline", name),
+                )),
+                (Some(false), true) => out.push((
+                    Level::Info,
+                    "disk.online",
+                    format!("disk/{}", d),
+                    format!("{} is back online", name),
+                )),
+                _ => {}
+            }
+        }
+        *last = Some(now);
+        out
     }
 
     pub fn info(&self) -> CommitterInfo {
@@ -297,19 +530,19 @@ impl<D: BlockDevice> Committer<D> {
         }
     }
 
-    pub async fn commit(&self, c: &VolumeCommit) -> Result<Committed, CommitError> {
+    pub async fn commit(&self, c: &DatasetCommit) -> Result<Committed, CommitError> {
         let state = self.auth.state();
         check_lease(&state, &c.writer, None, c.writer_epoch)?;
         check_lease(
             &state,
-            &volume_resource(&c.volume),
-            Some(&c.vol_owner),
-            c.vol_epoch,
+            &dataset_resource(&c.dataset),
+            Some(&c.ds_owner),
+            c.ds_epoch,
         )?;
         let lends = self.lends.lock().unwrap().clone();
         let txg = self
             .fs
-            .apply_volume_commit(c, |idx| {
+            .apply_dataset_commit(c, |idx| {
                 lends
                     .get(&idx)
                     .is_some_and(|(w, e)| *w == c.writer && *e == c.writer_epoch)
@@ -336,32 +569,32 @@ impl<D: BlockDevice> Committer<D> {
             .await
     }
 
-    /// Get `volume` ready for the holder of its `vol/<name>` lease: replay
+    /// Get `volume` ready for the holder of its `ds/<name>` lease: replay
     /// whatever intent log an earlier holder left (it can't add to it any
     /// more: its lease is gone).
-    pub async fn claim_volume(
+    pub async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
         check_lease(
             &self.auth.state(),
-            &volume_resource(volume),
-            Some(vol_owner),
-            vol_epoch,
+            &dataset_resource(volume),
+            Some(ds_owner),
+            ds_epoch,
         )?;
         let vol = self
             .fs
-            .open_volume(volume)
+            .open_dataset(volume)
             .await
             .map_err(|e| CommitError::Refused(format!("volume '{}': {}", volume, e)))?;
         let log = vol.log.lock().unwrap().clone();
         if let Some(l) = log
-            && (l.vol_owner != vol_owner || l.vol_epoch != vol_epoch)
+            && (l.ds_owner != ds_owner || l.ds_epoch != ds_epoch)
         {
             self.fs
-                .replay_volume_log(volume, &l)
+                .replay_dataset_log(volume, &l)
                 .await
                 .map_err(|e| CommitError::Retry(format!("replaying '{}': {}", volume, e)))?;
         }
@@ -370,13 +603,13 @@ impl<D: BlockDevice> Committer<D> {
 
     /// Replay the intent logs of volumes whose writer's lease is gone.
     async fn replay_orphaned_logs(&self) {
-        let Ok(logs) = self.fs.volume_logs().await else {
+        let Ok(logs) = self.fs.dataset_logs().await else {
             return;
         };
         let state = self.auth.state();
         let now = now_ms();
         for (name, l) in logs {
-            let resource = volume_resource(&name);
+            let resource = dataset_resource(&name);
             let fence = match orphan_state(state.leases.get(&resource), &l, now) {
                 Orphan::Live => continue,
                 Orphan::Gone => None,
@@ -385,7 +618,7 @@ impl<D: BlockDevice> Committer<D> {
                     None => continue,
                 },
             };
-            if let Err(e) = self.fs.replay_volume_log(&name, &l).await {
+            if let Err(e) = self.fs.replay_dataset_log(&name, &l).await {
                 eprintln!("committer: replaying the log of '{}': {}", name, e);
             }
             // The log's holder is superseded either way (a failed replay is
@@ -403,16 +636,16 @@ impl<D: BlockDevice> Committer<D> {
         }
     }
 
-    /// Who holds a `vol/<name>` lease while the committer replays its log.
+    /// Who holds a `ds/<name>` lease while the committer replays its log.
     fn replay_owner(&self) -> String {
         format!("{} (log replay)", self.owner)
     }
 
-    /// Take over a lapsed `vol/<name>` lease, so its holder can't renew it
+    /// Take over a lapsed `ds/<name>` lease, so its holder can't renew it
     /// (a lapsed lease can be renewed until someone else is granted it) and
     /// go on acknowledging flushes into a log that's been replayed. Returns
     /// the epoch granted, or None if the lease is live again.
-    async fn fence_lapsed(&self, resource: &str, l: &crate::inode::VolumeLog) -> Option<u64> {
+    async fn fence_lapsed(&self, resource: &str, l: &crate::inode::DatasetLog) -> Option<u64> {
         let op = LeaseOp::Acquire {
             resource: resource.to_string(),
             owner: self.replay_owner(),
@@ -424,7 +657,7 @@ impl<D: BlockDevice> Committer<D> {
             // now on, and its last one was sent over a TTL ago (the lease
             // had expired when this was granted), so it can't be
             // acknowledging anything any more.
-            Ok(Response::Granted { epoch, .. }) if epoch > l.vol_epoch => Some(epoch),
+            Ok(Response::Granted { epoch, .. }) if epoch > l.ds_epoch => Some(epoch),
             Ok(_) => None,
             Err(e) => {
                 eprintln!("committer: fencing {}: {}", resource, e);
@@ -457,6 +690,7 @@ impl<D: BlockDevice> Committer<D> {
     }
 
     pub async fn create_volume(&self, name: &str, size_bytes: u64) -> Result<(), FileSystemError> {
+        check_not_reserved(name)?;
         let vbs = self.fs.default_volblocksize();
         self.fs
             .create_block(name, size_bytes, vbs)
@@ -468,7 +702,7 @@ impl<D: BlockDevice> Committer<D> {
         let state = self.auth.state();
         state
             .leases
-            .get(&volume_resource(name))
+            .get(&dataset_resource(name))
             .filter(|l| !l.released && l.expires_ms > now_ms())
             .map(|l| l.desc.clone())
     }
@@ -480,13 +714,112 @@ impl<D: BlockDevice> Committer<D> {
                 name, by
             )));
         }
-        self.fs.delete(std::path::Path::new(name)).await?;
-        self.fs.close_volume(name);
+        self.fs.delete_volume(name).await?;
         self.fs.sync().await
     }
 
-    pub async fn set_props(&self, name: &str, props: VolumeProps) -> Result<(), FileSystemError> {
-        self.fs.set_volume_props(name, props).await
+    pub async fn set_props(&self, name: &str, props: DatasetProps) -> Result<(), FileSystemError> {
+        if let Ok(e) = self.fs.dataset_entry(name).await {
+            if e.format.is_system() {
+                return Err(reserved(name));
+            }
+            if e.format == crate::dataset::DatasetFormat::Etcd {
+                self.check_etcd_port(name, &props).await?;
+            }
+        }
+        self.fs.set_dataset_props(name, props).await
+    }
+
+    /// Dataset `name`'s kind ("Volume"...) and settings, for describing a
+    /// change to them.
+    pub async fn props_of(&self, name: &str) -> Option<(&'static str, DatasetProps)> {
+        let e = self.fs.dataset_entry(name).await.ok()?;
+        let d = self.fs.read_dnode(e.root).await.ok()?;
+        Some((
+            crate::events::format_label(e.format),
+            d.props.unwrap_or_default(),
+        ))
+    }
+
+    // ---- other datasets: kv, and the services (etcd, s3, queue) ----
+
+    pub async fn datasets(&self) -> Result<Vec<DatasetInfo>, FileSystemError> {
+        self.fs.list_btree_datasets().await
+    }
+
+    /// An etcd dataset needs a port of its own.
+    async fn check_etcd_port(
+        &self,
+        name: &str,
+        props: &DatasetProps,
+    ) -> Result<(), FileSystemError> {
+        let Some(port) = props.port else {
+            return Err(FileSystemError::InvalidArgument(
+                "an etcd dataset needs a port (its clients' port on every node)".into(),
+            ));
+        };
+        for d in self.fs.list_btree_datasets().await? {
+            if d.name != name
+                && d.format == crate::dataset::DatasetFormat::Etcd
+                && d.props.port == Some(port)
+            {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "port {} is etcd dataset '{}'s",
+                    port, d.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn create_dataset(&self, req: &CreateDataset) -> Result<(), FileSystemError> {
+        use crate::dataset::DatasetFormat;
+        check_not_reserved(&req.name)?;
+        match req.format {
+            DatasetFormat::Kv => {
+                self.fs.create_kv(&req.name).await?;
+                return self
+                    .fs
+                    .set_dataset_props(&req.name, req.props.clone())
+                    .await;
+            }
+            DatasetFormat::Etcd => self.check_etcd_port(&req.name, &req.props).await?,
+            DatasetFormat::S3 => check_bucket_name(&req.name)?,
+            DatasetFormat::Queue => check_queue_name(&req.name)?,
+            f => {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "{} datasets are made otherwise",
+                    f.name()
+                )));
+            }
+        }
+        self.fs
+            .create_service(&req.name, req.format, req.props.clone())
+            .await
+            .map(|_| ())
+    }
+
+    /// Delete dataset `name` (not a volume: see `delete_volume`).
+    pub async fn delete_dataset(&self, name: &str) -> Result<(), FileSystemError> {
+        let e = self.fs.dataset_entry(name).await?;
+        if e.format.is_system() {
+            return Err(reserved(name));
+        }
+        if !e.format.is_btree() {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a {} dataset",
+                name,
+                e.format.name()
+            )));
+        }
+        if let Some(by) = self.in_use(name) {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "dataset '{}' is running ({}); disable it first",
+                name, by
+            )));
+        }
+        self.fs.delete_dataset(name).await?;
+        self.fs.sync().await
     }
 
     // ---- snapshots (see `crate::snapshot`) ----
@@ -583,20 +916,20 @@ impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
             .give_back(&self.writer, self.epoch, idx)
             .await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         self.committer.commit(&c).await
     }
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.committer.commit_fs(&c).await
     }
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
         self.committer
-            .claim_volume(volume, vol_owner, vol_epoch)
+            .claim_dataset(volume, ds_owner, ds_epoch)
             .await
     }
 }
@@ -617,15 +950,63 @@ pub struct ReturnRequest {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClaimRequest {
-    pub volume: String,
-    pub vol_owner: String,
-    pub vol_epoch: u64,
+    pub dataset: String,
+    pub ds_owner: String,
+    pub ds_epoch: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateVolume {
     pub name: String,
     pub size_bytes: u64,
+}
+
+/// A dataset to make (see `Committer::create_dataset`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CreateDataset {
+    pub name: String,
+    pub format: crate::dataset::DatasetFormat,
+    #[serde(default)]
+    pub props: DatasetProps,
+}
+
+/// S3's rules for bucket names (those that work as host names).
+pub fn check_bucket_name(name: &str) -> Result<(), FileSystemError> {
+    let ok = (3..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+        && !name.contains("..")
+        && name.parse::<std::net::Ipv4Addr>().is_err();
+    if !ok {
+        return Err(FileSystemError::InvalidArgument(format!(
+            "bad bucket name '{}' (3 to 63 lowercase letters, digits, '.' and '-')",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// SQS's rules for queue names.
+pub fn check_queue_name(name: &str) -> Result<(), FileSystemError> {
+    if name.ends_with(".fifo") {
+        return Err(FileSystemError::InvalidArgument(
+            "FIFO queues aren't supported".into(),
+        ));
+    }
+    let ok = (1..=80).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        return Err(FileSystemError::InvalidArgument(format!(
+            "bad queue name '{}' (1 to 80 letters, digits, '-' and '_')",
+            name
+        )));
+    }
+    Ok(())
 }
 
 /// A snapshot or clone to make.
@@ -640,6 +1021,8 @@ pub struct CommitClient {
     endpoints: Vec<String>,
     http: reqwest::Client,
     writer: Option<(String, u64)>,
+    /// The admin this node asks for (see `crate::auth::Actor`).
+    on_behalf: Option<String>,
     /// Set when the writer gives up (its lease is gone): stop resending.
     pub cancel: Arc<AtomicBool>,
 }
@@ -659,8 +1042,42 @@ impl CommitClient {
                 .build()
                 .expect("http client"),
             writer: None,
+            on_behalf: None,
             cancel: Default::default(),
         }
+    }
+
+    /// The same client, asking on behalf of `who` (an admin's request
+    /// passed on: the activity log says it was theirs).
+    pub fn on_behalf(&self, who: &crate::auth::Principal) -> Self {
+        let mut c = self.clone();
+        c.on_behalf = Some(who.name.clone());
+        c
+    }
+
+    /// Report events (to whichever node is the committer), one try.
+    pub async fn report_events(&self, events: &[NewEvent]) -> Result<Vec<u64>, CommitError> {
+        self.once(reqwest::Method::POST, "/api/v1/pool/events", Some(&events))
+            .await
+    }
+
+    /// A page of the activity log.
+    pub async fn events(
+        &self,
+        q: &crate::events::EventQuery,
+    ) -> Result<crate::events::EventPage, CommitError> {
+        let mut qs = Vec::new();
+        if let Some(a) = q.after {
+            qs.push(format!("after={}", a));
+        }
+        if let Some(b) = q.before {
+            qs.push(format!("before={}", b));
+        }
+        if let Some(l) = q.limit {
+            qs.push(format!("limit={}", l));
+        }
+        let path = format!("/api/v1/pool/events?{}", qs.join("&"));
+        self.once(reqwest::Method::GET, &path, None::<&()>).await
     }
 
     /// The same client, committing as `writer` at `epoch`.
@@ -680,6 +1097,9 @@ impl CommitClient {
         let mut why = Vec::new();
         for ep in &self.endpoints {
             let mut req = self.http.request(method.clone(), format!("{}{}", ep, path));
+            if let Some(who) = &self.on_behalf {
+                req = req.header(crate::auth::ON_BEHALF, who);
+            }
             if let Some(b) = body {
                 req = req.json(b);
             }
@@ -763,7 +1183,33 @@ impl CommitClient {
             .await
     }
 
-    pub async fn set_props(&self, name: &str, props: &VolumeProps) -> Result<(), CommitError> {
+    pub async fn datasets(&self) -> Result<Vec<DatasetInfo>, CommitError> {
+        self.call(
+            reqwest::Method::GET,
+            "/api/v1/pool/datasets",
+            None::<&()>,
+            Some(10),
+        )
+        .await
+    }
+
+    pub async fn create_dataset(&self, req: &CreateDataset) -> Result<(), CommitError> {
+        self.call(
+            reqwest::Method::POST,
+            "/api/v1/pool/datasets",
+            Some(req),
+            Some(10),
+        )
+        .await
+    }
+
+    pub async fn delete_dataset(&self, name: &str) -> Result<(), CommitError> {
+        let path = format!("/api/v1/pool/datasets/{}", name);
+        self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
+            .await
+    }
+
+    pub async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/props", name);
         self.call(reqwest::Method::PUT, &path, Some(props), Some(10))
             .await
@@ -901,7 +1347,7 @@ impl CommitSink for CommitClient {
         )
         .await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         // A flush waits for the committer as long as it takes (a hard mount),
         // unless the writer gives up.
         self.call(reqwest::Method::POST, "/api/v1/pool/commit", Some(&c), None)
@@ -919,16 +1365,16 @@ impl CommitSink for CommitClient {
         )
         .await
     }
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
         let body = ClaimRequest {
-            volume: volume.into(),
-            vol_owner: vol_owner.into(),
-            vol_epoch,
+            dataset: volume.into(),
+            ds_owner: ds_owner.into(),
+            ds_epoch,
         };
         self.call(
             reqwest::Method::POST,
@@ -947,6 +1393,8 @@ pub type CommitterSlot = Arc<tokio::sync::RwLock<Option<Arc<Committer<crate::vde
 
 pub mod routes {
     use super::*;
+    use crate::auth::Actor;
+    use crate::events::EventQuery;
     use rocket::serde::json::Json;
     use rocket::{State, delete, get, post, put};
 
@@ -962,6 +1410,12 @@ pub mod routes {
 
     fn fs_err<T>(r: Result<T, FileSystemError>) -> Json<Result<T, CommitError>> {
         Json(r.map_err(|e| CommitError::Refused(e.to_string())))
+    }
+
+    /// `volume/<name>` (or whatever kind it is).
+    async fn subject_of(c: &Committer<crate::vdev::Pool>, name: &str) -> String {
+        let label = c.props_of(name).await.map_or("Dataset", |p| p.0);
+        format!("{}/{}", label.to_lowercase(), name)
     }
 
     #[get("/api/v1/pool/committer")]
@@ -1002,7 +1456,7 @@ pub mod routes {
     #[post("/api/v1/pool/commit", data = "<req>")]
     pub async fn commit(
         _auth: crate::auth::CanWrite,
-        req: Json<VolumeCommit>,
+        req: Json<DatasetCommit>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<Committed, CommitError>> {
         match current(slot).await {
@@ -1031,7 +1485,7 @@ pub mod routes {
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
             Some(c) => Json(
-                c.claim_volume(&req.volume, &req.vol_owner, req.vol_epoch)
+                c.claim_dataset(&req.dataset, &req.ds_owner, req.ds_epoch)
                     .await,
             ),
             None => not_committer(),
@@ -1049,14 +1503,48 @@ pub mod routes {
         }
     }
 
+    /// Record `message` about `subject` if `r` succeeded.
+    async fn noted<T>(
+        c: &Committer<crate::vdev::Pool>,
+        r: Result<T, FileSystemError>,
+        by: Actor,
+        kind: &str,
+        subject: String,
+        message: impl FnOnce(&T) -> String,
+    ) -> Json<Result<T, CommitError>> {
+        if let Ok(v) = &r {
+            let m = message(v);
+            c.note(Level::Info, kind, subject, m, by.0).await;
+        }
+        fs_err(r)
+    }
+
     #[post("/api/v1/pool/volumes", data = "<req>")]
     pub async fn create(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         req: Json<CreateVolume>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.create_volume(&req.name, req.size_bytes).await),
+            Some(c) => {
+                let r = c.create_volume(&req.name, req.size_bytes).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "volume.created",
+                    format!("volume/{}", req.name),
+                    |_| {
+                        format!(
+                            "Volume '{}' created ({})",
+                            req.name,
+                            crate::events::bytes(req.size_bytes)
+                        )
+                    },
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1064,11 +1552,23 @@ pub mod routes {
     #[delete("/api/v1/pool/volumes/<name>")]
     pub async fn remove(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.delete_volume(name).await),
+            Some(c) => {
+                let r = c.delete_volume(name).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "volume.deleted",
+                    format!("volume/{}", name),
+                    |_| format!("Volume '{}' deleted", name),
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1076,12 +1576,127 @@ pub mod routes {
     #[put("/api/v1/pool/volumes/<name>/props", data = "<props>")]
     pub async fn props(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
-        props: Json<VolumeProps>,
+        props: Json<DatasetProps>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.set_props(name, props.into_inner()).await),
+            Some(c) => {
+                let before = c.props_of(name).await;
+                let new = props.into_inner();
+                let r = c.set_props(name, new.clone()).await;
+                let what = match &before {
+                    Some((label, old)) => {
+                        let d = describe_props(old, &new);
+                        (!d.is_empty()).then_some((*label, d))
+                    }
+                    None => None,
+                };
+                match what {
+                    Some((label, d)) => {
+                        noted(
+                            &c,
+                            r,
+                            by,
+                            "dataset.settings",
+                            format!("{}/{}", label.to_lowercase(), name),
+                            |_| format!("{} '{}': {}", label, name, d),
+                        )
+                        .await
+                    }
+                    None => fs_err(r),
+                }
+            }
+            None => not_committer(),
+        }
+    }
+
+    #[get("/api/v1/pool/events?<q..>")]
+    pub async fn events(
+        _auth: crate::auth::CanRead,
+        q: EventQuery,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<crate::events::EventPage, CommitError>> {
+        match current(slot).await {
+            Some(c) => match c.events().await {
+                Ok(log) => fs_err(log.read(&q).await),
+                Err(e) => fs_err(Err(e)),
+            },
+            None => not_committer(),
+        }
+    }
+
+    /// Nodes report what happened on them.
+    #[post("/api/v1/pool/events", data = "<events>")]
+    pub async fn report_events(
+        _auth: crate::auth::IsNode,
+        events: Json<Vec<NewEvent>>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<Vec<u64>, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.record(events.into_inner()).await),
+            None => not_committer(),
+        }
+    }
+
+    #[get("/api/v1/pool/datasets")]
+    pub async fn datasets(
+        _auth: crate::auth::CanRead,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<Vec<DatasetInfo>, CommitError>> {
+        match current(slot).await {
+            Some(c) => fs_err(c.datasets().await),
+            None => not_committer(),
+        }
+    }
+
+    #[post("/api/v1/pool/datasets", data = "<req>")]
+    pub async fn create_dataset(
+        _auth: crate::auth::CanWrite,
+        by: Actor,
+        req: Json<CreateDataset>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let r = c.create_dataset(&req).await;
+                let label = crate::events::format_label(req.format);
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "dataset.created",
+                    format!("{}/{}", label.to_lowercase(), req.name),
+                    |_| format!("{} '{}' created", label, req.name),
+                )
+                .await
+            }
+            None => not_committer(),
+        }
+    }
+
+    #[delete("/api/v1/pool/datasets/<name>")]
+    pub async fn delete_dataset(
+        _auth: crate::auth::CanWrite,
+        by: Actor,
+        name: &str,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => {
+                let label = c.props_of(name).await.map_or("Dataset", |p| p.0);
+                let r = c.delete_dataset(name).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "dataset.deleted",
+                    format!("{}/{}", label.to_lowercase(), name),
+                    |_| format!("{} '{}' deleted", label, name),
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1101,12 +1716,24 @@ pub mod routes {
     #[post("/api/v1/pool/volumes/<name>/snapshots", data = "<req>")]
     pub async fn snapshot(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         req: Json<NewName>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<u64, CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.create_snapshot(name, &req.name).await),
+            Some(c) => {
+                let r = c.create_snapshot(name, &req.name).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "snapshot.created",
+                    subject_of(&c, name).await,
+                    |_| format!("Snapshot '{}@{}' taken", name, req.name),
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1114,12 +1741,24 @@ pub mod routes {
     #[delete("/api/v1/pool/volumes/<name>/snapshots/<snap>")]
     pub async fn destroy_snapshot(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         snap: &str,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.destroy_snapshot(name, snap).await),
+            Some(c) => {
+                let r = c.destroy_snapshot(name, snap).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "snapshot.destroyed",
+                    subject_of(&c, name).await,
+                    |_| format!("Snapshot '{}@{}' destroyed", name, snap),
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1127,13 +1766,21 @@ pub mod routes {
     #[post("/api/v1/pool/volumes/<name>/snapshots/<snap>/clone", data = "<req>")]
     pub async fn clone_snapshot(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         snap: &str,
         req: Json<NewName>,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.clone_snapshot(name, snap, &req.name).await),
+            Some(c) => {
+                let r = c.clone_snapshot(name, snap, &req.name).await;
+                let subject = subject_of(&c, &req.name).await;
+                noted(&c, r, by, "snapshot.cloned", subject, |_| {
+                    format!("'{}' cloned from '{}@{}'", req.name, name, snap)
+                })
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1141,6 +1788,7 @@ pub mod routes {
     #[post("/api/v1/pool/volumes/<name>/recv?<force>", data = "<data>")]
     pub async fn recv(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         force: Option<bool>,
         data: rocket::Data<'_>,
@@ -1149,7 +1797,17 @@ pub mod routes {
         match current(slot).await {
             Some(c) => {
                 let mut stream = data.open(rocket::data::ByteUnit::max_value());
-                fs_err(c.recv(name, &mut stream, force.unwrap_or(false)).await)
+                let r = c.recv(name, &mut stream, force.unwrap_or(false)).await;
+                let subject = subject_of(&c, name).await;
+                noted(&c, r, by, "snapshot.received", subject, |rep| {
+                    format!(
+                        "'{}' received {} ({})",
+                        name,
+                        rep.snapshot,
+                        crate::events::bytes(rep.data_bytes)
+                    )
+                })
+                .await
             }
             None => not_committer(),
         }
@@ -1172,11 +1830,23 @@ pub mod routes {
     #[post("/api/v1/pool/volumes/<name>/rollback")]
     pub async fn rollback(
         _auth: crate::auth::CanWrite,
+        by: Actor,
         name: &str,
         slot: &State<CommitterSlot>,
     ) -> Json<Result<(), CommitError>> {
         match current(slot).await {
-            Some(c) => fs_err(c.rollback(name).await),
+            Some(c) => {
+                let r = c.rollback(name).await;
+                noted(
+                    &c,
+                    r,
+                    by,
+                    "snapshot.rollback",
+                    subject_of(&c, name).await,
+                    |_| format!("'{}' rolled back to its newest snapshot", name),
+                )
+                .await
+            }
             None => not_committer(),
         }
     }
@@ -1193,13 +1863,18 @@ pub mod routes {
             create,
             remove,
             props,
+            datasets,
+            create_dataset,
+            delete_dataset,
             snapshots,
             snapshot,
             destroy_snapshot,
             clone_snapshot,
             rollback,
             recv,
-            recv_check
+            recv_check,
+            events,
+            report_events
         ]
     }
 }
@@ -1228,6 +1903,7 @@ pub async fn run(
     access: PoolAccess,
     leases: LeaseClient,
     node: String,
+    events: crate::events::EventSink,
 ) {
     loop {
         let held =
@@ -1270,9 +1946,22 @@ pub async fn run(
             "committer: this node commits the pool (epoch {})",
             held.epoch
         );
-        let monitor = crate::scan::spawn_health_monitor(fs.clone(), Duration::from_secs(30));
+        let monitor = crate::scan::spawn_health_monitor(
+            fs.clone(),
+            Duration::from_secs(30),
+            Some(events.clone()),
+        );
         *slot.write().await = Some(committer.clone());
+        let mut observe_failing = false;
         while !lost.load(Ordering::SeqCst) {
+            match committer.observe().await {
+                Ok(()) => observe_failing = false,
+                Err(e) if !observe_failing => {
+                    eprintln!("committer: activity log: {}", e);
+                    observe_failing = true;
+                }
+                Err(_) => {}
+            }
             tokio::time::sleep(Duration::from_secs(2)).await;
             committer.reclaim().await;
         }

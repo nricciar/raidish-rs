@@ -50,6 +50,7 @@ pub async fn listen(
     auth: crate::auth::AuthState,
     nfs: Option<crate::nfs::peers::NfsServers>,
     vms: Option<Arc<crate::vm::VmRuntime>>,
+    events: crate::events::EventSink,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -120,6 +121,7 @@ pub async fn listen(
         .manage(cluster)
         .manage(committer)
         .manage(agent)
+        .manage(events)
         .manage(crate::dashboard::DashboardState { pool: pool_map })
         .manage(crate::nfs::peers::NfsForwarding(nfs))
         .configure(figment)
@@ -136,10 +138,13 @@ pub async fn listen(
                 list_disks,
                 flush_disks,
                 ws_endpoint,
-                agent_status
+                agent_status,
+                activity
             ],
         )
         .mount("/", crate::cluster::routes::routes())
+        .attach(crate::cluster::routes::stop_raft_on_shutdown())
+        .mount("/", crate::frontend::routes::routes())
         .mount("/", crate::committer::routes::routes())
         .mount("/", crate::files_api::routes())
         .mount("/", crate::volumes_api::routes())
@@ -149,6 +154,24 @@ pub async fn listen(
         .launch()
         .await
         .unwrap();
+}
+
+use crate::events::EventQuery;
+
+/// HTTP: GET /api/v1/events - the cluster's activity log (see
+/// `crate::events`), from whichever node is the committer.
+#[get("/api/v1/events?<q..>")]
+async fn activity(
+    _auth: crate::auth::CanRead,
+    q: EventQuery,
+    volumes: &State<crate::volumes_api::VolumesState>,
+) -> Result<rocket::serde::json::Json<crate::events::EventPage>, (rocket::http::Status, String)> {
+    volumes
+        .client
+        .events(&q)
+        .await
+        .map(rocket::serde::json::Json)
+        .map_err(|e| (rocket::http::Status::ServiceUnavailable, e.to_string()))
 }
 
 /// HTTP: GET /api/v1/agent/status - the volumes this node runs.

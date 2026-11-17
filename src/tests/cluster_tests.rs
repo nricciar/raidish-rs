@@ -245,6 +245,7 @@ async fn start_node(name: &str, paths: &[String], port: u16, dir: &std::path::Pa
                 .merge(("log_level", "off")),
         )
         .mount("/", routes::routes())
+        .attach(routes::stop_raft_on_shutdown())
         .ignite()
         .await
         .unwrap();
@@ -370,6 +371,82 @@ async fn three_nodes_elect_grant_and_fail_over() {
     assert_eq!(status.state.pool_epoch(), b.epoch);
 
     for n in &rest {
+        stop_node(n).await;
+    }
+}
+
+/// The leader is stopped the way `docker stop` does it (the server is asked
+/// to shut down, nothing more) just before a follower's next renewal: the
+/// follower's lease must survive the election, renewed by the new leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followers_lease_survives_losing_the_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let nodes = vec![
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+        start_node("n3", &pool, ports[2], dir.path()).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(
+        wait_until(10, || leader_of(&all).is_some()).await,
+        "no leader elected"
+    );
+    let leader = leader_of(&all).unwrap();
+    let old = nodes.iter().find(|n| n.cluster.name == leader).unwrap();
+    let follower = nodes.iter().find(|n| n.cluster.name != leader).unwrap();
+
+    // As an agent does: its own node first, then the others.
+    let mut endpoints = vec![follower.url.clone()];
+    endpoints.extend(
+        nodes
+            .iter()
+            .filter(|n| n.url != follower.url)
+            .map(|n| n.url.clone()),
+    );
+    let client = LeaseClient::new(endpoints);
+    let held = Arc::new(
+        HeldLease::acquire(client, "node/follower", "follower")
+            .await
+            .unwrap(),
+    );
+    let lost = Arc::new(std::sync::Mutex::new(None::<String>));
+    let l = lost.clone();
+    held.hold(move |m| *l.lock().unwrap() = Some(m));
+
+    // Wait for a renewal, then stop the leader just before the next one.
+    let expires = |n: &TestNode| {
+        n.cluster
+            .lease_state("node/follower")
+            .map_or(0, |l| l.expires_ms)
+    };
+    assert!(wait_until(5, || expires(follower) > 0).await);
+    let first = expires(follower);
+    assert!(
+        wait_until(10, || expires(follower) > first).await,
+        "never renewed"
+    );
+    tokio::time::sleep(lease::LEASE_TTL / 3 - std::time::Duration::from_millis(300)).await;
+    let stopped_ms = now_ms();
+    old.shutdown.clone().notify();
+
+    // Well past a TTL later, it's still held, and the new leader renewed it.
+    let rest: Vec<&TestNode> = nodes.iter().filter(|n| n.cluster.name != leader).collect();
+    tokio::time::sleep(lease::LEASE_TTL * 3 / 2).await;
+    assert_eq!(*lost.lock().unwrap(), None, "the follower lost its lease");
+    assert!(held.fresh(), "the lease went stale");
+    assert!(
+        leader_of(&rest).is_some_and(|l| l != leader),
+        "no new leader"
+    );
+    assert!(
+        expires(follower) > stopped_ms + lease::LEASE_TTL.as_millis() as u64,
+        "not renewed since the leader stopped"
+    );
+
+    held.release().await;
+    for n in &nodes {
         stop_node(n).await;
     }
 }
@@ -589,4 +666,46 @@ fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
     assert!(s.nfs_clients.contains_key("6162"));
     assert_eq!(s.apply(&rec("n1", epoch, false, 3000)), Response::Recorded);
     assert!(s.nfs_clients.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_lease_nobody_holds_any_more_is_given_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port()];
+    let pool = urls(&ports);
+    let node = start_node("n1", &pool, ports[0], dir.path()).await;
+    assert!(
+        wait_until(10, || leader_of(&[&node]).is_some()).await,
+        "no leader elected"
+    );
+    let client = LeaseClient::new(vec![node.url.clone()]);
+    // Taken and renewed in the background, then dropped without `release`
+    // (as a start that fails part way does).
+    let a = Arc::new(
+        HeldLease::acquire(client.clone(), "writer/x", "a")
+            .await
+            .unwrap(),
+    );
+    a.hold(|m| panic!("lost: {}", m));
+    let epoch = a.epoch;
+    drop(a);
+    // Given back at the next renewal (a third of a TTL), well before it
+    // would expire.
+    let t = std::time::Instant::now();
+    let b = loop {
+        match HeldLease::acquire(client.clone(), "writer/x", "b").await {
+            Ok(b) => break b,
+            Err(e) => {
+                assert!(
+                    t.elapsed() < lease::LEASE_TTL * 2 / 3,
+                    "still held after {:?}: {}",
+                    t.elapsed(),
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert!(b.epoch > epoch);
+    stop_node(&node).await;
 }

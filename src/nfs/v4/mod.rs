@@ -34,7 +34,7 @@ pub mod attrs;
 pub mod state;
 
 use crate::disk::{BlockDevice, FileId};
-use crate::inode::{ObjType, ROOT_OBJECT, SetAttrs};
+use crate::inode::{ObjType, SetAttrs};
 use crate::nfs::backend::{Backend, status as s3};
 use crate::nfs::rpc::{Call, Cred, Reply};
 use crate::nfs::xdr::{Reader, Writer, XdrError, XdrResult};
@@ -557,7 +557,9 @@ impl<D: BlockDevice + 'static> Server<D> {
     /// Server owner and scope: the pool's, the same on every node.
     async fn identity(&self) -> Vec<u8> {
         let mut id = b"raidish".to_vec();
-        if let Ok(h) = self.backend.handle(ROOT_OBJECT).await {
+        if let Ok(root) = self.backend.root().await
+            && let Ok(h) = self.backend.handle(root).await
+        {
             id.push(b' ');
             id.extend_from_slice(&h[4..12]);
         }
@@ -748,7 +750,10 @@ impl<D: BlockDevice + 'static> Server<D> {
                 })
             }
             op::PUTROOTFH | op::PUTPUBFH => {
-                ctx.cfh = Some(ROOT_OBJECT);
+                ctx.cfh = Some(match self.backend.root().await {
+                    Ok(r) => r,
+                    Err(st) => return Ok(v4(st)),
+                });
                 Ok(err::OK)
             }
             op::READ => self.read(ctx, r, w).await,
@@ -1269,8 +1274,10 @@ impl<D: BlockDevice + 'static> Server<D> {
             Ok(d) => d,
             Err(e) => return Ok(e),
         };
-        if dir == ROOT_OBJECT {
-            return Ok(err::NOENT);
+        match self.backend.root().await {
+            Ok(root) if dir == root => return Ok(err::NOENT),
+            Ok(_) => {}
+            Err(st) => return Ok(v4(st)),
         }
         Ok(match self.backend.lookup(dir, "..").await {
             Ok(a) => {

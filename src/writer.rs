@@ -1,22 +1,23 @@
 //! Several nodes writing one pool: one *committer* and any number of
-//! *volume writers*.
+//! *writers*.
 //!
 //! The committer is the only process that writes the pool's metadata
-//! (inodes, the root index, space maps, uberblocks, labels). A volume
-//! writer runs volumes (each volume on exactly one writer, by its
-//! `vol/<name>` lease) and writes their records and indirect blocks
-//! straight to the disks, but only into metaslabs the committer *lent* it
-//! (`ms/<idx>` grants, see `cluster::state`). When a volume syncs, the
-//! writer builds the new tree exactly as a standalone pool does
-//! (`build_tree`), then hands the committer a [`VolumeCommit`]: the new
+//! (inodes, the dataset directory, space maps, uberblocks, labels). A
+//! writer runs tree datasets (see `crate::dataset`; each on exactly one
+//! writer, by its `ds/<name>` lease) and writes their records and indirect
+//! blocks straight to the disks, but only into metaslabs the committer
+//! *lent* it (`ms/<idx>` grants, see `cluster::state`). When a dataset
+//! syncs, the writer builds the new tree exactly as a standalone pool does
+//! (`build_tree`), then hands the committer a [`DatasetCommit`]: the new
 //! root, what it allocated and what it replaced. The committer checks it,
-//! points the inode at the new root, applies the space changes and commits
-//! a TXG. Only then does the writer switch its readers to the new tree.
+//! points the root object at the new tree, applies the space changes and
+//! commits a TXG. Only then does the writer switch its readers to the new
+//! tree. Posix datasets' files and directories go through [`FsOp`]s.
 //!
-//! A commit is a compare-and-swap on the volume's root, so a writer can
+//! A commit is a compare-and-swap on the dataset's root, so a writer can
 //! resend one after a committer failover: already applied is acknowledged,
 //! anything else is refused. Fencing keeps a writer that lost its metaslab
-//! or its volume from writing (see `crate::fence`).
+//! or its dataset from writing (see `crate::fence`).
 
 use crate::blkptr::BlockPtr;
 use crate::disk::BlockDevice;
@@ -42,14 +43,14 @@ pub struct LentMetaslab {
 
 /// One volume sync, from a writer to the committer.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct VolumeCommit {
-    pub volume: String,
+pub struct DatasetCommit {
+    pub dataset: String,
     /// The writer lease (`writer/...`) and its epoch.
     pub writer: String,
     pub writer_epoch: u64,
-    /// The `vol/<name>` lease owner and epoch.
-    pub vol_owner: String,
-    pub vol_epoch: u64,
+    /// The `ds/<name>` lease owner and epoch.
+    pub ds_owner: String,
+    pub ds_epoch: u64,
     /// The root the tree was built on, and the new one.
     pub base_root: Option<BlockPtr>,
     pub new_root: Option<BlockPtr>,
@@ -67,7 +68,7 @@ pub struct VolumeCommit {
     /// The volume's intent log from now on (see `crate::zil`): a fresh
     /// region (its extent is among `allocs`), or None. The one it replaces
     /// is freed.
-    pub log: Option<crate::inode::VolumeLog>,
+    pub log: Option<crate::inode::DatasetLog>,
     /// The lowest TXG any new block was stamped with (None: no new blocks).
     #[serde(default)]
     pub min_birth: Option<u64>,
@@ -239,33 +240,33 @@ pub trait CommitSink: Send + Sync {
     async fn lease_metaslab(&self, want_blocks: u64) -> Result<LentMetaslab, CommitError>;
     async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError>;
     /// Commit; resends `Retry` answers itself until there is a definite one.
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError>;
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError>;
     /// Commit a namespace change. Like `commit`, a resend of an applied op
     /// is acknowledged.
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError>;
-    /// Get volume `volume` ready to run under its `vol/<name>` lease
-    /// (`vol_owner`, `vol_epoch`): if a previous holder left an intent log,
+    /// Get volume `volume` ready to run under its `ds/<name>` lease
+    /// (`ds_owner`, `ds_epoch`): if a previous holder left an intent log,
     /// the committer replays it first.
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError>;
 }
 
 /// A volume a writer runs.
 pub(crate) struct Attached {
-    /// The `vol/<name>` lease owner and epoch.
+    /// The `ds/<name>` lease owner and epoch.
     pub owner: String,
     pub epoch: u64,
     /// Turns true once that lease is lost: a commit still waiting for the
-    /// committer then gives up (see `attach_volume_until`).
+    /// committer then gives up (see `attach_dataset_until`).
     pub lost: Option<tokio::sync::watch::Receiver<bool>>,
     /// Whether that lease is still provably held (renewed well within its
     /// TTL): an intent-log flush is only acknowledged if so. None: always.
     pub fresh: Option<LeaseCheck>,
-    /// Set by `detach_volume`: its last commit drops the intent log.
+    /// Set by `detach_dataset`: its last commit drops the intent log.
     pub detaching: bool,
 }
 
@@ -275,8 +276,8 @@ pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 /// A writer's side of things.
 pub(crate) struct WriterState {
     pub sink: Arc<dyn CommitSink>,
-    /// Volume name → its lease.
-    pub volumes: std::sync::Mutex<HashMap<String, Attached>>,
+    /// Dataset name → its lease.
+    pub datasets: std::sync::Mutex<HashMap<String, Attached>>,
     /// Metaslabs lent to this writer.
     pub lent: std::sync::Mutex<Vec<u32>>,
     /// Lent metaslabs holding records of a file still being written (not
@@ -304,7 +305,7 @@ impl WriterState {
 
     /// May a flush of volume `name` be acknowledged (see `Attached::fresh`)?
     pub(crate) fn lease_fresh(&self, name: &str) -> bool {
-        self.volumes.lock().unwrap().get(name).is_some_and(|a| {
+        self.datasets.lock().unwrap().get(name).is_some_and(|a| {
             !a.lost.as_ref().is_some_and(|l| *l.borrow()) && a.fresh.as_ref().is_none_or(|f| f())
         })
     }
@@ -341,7 +342,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         fs.writer = Some(Arc::new(WriterState {
             sink,
-            volumes: Default::default(),
+            datasets: Default::default(),
             lent: Default::default(),
             pinned: Default::default(),
         }));
@@ -352,34 +353,34 @@ impl<D: BlockDevice> FileSystem<D> {
         self.writer.is_some()
     }
 
-    /// Start running volume `name` under its `vol/<name>` lease.
-    pub async fn attach_volume(
+    /// Start running volume `name` under its `ds/<name>` lease.
+    pub async fn attach_dataset(
         &self,
         name: &str,
         owner: &str,
         epoch: u64,
     ) -> Result<(), FileSystemError> {
-        self.attach_volume_until(name, owner, epoch, None).await
+        self.attach_dataset_until(name, owner, epoch, None).await
     }
 
-    /// `attach_volume`, where `lost` turns true once the lease is lost. A
+    /// `attach_dataset`, where `lost` turns true once the lease is lost. A
     /// sync waiting for the committer then stops waiting: otherwise a lease
     /// that merely lapsed (nobody took it over) would be answered "retry"
     /// forever, and the sync would never return.
-    pub async fn attach_volume_until(
+    pub async fn attach_dataset_until(
         &self,
         name: &str,
         owner: &str,
         epoch: u64,
         lost: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), FileSystemError> {
-        self.attach_volume_leased(name, owner, epoch, lost, None)
+        self.attach_dataset_leased(name, owner, epoch, lost, None)
             .await
     }
 
-    /// `attach_volume_until`, where `fresh` says whether the lease is still
+    /// `attach_dataset_until`, where `fresh` says whether the lease is still
     /// provably held (see `Attached::fresh`).
-    pub async fn attach_volume_leased(
+    pub async fn attach_dataset_leased(
         &self,
         name: &str,
         owner: &str,
@@ -394,13 +395,13 @@ impl<D: BlockDevice> FileSystem<D> {
                 "not a volume writer".into(),
             ))?;
         // Whatever the last holder logged and acknowledged comes first.
-        w.sink.claim_volume(name, owner, epoch).await?;
+        w.sink.claim_dataset(name, owner, epoch).await?;
         // Reload the index: the volume may have been created, moved here or
         // replayed since this writer opened the pool.
         self.reload_root_index().await?;
-        self.close_volume(name);
-        self.open_volume(name).await?;
-        w.volumes.lock().unwrap().insert(
+        self.close_dataset(name);
+        self.open_dataset(name).await?;
+        w.datasets.lock().unwrap().insert(
             name.to_string(),
             Attached {
                 owner: owner.to_string(),
@@ -414,9 +415,9 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Stop running `name`: sync what's dirty, then forget it.
-    pub async fn detach_volume(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn detach_dataset(&self, name: &str) -> Result<(), FileSystemError> {
         if let Some(w) = &self.writer
-            && let Some(a) = w.volumes.lock().unwrap().get_mut(name)
+            && let Some(a) = w.datasets.lock().unwrap().get_mut(name)
         {
             a.detaching = true;
         }
@@ -426,7 +427,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for _ in 0..3 {
             if r.is_err()
                 || self
-                    .volumes
+                    .open_datasets
                     .lock()
                     .unwrap()
                     .get(name)
@@ -442,26 +443,26 @@ impl<D: BlockDevice> FileSystem<D> {
             r = self.retire_log(&w, name).await;
         }
         if let Some(w) = &self.writer {
-            if let Some(vol) = self.volumes.lock().unwrap().get(name).cloned() {
-                self.set_volume_log(w, &vol, None);
+            if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
+                self.set_dataset_log(w, &vol, None);
                 self.set_cursor(&vol, None);
             }
-            w.volumes.lock().unwrap().remove(name);
+            w.datasets.lock().unwrap().remove(name);
         }
-        self.close_volume(name);
+        self.close_dataset(name);
         r
     }
 
     /// Commit `name` unchanged but without its intent log (a detach).
     async fn retire_log(&self, w: &WriterState, name: &str) -> Result<(), FileSystemError> {
-        let Some(vol) = self.volumes.lock().unwrap().get(name).cloned() else {
+        let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() else {
             return Ok(());
         };
         if vol.log.lock().unwrap().is_none() {
             return Ok(());
         }
-        let Some((vol_owner, vol_epoch)) = w
-            .volumes
+        let Some((ds_owner, ds_epoch)) = w
+            .datasets
             .lock()
             .unwrap()
             .get(name)
@@ -480,12 +481,12 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let (writer, writer_epoch) = w.sink.writer();
         let root = vol.obj.root_ptr();
-        let commit = VolumeCommit {
-            volume: name.to_string(),
+        let commit = DatasetCommit {
+            dataset: name.to_string(),
             writer,
             writer_epoch,
-            vol_owner,
-            vol_epoch,
+            ds_owner,
+            ds_epoch,
             base_root: root.clone(),
             new_root: root,
             allocs: Vec::new(),
@@ -498,22 +499,81 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let c = w.sink.commit(commit).await?;
         self.note_open_txg(c.txg + 1).await;
-        self.set_volume_log(w, &vol, None);
+        self.set_dataset_log(w, &vol, None);
         self.set_cursor(&vol, None);
+        Ok(())
+    }
+
+    /// Report disk misses no commit has reported yet to the committer, in
+    /// a commit of `vol` (attached here) that changes nothing else, and
+    /// wait until it's durable (see `crate::zil`: a flush whose records a
+    /// disk missed isn't acknowledged before that). Waits for a commit in
+    /// progress, which may have reported them already.
+    pub(crate) async fn writer_report_misses(
+        &self,
+        w: &WriterState,
+        vol: &crate::dataset::Dataset,
+    ) -> Result<(), FileSystemError> {
+        let _tx = self.begin_tx().await;
+        let counts = self.miss_counts();
+        let missed: Vec<usize> = {
+            let seen = self.miss_seen.lock().unwrap();
+            (0..counts.len())
+                .filter(|&d| counts[d] != seen[d])
+                .collect()
+        };
+        if missed.is_empty() {
+            return Ok(());
+        }
+        let (ds_owner, ds_epoch) = w
+            .datasets
+            .lock()
+            .unwrap()
+            .get(&vol.name)
+            .map(|a| (a.owner.clone(), a.epoch))
+            .ok_or_else(|| {
+                FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
+            })?;
+        let (writer, writer_epoch) = w.sink.writer();
+        let root = vol.obj.root_ptr();
+        let commit = DatasetCommit {
+            dataset: vol.name.clone(),
+            writer,
+            writer_epoch,
+            ds_owner,
+            ds_epoch,
+            base_root: root.clone(),
+            new_root: root,
+            allocs: Vec::new(),
+            frees: Vec::new(),
+            free_births: Vec::new(),
+            missed: missed.clone(),
+            birth_txg: self.open_txg().await?,
+            // The log as registered: unchanged.
+            log: vol.log.lock().unwrap().clone(),
+            min_birth: None,
+        };
+        let c = w.sink.commit(commit).await?;
+        self.note_open_txg(c.txg + 1).await;
+        // Reported (only now: had it failed, the next try reports them).
+        let mut seen = self.miss_seen.lock().unwrap();
+        for d in missed {
+            seen[d] = seen[d].max(counts[d]);
+        }
         Ok(())
     }
 
     /// Drop `name` without syncing (its lease is gone: nothing may be
     /// written). Its intent log is left for the committer to replay.
-    pub fn abandon_volume(&self, name: &str) {
+    pub fn abandon_dataset(&self, name: &str) {
         if let Some(w) = &self.writer {
-            if let Some(vol) = self.volumes.lock().unwrap().get(name).cloned() {
-                self.set_volume_log(w, &vol, None);
+            if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
+                self.set_dataset_log(w, &vol, None);
                 self.set_cursor(&vol, None);
             }
-            w.volumes.lock().unwrap().remove(name);
+            w.datasets.lock().unwrap().remove(name);
         }
-        self.close_volume(name);
+        self.close_dataset(name);
     }
 
     /// Give every lent metaslab back (after the last sync), except those
@@ -649,14 +709,14 @@ impl<D: BlockDevice> FileSystem<D> {
         out
     }
 
-    /// The writer's commit: sync every volume (each one a `VolumeCommit`),
+    /// The writer's commit: sync every volume (each one a `DatasetCommit`),
     /// then give back full metaslabs.
     pub(crate) async fn writer_commit(&self, w: &WriterState) -> Result<u64, FileSystemError> {
         // A sync stamped below the birth floor is rebuilt (with the TXG
         // the committer sent back) and sent again.
         let mut attempts = 0;
         let result = loop {
-            let volumes = self.sync_volumes().await;
+            let volumes = self.sync_datasets().await;
             let result = volumes.and(self.sync_files().await);
             attempts += 1;
             match result {
@@ -669,17 +729,17 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(self.open_txg().await?.saturating_sub(1))
     }
 
-    /// `sync_volume` for a writer: build the tree in lent space, then have
+    /// `sync_dataset` for a writer: build the tree in lent space, then have
     /// the committer commit it.
-    pub(crate) async fn writer_sync_volume(
+    pub(crate) async fn writer_sync_dataset(
         &self,
         w: &WriterState,
-        vol: &crate::volume::Volume,
+        vol: &crate::dataset::Dataset,
         records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
     ) -> Result<(), FileSystemError> {
-        let (vol_owner, vol_epoch, lost, detaching) = w
-            .volumes
+        let (ds_owner, ds_epoch, lost, detaching) = w
+            .datasets
             .lock()
             .unwrap()
             .get(&vol.name)
@@ -687,7 +747,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
-        let mut span = crate::trace::Span::new("writer.sync_volume");
+        let mut span = crate::trace::Span::new("writer.sync_dataset");
         span.note("records", records.len());
         let log_blocks = if detaching {
             0
@@ -714,13 +774,13 @@ impl<D: BlockDevice> FileSystem<D> {
             from_seq = k;
         }
         regions.extend(new_region.clone());
-        let new_log = (!regions.is_empty()).then(|| crate::inode::VolumeLog {
+        let new_log = (!regions.is_empty()).then(|| crate::inode::DatasetLog {
             regions,
             from_seq,
             writer: writer.clone(),
             writer_epoch,
-            vol_owner: vol_owner.clone(),
-            vol_epoch,
+            ds_owner: ds_owner.clone(),
+            ds_epoch,
         });
         let release_log = async |r: &Option<crate::inode::LogRegion>| {
             if let Some(r) = r {
@@ -758,12 +818,12 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let mut allocs: Vec<(u64, u64)> = allocated.iter().map(ext).collect();
         allocs.extend(new_region.iter().map(crate::zil::region_alloc));
-        let commit = VolumeCommit {
-            volume: vol.name.clone(),
+        let commit = DatasetCommit {
+            dataset: vol.name.clone(),
             writer,
             writer_epoch,
-            vol_owner,
-            vol_epoch,
+            ds_owner,
+            ds_epoch,
             base_root,
             new_root: new_root.ptr.clone(),
             allocs,
@@ -789,7 +849,7 @@ impl<D: BlockDevice> FileSystem<D> {
             Ok(c) => {
                 self.note_open_txg(c.txg + 1).await;
                 vol.obj.set_root(new_root);
-                self.set_volume_log(w, vol, new_log);
+                self.set_dataset_log(w, vol, new_log);
                 if new_region.is_some() {
                     self.set_cursor(vol, new_region);
                 }
@@ -1003,7 +1063,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Apply a writer's namespace change. `lent_to_writer(idx)` as for
-    /// `apply_volume_commit`. Like it, the change is made durable by a
+    /// `apply_dataset_commit`. Like it, the change is made durable by a
     /// commit shared with whatever else was applied meanwhile.
     ///
     /// `object_ok(id)` says whether `c` may change object `id` (the caller
@@ -1120,12 +1180,6 @@ impl<D: BlockDevice> FileSystem<D> {
                             )));
                         }
                         object_ok(e.id)?;
-                        if d.kind == crate::inode::ObjType::Volume {
-                            return Err(refuse(format!(
-                                "{} is a volume (delete it with `volume delete`)",
-                                path
-                            )));
-                        }
                         self.delete_locked(p)
                             .await
                             .map_err(|e| refuse(format!("delete {}: {}", path, e)))?;
@@ -1353,16 +1407,16 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Apply a writer's commit. `lent_to_writer(idx)` says whether metaslab
     /// `idx` is lent to the committing writer (the caller checked the
     /// leases). Returns the durable TXG.
-    pub async fn apply_volume_commit(
+    pub async fn apply_dataset_commit(
         &self,
-        c: &VolumeCommit,
+        c: &DatasetCommit,
         lent_to_writer: impl Fn(u32) -> bool,
     ) -> Result<u64, CommitError> {
         let mut span = crate::trace::Span::new("committer.apply");
         {
             let _tx = self.begin_tx().await;
             span.mark("begin_tx");
-            self.stage_volume_commit(c, &lent_to_writer).await?;
+            self.stage_dataset_commit(c, &lent_to_writer).await?;
             span.mark("stage");
         }
         // A resend after a failure here is acknowledged by the root check.
@@ -1372,16 +1426,16 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Apply `c` in memory, in the open TXG (the caller holds `begin_tx`).
-    async fn stage_volume_commit(
+    async fn stage_dataset_commit(
         &self,
-        c: &VolumeCommit,
+        c: &DatasetCommit,
         lent_to_writer: &impl Fn(u32) -> bool,
     ) -> Result<(), CommitError> {
         let refuse = |m: String| CommitError::Refused(m);
         let vol = self
-            .open_volume(&c.volume)
+            .open_dataset(&c.dataset)
             .await
-            .map_err(|e| refuse(format!("volume '{}': {}", c.volume, e)))?;
+            .map_err(|e| refuse(format!("dataset '{}': {}", c.dataset, e)))?;
         let current = vol.obj.root_ptr();
         if current == c.new_root && c.new_root != c.base_root {
             // A resend of a commit already applied: just make sure it's durable.
@@ -1389,19 +1443,19 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         if current != c.base_root {
             return Err(refuse(format!(
-                "volume '{}' moved on (its root isn't the one this sync was built on)",
-                c.volume
+                "dataset '{}' moved on (its root isn't the one this sync was built on)",
+                c.dataset
             )));
         }
 
         // An intent log left by an earlier holder must be replayed first
-        // (attaching claims the volume, see `claim_volume`).
+        // (attaching claims the volume, see `claim_dataset`).
         if let Some(l) = vol.log.lock().unwrap().as_ref()
-            && (l.vol_owner != c.vol_owner || l.vol_epoch != c.vol_epoch)
+            && (l.ds_owner != c.ds_owner || l.ds_epoch != c.ds_epoch)
         {
             return Err(refuse(format!(
-                "volume '{}' has an unreplayed intent log from {}",
-                c.volume, l.writer
+                "dataset '{}' has an unreplayed intent log from {}",
+                c.dataset, l.writer
             )));
         }
         if let Some(l) = &c.log {
@@ -1410,14 +1464,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 current.as_ref().is_some_and(|o| o.regions.contains(r))
                     || c.allocs.contains(&crate::zil::region_alloc(r))
             };
-            if l.vol_owner != c.vol_owner
-                || l.vol_epoch != c.vol_epoch
+            if l.ds_owner != c.ds_owner
+                || l.ds_epoch != c.ds_epoch
                 || l.writer != c.writer
                 || !l.regions.iter().all(known)
             {
                 return Err(refuse(format!(
-                    "volume '{}': intent log doesn't belong to this commit",
-                    c.volume
+                    "dataset '{}': intent log doesn't belong to this commit",
+                    c.dataset
                 )));
             }
         }
@@ -1428,7 +1482,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .await?;
         let old_log = std::mem::replace(&mut *vol.log.lock().unwrap(), c.log.clone());
 
-        if let Err(e) = self.update_volume_dnode(&vol, c.new_root.clone()).await {
+        if let Err(e) = self.update_dataset_dnode(&vol, c.new_root.clone()).await {
             for &(start, len) in &c.allocs {
                 self.unallocate(start, len).await;
             }

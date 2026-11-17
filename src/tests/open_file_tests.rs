@@ -208,8 +208,13 @@ async fn rename_refuses_what_it_must() {
     refused(fs.rename(Path::new("/d"), Path::new("/full")).await);
     refused(fs.rename(Path::new("/f"), Path::new("/d")).await);
     refused(fs.rename(Path::new("/d"), Path::new("/f")).await);
+    // A volume is a dataset, not an entry in `/`: neither renamed this
+    // way, nor in the way of a file of the same name.
     refused(fs.rename(Path::new("/vol"), Path::new("/vol2")).await);
-    refused(fs.rename(Path::new("/f"), Path::new("/vol")).await);
+    fs.rename(Path::new("/f"), Path::new("/vol")).await.unwrap();
+    assert_eq!(fs.read_file(Path::new("/vol")).await.unwrap(), b"f");
+    assert_eq!(fs.list_volumes().await.unwrap().len(), 1);
+    fs.rename(Path::new("/vol"), Path::new("/f")).await.unwrap();
     refused(fs.rename(Path::new("/nope"), Path::new("/x")).await);
     // A directory over an empty one is fine.
     fs.mkdir(Path::new("/empty")).await.unwrap();

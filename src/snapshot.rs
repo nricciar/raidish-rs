@@ -1,10 +1,12 @@
-//! Volume snapshots and clones.
+//! Snapshots and clones of tree datasets (see `crate::dataset`; today the
+//! volumes, which the rest of this describes).
 //!
 //! A snapshot is a volume's tree as it was committed at some TXG, kept
-//! read-only as an object of its own (`ObjType::Snapshot`). Nothing is
-//! copied: the snapshot's dnode points at the same root, so the volume and
-//! the snapshot share every block until the volume overwrites one. A clone
-//! is a new volume whose tree starts as a snapshot's.
+//! read-only as an object of its own (`ObjType::Snapshot`), named
+//! `volume@snapshot`. Nothing is copied: the snapshot's dnode points at the
+//! same root, so the volume and the snapshot share every block until the
+//! volume overwrites one. A clone is a new dataset of the same format whose
+//! tree starts as a snapshot's.
 //!
 //! Which blocks are whose follows from birth TXGs (exact, see
 //! `FileSystem::raise_birth_floor`):
@@ -41,10 +43,9 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Dnode, Lineage, ObjType, ROOT_OBJECT, SnapRef};
+use crate::inode::{Dnode, Lineage, ObjType, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 
 /// A snapshot as listed.
@@ -125,12 +126,15 @@ fn short(r: &SnapRef) -> &str {
 impl<D: BlockDevice> FileSystem<D> {
     /// The volume `name` and its dnode (a volume, not a snapshot).
     async fn head(&self, name: &str) -> Result<(FileId, Dnode), FileSystemError> {
-        let id = self.volume_id(name).await?;
-        let d = self.read_dnode(id).await?;
-        if d.kind != ObjType::Volume {
+        let e = self.dataset_entry(name).await?;
+        if !e.format.is_tree() {
             return Err(FileSystemError::NotAFile);
         }
-        Ok((id, d))
+        let d = self.read_dnode(e.root).await?;
+        if d.kind != e.format.root_kind() {
+            return Err(FileSystemError::NotAFile);
+        }
+        Ok((e.root, d))
     }
 
     /// Blocks born at or before this are object `id`'s snapshots' (or
@@ -261,7 +265,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn list_snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, FileSystemError> {
         let (_, head) = self.head(name).await?;
         let (origin, snapshots) = head_lineage(&head);
-        let names = self.volume_names().await?;
+        let names = self.dataset_names().await?;
         let mut out = Vec::new();
         for (i, r) in snapshots.iter().enumerate() {
             let d = self.read_dnode(r.id).await?;
@@ -297,19 +301,6 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(out)
     }
 
-    /// Volume names by object number.
-    async fn volume_names(
-        &self,
-    ) -> Result<std::collections::HashMap<FileId, String>, FileSystemError> {
-        let (_, _, root) = self.resolve_dir(&[]).await?;
-        Ok(root
-            .files
-            .into_iter()
-            .filter(|(_, e)| e.kind == ObjType::Volume)
-            .map(|(n, e)| (e.id, n))
-            .collect())
-    }
-
     /// Destroy snapshot `name@snap`, freeing what only it referenced.
     /// Refused while clones of it exist.
     pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
@@ -325,7 +316,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(Lineage::Snapshot { clones, .. }) = &d.lineage
             && !clones.is_empty()
         {
-            let names = self.volume_names().await?;
+            let names = self.dataset_names().await?;
             let list: Vec<String> = clones
                 .iter()
                 .map(|c| names.get(c).cloned().unwrap_or_else(|| format!("#{}", c)))
@@ -380,15 +371,14 @@ impl<D: BlockDevice> FileSystem<D> {
             .cloned()
             .ok_or(FileSystemError::FileNotFound)?;
         let mut s = self.read_dnode(r.id).await?;
-        let l = self.lookup(Path::new(new)).await?;
-        if l.parent_id != ROOT_OBJECT {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}': volumes live in the root directory",
-                new
-            )));
-        }
-        let mut c = Dnode::volume(s.blksz, s.size, s.tree.levels);
+        let format = self.dataset_entry(name).await?.format;
+        let mut c = head.clone();
+        c.kind = format.root_kind();
+        c.blksz = s.blksz;
+        c.size = s.size;
         c.tree = s.tree.clone();
+        c.attrs = crate::inode::Attrs::new(head.attrs.mode);
+        c.log = None;
         c.props = head.props.clone().map(|mut p| {
             // A new volume: placed and started only when asked to.
             p.enabled = false;
@@ -396,7 +386,7 @@ impl<D: BlockDevice> FileSystem<D> {
             p
         });
         set_head_lineage(&mut c, Some(r.clone()), Vec::new());
-        let cid = self.link_new(l, c).await?;
+        let cid = self.create_dataset_locked(new, format, c).await?;
         if let Some(Lineage::Snapshot { clones, .. }) = &mut s.lineage {
             clones.push(cid);
         }
@@ -432,7 +422,7 @@ impl<D: BlockDevice> FileSystem<D> {
         head.attrs.touch();
         self.write_dnode(id, Some(head)).await?;
         // Its dirty records go with the cached volume.
-        self.close_volume(name);
+        self.close_dataset(name);
         for p in &gone {
             self.free(p.lba, p.asize as u64).await?;
         }
@@ -481,7 +471,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Before volume `d` (object `id`) is deleted: refuse if it has
     /// snapshots; for a clone, take it off its origin's list. Returns the
     /// TXG at or before which its blocks aren't its own to free.
-    pub(crate) async fn unlink_volume_lineage(
+    pub(crate) async fn unlink_dataset_lineage(
         &self,
         id: FileId,
         d: &Dnode,

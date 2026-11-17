@@ -194,7 +194,7 @@ impl V4Cluster for ClusterPeers {
             .iter()
             .map(|(id, h)| v4::Device {
                 id: *id,
-                node: format!("node-{}", id),
+                node: crate::cluster::members::node_name(*id),
                 addr: self.resolve(h),
                 port: self.port,
             })

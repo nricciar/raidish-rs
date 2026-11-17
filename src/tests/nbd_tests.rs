@@ -227,10 +227,10 @@ async fn remove_export_flushes_and_closes_its_connections() {
     let (mut b, _) = Client::connect_to(addr, "beta").await.unwrap();
     let data = vec![0x5Au8; 4096];
     assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
-    assert!(fs.has_dirty_volumes(), "write not yet committed");
+    assert!(fs.has_dirty_datasets(), "write not yet committed");
 
     assert!(server.remove_export("alpha").await.unwrap());
-    assert!(!fs.has_dirty_volumes(), "removal commits");
+    assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut a.s).await;
     assert_eq!(server.exports(), vec!["beta"]);
 
@@ -337,7 +337,7 @@ async fn trim_and_write_zeroes_accept_huge_ranges() {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
-    let vol = fs.open_volume("vol").await.unwrap();
+    let vol = fs.open_dataset("vol").await.unwrap();
     let used: u64 = fs
         .tree_extents(&vol.obj.root())
         .await

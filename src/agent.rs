@@ -1,5 +1,5 @@
 //! The node agent: every `listen` node runs one. It decides which volumes
-//! belong on this node (their placement settings, see `inode::VolumeProps`),
+//! belong on this node (their placement settings, see `inode::DatasetProps`),
 //! runs them as a volume writer (see `crate::writer`), exports them over
 //! NBD or NVMe/TCP and attaches the kernel device.
 //!
@@ -7,14 +7,15 @@
 //! runs on the first live node of its list (any live node with an empty
 //! list) and *stays* where it runs while that node is live: there's no
 //! fail-back, only `volume move`. Who actually runs it is decided by its
-//! `vol/<name>` lease, so two agents that both think a volume is theirs
+//! `ds/<name>` lease, so two agents that both think a volume is theirs
 //! can't both run it.
 
 use crate::cluster::Cluster;
 use crate::cluster::lease::{HeldLease, LeaseClient};
-use crate::committer::{CommitClient, PoolAccess, volume_resource};
+use crate::committer::{CommitClient, PoolAccess, dataset_resource};
+use crate::events::{EventSink, Level};
 use crate::fs::FileSystem;
-use crate::inode::{Transport, VolumeProps};
+use crate::inode::{DatasetProps, Transport};
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
 use crate::vdev::Pool;
@@ -73,8 +74,23 @@ impl AutomountConfig {
 
 /// Which node should run a volume, given who runs it now (`holder`) and
 /// which nodes are live. None: nowhere.
-pub fn place(props: &VolumeProps, holder: Option<&str>, live: &BTreeSet<String>) -> Option<String> {
-    if !props.enabled || props.automount.is_none() {
+pub fn place(
+    props: &DatasetProps,
+    holder: Option<&str>,
+    live: &BTreeSet<String>,
+) -> Option<String> {
+    props.automount?;
+    place_on(props, holder, live)
+}
+
+/// Which of the `live` nodes should run a dataset (enabled, by its node
+/// list), given who runs it now.
+pub fn place_on(
+    props: &DatasetProps,
+    holder: Option<&str>,
+    live: &BTreeSet<String>,
+) -> Option<String> {
+    if !props.enabled {
         return None;
     }
     let allowed = |n: &str| props.nodes.is_empty() || props.nodes.iter().any(|x| x == n);
@@ -120,10 +136,34 @@ pub struct AgentStatus {
 
 pub type AgentState = Arc<std::sync::RwLock<AgentStatus>>;
 
+/// Why a volume or service dataset didn't start here.
+#[derive(Debug)]
+enum StartError {
+    /// Its lease wasn't to be had (someone else still holds it, or the
+    /// cluster can't be asked): not its failure, it's tried again.
+    Busy(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Busy(e) | StartError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 struct Running {
     lease: Arc<HeldLease>,
     lost: Lost,
     info: RunningVolume,
+}
+
+/// A service dataset this agent runs (see `crate::frontend`).
+struct RunningService {
+    lease: Arc<HeldLease>,
+    lost: Lost,
+    format: crate::dataset::DatasetFormat,
 }
 
 /// This node's volume writer: its lease, the pool in writer role, the
@@ -165,6 +205,11 @@ pub struct Agent {
     specs: BTreeMap<String, crate::vm::VmSpec>,
     /// VMs asked to shut down here, and when.
     stopping: BTreeMap<String, std::time::Instant>,
+    /// This node's service front ends (None: it serves none).
+    frontend: Option<Arc<crate::frontend::Frontend>>,
+    services: BTreeMap<String, RunningService>,
+    /// What this agent does goes to the activity log (see `crate::events`).
+    events: EventSink,
 }
 
 impl Agent {
@@ -178,6 +223,7 @@ impl Agent {
         files: crate::files_api::WriterSlot,
     ) -> Self {
         state.write().unwrap().node = node.clone();
+        let events = EventSink::new(&node);
         Agent {
             node,
             cluster,
@@ -193,7 +239,22 @@ impl Agent {
             vm: None,
             specs: BTreeMap::new(),
             stopping: BTreeMap::new(),
+            frontend: None,
+            services: BTreeMap::new(),
+            events,
         }
+    }
+
+    /// Run service datasets too (see `crate::frontend`).
+    pub fn with_frontend(mut self, fe: Arc<crate::frontend::Frontend>) -> Self {
+        self.frontend = Some(fe);
+        self
+    }
+
+    /// Report to this activity log sink (otherwise events stay here).
+    pub fn with_events(mut self, events: EventSink) -> Self {
+        self.events = events;
+        self
     }
 
     /// Run VMs too (see `crate::vm`).
@@ -212,8 +273,13 @@ impl Agent {
         (host, config.nbd_port())
     }
 
+    /// What this agent's leases say: who it is, and (if it serves) where
+    /// others reach it.
     fn desc(&self) -> String {
-        format!("{}{}", DESC_PREFIX, self.node)
+        match &self.frontend {
+            Some(fe) => format!("{}{} @{}", DESC_PREFIX, self.node, fe.addr()),
+            None => format!("{}{}", DESC_PREFIX, self.node),
+        }
     }
 
     /// Keep `node/<name>` and run the placement loop, forever.
@@ -277,14 +343,53 @@ impl Agent {
         }
         for name in lost {
             eprintln!("agent: lost the lease on volume '{}'", name);
+            self.events.error(
+                "volume.lost",
+                format!("volume/{}", name),
+                format!(
+                    "Volume '{}' stopped on {}: its lease was lost",
+                    name, self.node
+                ),
+            );
             self.stop(&name, false).await;
+        }
+        let lost: Vec<String> = self
+            .services
+            .iter()
+            .filter(|(_, r)| r.lost.is_lost())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in lost {
+            eprintln!("agent: lost the lease on dataset '{}'", name);
+            let label = self.service_label(&name);
+            self.events.error(
+                "dataset.lost",
+                format!("{}/{}", label.to_lowercase(), name),
+                format!(
+                    "{} '{}' stopped on {}: its lease was lost",
+                    label, name, self.node
+                ),
+            );
+            self.stop_service(&name, false).await;
         }
         if self.writer.as_ref().is_some_and(|w| w.lost.is_lost()) {
             eprintln!("agent: lost the writer lease; dropping every volume");
+            self.events.error(
+                "node.writer_lost",
+                format!("node/{}", self.node),
+                format!(
+                    "{} lost its writer lease: everything it ran was stopped",
+                    self.node
+                ),
+            );
             let names: Vec<String> = self.running.keys().cloned().collect();
             self.destroy_vms_using(&names).await;
             for name in names {
                 self.stop(&name, false).await;
+            }
+            let names: Vec<String> = self.services.keys().cloned().collect();
+            for name in names {
+                self.stop_service(&name, false).await;
             }
             self.writer = None;
             *self.files.write().unwrap() = None;
@@ -317,14 +422,9 @@ impl Agent {
         let holder = |name: &str| -> Option<String> {
             state
                 .leases
-                .get(&volume_resource(name))
+                .get(&dataset_resource(name))
                 .filter(|l| !l.released && l.expires_ms > now)
-                .map(|l| {
-                    l.desc
-                        .strip_prefix(DESC_PREFIX)
-                        .unwrap_or(&l.desc)
-                        .to_string()
-                })
+                .map(|l| crate::frontend::parse_desc(&l.desc).0)
         };
 
         let by_name: BTreeMap<&str, &VolumeInfo> =
@@ -332,13 +432,13 @@ impl Agent {
         // A VM's volumes are placed by its anchor's settings and holder, so
         // they all land on one node, exported over NBD for qemu (and not
         // attached to the host kernel).
-        let mut vm_place: BTreeMap<String, (VolumeProps, Option<String>)> = BTreeMap::new();
+        let mut vm_place: BTreeMap<String, (DatasetProps, Option<String>)> = BTreeMap::new();
         if self.vm.is_some() {
             for spec in self.specs.values().filter(|s| s.usable()) {
                 let Some(anchor) = by_name.get(spec.anchor.as_str()) else {
                     continue;
                 };
-                let props = VolumeProps {
+                let props = DatasetProps {
                     automount: Some(Transport::Nbd),
                     ..anchor.props.clone()
                 };
@@ -350,13 +450,13 @@ impl Agent {
                 }
             }
         }
-        let target = |name: &str, own: &VolumeProps| -> Option<String> {
+        let target = |name: &str, own: &DatasetProps| -> Option<String> {
             match vm_place.get(name) {
                 Some((p, h)) => place(p, h.as_deref(), &live),
                 None => place(own, holder(name).as_deref(), &live),
             }
         };
-        let transport = |name: &str, own: &VolumeProps| -> Option<Transport> {
+        let transport = |name: &str, own: &DatasetProps| -> Option<Transport> {
             match vm_place.get(name) {
                 Some((p, _)) => p.automount,
                 None => own.automount,
@@ -404,6 +504,11 @@ impl Agent {
         for name in stop {
             println!("agent: stopping volume '{}' here", name);
             self.stop(&name, true).await;
+            self.events.info(
+                "volume.stopped",
+                format!("volume/{}", name),
+                format!("Volume '{}' stopped on {}", name, self.node),
+            );
         }
         // Start what belongs here.
         for v in &volumes {
@@ -422,8 +527,23 @@ impl Agent {
             let attach = !vm_place.contains_key(&v.name);
             if let Err(e) = self.start(v, t, attach).await {
                 eprintln!("agent: starting volume '{}': {}", v.name, e);
+                let StartError::Failed(e) = e else {
+                    continue;
+                };
+                self.events.once(
+                    &format!("volume/{}", v.name),
+                    Level::Error,
+                    "volume.start_failed",
+                    format!("volume/{}", v.name),
+                    format!(
+                        "Volume '{}' failed to start on {}: {}",
+                        v.name, self.node, e
+                    ),
+                );
             }
         }
+
+        self.tick_services(&state, now, &live).await;
 
         // VMs.
         let Some(vm) = self.vm.clone() else {
@@ -455,6 +575,14 @@ impl Agent {
                 if let Err(e) = vm.virsh.destroy(name).await {
                     eprintln!("agent: {}", e);
                 }
+                self.events.warn(
+                    "vm.orphan",
+                    format!("vm/{}", name),
+                    format!(
+                        "VM '{}' was running on {} without its volumes held there; destroyed it",
+                        name, self.node
+                    ),
+                );
                 self.stopping.remove(name);
                 continue;
             }
@@ -471,6 +599,11 @@ impl Agent {
             match self.stopping.get(name) {
                 None => {
                     println!("agent: shutting VM '{}' down", name);
+                    self.events.info(
+                        "vm.stopping",
+                        format!("vm/{}", name),
+                        format!("VM '{}' shutting down on {}", name, self.node),
+                    );
                     if let Err(e) = vm.virsh.shutdown(name).await {
                         eprintln!("agent: {}", e);
                     }
@@ -482,11 +615,28 @@ impl Agent {
                         "agent: VM '{}' didn't shut down in {:?}; destroying it",
                         name, vm.shutdown_timeout
                     );
+                    self.events.warn(
+                        "vm.forced_off",
+                        format!("vm/{}", name),
+                        format!(
+                            "VM '{}' didn't shut down in {:?}; forced it off",
+                            name, vm.shutdown_timeout
+                        ),
+                    );
                     if let Err(e) = vm.virsh.destroy(name).await {
                         eprintln!("agent: {}", e);
                     }
                 }
                 Some(_) => {}
+            }
+        }
+        for n in self.stopping.keys() {
+            if !ours.iter().any(|v| &v.domain.name == n) {
+                self.events.info(
+                    "vm.stopped",
+                    format!("vm/{}", n),
+                    format!("VM '{}' stopped on {}", n, self.node),
+                );
             }
         }
         self.stopping
@@ -503,15 +653,29 @@ impl Agent {
                 continue;
             }
             if let Some(e) = &spec.error {
+                self.events.once(
+                    &format!("vm/{}", spec.name),
+                    Level::Warn,
+                    "vm.invalid",
+                    format!("vm/{}", spec.name),
+                    format!("VM '{}' can't start: {}", spec.name, e),
+                );
                 errors.insert(spec.name.clone(), e.clone());
                 continue;
             }
             if let Some(d) = doms.iter().find(|d| d.name == spec.name && d.id.is_some()) {
                 if !ours.iter().any(|v| v.domain.name == d.name) {
-                    errors.insert(
-                        spec.name.clone(),
-                        format!("a domain '{}' not run by raidish is running here", d.name),
+                    let e = format!("a domain '{}' not run by raidish is running here", d.name);
+                    self.events.once(
+                        &format!("vm/{}", spec.name),
+                        Level::Warn,
+                        "vm.conflict",
+                        format!("vm/{}", spec.name),
+                        format!("VM '{}' can't start on {}: {}", spec.name, self.node, e),
                     );
+                    errors.insert(spec.name.clone(), e);
+                } else {
+                    self.events.clear(&format!("vm/{}", spec.name));
                 }
                 continue;
             }
@@ -524,9 +688,24 @@ impl Agent {
                 Err(e) => Err(e),
             };
             match started {
-                Ok(()) => println!("agent: started VM '{}' here", spec.name),
+                Ok(()) => {
+                    println!("agent: started VM '{}' here", spec.name);
+                    self.events.clear(&format!("vm/{}", spec.name));
+                    self.events.info(
+                        "vm.started",
+                        format!("vm/{}", spec.name),
+                        format!("VM '{}' started on {}", spec.name, self.node),
+                    );
+                }
                 Err(e) => {
                     eprintln!("agent: starting VM '{}': {}", spec.name, e);
+                    self.events.once(
+                        &format!("vm/{}", spec.name),
+                        Level::Error,
+                        "vm.start_failed",
+                        format!("vm/{}", spec.name),
+                        format!("VM '{}' failed to start on {}: {}", spec.name, self.node, e),
+                    );
                     errors.insert(spec.name.clone(), e);
                 }
             }
@@ -550,6 +729,14 @@ impl Agent {
                     "agent: destroying VM '{}' (its volume lease is gone)",
                     v.domain.name
                 );
+                self.events.error(
+                    "vm.killed",
+                    format!("vm/{}", v.domain.name),
+                    format!(
+                        "VM '{}' was killed on {}: its volume lease was lost",
+                        v.domain.name, self.node
+                    ),
+                );
                 if let Err(e) = vm.virsh.destroy(&v.domain.name).await {
                     eprintln!("agent: {}", e);
                 }
@@ -568,11 +755,15 @@ impl Agent {
             // committer (it would answer "retry" for as long as nobody
             // else takes the lease, which for `writer/<node>` is forever).
             let lost = hold(&lease, Some(sink.cancel.clone()));
-            let fs = Arc::new(
-                FileSystem::load_writer(self.access.open().await, Arc::new(sink))
-                    .await
-                    .map_err(|e| format!("opening the pool: {}", e))?,
-            );
+            let fs = match FileSystem::load_writer(self.access.open().await, Arc::new(sink)).await {
+                Ok(fs) => Arc::new(fs),
+                Err(e) => {
+                    // Let go now, so the next tick can take it again
+                    // (dropping it would too, a little later).
+                    lease.release().await;
+                    return Err(format!("opening the pool: {}", e));
+                }
+            };
             let bind = self.config.bind();
             let nbd = Arc::new(NbdServer::with_bind(
                 fs.clone(),
@@ -633,16 +824,21 @@ impl Agent {
         v: &VolumeInfo,
         transport: Transport,
         attach: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), StartError> {
         let lease = Arc::new(
-            HeldLease::acquire(self.leases.clone(), &volume_resource(&v.name), &self.desc())
-                .await?,
+            HeldLease::acquire(
+                self.leases.clone(),
+                &dataset_resource(&v.name),
+                &self.desc(),
+            )
+            .await
+            .map_err(StartError::Busy)?,
         );
         let lost = hold(&lease, None);
         let started = async {
             let w = self.ensure_writer().await?;
             let l = lease.clone();
-            w.fs.attach_volume_leased(
+            w.fs.attach_dataset_leased(
                 &v.name,
                 &lease.owner,
                 lease.epoch,
@@ -660,10 +856,10 @@ impl Agent {
         .await;
         if let Err(e) = started {
             if let Some(w) = &self.writer {
-                w.fs.abandon_volume(&v.name);
+                w.fs.abandon_dataset(&v.name);
             }
             lease.release().await;
-            return Err(e);
+            return Err(StartError::Failed(e));
         }
         let (device, note) = if !attach {
             (None, None)
@@ -682,15 +878,38 @@ impl Agent {
                 .map(|d| format!(" on {}", d))
                 .unwrap_or_default()
         );
+        self.events.clear(&format!("volume/{}", v.name));
+        self.events.info(
+            "volume.started",
+            format!("volume/{}", v.name),
+            format!(
+                "Volume '{}' started on {} ({}{})",
+                v.name,
+                self.node,
+                transport,
+                device
+                    .as_deref()
+                    .map(|d| format!(" on {}", d))
+                    .unwrap_or_default()
+            ),
+        );
         if let Some(n) = &note {
             eprintln!(
                 "agent: volume '{}' exported but not attached: {}",
                 v.name, n
             );
+            self.events.warn(
+                "volume.not_attached",
+                format!("volume/{}", v.name),
+                format!(
+                    "Volume '{}' is exported but not attached on {}: {}",
+                    v.name, self.node, n
+                ),
+            );
         }
         // Moved here on request: done, clear the request.
         if v.props.move_to.as_deref() == Some(&self.node) {
-            let props = VolumeProps {
+            let props = DatasetProps {
                 move_to: None,
                 ..v.props.clone()
             };
@@ -714,6 +933,188 @@ impl Agent {
         Ok(())
     }
 
+    /// Place, start and stop the service datasets (see `crate::frontend`),
+    /// and tell the front ends where each runs.
+    async fn tick_services(
+        &mut self,
+        state: &crate::cluster::state::ClusterState,
+        now: u64,
+        live: &BTreeSet<String>,
+    ) {
+        let Some(fe) = self.frontend.clone() else {
+            return;
+        };
+        let Ok(datasets) = self.committer.datasets().await else {
+            return;
+        };
+        let lease_of = |resource: &str| {
+            state
+                .leases
+                .get(resource)
+                .filter(|l| !l.released && l.expires_ms > now)
+        };
+        // The live nodes that serve, and where.
+        let nodes: BTreeMap<String, String> = live
+            .iter()
+            .filter_map(|n| {
+                let (_, addr) = crate::frontend::parse_desc(&lease_of(&node_resource(n))?.desc);
+                Some((n.clone(), addr?))
+            })
+            .collect();
+        let serving: BTreeSet<String> = nodes.keys().cloned().collect();
+        let mut routes = BTreeMap::new();
+        let mut wanted = BTreeMap::new();
+        for d in datasets.iter().filter(|d| d.format.is_service()) {
+            let holder =
+                lease_of(&dataset_resource(&d.name)).map(|l| crate::frontend::parse_desc(&l.desc));
+            let owner = holder
+                .clone()
+                .and_then(|(node, addr)| Some(crate::frontend::Owner { node, addr: addr? }));
+            routes.insert(
+                d.name.clone(),
+                crate::frontend::Route {
+                    format: d.format,
+                    port: d.props.port,
+                    created_ms: d.created_ms,
+                    owner,
+                },
+            );
+            let target = place_on(&d.props, holder.as_ref().map(|h| h.0.as_str()), &serving);
+            if target.as_deref() == Some(&self.node) {
+                wanted.insert(d.name.clone(), (d.format, holder.is_some()));
+            }
+        }
+        fe.set_routes(routes, nodes);
+        let stop: Vec<String> = self
+            .services
+            .keys()
+            .filter(|n| !wanted.contains_key(*n))
+            .cloned()
+            .collect();
+        for name in stop {
+            println!("agent: stopping dataset '{}' here", name);
+            let label = self.service_label(&name);
+            self.stop_service(&name, true).await;
+            self.events.info(
+                "dataset.stopped",
+                format!("{}/{}", label.to_lowercase(), name),
+                format!("{} '{}' stopped on {}", label, name, self.node),
+            );
+        }
+        for (name, (format, held)) in wanted {
+            if self.services.contains_key(&name) || held {
+                continue; // running, or someone still has it
+            }
+            let label = crate::events::format_label(format);
+            let subject = format!("{}/{}", label.to_lowercase(), name);
+            match self.start_service(&fe, &name, format).await {
+                Ok(()) => {
+                    println!("agent: serving {} dataset '{}' here", format.name(), name);
+                    self.events.clear(&subject);
+                    self.events.info(
+                        "dataset.started",
+                        subject,
+                        format!("{} '{}' started on {}", label, name, self.node),
+                    );
+                }
+                Err(StartError::Busy(e)) => {
+                    eprintln!("agent: starting dataset '{}': {}", name, e);
+                }
+                Err(StartError::Failed(e)) => {
+                    eprintln!("agent: starting dataset '{}': {}", name, e);
+                    self.events.once(
+                        &subject,
+                        Level::Error,
+                        "dataset.start_failed",
+                        subject.clone(),
+                        format!(
+                            "{} '{}' failed to start on {}: {}",
+                            label, name, self.node, e
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    async fn start_service(
+        &mut self,
+        fe: &Arc<crate::frontend::Frontend>,
+        name: &str,
+        format: crate::dataset::DatasetFormat,
+    ) -> Result<(), StartError> {
+        let lease = Arc::new(
+            HeldLease::acquire(self.leases.clone(), &dataset_resource(name), &self.desc())
+                .await
+                .map_err(StartError::Busy)?,
+        );
+        let lost = hold(&lease, None);
+        let started = async {
+            let w = self.ensure_writer().await?;
+            let l = lease.clone();
+            w.fs.attach_dataset_leased(
+                name,
+                &lease.owner,
+                lease.epoch,
+                Some(lost.watch()),
+                Some(Arc::new(move || l.fresh())),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            fe.serve_local(name, format, w.fs.clone(), lease.epoch)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        if let Err(e) = started {
+            fe.stop_local(name);
+            if let Some(w) = &self.writer {
+                w.fs.abandon_dataset(name);
+            }
+            lease.release().await;
+            return Err(StartError::Failed(e));
+        }
+        self.services.insert(
+            name.to_string(),
+            RunningService {
+                lease,
+                lost,
+                format,
+            },
+        );
+        Ok(())
+    }
+
+    /// What service dataset `name` is ("Bucket"...), if it runs here.
+    fn service_label(&self, name: &str) -> &'static str {
+        self.services
+            .get(name)
+            .map_or("Dataset", |r| crate::events::format_label(r.format))
+    }
+
+    /// Stop serving service dataset `name`; `clean`: sync it and give its
+    /// lease back (otherwise the lease is lost: drop it, writing nothing).
+    async fn stop_service(&mut self, name: &str, clean: bool) {
+        let Some(r) = self.services.remove(name) else {
+            return;
+        };
+        if let Some(fe) = &self.frontend {
+            fe.stop_local(name);
+        }
+        if let Some(w) = &self.writer {
+            if clean {
+                if let Err(e) = w.fs.detach_dataset(name).await {
+                    eprintln!("agent: last sync of '{}': {}", name, e);
+                }
+            } else {
+                w.fs.abandon_dataset(name);
+            }
+        }
+        if clean {
+            r.lease.release().await;
+        }
+    }
+
     /// Stop running `name`: detach, unexport, and (`clean`) sync and release
     /// the lease; otherwise (lease lost) drop it without writing.
     async fn stop(&mut self, name: &str, clean: bool) {
@@ -734,11 +1135,11 @@ impl Agent {
                 if let Err(e) = removed {
                     eprintln!("agent: unexporting '{}': {}", name, e);
                 }
-                if let Err(e) = w.fs.detach_volume(name).await {
+                if let Err(e) = w.fs.detach_dataset(name).await {
                     eprintln!("agent: last sync of '{}': {}", name, e);
                 }
             } else {
-                w.fs.abandon_volume(name);
+                w.fs.abandon_dataset(name);
             }
         }
         if clean {

@@ -17,6 +17,20 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     let profile = std::env::var("PROFILE").unwrap_or_default();
 
+    // The etcd v3 API's gRPC code (native builds: the servers).
+    if !target.starts_with("wasm32") {
+        println!("cargo:rerun-if-changed=proto");
+        // A protoc of our own: nothing to install.
+        let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
+        // SAFETY: build scripts are single threaded.
+        unsafe { std::env::set_var("PROTOC", protoc) };
+        tonic_build::configure()
+            .build_client(true)
+            .build_server(true)
+            .compile_protos(&["proto/etcd/api/etcdserverpb/rpc.proto"], &["proto"])
+            .expect("compiling the etcd protos");
+    }
+
     let bundle = !target.starts_with("wasm32")
         && profile == "release"
         && std::env::var_os("RAIDISH_SKIP_UI").is_none();

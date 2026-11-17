@@ -27,10 +27,10 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Lineage, ObjType};
-use crate::object::{INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
+use crate::inode::Lineage;
+use crate::object::{Dirty, INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
+use crate::volume::DIRTY_LIMIT_BYTES;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAGIC: &[u8; 8] = b"RAIDSEND";
@@ -45,6 +45,9 @@ const MAX_HEADER: u32 = 64 << 10;
 /// What a stream is of.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SendHeader {
+    /// The dataset's format (its records mean what that format says).
+    pub format: crate::dataset::DatasetFormat,
+    /// The root object's size and record size.
     pub size_bytes: u64,
     pub volblocksize: u32,
     /// The snapshot's short name and GUID, and the TXG it had where it was
@@ -152,7 +155,7 @@ impl<D: BlockDevice> FileSystem<D> {
         name: &str,
         snap: &str,
     ) -> Result<(crate::inode::SnapRef, TreeRoot, u64, u32), FileSystemError> {
-        let id = self.volume_id(name).await?;
+        let id = self.dataset_id(name).await?;
         let head = self.read_dnode(id).await?;
         let Some(Lineage::Head { snapshots, .. }) = &head.lineage else {
             return Err(FileSystemError::FileNotFound);
@@ -195,6 +198,7 @@ impl<D: BlockDevice> FileSystem<D> {
             None => None,
         };
         let header = SendHeader {
+            format: self.dataset_entry(name).await?.format,
             size_bytes: size,
             volblocksize: blksz,
             snapshot: snap.to_string(),
@@ -406,12 +410,12 @@ impl<D: BlockDevice> FileSystem<D> {
             // Put the volume back as it was.
             let undo = match header.from {
                 Some(_) => self.rollback_volume(name).await,
-                None => self.delete(Path::new(name)).await.map(|_| ()),
+                None => self.delete_dataset(name).await,
             };
             if let Err(u) = undo {
                 eprintln!("recv {}: undoing a failed receive: {}", name, u);
             }
-            self.close_volume(name);
+            self.close_dataset(name);
             return Err(e);
         }
         result
@@ -439,15 +443,41 @@ impl<D: BlockDevice> FileSystem<D> {
         prepare: bool,
     ) -> Result<(), FileSystemError> {
         let Some(base) = &header.from else {
-            if self.volume_id(name).await.is_ok() {
+            if self.dataset_entry(name).await.is_ok() {
                 return Err(FileSystemError::InvalidArgument(format!(
-                    "volume '{}' exists (a full stream makes a new volume)",
+                    "dataset '{}' exists (a full stream makes a new one)",
                     name
                 )));
             }
+            if !header.format.is_tree() {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "a stream of a {} dataset",
+                    header.format.name()
+                )));
+            }
             if prepare {
-                self.create_block(name, header.size_bytes, header.volblocksize)
-                    .await?;
+                match header.format {
+                    f if f.is_btree() => {
+                        let bs = header.volblocksize as u64;
+                        if bs == 0 || !header.size_bytes.is_multiple_of(bs) {
+                            return Err(FileSystemError::InvalidArgument(
+                                "a B+tree stream of partial nodes".into(),
+                            ));
+                        }
+                        self.create_btree(
+                            name,
+                            f,
+                            header.volblocksize,
+                            header.size_bytes / bs,
+                            Default::default(),
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        self.create_block(name, header.size_bytes, header.volblocksize)
+                            .await?;
+                    }
+                }
             } else if header.volblocksize == 0
                 || !header.volblocksize.is_multiple_of(self.volblock_align())
                 || header.volblocksize > self.max_volblocksize()
@@ -461,10 +491,15 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             return Ok(());
         };
-        let id = self.volume_id(name).await?;
+        let id = self.dataset_id(name).await?;
         let head = self.read_dnode(id).await?;
-        if head.kind != ObjType::Volume {
-            return Err(FileSystemError::NotAFile);
+        if head.kind != header.format.root_kind() {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a {}, the stream of a {} dataset",
+                name,
+                head.kind.name(),
+                header.format.name()
+            )));
         }
         if (head.size, head.blksz) != (header.size_bytes, header.volblocksize) {
             return Err(FileSystemError::InvalidArgument(format!(
@@ -498,7 +533,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let snap = self.read_dnode(newest.id).await?;
         let dirty = self
-            .volumes
+            .open_datasets
             .lock()
             .unwrap()
             .get(name)
@@ -525,6 +560,15 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<StreamReport, FileSystemError> {
         let bs = header.volblocksize as u64;
         let records = header.size_bytes.div_ceil(bs);
+        // Records go straight into the dataset's object whatever its format
+        // (the stream is records, not block or kv operations), with its
+        // operations held off until the stream is in.
+        let ds = self.open_dataset(name).await?;
+        let _w = ds.ops.write().await;
+        // A keyed dataset's intent log carries operations, never records
+        // (see `crate::zil`): what a receive writes there is durable when
+        // the receive commits, and not before.
+        let keyed = header.format.is_btree();
         let mut report = StreamReport {
             snapshot: format!("{}@{}", name, header.snapshot),
             incremental: header.from.is_some(),
@@ -543,7 +587,16 @@ impl<D: BlockDevice> FileSystem<D> {
                     // A whole record: its tail is zero.
                     let end = (header.size_bytes - idx * bs).min(bs);
                     data.resize(end as usize, 0);
-                    self.block_write(name, idx * bs, &data).await?;
+                    if keyed {
+                        ds.obj.put_records([(idx, Dirty::Data(data))], None);
+                    } else {
+                        self.object_modify(&ds.obj, idx * bs, data.len(), Some(&data))
+                            .await?;
+                    }
+                    if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
+                        self.commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
+                            .await?;
+                    }
                     report.data_records += 1;
                     report.data_bytes += len;
                 }
@@ -554,8 +607,13 @@ impl<D: BlockDevice> FileSystem<D> {
                         return Err(bad(format!("hole {}+{}", first, count)));
                     }
                     let end = ((first + count) * bs).min(header.size_bytes);
-                    self.block_zero(name, first * bs, (end - first * bs) as usize)
-                        .await?;
+                    if keyed {
+                        ds.obj
+                            .put_records((first..first + count).map(|i| (i, Dirty::Hole)), None);
+                    } else {
+                        self.object_modify(&ds.obj, first * bs, (end - first * bs) as usize, None)
+                            .await?;
+                    }
                     report.hole_records += count;
                 }
                 END => {

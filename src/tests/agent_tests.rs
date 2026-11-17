@@ -1,11 +1,12 @@
 use super::*;
 
-fn props(nodes: &[&str]) -> VolumeProps {
-    VolumeProps {
+fn props(nodes: &[&str]) -> DatasetProps {
+    DatasetProps {
         nodes: nodes.iter().map(|s| s.to_string()).collect(),
         automount: Some(Transport::Nvme),
         enabled: true,
         move_to: None,
+        port: None,
     }
 }
 

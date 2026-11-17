@@ -134,6 +134,12 @@ enum Commands {
         #[command(subcommand)]
         command: VolumeCommands,
     },
+    /// Service datasets (etcd keyspaces, S3 buckets, SQS queues) and where
+    /// they run (through the committer).
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommands,
+    },
     /// VMs whose disks are volumes, run through libvirt.
     Vm {
         #[command(subcommand)]
@@ -203,6 +209,39 @@ enum VolumeCommands {
     },
     /// Move a running volume to `node` (and keep it there).
     Move { name: String, node: String },
+}
+
+#[derive(Subcommand)]
+enum DatasetCommands {
+    /// List the pool's datasets (all formats) and where services run.
+    List,
+    /// Create a service dataset: `--format etcd --port 2379`, `--format
+    /// s3` (a bucket) or `--format queue`.
+    Create {
+        name: String,
+        #[arg(long)]
+        format: String,
+        /// An etcd dataset's client port (every node listens on it).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Nodes that may run it, most preferred first (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        nodes: Option<Vec<String>>,
+    },
+    /// Delete a service dataset and everything in it (stopped first).
+    Delete { name: String },
+    /// Change where and how a dataset runs.
+    Set {
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        nodes: Option<Vec<String>>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -424,7 +463,11 @@ pub async fn main() -> std::io::Result<()> {
         crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
     }
     if let Commands::Token { command } = &cli.command {
-        crate::cli_pki::run_token(command, &config);
+        if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
+            crate::cli_pki::s3_key(command, &config).await;
+        } else {
+            crate::cli_pki::run_token(command, &config);
+        }
         return Ok(());
     }
     let opts = config.disk_options();
@@ -445,7 +488,7 @@ pub async fn main() -> std::io::Result<()> {
             .cluster_members(port as u16)
             .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
         // The node's name comes from its id: the pool position of its first disk.
-        let name = format!("node-{}", members.me);
+        let name = cluster::members::node_name(members.me);
         let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
             Some(d) => expand_tilde(d).join(&name),
             None => cluster::default_data_dir(&name),
@@ -492,6 +535,28 @@ pub async fn main() -> std::io::Result<()> {
             })
         });
         let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
+        // What happens on this node goes to the activity log (through
+        // whichever node is the committer).
+        let events = crate::events::EventSink::new(&name);
+        {
+            let mut endpoints = vec![me.clone()];
+            for e in config.lease_endpoints().unwrap_or_default() {
+                if !endpoints.contains(&e) && !cluster::members::is_local_base(&e, port as u16) {
+                    endpoints.push(e);
+                }
+            }
+            let client = crate::committer::CommitClient::new(endpoints);
+            tokio::spawn(events.clone().run(move |batch| {
+                let client = client.clone();
+                async move {
+                    client
+                        .report_events(&batch)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            }));
+        }
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
             // committer's writes are fenced like everyone else's.
@@ -518,6 +583,7 @@ pub async fn main() -> std::io::Result<()> {
                     access.clone(),
                     cluster::lease::LeaseClient::new(vec![me.clone()]),
                     name.clone(),
+                    events.clone(),
                 ));
             }
             // The committer is wherever the `pool` lease is: ask every node.
@@ -527,6 +593,7 @@ pub async fn main() -> std::io::Result<()> {
                     endpoints.push(e);
                 }
             }
+            let endpoints_for_services = endpoints.clone();
             let mut agent = crate::agent::Agent::new(
                 name.clone(),
                 node.clone(),
@@ -536,8 +603,46 @@ pub async fn main() -> std::io::Result<()> {
                 agent_state.clone(),
                 files.clone(),
             );
+            agent = agent.with_events(events.clone());
             if let Some(vms) = &vms {
                 agent = agent.with_vms(vms.clone());
+            }
+            if let Some(services) = &config.services {
+                // Access keys come from tokens (see `crate::frontend::keys`),
+                // checked against the CA bundle: no TLS, no services.
+                let Some(tls) = &config.tls else {
+                    fail("services (S3, SQS, etcd) need TLS: set `tls:` in the config");
+                };
+                let verifier = crate::auth::Verifier::from_config(tls, &config.auth)
+                    .unwrap_or_else(|e| fail(format!("services: {}", e)));
+                let keys_from = node.clone();
+                let auth = crate::frontend::keys::ServiceAuth::new(
+                    services.region(),
+                    Arc::new(verifier),
+                    Arc::new(move || keys_from.service_key()),
+                );
+                // The cluster's service key, made now if no node has yet
+                // (nodes sign requests to each other with it).
+                let ensure = node.clone();
+                tokio::spawn(async move {
+                    while let Err(e) = ensure.ensure_service_key().await {
+                        eprintln!("services: making the service key: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+                let service_tls = crate::frontend::ServiceTls::new(tls)
+                    .unwrap_or_else(|e| fail(format!("services: {}", e)));
+                let fe = crate::frontend::Frontend::new(
+                    name.clone(),
+                    services.clone(),
+                    auth,
+                    service_tls,
+                    crate::committer::CommitClient::new(endpoints_for_services.clone()),
+                );
+                if let Err(e) = fe.start().await {
+                    fail(format!("services: {}", e));
+                }
+                agent = agent.with_frontend(fe);
             }
             tokio::spawn(agent.run());
             if let Some(nfs) = &config.nfs {
@@ -592,6 +697,7 @@ pub async fn main() -> std::io::Result<()> {
             auth,
             nfs_backend,
             vms,
+            events,
         )
         .await;
         return Ok(());
@@ -628,6 +734,17 @@ pub async fn main() -> std::io::Result<()> {
     // A committer runs the pool (see `crate::writer`): volumes are managed
     // through it, and `nbd` / `nvme` run as volume writers.
     let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+    if let Commands::Dataset { command } = &cli.command {
+        if endpoints.is_empty() {
+            fail("datasets are managed through the cluster: no lease endpoints configured");
+        }
+        let client = crate::committer::CommitClient::new(endpoints.clone());
+        if client.committer().await.is_none() {
+            fail("no committer is running (start `raidish listen` on a node)");
+        }
+        dataset_command(command, client, &endpoints).await;
+        return Ok(());
+    }
     if !endpoints.is_empty()
         && matches!(
             cli.command,
@@ -701,12 +818,12 @@ pub async fn main() -> std::io::Result<()> {
     match cli.command {
         Commands::Nbd { name, size: _ } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             nbd::serve_nbd(fs, name, 10809).await.unwrap();
         }
         Commands::Nvme { name } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             let server = nvme::NvmeTcpServer::new(fs, name, 4420).await.unwrap();
             server.run().await.unwrap();
         }
@@ -907,10 +1024,7 @@ pub async fn main() -> std::io::Result<()> {
                         .unwrap_or_else(|e| fail(e));
                 }
                 VolumeCommands::Delete { name } => {
-                    fs.delete(Path::new(&name))
-                        .await
-                        .unwrap_or_else(|e| fail(e));
-                    fs.sync().await.unwrap_or_else(|e| fail(e));
+                    fs.delete_volume(&name).await.unwrap_or_else(|e| fail(e));
                 }
                 VolumeCommands::List => {
                     print_volumes(&fs.list_volumes().await.unwrap_or_else(|e| fail(e)), None)
@@ -918,7 +1032,7 @@ pub async fn main() -> std::io::Result<()> {
                 cmd @ (VolumeCommands::Set { .. } | VolumeCommands::Move { .. }) => {
                     let vols = fs.list_volumes().await.unwrap_or_else(|e| fail(e));
                     let (name, props) = change_props(&cmd, &vols);
-                    fs.set_volume_props(&name, props)
+                    fs.set_dataset_props(&name, props)
                         .await
                         .unwrap_or_else(|e| fail(e));
                 }
@@ -928,7 +1042,8 @@ pub async fn main() -> std::io::Result<()> {
         | Commands::Vm { .. }
         | Commands::Cluster { .. }
         | Commands::Cert { .. }
-        | Commands::Token { .. } => unreachable!(),
+        | Commands::Token { .. }
+        | Commands::Dataset { .. } => unreachable!(),
     }
     if let Some(lease) = lease {
         lease.release().await;
@@ -940,7 +1055,7 @@ pub async fn main() -> std::io::Result<()> {
 fn change_props(
     cmd: &VolumeCommands,
     vols: &[crate::volume::VolumeInfo],
-) -> (String, crate::inode::VolumeProps) {
+) -> (String, crate::inode::DatasetProps) {
     let name = match cmd {
         VolumeCommands::Set { name, .. } | VolumeCommands::Move { name, .. } => name,
         _ => unreachable!(),
@@ -1080,7 +1195,7 @@ fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::St
             .and_then(|s| {
                 s.state
                     .leases
-                    .get(&crate::committer::volume_resource(&v.name))
+                    .get(&crate::committer::dataset_resource(&v.name))
                     .filter(|l| !l.released && l.expires_ms > s.now_ms)
                     .map(|l| l.desc.clone())
             })
@@ -1098,6 +1213,144 @@ fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::St
             },
             running
         );
+    }
+}
+
+fn parse_format(f: &str) -> crate::dataset::DatasetFormat {
+    use crate::dataset::DatasetFormat as F;
+    match f {
+        "etcd" => F::Etcd,
+        "s3" | "bucket" => F::S3,
+        "queue" | "sqs" => F::Queue,
+        f => fail(format!(
+            "unknown service format '{}' (etcd, s3 or queue)",
+            f
+        )),
+    }
+}
+
+/// Run a dataset command against the running committer.
+async fn dataset_command(
+    command: &DatasetCommands,
+    client: crate::committer::CommitClient,
+    endpoints: &[String],
+) {
+    let ok = |r: Result<(), crate::writer::CommitError>| r.unwrap_or_else(|e| fail(e));
+    match command {
+        DatasetCommands::List => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let status = cluster::lease::LeaseClient::new(endpoints.to_vec())
+                .status()
+                .await
+                .ok();
+            if ds.is_empty() {
+                println!("no datasets");
+                return;
+            }
+            println!(
+                "{:<20} {:<6} {:<6} {:<8} {:<20} RUNNING",
+                "NAME", "FORMAT", "PORT", "ENABLED", "NODES"
+            );
+            for d in ds {
+                let running = status
+                    .as_ref()
+                    .and_then(|s| {
+                        s.state
+                            .leases
+                            .get(&crate::committer::dataset_resource(&d.name))
+                            .filter(|l| !l.released && l.expires_ms > s.now_ms)
+                            .map(|l| crate::frontend::parse_desc(&l.desc).0)
+                    })
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<20} {:<6} {:<6} {:<8} {:<20} {}",
+                    d.name,
+                    d.format.name(),
+                    d.props.port.map_or("-".to_string(), |p| p.to_string()),
+                    if d.props.enabled { "yes" } else { "no" },
+                    if d.props.nodes.is_empty() {
+                        "(any)".to_string()
+                    } else {
+                        d.props.nodes.join(",")
+                    },
+                    running
+                );
+            }
+        }
+        DatasetCommands::Create {
+            name,
+            format,
+            port,
+            nodes,
+        } => {
+            let req = crate::committer::CreateDataset {
+                name: name.clone(),
+                format: parse_format(format),
+                props: crate::inode::DatasetProps {
+                    port: *port,
+                    nodes: nodes.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            };
+            ok(client.create_dataset(&req).await)
+        }
+        DatasetCommands::Delete { name } => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let Some(d) = ds.into_iter().find(|d| &d.name == name) else {
+                fail(format!("no dataset '{}'", name));
+            };
+            if !d.format.is_service() {
+                fail(format!(
+                    "'{}' is a {} dataset: delete it with `volume delete`",
+                    name,
+                    d.format.name()
+                ));
+            }
+            // Stopped everywhere first (the committer refuses a dataset in
+            // use).
+            if d.props.enabled {
+                let props = crate::inode::DatasetProps {
+                    enabled: false,
+                    ..d.props.clone()
+                };
+                ok(client.set_props(name, &props).await);
+            }
+            let mut last = None;
+            for _ in 0..60 {
+                match client.delete_dataset(name).await {
+                    Ok(()) => return,
+                    Err(e) => last = Some(e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            fail(last.unwrap())
+        }
+        DatasetCommands::Set {
+            name,
+            nodes,
+            port,
+            enable,
+            disable,
+        } => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let Some(d) = ds.into_iter().find(|d| &d.name == name) else {
+                fail(format!("no dataset '{}'", name));
+            };
+            let mut props = d.props;
+            if let Some(n) = nodes {
+                props.nodes = n.iter().filter(|n| !n.is_empty()).cloned().collect();
+            }
+            if port.is_some() {
+                props.port = *port;
+            }
+            if *enable {
+                props.enabled = true;
+            }
+            if *disable {
+                props.enabled = false;
+            }
+            ok(client.set_props(name, &props).await)
+        }
     }
 }
 
@@ -1177,7 +1430,7 @@ async fn via_committer(
             let writer = VolumeWriter::start(endpoints, spec, opts, name, &command.describe())
                 .await
                 .unwrap_or_else(|e| fail(e));
-            scan::spawn_health_monitor(writer.fs.clone(), HEALTH_INTERVAL);
+            scan::spawn_health_monitor(writer.fs.clone(), HEALTH_INTERVAL, None);
             if let Commands::Nbd { .. } = command {
                 nbd::serve_nbd(writer.fs.clone(), name.clone(), 10809)
                     .await
@@ -1194,9 +1447,11 @@ async fn via_committer(
 }
 
 /// A volume writer process (`nbd` / `nvme` with a committer running): its
-/// `writer/...` and `vol/<name>` leases and the pool opened in writer role.
+/// `writer/...` and `ds/<name>` leases and the pool opened in writer role.
 struct VolumeWriter {
     fs: Arc<FileSystem<crate::vdev::Pool>>,
+    /// Held (renewed) for as long as this writer runs.
+    _leases: [Arc<cluster::lease::HeldLease>; 2],
 }
 
 impl VolumeWriter {
@@ -1214,7 +1469,7 @@ impl VolumeWriter {
         let vol = Arc::new(
             cluster::lease::HeldLease::acquire(
                 leases,
-                &crate::committer::volume_resource(volume),
+                &crate::committer::dataset_resource(volume),
                 desc,
             )
             .await?,
@@ -1230,10 +1485,13 @@ impl VolumeWriter {
         let fs = FileSystem::load_writer(spec.open(opts).await, Arc::new(sink))
             .await
             .map_err(|e| format!("opening the pool: {}", e))?;
-        fs.attach_volume(volume, &vol.owner, vol.epoch)
+        fs.attach_dataset(volume, &vol.owner, vol.epoch)
             .await
             .map_err(|e| format!("volume '{}': {}", volume, e))?;
-        Ok(VolumeWriter { fs: Arc::new(fs) })
+        Ok(VolumeWriter {
+            fs: Arc::new(fs),
+            _leases: [writer, vol],
+        })
     }
 }
 

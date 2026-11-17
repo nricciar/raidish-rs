@@ -18,9 +18,10 @@
 //! * `salvage` copies out whatever is still readable, zero-filling the rest.
 
 use crate::blkptr::BlockPtr;
+use crate::dataset::{DEFAULT_FS, DatasetFormat};
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Lineage, ObjType, ROOT_OBJECT, decode_leaf};
+use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Lineage, ObjType, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
 use crate::object::{INDIRECT_FANOUT, TreeRoot};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -41,8 +42,9 @@ impl ObjKind {
     fn of(t: ObjType, level: u8) -> Self {
         match t {
             ObjType::File => ObjKind::File(level),
-            ObjType::Directory => ObjKind::Dir(level),
-            ObjType::Volume | ObjType::Snapshot => ObjKind::Volume(level),
+            ObjType::Directory | ObjType::Datasets => ObjKind::Dir(level),
+            // A B+tree's nodes are its object's data records.
+            ObjType::Volume | ObjType::Snapshot | ObjType::KvTree => ObjKind::Volume(level),
         }
     }
 
@@ -590,6 +592,13 @@ impl<D: BlockDevice> FileSystem<D> {
         report
     }
 
+    /// Check the B+tree of `d` (a `kv` dataset or a snapshot of one).
+    async fn check_kv(&self, path: &str, d: &Dnode, report: &mut WalkReport) {
+        for e in self.check_kv_tree(d).await.errors {
+            report.errors.push(format!("{}: {}", path, e));
+        }
+    }
+
     /// Visit every object linked from the root directory, by path; report
     /// entries for missing objects and objects nothing links to.
     async fn walk_namespace<V: Visitor>(
@@ -601,10 +610,70 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut complete = !report.incomplete;
         let mut reached: BTreeSet<FileId> = BTreeSet::new();
         let mut stack: Vec<(FileId, String)> = Vec::new();
-        match dnodes.get(&ROOT_OBJECT) {
-            Some(_) => stack.push((ROOT_OBJECT, "/".to_string())),
+        // Every dataset's namespace starts in the dataset directory.
+        let ds_id = self.datasets_object();
+        match dnodes.get(&ds_id) {
+            Some(ds) if ds.kind == ObjType::Datasets => {
+                reached.insert(ds_id);
+                match self.read_datasets(ds).await {
+                    Ok(index) => {
+                        if !index.datasets.contains_key(DEFAULT_FS) {
+                            report.errors.push(format!("no '{}' dataset", DEFAULT_FS));
+                        }
+                        for (name, e) in index.datasets.iter().rev() {
+                            let path = match e.format {
+                                DatasetFormat::Posix if name == DEFAULT_FS => "/".to_string(),
+                                DatasetFormat::Posix => format!("{}:/", name),
+                                // Where salvage puts its image.
+                                _ => format!("/{}", name),
+                            };
+                            let want = e.format.root_kind();
+                            match dnodes.get(&e.root) {
+                                None => {
+                                    report.errors.push(format!(
+                                        "dataset '{}': root object {} doesn't exist",
+                                        name, e.root
+                                    ));
+                                    complete = false;
+                                }
+                                Some(r) if r.kind != want => report.errors.push(format!(
+                                    "dataset '{}': root object {} is a {}, not a {}",
+                                    name,
+                                    e.root,
+                                    r.kind.name(),
+                                    want.name()
+                                )),
+                                Some(_) if reached.contains(&e.root) => {
+                                    report.errors.push(format!(
+                                        "dataset '{}': root object {} is linked more than once",
+                                        name, e.root
+                                    ))
+                                }
+                                Some(_) => {
+                                    reached.insert(e.root);
+                                    stack.push((e.root, path));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        report.errors.push(format!("dataset directory: {}", e));
+                        complete = false;
+                    }
+                }
+            }
+            Some(ds) => {
+                report.errors.push(format!(
+                    "dataset directory (object {}) is a {}",
+                    ds_id,
+                    ds.kind.name()
+                ));
+                complete = false;
+            }
             None => {
-                report.errors.push("the root directory is missing".into());
+                report
+                    .errors
+                    .push("the dataset directory is missing".into());
                 complete = false;
             }
         }
@@ -613,15 +682,23 @@ impl<D: BlockDevice> FileSystem<D> {
             let d = &dnodes[&id];
             match d.kind {
                 ObjType::File => v.file(&path, id, d),
-                ObjType::Volume => {
+                ObjType::Volume | ObjType::KvTree => {
                     v.volume(&path, id, d);
-                    for (sid, name) in check_lineage(id, d, dnodes, &mut report.errors) {
+                    let snaps = check_lineage(id, d, dnodes, &mut report.errors);
+                    if d.kind == ObjType::KvTree {
+                        self.check_kv(&path, d, report).await;
+                    }
+                    for (sid, name) in snaps {
                         reached.insert(sid);
-                        v.volume(&format!("{}@{}", path, name), sid, &dnodes[&sid]);
+                        let spath = format!("{}@{}", path, name);
+                        v.volume(&spath, sid, &dnodes[&sid]);
+                        if d.kind == ObjType::KvTree {
+                            self.check_kv(&spath, &dnodes[&sid], report).await;
+                        }
                     }
                 }
-                // Reached from its volume.
-                ObjType::Snapshot => {}
+                // Reached from its volume / the uberblock.
+                ObjType::Snapshot | ObjType::Datasets => {}
                 ObjType::Directory => {
                     v.dir(&path);
                     let index = match self.read_dir(d).await {
@@ -639,6 +716,14 @@ impl<D: BlockDevice> FileSystem<D> {
                                 "{}: entry for object {}, which doesn't exist",
                                 child, e.id
                             )),
+                            Some(cd) if !matches!(cd.kind, ObjType::File | ObjType::Directory) => {
+                                report.errors.push(format!(
+                                    "{}: entry for object {}, a {} (only the dataset directory links those)",
+                                    child,
+                                    e.id,
+                                    cd.kind.name()
+                                ))
+                            }
                             Some(cd) if cd.kind != e.kind => report.errors.push(format!(
                                 "{}: entry says {}, object {} is a {}",
                                 child,

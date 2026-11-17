@@ -56,9 +56,9 @@ async fn replacing_a_file_keeps_its_object_number() {
         content(1, 500_000)
     );
     // Replacing a directory's contents never touches the directory.
-    let root_before = fs.read_dnode(ROOT_OBJECT).await.unwrap();
+    let root_before = fs.read_dnode(fs.root_dir()).await.unwrap();
     fs.write_file(Path::new("/f"), b"three").await.unwrap();
-    assert_eq!(fs.read_dnode(ROOT_OBJECT).await.unwrap(), root_before);
+    assert_eq!(fs.read_dnode(fs.root_dir()).await.unwrap(), root_before);
 }
 
 /// One record needs no indirect block: the root points at it.
@@ -146,9 +146,9 @@ async fn the_change_counter_goes_up_with_every_change() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let change = |d: &Dnode| d.change;
-    let root0 = change(&fs.read_dnode(ROOT_OBJECT).await.unwrap());
+    let root0 = change(&fs.read_dnode(fs.root_dir()).await.unwrap());
     fs.write_file(Path::new("/f"), b"one").await.unwrap();
-    let root1 = change(&fs.read_dnode(ROOT_OBJECT).await.unwrap());
+    let root1 = change(&fs.read_dnode(fs.root_dir()).await.unwrap());
     assert!(root1 > root0, "creating an entry changes the directory");
     let (id, d) = fs.stat(Path::new("/f")).await.unwrap();
     let f1 = change(&d);
@@ -168,7 +168,7 @@ async fn the_change_counter_goes_up_with_every_change() {
     let f3 = change(&fs.read_dnode(id).await.unwrap());
     assert!(f3 > f2, "attributes");
     // Replacing a file's contents doesn't change its directory.
-    assert_eq!(change(&fs.read_dnode(ROOT_OBJECT).await.unwrap()), root1);
+    assert_eq!(change(&fs.read_dnode(fs.root_dir()).await.unwrap()), root1);
     drop(fs);
 
     let fs = pool.load().await;

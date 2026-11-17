@@ -7,7 +7,7 @@
 //! * `GET /api/v1/volumes`: every volume, with its snapshots.
 //! * `POST /api/v1/volumes` (`{"name", "size_bytes"}`): make a volume.
 //! * `DELETE /api/v1/volumes/<name>`: delete a volume.
-//! * `PUT /api/v1/volumes/<name>/props` (`VolumeProps`): placement settings.
+//! * `PUT /api/v1/volumes/<name>/props` (`DatasetProps`): placement settings.
 //! * `POST /api/v1/volumes/<name>/snapshots` (`{"name"}`): take a snapshot.
 //! * `DELETE /api/v1/volumes/<name>/snapshots/<snap>`: destroy one.
 //! * `POST /api/v1/volumes/<name>/snapshots/<snap>/clone` (`{"name"}`): a new
@@ -15,7 +15,7 @@
 //! * `POST /api/v1/volumes/<name>/rollback`: back to its newest snapshot.
 
 use crate::committer::{CommitClient, CreateVolume, NewName};
-use crate::inode::VolumeProps;
+use crate::inode::DatasetProps;
 use crate::snapshot::SnapshotInfo;
 use crate::volume::VolumeInfo;
 use crate::writer::CommitError;
@@ -76,11 +76,12 @@ async fn list(
 
 #[post("/api/v1/volumes", data = "<req>")]
 async fn create(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     req: Json<CreateVolume>,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .create_volume(&req.name, req.size_bytes)
         .await
         .map(Json)
@@ -89,11 +90,12 @@ async fn create(
 
 #[delete("/api/v1/volumes/<name>")]
 async fn remove(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .delete_volume(name)
         .await
         .map(Json)
@@ -102,12 +104,13 @@ async fn remove(
 
 #[put("/api/v1/volumes/<name>/props", data = "<props>")]
 async fn props(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
-    props: Json<VolumeProps>,
+    props: Json<DatasetProps>,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .set_props(name, &props)
         .await
         .map(Json)
@@ -116,12 +119,13 @@ async fn props(
 
 #[post("/api/v1/volumes/<name>/snapshots", data = "<req>")]
 async fn snapshot(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     req: Json<NewName>,
     st: &State<VolumesState>,
 ) -> Result<Json<u64>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .create_snapshot(name, &req.name)
         .await
         .map(Json)
@@ -130,12 +134,13 @@ async fn snapshot(
 
 #[delete("/api/v1/volumes/<name>/snapshots/<snap>")]
 async fn destroy_snapshot(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     snap: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .destroy_snapshot(name, snap)
         .await
         .map(Json)
@@ -144,13 +149,14 @@ async fn destroy_snapshot(
 
 #[post("/api/v1/volumes/<name>/snapshots/<snap>/clone", data = "<req>")]
 async fn clone_snapshot(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     snap: &str,
     req: Json<NewName>,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.client
+        .on_behalf(&auth.0)
         .clone_snapshot(name, snap, &req.name)
         .await
         .map(Json)
@@ -159,11 +165,16 @@ async fn clone_snapshot(
 
 #[post("/api/v1/volumes/<name>/rollback")]
 async fn rollback(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
-    st.client.rollback(name).await.map(Json).map_err(api_err)
+    st.client
+        .on_behalf(&auth.0)
+        .rollback(name)
+        .await
+        .map(Json)
+        .map_err(api_err)
 }
 
 pub fn routes() -> Vec<rocket::Route> {

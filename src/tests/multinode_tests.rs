@@ -84,10 +84,10 @@ async fn writer(s: &Setup, dev: Pool, id: &str) -> Writer {
     }
 }
 
-/// Take `vol/<name>` as `owner` and run it on `w`.
+/// Take `ds/<name>` as `owner` and run it on `w`.
 async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> u64 {
-    let epoch = lease(&s.auth, &volume_resource(vol), owner).await;
-    w.fs.attach_volume(vol, owner, epoch).await.unwrap();
+    let epoch = lease(&s.auth, &dataset_resource(vol), owner).await;
+    w.fs.attach_dataset(vol, owner, epoch).await.unwrap();
     epoch
 }
 
@@ -150,8 +150,8 @@ async fn two_writers_two_volumes() {
     // everything goes back.
     w1.fs.return_metaslabs().await;
     assert!(!s.committer.fs.lent_metaslabs().await.is_empty());
-    w1.fs.detach_volume("a").await.unwrap();
-    w2.fs.detach_volume("b").await.unwrap();
+    w1.fs.detach_dataset("a").await.unwrap();
+    w2.fs.detach_dataset("b").await.unwrap();
     w1.fs.return_metaslabs().await;
     w2.fs.return_metaslabs().await;
     assert!(s.committer.fs.lent_metaslabs().await.is_empty());
@@ -168,7 +168,7 @@ async fn two_writers_two_volumes() {
 /// Wraps a sink and keeps the last commit, to resend it.
 struct Recording {
     inner: DirectSink<Pool>,
-    last: std::sync::Mutex<Option<VolumeCommit>>,
+    last: std::sync::Mutex<Option<DatasetCommit>>,
     last_fs: std::sync::Mutex<Option<FsCommit>>,
 }
 
@@ -183,7 +183,7 @@ impl CommitSink for Recording {
     async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
         self.inner.return_metaslab(idx).await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         *self.last.lock().unwrap() = Some(c.clone());
         self.inner.commit(c).await
     }
@@ -191,13 +191,13 @@ impl CommitSink for Recording {
         *self.last_fs.lock().unwrap() = Some(c.clone());
         self.inner.commit_fs(c).await
     }
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
-        self.inner.claim_volume(volume, vol_owner, vol_epoch).await
+        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
     }
 }
 
@@ -218,8 +218,8 @@ async fn commits_are_compare_and_swap() {
     let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
         .await
         .unwrap();
-    let vol_epoch = lease(&s.auth, &volume_resource("a"), "o").await;
-    fs.attach_volume("a", "o", vol_epoch).await.unwrap();
+    let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", "o", ds_epoch).await.unwrap();
     fs.block_write("a", 0, &pattern(300_000, 3)).await.unwrap();
     fs.sync().await.unwrap();
     let first = sink.last.lock().unwrap().clone().unwrap();
@@ -252,14 +252,14 @@ async fn commits_are_compare_and_swap() {
 async fn a_writer_without_its_leases_cannot_commit() {
     let s = setup(&["a"]).await;
     let w = writer(&s, s.pool.dev().await, "1").await;
-    let vol_epoch = attach(&s, &w, "a", "o").await;
+    let ds_epoch = attach(&s, &w, "a", "o").await;
     w.fs.block_write("a", 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w.fs.sync().await.unwrap();
 
     // The volume lease is released (moved elsewhere): the next sync is refused.
-    release(&s.auth, &volume_resource("a"), "o", vol_epoch).await;
+    release(&s.auth, &dataset_resource("a"), "o", ds_epoch).await;
     w.fs.block_write("a", 0, &pattern(100_000, 2))
         .await
         .unwrap();
@@ -310,7 +310,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     // A stalls; the cluster decides it's gone: its leases lapse and the
     // committer takes its metaslabs back.
     release(&s.auth, &a.resource, "a", a.epoch).await;
-    release(&s.auth, &volume_resource("a"), "oa", a_vol).await;
+    release(&s.auth, &dataset_resource("a"), "oa", a_vol).await;
     s.committer.reclaim().await;
     assert!(s.committer.fs.lent_metaslabs().await.is_empty());
     sync_fence(&server, &s);
@@ -360,7 +360,7 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     let s = setup(&["a"]).await;
     // The writer's and volume's leases are visible; the lends to come aren't.
     let w_epoch = lease(&s.auth, "writer/1", "1").await;
-    let v_epoch = lease(&s.auth, &volume_resource("a"), "o").await;
+    let v_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
     let lagging = Arc::new(Lagging {
         inner: s.auth.clone(),
         view: std::sync::Mutex::new(s.auth.state()),
@@ -384,7 +384,7 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
-    fs.attach_volume("a", "o", v_epoch).await.unwrap();
+    fs.attach_dataset("a", "o", v_epoch).await.unwrap();
     fs.block_write("a", 0, &pattern(200_000, 5)).await.unwrap();
     fs.sync().await.unwrap();
     committer.reclaim().await;
@@ -411,7 +411,7 @@ impl CommitSink for Retrying {
     async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
         self.0.return_metaslab(idx).await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         loop {
             match self.0.commit(c.clone()).await {
                 Err(CommitError::Retry(_)) => {
@@ -424,13 +424,13 @@ impl CommitSink for Retrying {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.0.commit_fs(c).await
     }
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
-        self.0.claim_volume(volume, vol_owner, vol_epoch).await
+        self.0.claim_dataset(volume, ds_owner, ds_epoch).await
     }
 }
 
@@ -450,7 +450,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
     // A short volume lease, which lapses without anyone taking it over: the
     // committer answers "retry" (it could still be renewed), forever.
     let op = LeaseOp::Acquire {
-        resource: volume_resource("a"),
+        resource: dataset_resource("a"),
         owner: "o".into(),
         desc: "test o".into(),
         ttl_ms: 2_000,
@@ -459,7 +459,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
         panic!("volume lease not granted");
     };
     let (lost, rx) = tokio::sync::watch::channel(false);
-    fs.attach_volume_until("a", "o", v_epoch, Some(rx))
+    fs.attach_dataset_until("a", "o", v_epoch, Some(rx))
         .await
         .unwrap();
     fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
@@ -482,7 +482,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
         .expect("sync still waiting after the lease was lost")
         .unwrap();
     assert!(r.is_err());
-    fs.abandon_volume("a");
+    fs.abandon_dataset("a");
 
     // Only what was committed is there.
     let fs = s.pool.load().await;
@@ -758,20 +758,20 @@ impl CommitSink for Holding {
     async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
         self.inner.return_metaslab(idx).await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         self.inner.commit(c).await
     }
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.held.lock().unwrap().push(c);
         Err(CommitError::Retry("held".into()))
     }
-    async fn claim_volume(
+    async fn claim_dataset(
         &self,
         volume: &str,
-        vol_owner: &str,
-        vol_epoch: u64,
+        ds_owner: &str,
+        ds_epoch: u64,
     ) -> Result<(), CommitError> {
-        self.inner.claim_volume(volume, vol_owner, vol_epoch).await
+        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
     }
 }
 
@@ -944,7 +944,7 @@ async fn object_numbers_are_pool_wide_and_never_reused() {
     w.fs.mkdir(Path::new("a")).await.unwrap();
     w.fs.mkdir(Path::new("b")).await.unwrap();
     let mut ids = vec![
-        s.committer.fs.file_id(Path::new("vol")).await.ok(),
+        s.committer.fs.dataset_id("vol").await.ok(),
         w.fs.create_file(Path::new("a/x")).await.ok(),
         w.fs.create_file(Path::new("b/x")).await.ok(),
         w.fs.create_file(Path::new("x")).await.ok(),
@@ -1073,27 +1073,25 @@ fn a_grant_this_view_hasnt_seen_yet_is_retried_not_refused() {
         released,
     };
     // The previous holder's (expired) grant is all this node knows of yet.
-    state.leases.insert("vol/a".into(), lease("old", 5, false));
+    state.leases.insert("ds/a".into(), lease("old", 5, false));
     assert!(matches!(
-        check_lease(&state, "vol/a", Some("new"), 7),
+        check_lease(&state, "ds/a", Some("new"), 7),
         Err(CommitError::Retry(_))
     ));
-    state.leases.insert("vol/a".into(), lease("old", 5, true));
+    state.leases.insert("ds/a".into(), lease("old", 5, true));
     assert!(matches!(
-        check_lease(&state, "vol/a", Some("new"), 7),
+        check_lease(&state, "ds/a", Some("new"), 7),
         Err(CommitError::Retry(_))
     ));
     // Taken over by a newer grant, or this grant released: lost for good.
-    state
-        .leases
-        .insert("vol/a".into(), lease("newer", 9, false));
+    state.leases.insert("ds/a".into(), lease("newer", 9, false));
     assert!(matches!(
-        check_lease(&state, "vol/a", Some("new"), 7),
+        check_lease(&state, "ds/a", Some("new"), 7),
         Err(CommitError::Refused(_))
     ));
-    state.leases.insert("vol/a".into(), lease("new", 7, true));
+    state.leases.insert("ds/a".into(), lease("new", 7, true));
     assert!(matches!(
-        check_lease(&state, "vol/a", Some("new"), 7),
+        check_lease(&state, "ds/a", Some("new"), 7),
         Err(CommitError::Refused(_))
     ));
 }
@@ -1101,13 +1099,13 @@ fn a_grant_this_view_hasnt_seen_yet_is_retried_not_refused() {
 #[test]
 fn an_orphaned_log_is_replayed_only_once_its_lease_is_gone() {
     use crate::cluster::state::Lease;
-    let log = crate::inode::VolumeLog {
+    let log = crate::inode::DatasetLog {
         regions: Vec::new(),
         from_seq: 0,
         writer: "writer/1".into(),
         writer_epoch: 3,
-        vol_owner: "o".into(),
-        vol_epoch: 7,
+        ds_owner: "o".into(),
+        ds_epoch: 7,
     };
     let now = 1_000_000;
     let lease = |owner: &str, epoch: u64, expires_ms: u64, released: bool| Lease {
@@ -1176,7 +1174,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
     );
 
     w.fs.sync().await.unwrap();
-    let vol = s.committer.fs.open_volume("vol").await.unwrap();
+    let vol = s.committer.fs.open_dataset("vol").await.unwrap();
     let b = births(&s.committer.fs, &vol.obj.root()).await;
     assert!(
         !b.is_empty() && b.iter().all(|&t| t >= floor),
@@ -1185,7 +1183,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
         floor
     );
     assert_eq!(read(&s.committer.fs, "vol", 0, data.len()).await, data);
-    w.fs.detach_volume("vol").await.unwrap();
+    w.fs.detach_dataset("vol").await.unwrap();
     w.fs.return_metaslabs().await;
     drop(w);
     let report = s.pool.load().await.fsck(false).await.unwrap();
@@ -1363,7 +1361,7 @@ async fn snapshots_of_a_volume_a_writer_runs() {
     assert!(report.is_clean(), "{}", report);
 
     s.committer.fs.destroy_snapshot("vol", "s").await.unwrap();
-    w.fs.detach_volume("vol").await.unwrap();
+    w.fs.detach_dataset("vol").await.unwrap();
     w.fs.return_metaslabs().await;
     drop(w);
     assert_eq!(read(&s.committer.fs, "vol", 0, c.len()).await, c);

@@ -245,7 +245,7 @@ async fn multi_block_root_index_loads() {
         let name = format!("/a-fairly-long-file-name-to-grow-the-index-{:04}", i);
         fs.write_file(Path::new(&name), b"x").await.unwrap();
     }
-    let root = fs.read_dnode(crate::inode::ROOT_OBJECT).await.unwrap();
+    let root = fs.read_dnode(fs.root_dir()).await.unwrap();
     assert!(root.size > BLOCK_SIZE as u64);
     drop(fs);
 

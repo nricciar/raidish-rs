@@ -319,7 +319,7 @@ impl Component for App {
                 </nav>
                 <div class="top-meta">
                     { self.cluster.as_ref().map(|c| html! {
-                        <span class="muted">{ format!("via node {} ({})", c.id, c.node) }</span>
+                        <span class="muted">{ format!("via {}", c.node) }</span>
                     }).unwrap_or_default() }
                     if on_overview { { self.refresh_note() } }
                     if let Some(user) = &ctx.props().user {
@@ -361,6 +361,7 @@ impl Component for App {
                             session={self.session.clone().map(Shared)} />
                     </div>
                 </main>
+                <crate::activity::Activity />
             </>
         }
     }

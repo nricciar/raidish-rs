@@ -6,7 +6,7 @@
 
 use crate::disk::{BlockDevice, IoStats};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
-use crate::inode::{ObjType, ROOT_OBJECT};
+use crate::inode::ObjType;
 use crate::metaslab::SPACEMAP_SLOTS;
 use crate::vdev::Topology;
 
@@ -88,6 +88,8 @@ pub enum ObjectKind {
     File,
     Directory,
     Volume,
+    /// A `kv` dataset.
+    Kv,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -506,13 +508,54 @@ impl<D: BlockDevice> FileSystem<D> {
             push(&mut spans, e.start(), e.len(), BlockKind::ObjectTable, None);
         }
 
+        // The dataset directory, and the tree datasets it lists (volumes),
+        // shown as `/<name>`.
+        if let Ok(ds) = self.read_dnode(self.datasets_object()).await {
+            for e in self.dnode_extents(&ds).await.unwrap_or_default() {
+                push(&mut spans, e.start(), e.len(), BlockKind::Directory, None);
+            }
+        }
+        for (name, e) in self
+            .datasets()
+            .await
+            .map(|i| i.datasets)
+            .unwrap_or_default()
+        {
+            if !e.format.is_tree() {
+                continue;
+            }
+            let Ok(d) = self.read_dnode(e.root).await else {
+                continue;
+            };
+            let path = format!("/{}", name);
+            let owner = owners.len() as u32;
+            owners.push(path.clone());
+            let mut allocated = 0;
+            for x in self.dnode_extents(&d).await.unwrap_or_default() {
+                allocated += x.len();
+                push(&mut spans, x.start(), x.len(), BlockKind::Data, Some(owner));
+            }
+            objects.push(ObjectReport {
+                path,
+                kind: if e.format.is_btree() {
+                    ObjectKind::Kv
+                } else {
+                    ObjectKind::Volume
+                },
+                size_bytes: d.size,
+                allocated_blocks: allocated,
+                volblocksize: Some(d.blksz),
+            });
+        }
+
         // Walk the namespace from the root directory.
-        let mut dirs: Vec<(String, u64)> = vec![(String::new(), ROOT_OBJECT)];
+        let root = self.root_dir();
+        let mut dirs: Vec<(String, u64)> = vec![(String::new(), root)];
         while let Some((prefix, dir_id)) = dirs.pop() {
             let Ok(dir) = self.read_dnode(dir_id).await else {
                 continue;
             };
-            if dir_id == ROOT_OBJECT {
+            if dir_id == root {
                 for e in self.dnode_extents(&dir).await.unwrap_or_default() {
                     push(&mut spans, e.start(), e.len(), BlockKind::Directory, None);
                 }
@@ -525,6 +568,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 let Ok(d) = self.read_dnode(entry.id).await else {
                     continue;
                 };
+                // Only the dataset directory links anything else.
+                if !matches!(d.kind, ObjType::File | ObjType::Directory) {
+                    continue;
+                }
                 let owner = owners.len() as u32;
                 owners.push(path.clone());
                 let block_kind = match d.kind {
@@ -542,8 +589,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         dirs.push((path.clone(), entry.id));
                         (ObjectKind::Directory, 0, None)
                     }
-                    ObjType::Volume | ObjType::Snapshot => {
-                        (ObjectKind::Volume, d.size, Some(d.blksz))
+                    ObjType::Volume | ObjType::Snapshot | ObjType::Datasets | ObjType::KvTree => {
+                        unreachable!()
                     }
                 };
                 objects.push(ObjectReport {

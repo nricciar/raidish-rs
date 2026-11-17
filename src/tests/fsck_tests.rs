@@ -504,7 +504,7 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
         reads: reads.clone(),
     };
     let fs = FileSystem::load(dev).await.unwrap();
-    fs.open_volume("vol").await.unwrap();
+    fs.open_dataset("vol").await.unwrap();
     reads.store(0, Ordering::SeqCst);
     let mut buf = vec![0u8; 21 * vbs];
     fs.block_read("vol", 0, &mut buf).await.unwrap();
@@ -519,7 +519,7 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
     // A corrupt record inside a coalesced read still self-heals.
     let ptr = {
         let fs = pool.load().await;
-        let vol = fs.open_volume("vol").await.unwrap();
+        let vol = fs.open_dataset("vol").await.unwrap();
         fs.tree_leaves(&vol.obj.root()).await.unwrap()[30].1.clone()
     };
     let (disk, offset) = TestPool::locate(ptr.lba + 1);

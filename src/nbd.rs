@@ -118,7 +118,7 @@ where
                 _ = fold.wait() => {}
             }
             let Some(fs) = weak.upgrade() else { return };
-            if fs.has_dirty_volumes()
+            if fs.has_dirty_datasets()
                 && let Err(e) = fs.sync().await
             {
                 eprintln!("{}: background sync failed: {}", who, e);
@@ -252,7 +252,7 @@ where
                 name
             )));
         }
-        let size = self.fs.open_volume(name).await?.size_bytes;
+        let size = self.fs.open_dataset(name).await?.size_bytes;
         let mut exports = self.exports.lock().unwrap();
         if exports.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);

@@ -29,6 +29,13 @@ pub struct Members {
     pub fingerprint: String,
 }
 
+/// A node's name: from its id (the pool position of its first disk), so
+/// every node knows every name without being told. Addresses (the hosts in
+/// disk URLs) are where to reach a node, not what it's called.
+pub fn node_name(id: u64) -> String {
+    format!("node-{}", id)
+}
+
 impl Members {
     /// A cluster of one (no pool configured).
     pub fn solo() -> Self {

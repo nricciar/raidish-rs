@@ -63,6 +63,27 @@ impl ScanReport {
     pub fn mismatched(&self) -> u64 {
         self.shards.mismatched.iter().sum()
     }
+
+    /// One line, for the activity log.
+    pub fn summary(&self) -> String {
+        let mut s = format!(
+            "{} records ({:.1} MiB) checked, {} repaired",
+            self.records,
+            self.bytes as f64 / (1u64 << 20) as f64,
+            self.repaired()
+        );
+        if !self.cleared.is_empty() {
+            let disks: Vec<String> = self.cleared.iter().map(|d| d.to_string()).collect();
+            s += &format!("; disk {} back in sync", disks.join(", "));
+        }
+        if !self.errors.is_empty() {
+            s += &format!("; {} unreadable records", self.errors.len());
+        }
+        if let Some(a) = &self.aborted {
+            s += &format!("; stopped: {}", a);
+        }
+        s
+    }
 }
 
 impl std::fmt::Display for ScanReport {
@@ -402,6 +423,7 @@ impl<D: BlockDevice> FileSystem<D> {
 pub fn spawn_health_monitor<D: BlockDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     interval: Duration,
+    events: Option<crate::events::EventSink>,
 ) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     if let Some(pool) = fs.dev.pool() {
@@ -430,6 +452,23 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
                     Ok(report) => {
                         if report.since > 0 || !report.cleared.is_empty() {
                             eprintln!("{}", report);
+                            if let Some(ev) = &events {
+                                ev.clear("resilver");
+                                let line = report.summary();
+                                if report.is_clean() {
+                                    ev.info(
+                                        "resilver.done",
+                                        "pool",
+                                        format!("Resilver finished: {}", line),
+                                    );
+                                } else {
+                                    ev.warn(
+                                        "resilver.incomplete",
+                                        "pool",
+                                        format!("Resilver incomplete (will retry): {}", line),
+                                    );
+                                }
+                            }
                         }
                         wait = if report.is_clean() {
                             interval
@@ -439,6 +478,15 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
                     }
                     Err(e) => {
                         eprintln!("resilver failed: {}", e);
+                        if let Some(ev) = &events {
+                            ev.once(
+                                "resilver",
+                                crate::events::Level::Error,
+                                "resilver.failed",
+                                "pool",
+                                format!("Resilver failed: {}", e),
+                            );
+                        }
                         wait = (wait * 2).min(interval * 20);
                     }
                 }

@@ -19,6 +19,7 @@ mod api;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod auth;
 pub mod blkptr;
+pub mod btree;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,16 +34,24 @@ pub mod committer;
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 mod dashboard;
+pub mod dataset;
 pub mod disk;
 pub mod disks;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod etcd;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod events;
 pub mod fence;
 pub mod file_writer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod files_api;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod frontend;
 pub mod fs;
 mod fsck;
 pub mod inode;
 pub mod inspect;
+pub mod kv;
 mod metaslab;
 mod mirror;
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,10 +66,16 @@ pub mod open_file;
 pub mod pki;
 mod raidz;
 mod rt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod s3;
 mod scan;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod send;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sigv4;
 pub mod snapshot;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sqs;
 mod stripe;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tls;

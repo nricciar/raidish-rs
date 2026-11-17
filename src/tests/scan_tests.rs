@@ -288,7 +288,7 @@ async fn health_monitor_resilvers_a_returning_disk() {
     let pool = TestPool::new().await;
     let server = TestDiskServer::start(&pool.paths).await;
     let fs = Arc::new(format_remote(&pool, &server, &[3]).await);
-    let monitor = spawn_health_monitor(fs.clone(), Duration::from_millis(100));
+    let monitor = spawn_health_monitor(fs.clone(), Duration::from_millis(100), None);
 
     server.stop();
     let stripe = &fs.dev.pool().unwrap().disks;

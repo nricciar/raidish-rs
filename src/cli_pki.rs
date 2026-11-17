@@ -247,6 +247,87 @@ pub enum TokenCommands {
     },
     /// Decode a token, and check it against this config's CA bundle.
     Inspect { token: String },
+    /// Make an S3/SQS access key (for AWS clients) from a token, or from
+    /// this config's admin certificate. A token's key carries the token's
+    /// id, role and expiry: revoking the token revokes the key.
+    S3Key {
+        /// The token to make it from (default: this config's certificate).
+        #[arg(long)]
+        token: Option<String>,
+        /// readonly or admin (default: the token's role, or admin).
+        #[arg(long)]
+        role: Option<Role>,
+        /// Lifetime, e.g. 90d (at most the token's).
+        #[arg(long)]
+        expires: Option<String>,
+    },
+}
+
+/// `token s3-key`: ask a node for an access key.
+pub async fn s3_key(command: &TokenCommands, config: &crate::config::Config) {
+    let TokenCommands::S3Key {
+        token,
+        role,
+        expires,
+    } = command
+    else {
+        unreachable!()
+    };
+    if config.tls.is_none() {
+        fail("S3 and SQS need TLS: set `tls:` in the config");
+    }
+    let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+    if endpoints.is_empty() {
+        fail("no cluster endpoints configured");
+    }
+    let req = serde_json::json!({
+        "token": token,
+        "role": role.map(|r| r.to_string()),
+        "expires": expires,
+    });
+    let http = crate::tls::http_builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|e| fail(e));
+    let mut last = String::new();
+    for ep in &endpoints {
+        let r = match http
+            .post(format!("{}/api/v1/services/keys", ep))
+            .json(&req)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last = format!("{}: {}", ep, e);
+                continue;
+            }
+        };
+        if !r.status().is_success() {
+            let status = r.status();
+            fail(format!(
+                "{}: {}",
+                status,
+                r.text().await.unwrap_or_default()
+            ));
+        }
+        let k: crate::frontend::routes::KeyResponse = r.json().await.unwrap_or_else(|e| fail(e));
+        eprintln!(
+            "access key for {} ({}), expires {}; revoked with id {}",
+            if token.is_some() {
+                "the token"
+            } else {
+                "this certificate"
+            },
+            k.role,
+            k.expires.map(when).unwrap_or("never".into()),
+            k.id
+        );
+        println!("AWS_ACCESS_KEY_ID={}", k.access_key_id);
+        println!("AWS_SECRET_ACCESS_KEY={}", k.secret_access_key);
+        return;
+    }
+    fail(last)
 }
 
 /// `90d`, `12h`, `30m`, `45s` or plain seconds.
@@ -304,6 +385,7 @@ pub fn run_token(command: &TokenCommands, config: &crate::config::Config) {
             eprintln!("revoke it by adding its id to `auth: {{ revoked: [...] }}` on every node");
             println!("{}", token);
         }
+        TokenCommands::S3Key { .. } => unreachable!("async: s3_key"),
         TokenCommands::Inspect { token } => {
             let t = crate::auth::parse_token(token).unwrap_or_else(|e| fail(e));
             println!("id:      {}", t.claims.id);

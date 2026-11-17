@@ -3,7 +3,6 @@ use crate::object::INDIRECT_FANOUT;
 use crate::test_util::TestPool;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
-use std::path::Path;
 
 const MB: u64 = 1024 * 1024;
 
@@ -179,7 +178,7 @@ async fn overwrites_are_copy_on_write_and_free_old_space() {
     fs.block_write("vol", 0, &first).await.unwrap();
     fs.sync().await.unwrap();
 
-    let vol = fs.open_volume("vol").await.unwrap();
+    let vol = fs.open_dataset("vol").await.unwrap();
     let old_leaf = fs
         .tree_lookup(&vol.obj, &vol.obj.root(), 0, 3)
         .await
@@ -248,7 +247,7 @@ async fn multi_level_trees() {
     // > FANOUT^2 records -> 3 levels, all sparse.
     let size = (INDIRECT_FANOUT * INDIRECT_FANOUT + 10) * vbs;
     fs.create_block("vol", size, VOLBLOCK_ALIGN).await.unwrap();
-    assert_eq!(fs.open_volume("vol").await.unwrap().obj.levels(), 3);
+    assert_eq!(fs.open_dataset("vol").await.unwrap().obj.levels(), 3);
 
     let records = [
         0,
@@ -347,7 +346,7 @@ async fn delete_frees_the_whole_tree() {
         .unwrap();
     fs.sync().await.unwrap();
 
-    fs.delete(Path::new("/vol")).await.unwrap();
+    fs.delete_volume("vol").await.unwrap();
     settle(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);
     assert!(matches!(
@@ -366,7 +365,7 @@ async fn corrupted_volume_record_self_heals() {
     let data = pattern(DEFAULT_VOLBLOCKSIZE as usize, 9);
     fs.block_write("vol", 0, &data).await.unwrap();
     fs.sync().await.unwrap();
-    let vol = fs.open_volume("vol").await.unwrap();
+    let vol = fs.open_dataset("vol").await.unwrap();
     let leaf = fs
         .tree_lookup(&vol.obj, &vol.obj.root(), 0, 0)
         .await
@@ -507,7 +506,7 @@ async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
     let vbs = VOLBLOCK_ALIGN as usize;
 
     // Two levels: record 600 needs an L1 indirect and the root indirect.
-    assert_eq!(fs.open_volume("vol").await.unwrap().obj.levels(), 2);
+    assert_eq!(fs.open_dataset("vol").await.unwrap().obj.levels(), 2);
     let rec = 600u64;
     fs.block_write("vol", rec * vbs as u64, &pattern(vbs, 1))
         .await
@@ -539,7 +538,7 @@ async fn read_any<D: crate::disk::BlockDevice + Send + Sync + 'static>(
 
 #[tokio::test]
 async fn volume_props_persist_and_keep_data() {
-    use crate::inode::{Transport, VolumeProps};
+    use crate::inode::{DatasetProps, Transport};
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     fs.create_block("vol", 4 * MB, DEFAULT_VOLBLOCKSIZE)
@@ -553,16 +552,17 @@ async fn volume_props_persist_and_keep_data() {
     fs.sync().await.unwrap();
     let before = allocated(&fs).await;
 
-    let props = VolumeProps {
+    let props = DatasetProps {
         nodes: vec!["node-1".into(), "node-2".into()],
         automount: Some(Transport::Nvme),
         enabled: true,
         move_to: None,
+        port: None,
     };
-    fs.set_volume_props("vol", props.clone()).await.unwrap();
+    fs.set_dataset_props("vol", props.clone()).await.unwrap();
     // Unsynced writes ride along with the next commit, props or not.
     fs.block_write("vol", 0, &[1u8; 10]).await.unwrap();
-    fs.set_volume_props("vol", props.clone()).await.unwrap();
+    fs.set_dataset_props("vol", props.clone()).await.unwrap();
     settle(&fs).await;
     assert!(
         allocated(&fs).await <= before + 64,
@@ -578,12 +578,12 @@ async fn volume_props_persist_and_keep_data() {
     assert_eq!(v.size_bytes, 4 * MB);
     assert_eq!(
         vols.iter().find(|v| v.name == "other").unwrap().props,
-        VolumeProps::default()
+        DatasetProps::default()
     );
     assert_eq!(read(&fs, 4096, data.len()).await, data);
     assert_eq!(read(&fs, 0, 10).await, vec![1u8; 10]);
     assert!(matches!(
-        fs.set_volume_props("missing", props).await,
+        fs.set_dataset_props("missing", props).await,
         Err(FileSystemError::FileNotFound)
     ));
 }

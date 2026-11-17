@@ -21,7 +21,7 @@ use crate::committer::object_resource;
 use crate::disk::{BlockDevice, FileId};
 use crate::files_api::{ObjectGuard, ObjectLeases};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Dnode, ObjType, ROOT_OBJECT, SetAttrs};
+use crate::inode::{Dnode, ObjType, SetAttrs};
 use crate::object::{ObjTree, Sizing};
 use crate::open_file::OpenFile;
 use std::collections::HashMap;
@@ -393,8 +393,9 @@ impl<D: BlockDevice + 'static> Backend<D> {
             found = fs.try_read_dnode(id).await.map_err(err)?;
         }
         match found {
-            // Volumes aren't files to NFS.
-            Some(d) if d.kind != ObjType::Volume => Ok(d),
+            // Only files and directories are NFS objects (not volumes,
+            // snapshots or the dataset directory).
+            Some(d) if matches!(d.kind, ObjType::File | ObjType::Directory) => Ok(d),
             _ => Err(status::STALE),
         }
     }
@@ -468,9 +469,9 @@ impl<D: BlockDevice + 'static> Backend<D> {
         }
         let id = match name {
             "." => dir,
-            ".." => d.parent.max(ROOT_OBJECT),
+            ".." if d.parent == 0 => fs.root_dir(),
+            ".." => d.parent,
             _ => match self.entry(&fs, dir, name).await? {
-                Some((_, c)) if c.kind == ObjType::Volume => return Err(status::NOENT),
                 Some((id, _)) => id,
                 None => return Err(status::NOENT),
             },
@@ -489,7 +490,6 @@ impl<D: BlockDevice + 'static> Backend<D> {
         let entries = index
             .files
             .into_iter()
-            .filter(|(_, e)| e.kind != ObjType::Volume)
             .map(|(name, e)| Entry {
                 name,
                 id: e.id,
@@ -556,6 +556,11 @@ impl<D: BlockDevice + 'static> Backend<D> {
     }
 
     /// The directory an export path names (from the root).
+    /// The exported root: the default posix dataset's root directory.
+    pub async fn root(&self) -> NfsResult<FileId> {
+        Ok(self.fs().await?.root_dir())
+    }
+
     pub async fn export(&self, path: &str) -> NfsResult<FileId> {
         let fs = self.fs().await?;
         let parts = crate::inode::path_components(std::path::Path::new(path));
@@ -799,7 +804,6 @@ impl<D: BlockDevice + 'static> Backend<D> {
     pub async fn remove(&self, dir: FileId, name: &str, dir_only: bool) -> NfsResult<()> {
         let fs = self.fs().await?;
         let (id, d) = match self.entry(&fs, dir, name).await? {
-            Some((_, d)) if d.kind == ObjType::Volume => return Err(status::NOENT),
             Some(x) => x,
             None => return Err(status::NOENT),
         };
@@ -829,13 +833,11 @@ impl<D: BlockDevice + 'static> Backend<D> {
             return Err(status::NAMETOOLONG);
         }
         let moved = match self.entry(&fs, from_dir, from).await? {
-            Some((_, d)) if d.kind == ObjType::Volume => return Err(status::NOENT),
             Some(x) => x,
             None => return Err(status::NOENT),
         };
         if let Some((tid, target)) = fs.lookup_in(to_dir, to).await.map_err(err)? {
             match (moved.1.is_directory(), target.is_directory()) {
-                (_, _) if target.kind == ObjType::Volume => return Err(status::EXIST),
                 (true, false) => return Err(status::NOTDIR),
                 (false, true) => return Err(status::ISDIR),
                 (true, true) if !fs.read_dir(&target).await.map_err(err)?.files.is_empty() => {

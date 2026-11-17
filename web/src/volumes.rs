@@ -367,10 +367,10 @@ impl Volumes {
         }
     }
 
-    /// Who runs `name` now, from the cluster's `vol/<name>` lease.
+    /// Who runs `name` now, from the cluster's `ds/<name>` lease.
     fn running(&self, ctx: &Context<Self>, name: &str) -> Option<String> {
         let c = ctx.props().cluster.as_ref()?;
-        let lease = c.state.leases.get(&format!("vol/{}", name))?;
+        let lease = c.state.leases.get(&format!("ds/{}", name))?;
         (!lease.released && c.remaining_ms(lease, now_ms()) > 0.0).then(|| {
             if lease.desc.is_empty() {
                 lease.owner.clone()

@@ -1,10 +1,11 @@
+use crate::dataset::Dataset;
+use crate::dataset::{DEFAULT_FS, DatasetEntry, DatasetFormat, DatasetIndex};
 use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, DiskError, FileId};
-use crate::inode::{Dnode, FileIndex, ROOT_OBJECT};
+use crate::inode::{Dnode, FileIndex};
 use crate::metaslab::{MetaslabLayout, MetaslabState};
 use crate::object::{ObjTree, Sizing, TreeRoot};
 use crate::raidz::RaidZError;
 use crate::vdev::Topology;
-use crate::volume::Volume;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -13,7 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV21";
+pub const FS_ID: &str = "RAIDISHV23";
+/// Version of the uberblock layout written.
+pub const UBERBLOCK_VERSION: u32 = 2;
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
@@ -182,6 +185,8 @@ pub struct Uberblock {
     pub degraded: Vec<Option<u64>>,
     /// The next pool-wide object number (inode id). Never reused.
     pub next_object: u64,
+    /// The dataset directory's object number (see `crate::dataset`).
+    pub datasets: FileId,
 }
 
 /// Identity of a member disk, stored (twice) in its label area outside the
@@ -205,6 +210,13 @@ pub enum LabelState {
 }
 
 /// A random-enough 64-bit id (no RNG dependency needed).
+/// Milliseconds since the epoch (wasm too).
+pub(crate) fn now_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 pub(crate) fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(
@@ -310,8 +322,14 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
     /// The object table, with the open TXG's changes (see `crate::inode`).
     pub(crate) objects: Arc<ObjTree>,
+    /// The dataset directory's object number (from the uberblock; fixed
+    /// once formatted).
+    pub(crate) datasets_obj: Arc<AtomicU64>,
+    /// The default posix dataset's root directory (from the dataset
+    /// directory; fixed once formatted).
+    pub(crate) root_dir: Arc<AtomicU64>,
     /// Open copy-on-write volumes and their dirty records.
-    pub(crate) volumes: Arc<std::sync::Mutex<HashMap<String, Arc<Volume>>>>,
+    pub(crate) open_datasets: Arc<std::sync::Mutex<HashMap<String, Arc<Dataset>>>>,
     /// Files open for writing at any offset (see `crate::open_file`).
     pub(crate) files: Arc<std::sync::Mutex<HashMap<FileId, Arc<crate::open_file::OpenFile>>>>,
     commit_lock: Arc<Mutex<()>>,
@@ -370,7 +388,9 @@ impl<D: BlockDevice> FileSystem<D> {
                     levels: 0,
                 },
             )),
-            volumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            datasets_obj: Arc::new(AtomicU64::new(0)),
+            root_dir: Arc::new(AtomicU64::new(0)),
+            open_datasets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             files: Arc::new(std::sync::Mutex::new(HashMap::new())),
             commit_lock: Arc::new(Mutex::new(())),
             commits_started: Arc::new(AtomicU64::new(0)),
@@ -481,6 +501,7 @@ impl<D: BlockDevice> FileSystem<D> {
             },
             degraded: vec![None; fs.disk_count()],
             next_object: 1,
+            datasets: 0,
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         // Disks that failed during format must not count as missed writes
@@ -536,11 +557,28 @@ impl<D: BlockDevice> FileSystem<D> {
             ptr: None,
             levels: 0,
         }));
+        // The dataset directory, and the default posix dataset's root.
+        let datasets = fs.alloc_object();
+        fs.datasets_obj.store(datasets, Ordering::SeqCst);
+        fs.write_dnode(datasets, Some(Dnode::datasets(fs.file_blksz())))
+            .await?;
         let root = fs.alloc_object();
-        debug_assert_eq!(root, ROOT_OBJECT);
         let mut dir = Dnode::directory(fs.file_blksz());
-        dir.parent = ROOT_OBJECT;
+        dir.parent = root;
         fs.write_dnode(root, Some(dir)).await?;
+        let mut index = DatasetIndex::default();
+        index.datasets.insert(
+            DEFAULT_FS.to_string(),
+            DatasetEntry {
+                root,
+                format: DatasetFormat::Posix,
+                guid: new_guid(root),
+                created_txg: 1,
+                created_ms: now_ms(),
+            },
+        );
+        fs.write_datasets(&index).await?;
+        fs.root_dir.store(root, Ordering::SeqCst);
         fs.commit_txg().await?;
 
         Ok(fs)
@@ -551,22 +589,33 @@ impl<D: BlockDevice> FileSystem<D> {
         ObjTree::new(self.table_blksz(), Sizing::Growable, 0, root)
     }
 
-    /// Whether the root directory of the object table at `root` reads.
-    async fn root_readable(&self, root: &TreeRoot) -> bool {
-        let table = self.table_tree(root.clone());
-        let Ok(Some(buf)) = self
-            .object_record(&table, ROOT_OBJECT / crate::inode::DNODES_PER_LEAF)
+    /// Object `id`'s dnode in the object table at `root` (None: missing or
+    /// unreadable).
+    async fn dnode_in(&self, table: &ObjTree, id: FileId) -> Option<Dnode> {
+        let buf = self
+            .object_record(table, id / crate::inode::DNODES_PER_LEAF)
             .await
-        else {
-            return false;
-        };
-        let Ok(slots) = crate::inode::decode_leaf(&buf) else {
-            return false;
-        };
-        let Some(Some(dir)) = slots
-            .get((ROOT_OBJECT % crate::inode::DNODES_PER_LEAF) as usize)
+            .ok()??;
+        let slots = crate::inode::decode_leaf(&buf).ok()?;
+        slots
+            .get((id % crate::inode::DNODES_PER_LEAF) as usize)
             .cloned()
-        else {
+            .flatten()
+    }
+
+    /// Whether `uber`'s dataset directory and root directory read.
+    async fn root_readable(&self, uber: &Uberblock) -> bool {
+        let table = self.table_tree(uber.objects.clone());
+        let Some(ds) = self.dnode_in(&table, uber.datasets).await else {
+            return false;
+        };
+        let Ok(index) = self.read_datasets(&ds).await else {
+            return false;
+        };
+        let Ok(root) = Self::default_root(&index) else {
+            return false;
+        };
+        let Some(dir) = self.dnode_in(&table, root).await else {
             return false;
         };
         self.read_dir(&dir).await.is_ok()
@@ -631,6 +680,9 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         fs.layout = MetaslabLayout::from_superblock(&superblock);
         fs.publish_fence_map();
+        // Fixed once formatted, so every TXG in the ring has the same one;
+        // choosing a rewind target walks namespaces from it.
+        fs.datasets_obj.store(newest.datasets, Ordering::SeqCst);
 
         let uber = match opts.rewind {
             Rewind::None => newest.clone(),
@@ -645,7 +697,7 @@ impl<D: BlockDevice> FileSystem<D> {
             Rewind::Readable => {
                 let mut pick = None;
                 for u in &ring {
-                    if fs.root_readable(&u.objects).await {
+                    if fs.root_readable(u).await {
                         pick = Some(u.clone());
                         break;
                     }
@@ -716,9 +768,18 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(FileSystemError::ChecksumMismatch);
         }
         fs.objects = Arc::new(fs.table_tree(uber.objects.clone()));
-        // The root directory must read.
-        let root = fs.read_dnode(ROOT_OBJECT).await?;
+        // The dataset directory and the root directory must read.
+        if uber.datasets != newest.datasets {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "TXG {} names dataset directory {}, the newest TXG {}",
+                uber.txg, uber.datasets, newest.datasets
+            )));
+        }
+        let index = fs.datasets().await?;
+        let root_id = Self::default_root(&index)?;
+        let root = fs.read_dnode(root_id).await?;
         fs.read_dir(&root).await?;
+        fs.root_dir.store(root_id, Ordering::SeqCst);
 
         if rewound && !fs.read_only {
             let older: Vec<TreeRoot> = ring
@@ -857,7 +918,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(id)
     }
 
-    /// Delete a file, an empty directory or a volume.
+    /// Delete a file or an empty directory.
     pub async fn delete(&self, path: &Path) -> Result<FileId, FileSystemError> {
         if let Some(w) = self.writer.clone() {
             return self.writer_delete(&w, path, None).await;
@@ -971,12 +1032,6 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<FileId, FileSystemError> {
         let l = self.lookup_at(dir, name).await?;
         let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
-        if entry.kind == crate::inode::ObjType::Volume {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "'{}' is a volume (delete it with `volume delete`)",
-                name
-            )));
-        }
         self.discard_file(entry.id);
         self.unlink(l).await
     }
@@ -1041,9 +1096,6 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn delete_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
         let l = self.lookup(path).await?;
         let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
-        if entry.kind == crate::inode::ObjType::Volume {
-            self.close_volume(&l.name);
-        }
         self.discard_file(entry.id);
         self.unlink(l).await
     }
@@ -1119,7 +1171,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let txg = self.open_txg().await?;
         // Volumes sync all-or-nothing each, so whatever did sync is safe to
         // commit; a failure is reported after the TXG is durable.
-        let volumes = self.sync_volumes().await;
+        let volumes = self.sync_datasets().await;
         let files = self.sync_files().await;
         let volumes = volumes.and(files);
         span.mark("objects");
@@ -1322,12 +1374,13 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let uberblock = Uberblock {
             magic: UBERBLOCK_MAGIC,
-            version: 1,
+            version: UBERBLOCK_VERSION,
             txg,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             objects,
             degraded,
             next_object: self.next_object.load(Ordering::SeqCst),
+            datasets: self.datasets_object(),
         };
 
         // Rotate through the ring; one copy per block of the slot.
@@ -1365,6 +1418,7 @@ impl<D: BlockDevice> FileSystem<D> {
             },
             degraded: Vec::new(),
             next_object: 0,
+            datasets: 0,
         };
         let mut buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;
@@ -1449,7 +1503,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for i in 0..self.header.uberblock_blocks() {
             let lba = self.header.uberblock_start + i;
             for (txg, ub) in self.read_label_versions::<Uberblock>(lba).await {
-                if ub.magic != UBERBLOCK_MAGIC || ub.txg != txg {
+                if ub.magic != UBERBLOCK_MAGIC || ub.version != UBERBLOCK_VERSION || ub.txg != txg {
                     continue;
                 }
                 if !found.iter().any(|u| u.txg == txg) {

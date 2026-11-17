@@ -45,6 +45,7 @@ ws = { package = "rocket_ws", version = "0.1.1" }
 openraft = { version = "=0.9.26", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 x509-parser = "0.16"
 ring = "0.17"
@@ -53,6 +54,20 @@ time = "0.3"
 clap = { version = "4.5", features = ["derive", "color"] }
 term_size = "0.3.2"
 quick-xml = "0.37"
+# The etcd v3 API (see `crate::etcd`).
+tonic = "0.12"
+prost = "0.13"
+# The S3 and SQS endpoints (see `crate::s3`, `crate::sqs`).
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+percent-encoding = "2"
 
 # The browser disk backend (websocket via web-sys).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -62,6 +77,10 @@ js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 chrono = { version = "0.4.43", features = ["wasmbind"] }
 web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3.24.0"

@@ -384,7 +384,7 @@ async fn crash_at_every_point_of_a_workload() {
                 assert!(data.iter().all(|&b| b == data[0]), "k={k}: {name} torn");
             }
         }
-        if fs.open_volume("vol").await.is_ok() {
+        if fs.open_dataset("vol").await.is_ok() {
             let mut buf = vec![0u8; 4 << 20];
             fs.block_read("vol", 0, &mut buf)
                 .await

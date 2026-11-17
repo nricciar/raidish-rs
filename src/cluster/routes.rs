@@ -100,3 +100,20 @@ pub async fn status(_auth: crate::auth::CanRead, cluster: &State<Shared>) -> Jso
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![append, vote, snapshot, lease, status]
 }
+
+/// Stops this node's Raft member as soon as the server is asked to shut
+/// down. Rocket keeps serving open connections for its grace period
+/// (seconds), and a leader whose heartbeats still get through keeps the
+/// followers from electing anyone while the lease requests they forward to
+/// it fail: long enough for their leases to run out. Stopped, it goes
+/// quiet at once and the others elect a new leader within an election
+/// timeout.
+pub fn stop_raft_on_shutdown() -> rocket::fairing::AdHoc {
+    rocket::fairing::AdHoc::on_shutdown("stop raft", |rocket| {
+        Box::pin(async move {
+            if let Some(cluster) = rocket.state::<Shared>() {
+                let _ = cluster.raft.shutdown().await;
+            }
+        })
+    })
+}

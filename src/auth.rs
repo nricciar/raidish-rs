@@ -178,6 +178,11 @@ impl Verifier {
             .map_err(|e| format!("signer certificate: {}", e))
     }
 
+    /// Whether token (or access key) `id` is revoked.
+    pub fn is_revoked(&self, id: &str) -> bool {
+        self.revoked.iter().any(|r| r == id)
+    }
+
     /// A token's holder, if the token is good.
     pub fn verify_token(&self, token: &str) -> Result<Principal, String> {
         let t = parse_token(token)?;
@@ -208,6 +213,7 @@ impl Verifier {
             name: t.claims.sub,
             role,
             via: Via::Token(t.claims.id),
+            exp: t.claims.exp,
         })
     }
 }
@@ -227,6 +233,9 @@ pub struct Principal {
     pub name: String,
     pub role: Role,
     pub via: Via,
+    /// A token's expiry (unix seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<i64>,
 }
 
 impl Principal {
@@ -263,6 +272,7 @@ impl<'r> FromRequest<'r> for Principal {
                         name: "anonymous".into(),
                         role: Role::Node,
                         via: Via::Open,
+                        exp: None,
                     });
                 };
                 // Rocket has already checked a presented certificate's chain.
@@ -275,6 +285,7 @@ impl<'r> FromRequest<'r> for Principal {
                         name: info.name,
                         role,
                         via: Via::Cert,
+                        exp: None,
                     });
                 }
                 match bearer(req) {
@@ -312,6 +323,33 @@ macro_rules! role_guard {
             }
         }
     };
+}
+
+/// The header a node passes on an admin's request with: whose it is (for
+/// the activity log, see `crate::events`). Believed only from nodes.
+pub const ON_BEHALF: &str = "X-Raidish-On-Behalf-Of";
+
+/// Who asked for a change: the caller, or the admin a node passes on a
+/// request for (None: a node acting on its own).
+pub struct Actor(pub Option<String>);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Actor {
+    type Error = String;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
+        let Outcome::Success(p) = req.guard::<Principal>().await else {
+            return Outcome::Success(Actor(None));
+        };
+        if p.role == Role::Node {
+            let on_behalf = req
+                .headers()
+                .get_one(ON_BEHALF)
+                .map(|n| n.chars().filter(|c| !c.is_control()).take(128).collect());
+            return Outcome::Success(Actor(on_behalf));
+        }
+        Outcome::Success(Actor(Some(p.name)))
+    }
 }
 
 role_guard!(CanRead, "Any authenticated caller.", |_p| true);

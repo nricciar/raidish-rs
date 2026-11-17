@@ -15,7 +15,7 @@
 //! *transient* domain, so libvirt forgets it once it stops.
 //!
 //! Where a VM runs follows its **anchor**, the first raidish disk: that
-//! volume's placement settings (`VolumeProps`: nodes, `move_to`, enabled)
+//! volume's placement settings (`DatasetProps`: nodes, `move_to`, enabled)
 //! place the VM, and its other disks go wherever the anchor goes. Whether
 //! it *should* run is one replicated bit (`ClusterState::vms`). Whether it
 //! *does* is never stored: it is what libvirt on the anchor's node says.
@@ -467,7 +467,7 @@ fn raidish_disks(root: &El) -> Result<Vec<String>, String> {
 /// The domain XML libvirt is given: the VM's XML with its name forced,
 /// raidish disks pointed at `nbd` (host, port), any graphics replaced by a
 /// VNC console on 127.0.0.1, and raidish's metadata in place of any other.
-/// `owner` is the anchor's `vol/` lease owner: a domain whose owner isn't
+/// `owner` is the anchor's `ds/` lease owner: a domain whose owner isn't
 /// the lease's current one is an orphan of an earlier raidish (its disks'
 /// NBD connections go nowhere).
 pub fn render(spec: &VmSpec, nbd: (&str, u16), owner: &str) -> Result<String, String> {

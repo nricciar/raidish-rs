@@ -124,7 +124,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let n = self
             .object_modify(&f.obj, offset, data.len(), Some(data))
             .await?;
-        if self.volumes_dirty_bytes() + self.files_dirty_bytes() > crate::volume::DIRTY_LIMIT_BYTES
+        if self.datasets_dirty_bytes() + self.files_dirty_bytes() > crate::volume::DIRTY_LIMIT_BYTES
         {
             self.commit_txg().await?;
         }

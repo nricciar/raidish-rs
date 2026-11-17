@@ -92,6 +92,9 @@ pub enum Request {
         running: bool,
         now_ms: u64,
     },
+    /// The key S3/SQS access keys are derived with (see
+    /// `crate::frontend::keys`): set once, by whichever node asks first.
+    SetServiceKey { key: String },
 }
 
 /// What applying a [`Request`] produced.
@@ -157,6 +160,10 @@ pub struct ClusterState {
     /// stopped (see `crate::vm`).
     #[serde(default)]
     pub vms: BTreeMap<String, u64>,
+    /// The key S3/SQS secrets are derived with (hex), once some node made
+    /// one. Secret: `crate::cluster::Cluster::status` leaves it out.
+    #[serde(default)]
+    pub service_key: Option<String>,
 }
 
 impl ClusterState {
@@ -343,6 +350,12 @@ impl ClusterState {
                     self.vms.insert(name.clone(), *now_ms);
                 } else {
                     self.vms.remove(name);
+                }
+                Response::Recorded
+            }
+            Request::SetServiceKey { key } => {
+                if self.service_key.is_none() {
+                    self.service_key = Some(key.clone());
                 }
                 Response::Recorded
             }

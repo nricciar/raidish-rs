@@ -48,6 +48,9 @@ pub struct Config {
     /// Serve the pool over NFS from `listen` (see `crate::nfs`). Absent: no
     /// NFS server.
     pub nfs: Option<crate::nfs::NfsConfig>,
+    /// Serve etcd, S3 and SQS datasets (see `crate::frontend`). Absent:
+    /// this node serves none (it still forwards nothing either).
+    pub services: Option<crate::frontend::ServicesConfig>,
     /// Run VMs whose disks are volumes, through libvirt (see `crate::vm`).
     /// Absent: this node runs none.
     pub vm: Option<crate::vm::VmConfig>,

@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
-use std::path::Path;
 
 const MB: u64 = 1024 * 1024;
 // Small records: an 8 MiB volume has two levels of indirects.
@@ -129,16 +128,13 @@ async fn destroying_snapshots_frees_exactly_their_blocks() {
         }
         assert_eq!(read(&fs, "vol", VOL as usize).await, want);
     }
-    assert!(
-        fs.delete(Path::new("vol")).await.is_err(),
-        "it has a snapshot"
-    );
+    assert!(fs.delete_volume("vol").await.is_err(), "it has a snapshot");
     fs.destroy_snapshot("vol", "s3").await.unwrap();
     assert!(matches!(
         fs.destroy_snapshot("vol", "s3").await,
         Err(FileSystemError::FileNotFound)
     ));
-    fs.delete(Path::new("vol")).await.unwrap();
+    fs.delete_volume("vol").await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);
@@ -190,12 +186,12 @@ async fn clones_share_until_written() {
         Err(FileSystemError::InvalidArgument(_))
     ));
     fs.destroy_snapshot("copy", "c1").await.unwrap();
-    fs.delete(Path::new("copy")).await.unwrap();
+    fs.delete_volume("copy").await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(read(&fs, "vol@s", VOL as usize).await, at_snap);
     fs.destroy_snapshot("vol", "s").await.unwrap();
-    fs.delete(Path::new("vol")).await.unwrap();
+    fs.delete_volume("vol").await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);

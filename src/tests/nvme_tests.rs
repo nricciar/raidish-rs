@@ -421,10 +421,10 @@ async fn remove_export_flushes_and_closes_its_queues() {
 
     let data = pattern(4096, 7);
     assert!(qa.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
-    assert!(fs.has_dirty_volumes(), "write not yet committed");
+    assert!(fs.has_dirty_datasets(), "write not yet committed");
 
     assert!(server.remove_export("alpha").await.unwrap());
-    assert!(!fs.has_dirty_volumes(), "removal commits");
+    assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut qa).await;
     assert_hung_up(&mut admin_a).await;
     assert_eq!(server.exports(), vec!["beta"]);

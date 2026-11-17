@@ -228,8 +228,13 @@ fn disk_card(d: &DiskReport, p: &TopologyProps) -> Html {
         .as_ref()
         .and_then(|c| c.owner_of(d.index))
         .map(|m| match &m.addr {
-            Some(a) => format!("node {} · {}", m.id, a.trim_start_matches("http://")),
-            None => format!("node {} · this node", m.id),
+            Some(a) => format!(
+                "node-{} · {}",
+                m.id,
+                a.trim_start_matches("https://")
+                    .trim_start_matches("http://")
+            ),
+            None => format!("node-{} · this node", m.id),
         });
     let history = p.history.get(d.index);
     // Mean round trip over each refresh interval.
@@ -349,7 +354,7 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
             <div class="kv">
                 <span>{ "Leader" }</span>
                 <span>
-                    if let Some(l) = s.leader { { format!("node {}", l) } }
+                    if let Some(l) = s.leader { { format!("node-{}", l) } }
                     else { <span class="tag bad">{ "no quorum" }</span> }
                 </span>
                 <span>{ "Raft term" }</span><span>{ s.term }</span>
@@ -363,9 +368,9 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     html! {
                         <li>
                             <span class={classes!("dot", if quorum { "ok" } else { "warn" })}></span>
-                            <span class="mono">{ format!("node {}", m.id) }</span>
+                            <span class="mono">{ format!("node-{}", m.id) }</span>
                             if leader { <span class="crown" title="leader">{ "♛" }</span> }
-                            <span class="muted">{ m.addr.clone().unwrap_or_else(|| format!("{} (this node)", s.node)) }</span>
+                            <span class="muted">{ m.addr.clone().unwrap_or_else(|| "this node".to_string()) }</span>
                             <span class="muted small">{ format!("disks {}", m.disks.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) }</span>
                         </li>
                     }

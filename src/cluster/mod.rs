@@ -46,6 +46,11 @@ pub const FINGERPRINT_HEADER: &str = "X-Raidish-Layout";
 /// whose config disagrees about who is who gets refused.
 pub const TO_HEADER: &str = "X-Raidish-To";
 
+/// How long a lease request waits for a leader (one that answers) before
+/// giving up: a few election timeouts, and under the clients' request
+/// timeout (see `lease::LeaseClient`).
+pub const FORWARD_WAIT: Duration = Duration::from_secs(4);
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -93,6 +98,9 @@ pub enum LeaseOp {
     SetVm {
         name: String,
         running: bool,
+    },
+    SetServiceKey {
+        key: String,
     },
 }
 
@@ -173,6 +181,7 @@ impl LeaseOp {
                 running,
                 now_ms,
             },
+            LeaseOp::SetServiceKey { key } => Request::SetServiceKey { key },
         }
     }
 }
@@ -323,33 +332,104 @@ impl Cluster {
     }
 
     /// Apply a lease op, forwarding it to the leader if this node isn't.
+    ///
+    /// While there's no leader, or the one this node knows of doesn't
+    /// answer (it has just stopped, say), it waits for the next one for up
+    /// to [`FORWARD_WAIT`] and tries again: losing the leader shouldn't
+    /// cost healthy holders their leases, so their renewals have to reach
+    /// the new leader as soon as there is one.
     pub async fn lease(&self, op: &LeaseOp, forwarded: bool) -> Result<Response, String> {
-        match self.raft.client_write(op.stamp(now_ms())).await {
-            Ok(resp) => Ok(resp.data),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) if !forwarded => {
-                let Some(addr) = f.leader_id.and_then(|id| self.members.peers.get(&id)) else {
-                    return Err("no cluster leader (quorum lost?)".into());
-                };
-                let url = format!("{}/api/v1/cluster/lease?forwarded=true", addr);
-                let resp = self
-                    .http
-                    .post(&url)
-                    .timeout(Duration::from_secs(5))
-                    .json(op)
-                    .send()
-                    .await
-                    .map_err(|e| format!("forwarding to leader: {}", e))?;
-                resp.json::<Result<Response, String>>()
-                    .await
-                    .map_err(|e| format!("forwarding to leader: {}", e))?
+        let deadline = tokio::time::Instant::now() + FORWARD_WAIT;
+        loop {
+            let (leader, err) = match self.raft.client_write(op.stamp(now_ms())).await {
+                Ok(resp) => return Ok(resp.data),
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) if !forwarded => {
+                    match f.leader_id.and_then(|id| self.members.peers.get(&id)) {
+                        None => (None, "no cluster leader (quorum lost?)".to_string()),
+                        Some(addr) => match self.forward(addr, op, deadline).await {
+                            Ok(r) => return r,
+                            Err(e) => (f.leader_id, e),
+                        },
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(err);
             }
-            Err(e) => Err(e.to_string()),
+            // A (different) leader, or a second's pause before asking the
+            // same one again.
+            let _ = self
+                .raft
+                .wait(Some(left.min(Duration::from_secs(1))))
+                .metrics(
+                    |m| m.current_leader.is_some() && m.current_leader != leader,
+                    "a new leader",
+                )
+                .await;
         }
+    }
+
+    /// Send `op` to the leader at `addr`. `Err` if it didn't answer; its
+    /// answer, refusals included, otherwise.
+    async fn forward(
+        &self,
+        addr: &str,
+        op: &LeaseOp,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<Response, String>, String> {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let url = format!("{}/api/v1/cluster/lease?forwarded=true", addr);
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(left.max(Duration::from_secs(1)))
+            .json(op)
+            .send()
+            .await
+            .map_err(|e| format!("forwarding to leader: {}", e))?;
+        resp.json::<Result<Response, String>>()
+            .await
+            .map_err(|e| format!("forwarding to leader: {}", e))
     }
 
     /// The NFSv4 client records (owner strings, hex) as this node has them.
     pub fn nfs_clients(&self) -> Vec<String> {
         self.store.nfs_clients()
+    }
+
+    /// The key S3/SQS secrets are derived with, if made yet.
+    pub fn service_key(&self) -> Option<Vec<u8>> {
+        self.store
+            .state()
+            .service_key
+            .and_then(|k| hex::decode(k).ok())
+    }
+
+    /// The service key, made (randomly, by this node) if there's none yet.
+    pub async fn ensure_service_key(&self) -> Result<Vec<u8>, String> {
+        if let Some(k) = self.service_key() {
+            return Ok(k);
+        }
+        let mut key = [0u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+            .map_err(|_| "no randomness")?;
+        self.lease(
+            &LeaseOp::SetServiceKey {
+                key: hex::encode(key),
+            },
+            false,
+        )
+        .await?;
+        // Whichever node's key went in first (applied here by now).
+        for _ in 0..50 {
+            if let Some(k) = self.service_key() {
+                return Ok(k);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err("the service key didn't arrive".into())
     }
 
     /// Lease `resource` as this node's applied state has it.
@@ -375,7 +455,11 @@ impl Cluster {
                 })
                 .collect(),
             fingerprint: self.members.fingerprint.clone(),
-            state: self.store.state(),
+            state: ClusterState {
+                // Never handed out (status is for any reader).
+                service_key: None,
+                ..self.store.state()
+            },
             now_ms: now_ms(),
         }
     }

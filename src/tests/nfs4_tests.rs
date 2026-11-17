@@ -237,7 +237,9 @@ fn opened(r: &mut Reader<'_>) -> (u32, [u8; 12]) {
 #[tokio::test]
 async fn sessions_and_their_rules() {
     let pool = TestPool::new().await;
-    let addr = serve(Arc::new(pool.format().await)).await;
+    let fs = Arc::new(pool.format().await);
+    let root_id = fs.root_dir();
+    let addr = serve(fs).await;
     let mut v = V4::connect(addr, "client-a").await;
 
     // The root's attributes.
@@ -278,7 +280,7 @@ async fn sessions_and_their_rules() {
     a.u64().unwrap();
     a.u64().unwrap(); // fsid
     assert_eq!(a.u32().unwrap(), super::state::LEASE_SECS);
-    assert_eq!(a.u64().unwrap(), crate::inode::ROOT_OBJECT);
+    assert_eq!(a.u64().unwrap(), root_id);
 
     // Replays: the cached reply, byte for byte; uncached ones refused.
     let ask = || getattr(putroot(Ops::new()), &[attrs::CHANGE]);

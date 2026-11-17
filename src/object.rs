@@ -29,6 +29,7 @@ use crate::disk::BLOCK_SIZE;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use crate::zil::KeyedOp;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -85,6 +86,18 @@ pub(crate) struct DirtyState {
     /// log, and which bytes of each (a writer's flush logs exactly these,
     /// see `crate::zil`).
     pub(crate) unlogged: BTreeMap<u64, Unlogged>,
+    /// Keyed operations applied since they were last logged, in order,
+    /// with their sequence numbers: what the intent log carries for a
+    /// dataset whose records are changed only by them (a `kv` dataset's
+    /// B+tree, see `crate::zil`), instead of the records.
+    pub(crate) ops: Vec<(u64, KeyedOp)>,
+    /// The next operation's sequence number.
+    pub(crate) next_op: u64,
+    /// Operations before this one are in the records a sync in progress
+    /// took (set by `begin_sync`).
+    pub(crate) ops_cut: u64,
+    /// Operations before this one are committed: none of them need logging.
+    pub(crate) ops_synced: u64,
 }
 
 /// Most byte ranges tracked per unlogged record; past it, the whole record.
@@ -156,8 +169,17 @@ impl DirtyState {
             .add(start as u32, end as u32);
     }
 
-    /// Put back changes taken for a log append that didn't make it.
-    pub(crate) fn restore_unlogged(&mut self, taken: BTreeMap<u64, Unlogged>) {
+    /// Put back changes taken for a log append that didn't make it (the
+    /// operations ahead of any applied since, less those committed since).
+    pub(crate) fn restore_unlogged(
+        &mut self,
+        taken: BTreeMap<u64, Unlogged>,
+        ops: Vec<(u64, KeyedOp)>,
+    ) {
+        let synced = self.ops_synced;
+        let mut back: Vec<(u64, KeyedOp)> = ops.into_iter().filter(|(n, _)| *n >= synced).collect();
+        back.append(&mut self.ops);
+        self.ops = back;
         for (idx, ch) in taken {
             match self.unlogged.get_mut(&idx) {
                 Some(cur) => cur.merge(&ch),
@@ -348,6 +370,39 @@ impl ObjTree {
         d.mark_whole(idx);
     }
 
+    /// Replace several records at once: a sync or intent log flush (which
+    /// take the dirty records under the same lock) sees all of them or
+    /// none (see `crate::btree`). The intent log doesn't carry the records
+    /// themselves: it carries `op`, the operation that made them (None:
+    /// nothing; they're durable once committed, as a receive's are, or
+    /// they're a replay's).
+    pub(crate) fn put_records(
+        &self,
+        recs: impl IntoIterator<Item = (u64, Dirty)>,
+        op: Option<KeyedOp>,
+    ) {
+        let recs: Vec<(u64, Dirty)> = recs
+            .into_iter()
+            .map(|(idx, rec)| match rec {
+                Dirty::Data(mut b) => {
+                    assert!(b.len() <= self.blksz, "record larger than blksz");
+                    b.resize(self.blksz, 0);
+                    (idx, Dirty::Data(b))
+                }
+                Dirty::Hole => (idx, Dirty::Hole),
+            })
+            .collect();
+        let mut d = self.dirty.lock().unwrap();
+        for (idx, rec) in recs {
+            d.records.insert(idx, rec);
+        }
+        if let Some(op) = op {
+            let n = d.next_op;
+            d.next_op += 1;
+            d.ops.push((n, op));
+        }
+    }
+
     /// Point at a different committed tree, dropping nothing else: for a
     /// process that doesn't commit itself, catching up with what another
     /// committed. Never dirty there.
@@ -365,6 +420,7 @@ impl ObjTree {
         }
         let taken = Arc::new(std::mem::take(&mut d.records));
         d.syncing = Some(taken.clone());
+        d.ops_cut = d.next_op;
         Some(taken)
     }
 
@@ -388,6 +444,12 @@ impl ObjTree {
             records, unlogged, ..
         } = &mut *d;
         unlogged.retain(|k, _| records.contains_key(k));
+        // Operations whose records were all synced are committed.
+        if synced.is_some_and(|s| s.len() == taken.len()) {
+            d.ops_synced = d.ops_synced.max(d.ops_cut);
+            let synced = d.ops_synced;
+            d.ops.retain(|(n, _)| *n >= synced);
+        }
     }
 }
 

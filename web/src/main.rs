@@ -5,6 +5,7 @@
 // Only the wasm build runs; the native build just type-checks.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 
+mod activity;
 mod api;
 mod app;
 mod blockmap;

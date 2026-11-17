@@ -1,10 +1,11 @@
 //! Client side of leases: what a writing command (`nbd`, `block`, `fsck
 //! --repair`, ...) uses to become the pool's one writer.
 //!
-//! The holder renews every `ttl / 3`. If it can't renew for most of a TTL it
-//! assumes the lease is gone and stops (see [`HeldLease::hold`]). The disk
-//! servers fence it in any case: once anyone uses a newer epoch, writes with
-//! the old one are refused.
+//! The holder renews every `ttl / 3`, and every [`RETRY_PAUSE`] after a
+//! failed renewal (a leader election, typically). If it can't renew for most
+//! of a TTL it assumes the lease is gone and stops (see [`HeldLease::hold`]).
+//! The disk servers fence it in any case: once anyone uses a newer epoch,
+//! writes with the old one are refused.
 
 use super::LeaseOp;
 use super::state::Response;
@@ -12,6 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const LEASE_TTL: Duration = Duration::from_secs(10);
+
+/// How soon a failed renewal is tried again.
+const RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 /// Talks to whichever `listen` node answers (non-leaders forward).
 #[derive(Clone)]
@@ -135,16 +139,40 @@ impl HeldLease {
         }
     }
 
-    /// Keep renewing in the background. `on_lost` runs (once) when the lease
-    /// is lost or can't be renewed for most of a TTL.
+    /// Keep renewing in the background, for as long as anyone holds this
+    /// `HeldLease`: once the last `Arc` is dropped the lease is released
+    /// (whoever let go of it, a failed start included, needn't remember
+    /// to). `on_lost` runs (once) when the lease is lost or can't be
+    /// renewed for most of a TTL.
     pub fn hold(self: &Arc<Self>, on_lost: impl FnOnce(String) + Send + 'static) {
-        let me = self.clone();
+        let weak = Arc::downgrade(self);
+        let (client, resource, owner, epoch) = (
+            self.client.clone(),
+            self.resource.clone(),
+            self.owner.clone(),
+            self.epoch,
+        );
         tokio::spawn(async move {
             let ttl = LEASE_TTL;
             // Conservative: the lease counts from when the request was sent.
             let mut valid_from = Instant::now();
+            let mut pause = ttl / 3;
             loop {
-                tokio::time::sleep(ttl / 3).await;
+                tokio::time::sleep(pause).await;
+                let Some(me) = weak.upgrade() else {
+                    // Dropped without `release`: give it back rather than
+                    // renew a lease nobody uses (it would block everyone
+                    // else, this process's own next attempt included).
+                    let op = LeaseOp::Release {
+                        resource,
+                        owner,
+                        epoch,
+                    };
+                    if let Err(e) = client.call(&op).await {
+                        eprintln!("lease: release failed (it will expire): {}", e);
+                    }
+                    return;
+                };
                 if me.released.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
@@ -155,10 +183,18 @@ impl HeldLease {
                     epoch: me.epoch,
                     ttl_ms: ttl.as_millis() as u64,
                 };
-                match me.client.call(&op).await {
+                // Never wait on a renewal past the point where the lease
+                // has to count as gone.
+                let left = (ttl * 4 / 5).saturating_sub(valid_from.elapsed());
+                let result = match tokio::time::timeout(left, me.client.call(&op)).await {
+                    Ok(r) => r,
+                    Err(_) => Err("timed out".to_string()),
+                };
+                match result {
                     Ok(Response::Granted { epoch, .. }) if epoch == me.epoch => {
                         valid_from = sent;
                         *me.renewed.lock().unwrap() = sent;
+                        pause = ttl / 3;
                     }
                     Ok(_) if me.released.load(std::sync::atomic::Ordering::SeqCst) => return,
                     Ok(other) => {
@@ -166,14 +202,18 @@ impl HeldLease {
                         return;
                     }
                     Err(e) => {
-                        if valid_from.elapsed() > ttl * 4 / 5 {
+                        if valid_from.elapsed() >= ttl * 4 / 5 {
                             on_lost(format!(
                                 "lease on {} could not be renewed: {}",
                                 me.resource, e
                             ));
                             return;
                         }
+                        // Most likely the leader has just gone and the
+                        // others are electing a new one: keep asking, often,
+                        // so the renewal lands as soon as there is one.
                         eprintln!("lease: renew failed (will retry): {}", e);
+                        pause = RETRY_PAUSE;
                     }
                 }
             }

@@ -20,7 +20,7 @@
 //!   node's libvirt, for the above.
 
 use crate::cluster::{Cluster, LeaseOp};
-use crate::committer::volume_resource;
+use crate::committer::dataset_resource;
 use crate::vm::{LocalVm, VmRuntime, VmSpec};
 use crate::volumes_api::VolumesState;
 use rocket::futures::{SinkExt, StreamExt};
@@ -97,9 +97,9 @@ pub struct VmView {
 fn holder(cluster: &Cluster, volume: &str) -> Option<String> {
     let now = crate::cluster::now_ms();
     cluster
-        .lease_state(&volume_resource(volume))
+        .lease_state(&dataset_resource(volume))
         .filter(|l| !l.released && l.expires_ms > now)
-        .map(|l| l.desc.strip_prefix("agent ").unwrap_or(&l.desc).to_string())
+        .map(|l| crate::frontend::parse_desc(&l.desc).0)
 }
 
 /// A node's base URL; None: this node.
@@ -329,10 +329,12 @@ pub struct MoveTo {
 }
 
 #[post("/api/v1/vms/<name>/move", data = "<to>")]
+#[allow(clippy::too_many_arguments)]
 async fn move_vm(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     to: Json<MoveTo>,
+    events: &State<crate::events::EventSink>,
     st: &State<VmsState>,
     files: &State<crate::files_api::FilesState>,
     cluster: &State<Arc<Cluster>>,
@@ -358,18 +360,27 @@ async fn move_vm(
     props.move_to = Some(to.node.clone());
     volumes
         .client
+        .on_behalf(&auth.0)
         .set_props(&spec.anchor, &props)
         .await
         .map_err(|e| (Status::ServiceUnavailable, e.to_string()))?;
+    events.emit(
+        crate::events::Level::Info,
+        "vm.move",
+        format!("vm/{}", name),
+        format!("VM '{}' asked to move to {}", name, to.node),
+        Some(auth.0.name.clone()),
+    );
     poke(st, cluster, &spec).await;
     Ok(Json(()))
 }
 
 #[post("/api/v1/vms/<name>/<action>", rank = 2)]
 async fn action(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     name: &str,
     action: &str,
+    events: &State<crate::events::EventSink>,
     st: &State<VmsState>,
     files: &State<crate::files_api::FilesState>,
     cluster: &State<Arc<Cluster>>,
@@ -400,6 +411,20 @@ async fn action(
         }
         a => return Err(bad(format!("unknown action '{}'", a))),
     }
+    let what = match action {
+        "start" => "asked to start",
+        "stop" => "asked to shut down",
+        "kill" => "forced off",
+        "reboot" | "restart" => "rebooted",
+        _ => "reset",
+    };
+    events.emit(
+        crate::events::Level::Info,
+        &format!("vm.{}", action),
+        format!("vm/{}", name),
+        format!("VM '{}' {}", name, what),
+        Some(auth.0.name.clone()),
+    );
     Ok(Json(()))
 }
 

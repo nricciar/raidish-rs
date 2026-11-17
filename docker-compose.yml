@@ -35,7 +35,7 @@ services:
       pki: { condition: service_completed_successfully }
     hostname: node0
     command: --config /etc/raidish/node.yaml listen --port 8881
-    ports: ["127.0.0.1:8881:8881"]
+    ports: ["127.0.0.1:8881:8881", "127.0.0.1:9000:9000", "127.0.0.1:9324:9324", "127.0.0.1:2379:2379"]
     volumes:
       - ./docker/node0.yaml:/etc/raidish/node.yaml:ro
       - ./docker/pki/node0:/etc/raidish/tls:ro

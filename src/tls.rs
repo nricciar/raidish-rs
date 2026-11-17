@@ -109,6 +109,39 @@ impl TlsConfig {
     }
 }
 
+impl TlsConfig {
+    /// A rustls server config with this process's certificate: clients
+    /// must (`require_client`) or may present a certificate chaining to
+    /// the bundle. `alpn`: the protocols offered.
+    pub fn server_config(
+        &self,
+        require_client: bool,
+        alpn: &[&[u8]],
+    ) -> Result<rustls::ServerConfig, String> {
+        install_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in self.roots()? {
+            roots.add(c).map_err(|e| format!("tls: bad CA: {}", e))?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+        let verifier = if require_client {
+            verifier.build()
+        } else {
+            verifier.allow_unauthenticated().build()
+        }
+        .map_err(|e| format!("tls: {}", e))?;
+        let (chain, key) = self
+            .identity()?
+            .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
+        let mut c = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain, key)
+            .map_err(|e| format!("tls: {}", e))?;
+        c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(c)
+    }
+}
+
 /// Use ring for rustls (the one crypto backend we build).
 pub fn install_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();

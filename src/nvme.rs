@@ -338,7 +338,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
                 volume
             )));
         }
-        let size = self.target.fs.open_volume(volume).await?.size_bytes;
+        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
         let mut exports = self.target.exports.lock().unwrap();
         if exports.contains_key(&nqn) {
             return Err(FileSystemError::AlreadyExists);
