@@ -49,6 +49,7 @@ pub async fn listen(
     tls: Option<&crate::tls::TlsConfig>,
     auth: crate::auth::AuthState,
     nfs: Option<crate::nfs::peers::NfsServers>,
+    vms: Option<Arc<crate::vm::VmRuntime>>,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -115,6 +116,7 @@ pub async fn listen(
         .manage(server)
         .manage(files)
         .manage(volumes)
+        .manage(crate::vms_api::VmsState::new(vms))
         .manage(cluster)
         .manage(committer)
         .manage(agent)
@@ -141,6 +143,7 @@ pub async fn listen(
         .mount("/", crate::committer::routes::routes())
         .mount("/", crate::files_api::routes())
         .mount("/", crate::volumes_api::routes())
+        .mount("/", crate::vms_api::routes())
         .mount("/", crate::nfs::peers::routes())
         .mount("/", crate::dashboard::routes())
         .launch()

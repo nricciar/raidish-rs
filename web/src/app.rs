@@ -5,6 +5,8 @@ use crate::cluster::{self, Status};
 use crate::files::FileManager;
 use crate::panels::{ClusterPanel, Hero, Metaslabs, Timeline, TopologyPanel};
 use crate::session::{LayoutData, Session, Shared, Snapshot, now_ms, tab_hidden};
+use crate::vm_page::VmPage;
+use crate::vms::Vms;
 use crate::volumes::Volumes;
 use gloo_timers::callback::Interval;
 use raidish::disk::IoStats;
@@ -40,6 +42,8 @@ pub struct Props {
 pub enum Route {
     Overview,
     Files(String),
+    /// `#vms`: the list; `#vms/<name>`: one VM.
+    Vms(Option<String>),
 }
 
 impl Route {
@@ -48,6 +52,16 @@ impl Route {
             .and_then(|w| w.location().hash().ok())
             .unwrap_or_default();
         let hash = hash.trim_start_matches('#');
+        if let Some(rest) = hash.strip_prefix("vms")
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            let name = rest.trim_matches('/');
+            return Route::Vms((!name.is_empty()).then(|| {
+                js_sys::decode_uri_component(name)
+                    .map(String::from)
+                    .unwrap_or_else(|_| name.to_string())
+            }));
+        }
         match hash.strip_prefix("files") {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => Route::Files(
                 rest.split('/')
@@ -64,15 +78,17 @@ impl Route {
         }
     }
 
-    fn href(&self) -> String {
+    pub fn href(&self) -> String {
         match self {
             Route::Overview => "#overview".into(),
+            Route::Vms(None) => "#vms".into(),
+            Route::Vms(Some(n)) => format!("#vms/{}", crate::api::encode_path(n)),
             Route::Files(p) if p.is_empty() => "#files".into(),
             Route::Files(p) => format!("#files/{}", crate::api::encode_path(p)),
         }
     }
 
-    fn go(&self) {
+    pub fn go(&self) {
         if let Some(w) = web_sys::window() {
             let _ = w.location().set_hash(&self.href());
         }
@@ -142,7 +158,7 @@ impl Component for App {
         let route = Route::current();
         let files_dir = match &route {
             Route::Files(d) => d.clone(),
-            Route::Overview => String::new(),
+            Route::Overview | Route::Vms(_) => String::new(),
         };
         App {
             session: None,
@@ -287,6 +303,8 @@ impl Component for App {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let on_files = matches!(self.route, Route::Files(_));
+        let on_vms = matches!(self.route, Route::Vms(_));
+        let on_overview = self.route == Route::Overview;
         let files_href = Route::Files(self.files_dir.clone()).href();
         let header = html! {
             <header class="top">
@@ -295,14 +313,15 @@ impl Component for App {
                     <span>{ "raidish" }</span>
                 </div>
                 <nav class="tabs">
-                    <a class={classes!("tab", (!on_files).then_some("on"))} href="#overview">{ "Overview" }</a>
+                    <a class={classes!("tab", on_overview.then_some("on"))} href="#overview">{ "Overview" }</a>
                     <a class={classes!("tab", on_files.then_some("on"))} href={files_href}>{ "File Manager" }</a>
+                    <a class={classes!("tab", on_vms.then_some("on"))} href="#vms">{ "VMs" }</a>
                 </nav>
                 <div class="top-meta">
                     { self.cluster.as_ref().map(|c| html! {
                         <span class="muted">{ format!("via node {} ({})", c.id, c.node) }</span>
                     }).unwrap_or_default() }
-                    if !on_files { { self.refresh_note() } }
+                    if on_overview { { self.refresh_note() } }
                     if let Some(user) = &ctx.props().user {
                         <span class="user">
                             <span class="muted">{ user }</span>
@@ -316,7 +335,7 @@ impl Component for App {
         };
         let path: AttrValue = match &self.route {
             Route::Files(d) => d.clone().into(),
-            Route::Overview => self.files_dir.clone().into(),
+            Route::Overview | Route::Vms(_) => self.files_dir.clone().into(),
         };
         let can_write = ctx.props().can_write;
         let on_navigate = Callback::from(|dir: String| Route::Files(dir).go());
@@ -324,7 +343,17 @@ impl Component for App {
             <>
                 { header }
                 <main>
-                    if !on_files { { self.overview(ctx) } }
+                    if on_overview { { self.overview(ctx) } }
+                    if let Route::Vms(None) = &self.route {
+                        <div class="wrap">
+                            <Vms active={true} {can_write} />
+                        </div>
+                    }
+                    if let Route::Vms(Some(name)) = &self.route {
+                        <div class="wrap">
+                            <VmPage key={name.clone()} name={name.clone()} {can_write} cluster={self.cluster.clone()} />
+                        </div>
+                    }
                     // Kept mounted on the overview too, so uploads carry on.
                     <div class="wrap" hidden={!on_files}>
                         <FileManager {path} active={on_files} {can_write} {on_navigate} />

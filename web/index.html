@@ -7,6 +7,9 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='2' width='14' height='3' rx='1' fill='%2330a46c'/><rect x='1' y='6.5' width='14' height='3' rx='1' fill='%233e9bf5'/><rect x='1' y='11' width='14' height='3' rx='1' fill='%23f5c518'/></svg>" />
     <link data-trunk rel="css" href="style.css" />
     <link data-trunk rel="rust" data-wasm-opt="z" />
+    <!-- The VM console's VNC client (noVNC, MPL-2.0; see hack/bundle-novnc.py). -->
+    <link data-trunk rel="copy-dir" href="novnc" />
+    <script src="novnc/novnc-1.5.0.js" defer></script>
   </head>
   <body></body>
 </html>

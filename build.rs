@@ -32,6 +32,7 @@ fn main() {
         "web/style.css",
         "web/Trunk.toml",
         "web/Cargo.toml",
+        "web/novnc",
         "src",
     ] {
         println!("cargo:rerun-if-changed={}", manifest.join(dir).display());

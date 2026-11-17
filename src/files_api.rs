@@ -141,6 +141,21 @@ impl FilesState {
     }
 }
 
+impl FilesState {
+    /// Every VM definition, as of the newest committed root.
+    pub(crate) async fn vm_specs(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::vm::VmSpec>, ApiError> {
+        let mut specs = std::collections::BTreeMap::new();
+        match self.reader()? {
+            Reader::Writer(fs) => crate::vm::load_specs(&fs, &mut specs).await,
+            Reader::ReadOnly(fs) => crate::vm::load_specs(&fs, &mut specs).await,
+        }
+        .map_err(api_err)?;
+        Ok(specs)
+    }
+}
+
 // ---- reads ----
 
 /// A file's dnode, as of the newest committed root.

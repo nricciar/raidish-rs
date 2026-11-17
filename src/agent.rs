@@ -113,6 +113,9 @@ pub struct RunningVolume {
 pub struct AgentStatus {
     pub node: String,
     pub volumes: Vec<RunningVolume>,
+    /// Why VMs that should run here don't (as of the last tick).
+    #[serde(default)]
+    pub vm_errors: BTreeMap<String, String>,
 }
 
 pub type AgentState = Arc<std::sync::RwLock<AgentStatus>>;
@@ -156,6 +159,12 @@ pub struct Agent {
     /// Where this node's file API finds the writer.
     files: crate::files_api::WriterSlot,
     running: BTreeMap<String, Running>,
+    /// Running VMs here (None: this node runs none).
+    vm: Option<Arc<crate::vm::VmRuntime>>,
+    /// The VM definitions as last read.
+    specs: BTreeMap<String, crate::vm::VmSpec>,
+    /// VMs asked to shut down here, and when.
+    stopping: BTreeMap<String, std::time::Instant>,
 }
 
 impl Agent {
@@ -181,7 +190,26 @@ impl Agent {
             writer: None,
             files,
             running: BTreeMap::new(),
+            vm: None,
+            specs: BTreeMap::new(),
+            stopping: BTreeMap::new(),
         }
+    }
+
+    /// Run VMs too (see `crate::vm`).
+    pub fn with_vms(mut self, vm: Arc<crate::vm::VmRuntime>) -> Self {
+        self.vm = Some(vm);
+        self
+    }
+
+    /// Where qemu reaches this node's NBD exports.
+    pub fn nbd_target(config: &AutomountConfig) -> (String, u16) {
+        let bind = config.bind();
+        let host = match bind.as_str() {
+            "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+            b => b.to_string(),
+        };
+        (host, config.nbd_port())
     }
 
     fn desc(&self) -> String {
@@ -216,7 +244,15 @@ impl Agent {
                 eprintln!("agent: {}", e);
             }
             self.publish();
-            tokio::time::sleep(TICK).await;
+            match self.vm.clone() {
+                Some(vm) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(TICK) => {}
+                        _ = vm.poke.notified() => {}
+                    }
+                }
+                None => tokio::time::sleep(TICK).await,
+            }
         }
     }
 
@@ -226,13 +262,19 @@ impl Agent {
     }
 
     async fn tick(&mut self) -> Result<(), String> {
-        // Volumes whose lease is gone: stop serving them at once.
+        // Volumes whose lease is gone: stop serving them at once, and kill
+        // any VM using them first (its writes are fenced already; this
+        // keeps it from running on with I/O errors while another node
+        // starts it).
         let lost: Vec<String> = self
             .running
             .iter()
             .filter(|(_, r)| r.lost.is_lost())
             .map(|(n, _)| n.clone())
             .collect();
+        if !lost.is_empty() {
+            self.destroy_vms_using(&lost).await;
+        }
         for name in lost {
             eprintln!("agent: lost the lease on volume '{}'", name);
             self.stop(&name, false).await;
@@ -240,6 +282,7 @@ impl Agent {
         if self.writer.as_ref().is_some_and(|w| w.lost.is_lost()) {
             eprintln!("agent: lost the writer lease; dropping every volume");
             let names: Vec<String> = self.running.keys().cloned().collect();
+            self.destroy_vms_using(&names).await;
             for name in names {
                 self.stop(&name, false).await;
             }
@@ -254,6 +297,14 @@ impl Agent {
         // or not a volume runs here.
         if let Err(e) = self.ensure_writer().await {
             eprintln!("agent: opening the pool as a writer: {}", e);
+        }
+        // VM definitions. On a read error keep the last ones read: losing
+        // them would look like every VM was deleted.
+        if self.vm.is_some()
+            && let Some(w) = &self.writer
+            && let Err(e) = crate::vm::load_specs(&w.fs, &mut self.specs).await
+        {
+            eprintln!("agent: reading VM definitions: {}", e);
         }
         let state = self.cluster.status().state;
         let now = crate::cluster::now_ms();
@@ -278,17 +329,76 @@ impl Agent {
 
         let by_name: BTreeMap<&str, &VolumeInfo> =
             volumes.iter().map(|v| (v.name.as_str(), v)).collect();
-        // Stop what no longer belongs here (deleted, disabled, moved, changed transport).
+        // A VM's volumes are placed by its anchor's settings and holder, so
+        // they all land on one node, exported over NBD for qemu (and not
+        // attached to the host kernel).
+        let mut vm_place: BTreeMap<String, (VolumeProps, Option<String>)> = BTreeMap::new();
+        if self.vm.is_some() {
+            for spec in self.specs.values().filter(|s| s.usable()) {
+                let Some(anchor) = by_name.get(spec.anchor.as_str()) else {
+                    continue;
+                };
+                let props = VolumeProps {
+                    automount: Some(Transport::Nbd),
+                    ..anchor.props.clone()
+                };
+                let h = holder(&spec.anchor);
+                for v in &spec.volumes {
+                    vm_place
+                        .entry(v.clone())
+                        .or_insert_with(|| (props.clone(), h.clone()));
+                }
+            }
+        }
+        let target = |name: &str, own: &VolumeProps| -> Option<String> {
+            match vm_place.get(name) {
+                Some((p, h)) => place(p, h.as_deref(), &live),
+                None => place(own, holder(name).as_deref(), &live),
+            }
+        };
+        let transport = |name: &str, own: &VolumeProps| -> Option<Transport> {
+            match vm_place.get(name) {
+                Some((p, _)) => p.automount,
+                None => own.automount,
+            }
+        };
+
+        // What libvirt runs here. Unknown (libvirt down): leave VM volumes
+        // where they are, they may be in use.
+        let doms = match &self.vm {
+            Some(vm) => vm.virsh.list().await.map_err(|e| {
+                eprintln!("agent: {}", e);
+                e
+            }),
+            None => Ok(Vec::new()),
+        };
+        let mut ours: Vec<crate::vm::LocalVm> = Vec::new();
+        if let (Some(vm), Ok(doms)) = (&self.vm, &doms) {
+            for d in doms.iter().filter(|d| d.id.is_some()) {
+                if let Some(v) = vm.virsh.local_vm(d.clone()).await {
+                    ours.push(v);
+                }
+            }
+        }
+        let in_use: BTreeSet<String> = ours
+            .iter()
+            .flat_map(|v| v.meta.volumes.iter().cloned())
+            .collect();
+
+        // Stop what no longer belongs here (deleted, disabled, moved,
+        // changed transport), once no VM here uses it.
         let stop: Vec<String> = self
             .running
             .iter()
             .filter(|(name, r)| match by_name.get(name.as_str()) {
                 None => true,
                 Some(v) => {
-                    place(&v.props, Some(&self.node), &live).as_deref() != Some(&self.node)
-                        || v.props.automount != Some(r.info.transport)
+                    target(name, &v.props).as_deref() != Some(&self.node)
+                        || transport(name, &v.props) != Some(r.info.transport)
                 }
             })
+            .filter(|(name, _)| !in_use.contains(*name))
+            .filter(|(name, _)| doms.is_ok() || !vm_place.contains_key(*name))
             .map(|(n, _)| n.clone())
             .collect();
         for name in stop {
@@ -300,18 +410,152 @@ impl Agent {
             if self.running.contains_key(&v.name) {
                 continue;
             }
-            let h = holder(&v.name);
-            if place(&v.props, h.as_deref(), &live).as_deref() != Some(&self.node) {
+            if target(&v.name, &v.props).as_deref() != Some(&self.node) {
                 continue;
             }
-            if h.is_some() {
+            if holder(&v.name).is_some() {
                 continue; // someone still has it: wait for them to let go
             }
-            if let Err(e) = self.start(v).await {
+            let Some(t) = transport(&v.name, &v.props) else {
+                continue;
+            };
+            let attach = !vm_place.contains_key(&v.name);
+            if let Err(e) = self.start(v, t, attach).await {
                 eprintln!("agent: starting volume '{}': {}", v.name, e);
             }
         }
+
+        // VMs.
+        let Some(vm) = self.vm.clone() else {
+            return Ok(());
+        };
+        let Ok(doms) = doms else {
+            return Ok(());
+        };
+        let anchor_here = |spec: &crate::vm::VmSpec| -> bool {
+            by_name
+                .get(spec.anchor.as_str())
+                .is_some_and(|a| target(&spec.anchor, &a.props).as_deref() == Some(&self.node))
+        };
+        for v in &ours {
+            let name = &v.domain.name;
+            // Running without this process holding its disks, or started
+            // under an earlier lease (an orphan of an earlier raidish here:
+            // its NBD connections go nowhere, its writes would be refused).
+            let current = self
+                .running
+                .get(&v.meta.anchor)
+                .is_some_and(|r| r.lease.owner == v.meta.owner);
+            if !current || !v.meta.volumes.iter().all(|x| self.running.contains_key(x)) {
+                eprintln!(
+                    "agent: VM '{}' runs here without this node's hold on its volumes \
+                     (an orphan); destroying it",
+                    name
+                );
+                if let Err(e) = vm.virsh.destroy(name).await {
+                    eprintln!("agent: {}", e);
+                }
+                self.stopping.remove(name);
+                continue;
+            }
+            let wanted = state.vms.contains_key(name)
+                && !vm.restart.lock().unwrap().contains(name)
+                && self
+                    .specs
+                    .get(name)
+                    .is_some_and(|s| s.usable() && anchor_here(s));
+            if wanted {
+                self.stopping.remove(name);
+                continue;
+            }
+            match self.stopping.get(name) {
+                None => {
+                    println!("agent: shutting VM '{}' down", name);
+                    if let Err(e) = vm.virsh.shutdown(name).await {
+                        eprintln!("agent: {}", e);
+                    }
+                    self.stopping
+                        .insert(name.clone(), std::time::Instant::now());
+                }
+                Some(t) if t.elapsed() > vm.shutdown_timeout => {
+                    eprintln!(
+                        "agent: VM '{}' didn't shut down in {:?}; destroying it",
+                        name, vm.shutdown_timeout
+                    );
+                    if let Err(e) = vm.virsh.destroy(name).await {
+                        eprintln!("agent: {}", e);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        self.stopping
+            .retain(|n, _| ours.iter().any(|v| &v.domain.name == n));
+        // Restarts are done once the old domain is gone (it's started again
+        // below, from the current XML).
+        vm.restart
+            .lock()
+            .unwrap()
+            .retain(|n| ours.iter().any(|v| &v.domain.name == n));
+        let mut errors = BTreeMap::new();
+        for spec in self.specs.values() {
+            if !state.vms.contains_key(&spec.name) || !anchor_here(spec) {
+                continue;
+            }
+            if let Some(e) = &spec.error {
+                errors.insert(spec.name.clone(), e.clone());
+                continue;
+            }
+            if let Some(d) = doms.iter().find(|d| d.name == spec.name && d.id.is_some()) {
+                if !ours.iter().any(|v| v.domain.name == d.name) {
+                    errors.insert(
+                        spec.name.clone(),
+                        format!("a domain '{}' not run by raidish is running here", d.name),
+                    );
+                }
+                continue;
+            }
+            if !spec.volumes.iter().all(|v| self.running.contains_key(v)) {
+                continue; // its disks aren't all here yet
+            }
+            let owner = self.running[&spec.anchor].lease.owner.clone();
+            let started = match crate::vm::render(spec, (&vm.nbd.0, vm.nbd.1), &owner) {
+                Ok(xml) => vm.virsh.create(&spec.name, &xml).await,
+                Err(e) => Err(e),
+            };
+            match started {
+                Ok(()) => println!("agent: started VM '{}' here", spec.name),
+                Err(e) => {
+                    eprintln!("agent: starting VM '{}': {}", spec.name, e);
+                    errors.insert(spec.name.clone(), e);
+                }
+            }
+        }
+        self.state.write().unwrap().vm_errors = errors;
         Ok(())
+    }
+
+    /// Destroy (no shutdown: there's no time) every VM of ours here using
+    /// one of `volumes`.
+    async fn destroy_vms_using(&mut self, volumes: &[String]) {
+        let Some(vm) = self.vm.clone() else {
+            return;
+        };
+        let Ok(vms) = vm.virsh.local_vms().await else {
+            return;
+        };
+        for v in vms.iter().filter(|v| v.domain.id.is_some()) {
+            if v.meta.volumes.iter().any(|x| volumes.contains(x)) {
+                eprintln!(
+                    "agent: destroying VM '{}' (its volume lease is gone)",
+                    v.domain.name
+                );
+                if let Err(e) = vm.virsh.destroy(&v.domain.name).await {
+                    eprintln!("agent: {}", e);
+                }
+                self.stopping.remove(&v.domain.name);
+            }
+        }
     }
 
     async fn ensure_writer(&mut self) -> Result<&NodeWriter, String> {
@@ -382,8 +626,14 @@ impl Agent {
         Ok(self.writer.as_ref().unwrap())
     }
 
-    async fn start(&mut self, v: &VolumeInfo) -> Result<(), String> {
-        let transport = v.props.automount.ok_or("not auto-mounted")?;
+    /// Run volume `v` here, exported over `transport`; `attach` the
+    /// kernel device too (a VM's disks aren't: qemu is the NBD client).
+    async fn start(
+        &mut self,
+        v: &VolumeInfo,
+        transport: Transport,
+        attach: bool,
+    ) -> Result<(), String> {
         let lease = Arc::new(
             HeldLease::acquire(self.leases.clone(), &volume_resource(&v.name), &self.desc())
                 .await?,
@@ -415,9 +665,13 @@ impl Agent {
             lease.release().await;
             return Err(e);
         }
-        let (device, note) = match self.attach(&v.name, transport).await {
-            Ok(d) => (d, None),
-            Err(e) => (None, Some(e)),
+        let (device, note) = if !attach {
+            (None, None)
+        } else {
+            match self.attach(&v.name, transport).await {
+                Ok(d) => (d, None),
+                Err(e) => (None, Some(e)),
+            }
         };
         println!(
             "agent: running volume '{}' here ({}{})",

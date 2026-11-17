@@ -84,6 +84,14 @@ pub enum Request {
         pool_epoch: u64,
         now_ms: u64,
     },
+    /// Whether VM `name` should be running (see `crate::vm`). Only the
+    /// intent: what actually runs is whatever libvirt says on the node that
+    /// holds the VM's disk.
+    SetVm {
+        name: String,
+        running: bool,
+        now_ms: u64,
+    },
 }
 
 /// What applying a [`Request`] produced.
@@ -145,6 +153,10 @@ pub struct ClusterState {
     /// owner string (hex) → when recorded.
     #[serde(default)]
     pub nfs_clients: BTreeMap<String, u64>,
+    /// VMs that should be running: name → when that was asked. Absent:
+    /// stopped (see `crate::vm`).
+    #[serde(default)]
+    pub vms: BTreeMap<String, u64>,
 }
 
 impl ClusterState {
@@ -319,6 +331,18 @@ impl ClusterState {
                     self.nfs_clients.insert(client.clone(), *now_ms);
                 } else {
                     self.nfs_clients.remove(client);
+                }
+                Response::Recorded
+            }
+            Request::SetVm {
+                name,
+                running,
+                now_ms,
+            } => {
+                if *running {
+                    self.vms.insert(name.clone(), *now_ms);
+                } else {
+                    self.vms.remove(name);
                 }
                 Response::Recorded
             }

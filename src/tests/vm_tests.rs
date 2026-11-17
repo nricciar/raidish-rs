@@ -1,0 +1,237 @@
+use super::*;
+
+const DUMPXML: &str = r#"<domain type='kvm'>
+  <name>old-name</name>
+  <uuid>7c3b1d0a-5f43-4d8e-9a54-3d3c1e0f2a11</uuid>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://debian.org/debian/12"/>
+    </libosinfo:libosinfo>
+  </metadata>
+  <memory unit='KiB'>2097152</memory>
+  <vcpu placement='static'>2</vcpu>
+  <os><type arch='x86_64' machine='q35'>hvm</type></os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='raidish:iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='raidish:vm1'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1'/>
+    </disk>
+    <disk type='network' device='disk'>
+      <source protocol='nbd' name='data'>
+        <host name='10.0.0.9' port='10809'/>
+      </source>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <source file='/var/lib/libvirt/images/scratch.qcow2'/>
+      <target dev='vdc' bus='virtio'/>
+    </disk>
+    <interface type='network'><source network='default'/><model type='virtio'/></interface>
+    <graphics type='spice' autoport='yes'><listen type='address'/></graphics>
+    <video><model type='virtio'/></video>
+  </devices>
+</domain>"#;
+
+#[test]
+fn finds_raidish_disks_anchor_first() {
+    let s = VmSpec::parse("web", DUMPXML, 7);
+    assert_eq!(s.error, None);
+    assert_eq!(s.anchor, "vm1");
+    assert_eq!(s.volumes, vec!["vm1", "data", "iso"]);
+}
+
+#[test]
+fn no_raidish_disk_is_an_error() {
+    let s = VmSpec::parse("x", "<domain><name>x</name><devices/></domain>", 1);
+    assert!(s.error.is_some());
+    assert!(!s.usable());
+    let s = VmSpec::parse("x", "<notadomain/>", 1);
+    assert!(s.error.unwrap().contains("domain"));
+    let s = VmSpec::parse("x", "<domain><devices>", 1);
+    assert!(s.error.is_some());
+}
+
+#[test]
+fn renders_disks_console_name_and_metadata() {
+    let s = VmSpec::parse("web", DUMPXML, 7);
+    let xml = render(&s, ("127.0.0.1", 10809), "host:1:2").unwrap();
+    let root = parse_domain(&xml).unwrap();
+    assert_eq!(
+        to_string(root.child("name").unwrap()),
+        "<name>web</name>".to_string()
+    );
+    // Only our metadata.
+    let meta = root.child("metadata").unwrap();
+    assert_eq!(meta.elements().count(), 1);
+    let m = parse_meta(&to_string(meta.elements().next().unwrap())).unwrap();
+    assert_eq!(
+        m,
+        DomMeta {
+            anchor: "vm1".into(),
+            volumes: vec!["vm1".into(), "data".into(), "iso".into()],
+            change: 7,
+            owner: "host:1:2".into(),
+        }
+    );
+    let devices = root.child("devices").unwrap();
+    let disks: Vec<&El> = devices.elements().filter(|e| e.name == "disk").collect();
+    assert_eq!(disks.len(), 4);
+    for (d, vol) in disks.iter().take(3).zip(["iso", "vm1", "data"]) {
+        assert_eq!(d.attr("type"), Some("network"));
+        assert_eq!(d.child("driver").unwrap().attr("type"), Some("raw"));
+        let src = d.child("source").unwrap();
+        assert_eq!(src.attr("protocol"), Some("nbd"));
+        assert_eq!(src.attr("name"), Some(vol));
+        let host = src.child("host").unwrap();
+        assert_eq!(host.attr("name"), Some("127.0.0.1"));
+        assert_eq!(host.attr("port"), Some("10809"));
+        assert!(d.child("target").is_some());
+    }
+    assert_eq!(disks[0].attr("device"), Some("cdrom"));
+    assert!(disks[0].child("readonly").is_some());
+    assert!(disks[1].child("boot").is_some());
+    // Not ours: untouched.
+    assert_eq!(disks[3].attr("type"), Some("file"));
+    // One console, VNC on localhost.
+    let g: Vec<&El> = devices
+        .elements()
+        .filter(|e| e.name == "graphics")
+        .collect();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].attr("type"), Some("vnc"));
+    assert_eq!(g[0].attr("listen"), Some("127.0.0.1"));
+    // Everything else kept.
+    assert!(devices.child("interface").is_some());
+    assert!(devices.child("video").is_some());
+    assert!(root.child("uuid").is_some());
+    // And it parses back to the same VM.
+    let again = VmSpec::parse("web", &xml, 7);
+    assert_eq!(again.volumes, s.volumes);
+}
+
+#[test]
+fn escapes_survive_a_round_trip() {
+    let xml = "<domain><name>a</name><description>x &amp; y &lt;z&gt;</description>\
+               <devices><disk device='disk'><source file='raidish:v'/></disk></devices></domain>";
+    let s = VmSpec::parse("a", xml, 1);
+    let out = render(&s, ("127.0.0.1", 1), "o").unwrap();
+    assert!(out.contains("x &amp; y &lt;z&gt;"), "{}", out);
+}
+
+#[test]
+fn names() {
+    assert!(valid_name("web-1.prod_x"));
+    assert!(!valid_name(""));
+    assert!(!valid_name(".hidden"));
+    assert!(!valid_name("a/b"));
+    assert!(!valid_name("a b"));
+}
+
+#[test]
+fn parses_virsh_list() {
+    let out = " 3    web    running\n -    old    shut off\n 12   db     in shutdown\n\n";
+    let l = parse_list(out);
+    assert_eq!(l.len(), 3);
+    assert_eq!(l[0].id, Some(3));
+    assert_eq!(l[1].id, None);
+    assert_eq!(l[1].state, "shut off");
+    assert_eq!(l[2].state, "in shutdown");
+}
+
+#[test]
+fn parses_metadata_whatever_the_prefix() {
+    let m = parse_meta(&format!(
+        "<rd:vm xmlns:rd=\"{}\" anchor=\"a\" volumes=\"a,b\" change=\"3\"/>",
+        META_NS
+    ))
+    .unwrap();
+    assert_eq!(m.volumes, vec!["a", "b"]);
+    assert_eq!(parse_meta("<other/>"), None);
+}
+
+#[test]
+fn reads_the_hardware() {
+    let s = VmSpec::parse("web", DUMPXML, 7);
+    let hw = &s.hw;
+    assert_eq!(hw.vcpus, Some(2));
+    assert_eq!(hw.memory_kib, Some(2 * 1024 * 1024));
+    assert_eq!(hw.arch.as_deref(), Some("x86_64"));
+    assert_eq!(hw.machine.as_deref(), Some("q35"));
+    assert_eq!(hw.disks.len(), 4);
+    assert_eq!(hw.disks[0].device, "cdrom");
+    assert_eq!(hw.disks[0].volume.as_deref(), Some("iso"));
+    assert_eq!(hw.disks[1].target.as_deref(), Some("vda"));
+    assert_eq!(hw.disks[1].bus.as_deref(), Some("virtio"));
+    assert_eq!(hw.disks[2].volume.as_deref(), Some("data"));
+    assert_eq!(hw.disks[3].volume, None);
+    assert_eq!(
+        hw.disks[3].source.as_deref(),
+        Some("/var/lib/libvirt/images/scratch.qcow2")
+    );
+    assert_eq!(hw.nics.len(), 1);
+    assert_eq!(hw.nics[0].kind, "network");
+    assert_eq!(hw.nics[0].source.as_deref(), Some("default"));
+    assert_eq!(hw.nics[0].model.as_deref(), Some("virtio"));
+}
+
+#[test]
+fn memory_units() {
+    let mem = |x: &str| {
+        VmSpec::parse("m", &format!("<domain>{}<devices/></domain>", x), 1)
+            .hw
+            .memory_kib
+    };
+    assert_eq!(mem("<memory>1024</memory>"), Some(1024));
+    assert_eq!(mem("<memory unit='MiB'>2</memory>"), Some(2048));
+    assert_eq!(mem("<memory unit='G'>1</memory>"), Some(1024 * 1024));
+    assert_eq!(mem("<memory unit='bytes'>4096</memory>"), Some(4));
+    assert_eq!(
+        mem("<memory unit='GiB'>4</memory><currentMemory unit='GiB'>2</currentMemory>"),
+        Some(2 * 1024 * 1024)
+    );
+    assert_eq!(mem("<memory unit='parsecs'>1</memory>"), None);
+}
+
+#[test]
+fn a_new_vms_template_is_a_usable_vm() {
+    use crate::vm_def::{NewVm, disk_volume, template};
+    let new = NewVm {
+        name: "web1".into(),
+        vcpus: 4,
+        memory_mib: 4096,
+        disk: disk_volume("web1"),
+        iso: Some("debian-iso".into()),
+        network: Some("default".into()),
+    };
+    let s = VmSpec::parse("web1", &template(&new), 1);
+    assert_eq!(s.error, None);
+    assert_eq!(s.anchor, "web1-disk0");
+    assert_eq!(s.volumes, vec!["web1-disk0", "debian-iso"]);
+    assert_eq!(s.hw.vcpus, Some(4));
+    assert_eq!(s.hw.memory_kib, Some(4096 * 1024));
+    assert_eq!(s.hw.boot, vec!["hd", "cdrom"]);
+    assert_eq!(s.hw.disks[1].device, "cdrom");
+    assert_eq!(s.hw.nics[0].source.as_deref(), Some("default"));
+    // It renders (gets its console etc.) like any other.
+    let xml = render(&s, ("127.0.0.1", 10809), "o").unwrap();
+    assert!(xml.contains("<graphics type=\"vnc\""));
+
+    let bare = NewVm {
+        iso: None,
+        network: None,
+        ..new
+    };
+    let s = VmSpec::parse("web1", &template(&bare), 1);
+    assert_eq!(s.error, None);
+    assert_eq!(s.volumes, vec!["web1-disk0"]);
+    assert!(s.hw.nics.is_empty());
+}

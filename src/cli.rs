@@ -134,6 +134,11 @@ enum Commands {
         #[command(subcommand)]
         command: VolumeCommands,
     },
+    /// VMs whose disks are volumes, run through libvirt.
+    Vm {
+        #[command(subcommand)]
+        command: crate::cli_vm::VmCommands,
+    },
     /// The cluster's certificate authority: issue node and client certs.
     Cert {
         #[command(subcommand)]
@@ -476,6 +481,16 @@ pub async fn main() -> std::io::Result<()> {
         let agent_state: crate::agent::AgentState = Default::default();
         let files: crate::files_api::WriterSlot = Default::default();
         let mut nfs_backend = None;
+        let vms = config.vm.as_ref().map(|c| {
+            println!("vm: running VMs through libvirt ({})", c.virsh().uri);
+            Arc::new(crate::vm::VmRuntime {
+                virsh: c.virsh(),
+                shutdown_timeout: c.shutdown_timeout(),
+                poke: Default::default(),
+                nbd: crate::agent::Agent::nbd_target(&config.automount),
+                restart: Default::default(),
+            })
+        });
         let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
@@ -512,7 +527,7 @@ pub async fn main() -> std::io::Result<()> {
                     endpoints.push(e);
                 }
             }
-            let agent = crate::agent::Agent::new(
+            let mut agent = crate::agent::Agent::new(
                 name.clone(),
                 node.clone(),
                 endpoints,
@@ -521,6 +536,9 @@ pub async fn main() -> std::io::Result<()> {
                 agent_state.clone(),
                 files.clone(),
             );
+            if let Some(vms) = &vms {
+                agent = agent.with_vms(vms.clone());
+            }
             tokio::spawn(agent.run());
             if let Some(nfs) = &config.nfs {
                 let slot = files.clone();
@@ -573,8 +591,20 @@ pub async fn main() -> std::io::Result<()> {
             config.tls.as_ref(),
             auth,
             nfs_backend,
+            vms,
         )
         .await;
+        return Ok(());
+    }
+
+    if let Commands::Vm { command } = &cli.command {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            fail("no cluster to ask: the pool has no remote disks");
+        }
+        crate::cli_vm::run(command, endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
         return Ok(());
     }
 
@@ -895,6 +925,7 @@ pub async fn main() -> std::io::Result<()> {
             }
         }
         Commands::Listen { .. }
+        | Commands::Vm { .. }
         | Commands::Cluster { .. }
         | Commands::Cert { .. }
         | Commands::Token { .. } => unreachable!(),

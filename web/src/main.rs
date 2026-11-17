@@ -16,6 +16,9 @@ mod login;
 mod panels;
 mod session;
 mod upload;
+mod vm_new;
+mod vm_page;
+mod vms;
 mod volumes;
 
 fn main() {

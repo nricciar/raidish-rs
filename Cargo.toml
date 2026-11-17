@@ -52,6 +52,7 @@ base64 = "0.22"
 time = "0.3"
 clap = { version = "4.5", features = ["derive", "color"] }
 term_size = "0.3.2"
+quick-xml = "0.37"
 
 # The browser disk backend (websocket via web-sys).
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -289,3 +289,205 @@ pub fn parse_size(s: &str) -> Option<u64> {
     let v = n * mul as f64;
     (v >= 1.0 && v.is_finite()).then_some(v as u64)
 }
+
+// ---- VMs ----
+
+pub use raidish::vm_def::{NewVm, VmHardware};
+
+/// Where VM definitions live in the pool (`raidish::vm::VM_DIR`).
+pub const VM_DIR: &str = "vms";
+
+/// A valid VM name (as `raidish::vm::valid_name`).
+pub fn valid_vm_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && !name.starts_with('.')
+}
+
+/// A VM (`GET /api/v1/vms`): its definition joined with libvirt's live
+/// state on the node holding its disks.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Vm {
+    pub name: String,
+    pub change: u64,
+    /// The volume that places it (its first raidish disk).
+    pub anchor: String,
+    pub volumes: Vec<String>,
+    /// Why its XML is unusable.
+    pub error: Option<String>,
+    pub want_running: bool,
+    /// Where its disks are (where it runs, or would).
+    pub node: Option<String>,
+    /// libvirt's state there; None: not running.
+    pub state: Option<String>,
+    /// That node couldn't be asked.
+    pub unreachable: Option<String>,
+    pub restart_pending: bool,
+    pub vcpus: Option<u32>,
+    pub memory_kib: Option<u64>,
+    pub cpu_s: Option<f64>,
+    pub console: bool,
+    /// Why its node couldn't start it.
+    pub start_error: Option<String>,
+    /// What its XML configures.
+    #[serde(default)]
+    pub hw: VmHardware,
+}
+
+impl Vm {
+    /// Is libvirt running it (in any state)?
+    pub fn running(&self) -> bool {
+        self.state.is_some()
+    }
+    /// vCPUs: libvirt's while it runs, else the XML's.
+    pub fn vcpus(&self) -> Option<u32> {
+        self.vcpus.or(self.hw.vcpus)
+    }
+    /// Memory: libvirt's while it runs, else the XML's.
+    pub fn memory_kib(&self) -> Option<u64> {
+        self.memory_kib.or(self.hw.memory_kib)
+    }
+    /// Where its definition lives in the pool.
+    pub fn xml_path(&self) -> String {
+        vm_xml_path(&self.name)
+    }
+}
+
+pub fn vm_xml_path(name: &str) -> String {
+    format!("{}/{}.xml", VM_DIR, name)
+}
+
+pub async fn vms() -> Result<Vec<Vm>, String> {
+    json(send(Request::get("/api/v1/vms")).await?).await
+}
+
+/// `start`, `stop`, `kill`, `restart`, `reboot` or `reset`.
+pub async fn vm_action(name: &str, action: &str) -> Result<(), String> {
+    send(Request::post(&format!(
+        "/api/v1/vms/{}/{}",
+        enc(name),
+        action
+    )))
+    .await
+    .map(drop)
+}
+
+#[derive(Serialize)]
+struct MoveTo<'a> {
+    node: &'a str,
+}
+
+pub async fn vm_move(name: &str, node: &str) -> Result<(), String> {
+    send_json(
+        Request::post(&format!("/api/v1/vms/{}/move", enc(name))),
+        &MoveTo { node },
+    )
+    .await
+    .map(drop)
+}
+
+/// A (small) file's text.
+pub async fn get_text(path: &str) -> Result<String, String> {
+    send(Request::get(&format!(
+        "/api/v1/files/{}",
+        encode_path(path)
+    )))
+    .await?
+    .text()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Write a (small) file, replacing it: the file manager's upload.
+pub async fn put_text(path: &str, body: &str) -> Result<(), String> {
+    let req = auth(Request::put(&format!(
+        "/api/v1/files/{}",
+        encode_path(path)
+    )))
+    .header("Content-Type", "application/octet-stream")
+    .body(body.to_string())
+    .map_err(|e| e.to_string())?;
+    check(req.send().await.map_err(|e| e.to_string())?)
+        .await
+        .map(drop)
+}
+
+/// Store a new VM's XML as `/vms/<name>.xml` (refusing to replace one).
+pub async fn vm_create(name: &str, xml: &str) -> Result<(), String> {
+    if !valid_vm_name(name) {
+        return Err(format!(
+            "bad VM name '{}' (letters, digits, '-', '_', '.')",
+            name
+        ));
+    }
+    match list_dir(VM_DIR).await {
+        Ok(entries) => {
+            let file = format!("{}.xml", name);
+            if entries.iter().any(|e| e.name == file) {
+                return Err(format!("there is already a VM '{}'", name));
+            }
+        }
+        // No /vms yet.
+        Err(_) => mkdir(VM_DIR).await?,
+    }
+    put_text(&vm_xml_path(name), xml).await
+}
+
+/// Create a VM from the simple form: its disk volume, then its XML (and
+/// the volume goes again if the XML can't be stored).
+pub async fn vm_create_simple(new: NewVm, disk_bytes: u64) -> Result<(), String> {
+    if !valid_vm_name(&new.name) {
+        return Err(format!(
+            "bad VM name '{}' (letters, digits, '-', '_', '.')",
+            new.name
+        ));
+    }
+    if let Some(n) = &new.network
+        && !valid_vm_name(n)
+    {
+        return Err(format!("bad network name '{}'", n));
+    }
+    create_volume(&new.disk, disk_bytes)
+        .await
+        .map_err(|e| format!("creating volume {}: {}", new.disk, e))?;
+    let xml = raidish::vm_def::template(&new);
+    if let Err(e) = vm_create(&new.name, &xml).await {
+        let _ = delete_volume(&new.disk).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Delete a VM's definition, then the volumes `disks`.
+pub async fn vm_delete(name: &str, disks: &[String]) -> Result<(), String> {
+    delete(&vm_xml_path(name)).await?;
+    for d in disks {
+        delete_volume(d)
+            .await
+            .map_err(|e| format!("deleting volume {}: {}", d, e))?;
+    }
+    Ok(())
+}
+
+/// The websocket URL of a VM's VNC console (RFB in binary frames).
+pub fn console_url(name: &str) -> String {
+    let loc = web_sys::window().map(|w| w.location());
+    let https = loc
+        .as_ref()
+        .and_then(|l| l.protocol().ok())
+        .is_some_and(|p| p == "https:");
+    let host = loc.and_then(|l| l.host().ok()).unwrap_or_default();
+    let mut url = format!(
+        "{}://{}/api/v1/vms/{}/console",
+        if https { "wss" } else { "ws" },
+        host,
+        enc(name)
+    );
+    if let Some(t) = token() {
+        url.push_str(&format!("?access_token={}", enc(&t)));
+    }
+    url
+}

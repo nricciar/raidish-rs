@@ -48,6 +48,9 @@ pub struct Config {
     /// Serve the pool over NFS from `listen` (see `crate::nfs`). Absent: no
     /// NFS server.
     pub nfs: Option<crate::nfs::NfsConfig>,
+    /// Run VMs whose disks are volumes, through libvirt (see `crate::vm`).
+    /// Absent: this node runs none.
+    pub vm: Option<crate::vm::VmConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]

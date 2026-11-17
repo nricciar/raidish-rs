@@ -24,6 +24,8 @@ pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
+mod cli_vm;
+#[cfg(not(target_arch = "wasm32"))]
 mod cluster;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod committer;
@@ -66,6 +68,11 @@ mod trace;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
 pub mod vdev;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod vm;
+pub mod vm_def;
+#[cfg(not(target_arch = "wasm32"))]
+mod vms_api;
 mod volume;
 #[cfg(not(target_arch = "wasm32"))]
 mod volumes_api;

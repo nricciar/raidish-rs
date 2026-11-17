@@ -90,6 +90,10 @@ pub enum LeaseOp {
         nfs_owner: String,
         nfs_epoch: u64,
     },
+    SetVm {
+        name: String,
+        running: bool,
+    },
 }
 
 impl LeaseOp {
@@ -162,6 +166,11 @@ impl LeaseOp {
                 present,
                 nfs_owner,
                 nfs_epoch,
+                now_ms,
+            },
+            LeaseOp::SetVm { name, running } => Request::SetVm {
+                name,
+                running,
                 now_ms,
             },
         }
