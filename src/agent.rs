@@ -157,7 +157,12 @@ struct Running {
     lease: Arc<HeldLease>,
     lost: Lost,
     info: RunningVolume,
+    /// When attaching its kernel device last failed (it's tried again).
+    attach_failed: Option<std::time::Instant>,
 }
+
+/// How long after a failed attach the agent tries again.
+const ATTACH_RETRY: Duration = Duration::from_secs(10);
 
 /// A service dataset this agent runs (see `crate::frontend`).
 struct RunningService {
@@ -559,6 +564,7 @@ impl Agent {
             }
         }
 
+        self.retry_attach().await;
         self.tick_services(&state, now, &live).await;
 
         // VMs.
@@ -946,6 +952,7 @@ impl Agent {
             Running {
                 lease,
                 lost,
+                attach_failed: note.as_ref().map(|_| std::time::Instant::now()),
                 info: RunningVolume {
                     name: v.name.clone(),
                     transport,
@@ -955,6 +962,43 @@ impl Agent {
             },
         );
         Ok(())
+    }
+
+    /// Attach again the kernel devices of running volumes whose attach
+    /// failed (the helper or a kernel module was missing, a transient
+    /// error), so whatever waits for the device (see `crate::csi`) gets it.
+    async fn retry_attach(&mut self) {
+        let due: Vec<(String, Transport)> = self
+            .running
+            .iter()
+            .filter(|(_, r)| r.attach_failed.is_some_and(|t| t.elapsed() >= ATTACH_RETRY))
+            .map(|(n, r)| (n.clone(), r.info.transport))
+            .collect();
+        for (name, t) in due {
+            let result = self.attach(&name, t).await;
+            let Some(r) = self.running.get_mut(&name) else {
+                continue;
+            };
+            match result {
+                Ok(device) => {
+                    println!(
+                        "agent: attached volume '{}'{}",
+                        name,
+                        device
+                            .as_deref()
+                            .map(|d| format!(" on {}", d))
+                            .unwrap_or_default()
+                    );
+                    r.info.device = device;
+                    r.info.note = None;
+                    r.attach_failed = None;
+                }
+                Err(e) => {
+                    r.info.note = Some(e);
+                    r.attach_failed = Some(std::time::Instant::now());
+                }
+            }
+        }
     }
 
     /// Place, start and stop the service datasets (see `crate::frontend`),

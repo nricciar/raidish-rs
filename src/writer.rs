@@ -41,6 +41,30 @@ pub struct LentMetaslab {
     pub open_txg: u64,
 }
 
+/// A writer's commit, sent, whose answer hasn't been acted on yet: what's
+/// needed to act on it later (see `FileSystem::resolve_in_doubt`).
+#[derive(Clone, Debug)]
+pub(crate) struct InDoubt {
+    commit: DatasetCommit,
+    new_root: TreeRoot,
+    allocated: Vec<BlockPtr>,
+    new_log: Option<crate::inode::DatasetLog>,
+    new_region: Option<crate::inode::LogRegion>,
+}
+
+/// While a commit's answer is awaited: dropped then (the caller gave up),
+/// flushes stop logging into the dataset's current region, as after any
+/// unknown outcome (it may be freed if that commit was applied).
+struct LogNowhereOnDrop<'a>(Option<&'a crate::dataset::Dataset>);
+
+impl Drop for LogNowhereOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(vol) = self.0 {
+            *vol.cursor.lock().unwrap() = None;
+        }
+    }
+}
+
 /// One volume sync, from a writer to the committer.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DatasetCommit {
@@ -473,6 +497,8 @@ impl<D: BlockDevice> FileSystem<D> {
         // No flush may log into it meanwhile.
         let _io = self.log_io.lock().await;
         let _tx = self.begin_tx().await;
+        // Its commit is built on the root: settle one in doubt first.
+        self.resolve_in_doubt(w, &vol).await?;
         if vol.is_dirty() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume '{}' was written to while being detached",
@@ -515,6 +541,8 @@ impl<D: BlockDevice> FileSystem<D> {
         vol: &crate::dataset::Dataset,
     ) -> Result<(), FileSystemError> {
         let _tx = self.begin_tx().await;
+        // Its commit is built on the root: settle one in doubt first.
+        self.resolve_in_doubt(w, vol).await?;
         let counts = self.miss_counts();
         let missed: Vec<usize> = {
             let seen = self.miss_seen.lock().unwrap();
@@ -711,12 +739,24 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The writer's commit: sync every volume (each one a `DatasetCommit`),
     /// then give back full metaslabs.
-    pub(crate) async fn writer_commit(&self, w: &WriterState) -> Result<u64, FileSystemError> {
+    /// Also returns the datasets it left clean (see `sync_datasets_noting`).
+    pub(crate) async fn writer_commit(
+        &self,
+        w: &WriterState,
+    ) -> (Result<u64, FileSystemError>, Vec<String>) {
         // A sync stamped below the birth floor is rebuilt (with the TXG
         // the committer sent back) and sent again.
         let mut attempts = 0;
+        let mut clean = Vec::new();
         let result = loop {
-            let volumes = self.sync_datasets().await;
+            let (now_clean, volumes) = self.sync_datasets_noting().await;
+            // Clean in any pass stays clean: a later pass only finds it
+            // with nothing dirty from before this commit began, or syncs it.
+            for n in now_clean {
+                if !clean.contains(&n) {
+                    clean.push(n);
+                }
+            }
             let result = volumes.and(self.sync_files().await);
             attempts += 1;
             match result {
@@ -725,8 +765,11 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         };
         self.return_full(w).await;
-        result?;
-        Ok(self.open_txg().await?.saturating_sub(1))
+        let r = match result {
+            Ok(()) => self.open_txg().await.map(|t| t.saturating_sub(1)),
+            Err(e) => Err(e),
+        };
+        (r, clean)
     }
 
     /// `sync_dataset` for a writer: build the tree in lent space, then have
@@ -738,12 +781,12 @@ impl<D: BlockDevice> FileSystem<D> {
         records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
     ) -> Result<(), FileSystemError> {
-        let (ds_owner, ds_epoch, lost, detaching) = w
+        let (ds_owner, ds_epoch, detaching) = w
             .datasets
             .lock()
             .unwrap()
             .get(&vol.name)
-            .map(|a| (a.owner.clone(), a.epoch, a.lost.clone(), a.detaching))
+            .map(|a| (a.owner.clone(), a.epoch, a.detaching))
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
@@ -834,32 +877,87 @@ impl<D: BlockDevice> FileSystem<D> {
             log: new_log.clone(),
             min_birth: allocated.iter().map(|p| p.birth_txg).min(),
         };
-        let outcome = match lost {
+        // From the moment it's sent until its answer is settled, the commit
+        // is in doubt: if this future is dropped meanwhile (a caller giving
+        // up), the next sync resends it before building anything new.
+        let sent = InDoubt {
+            commit,
+            new_root: new_root.clone(),
+            allocated,
+            new_log,
+            new_region,
+        };
+        *vol.in_doubt.lock().unwrap() = Some(sent.clone());
+        let mut waiting = LogNowhereOnDrop(Some(vol));
+        let outcome = self.send_commit(w, &vol.name, sent.commit.clone()).await;
+        waiting.0 = None;
+        span.mark("commit_rpc");
+        self.settle_commit(w, vol, sent, outcome).await
+    }
+
+    /// Send `commit` of dataset `name`; a lost `ds/<name>` lease ends the
+    /// wait (the committer would answer "retry" for as long as nobody took
+    /// the lease over).
+    async fn send_commit(
+        &self,
+        w: &WriterState,
+        name: &str,
+        commit: DatasetCommit,
+    ) -> Result<Committed, CommitError> {
+        let lost = w
+            .datasets
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|a| a.lost.clone());
+        match lost {
             None => w.sink.commit(commit).await,
             Some(lost) => tokio::select! {
                 r = w.sink.commit(commit) => r,
                 _ = lease_lost(lost) => Err(CommitError::Retry(format!(
                     "lost the lease on volume '{}'",
-                    vol.name
+                    name
                 ))),
             },
-        };
-        span.mark("commit_rpc");
+        }
+    }
+
+    /// Act on the answer to `sent` (`vol`'s commit in doubt). Every change
+    /// to `vol` is made before the first await, so a caller giving up
+    /// halfway can't leave it half-settled.
+    async fn settle_commit(
+        &self,
+        w: &WriterState,
+        vol: &crate::dataset::Dataset,
+        sent: InDoubt,
+        outcome: Result<Committed, CommitError>,
+    ) -> Result<(), FileSystemError> {
+        let InDoubt {
+            new_root,
+            allocated,
+            new_log,
+            new_region,
+            ..
+        } = sent;
         match outcome {
             Ok(c) => {
-                self.note_open_txg(c.txg + 1).await;
+                *vol.in_doubt.lock().unwrap() = None;
                 vol.obj.set_root(new_root);
                 self.set_dataset_log(w, vol, new_log);
                 if new_region.is_some() {
                     self.set_cursor(vol, new_region);
                 }
+                self.note_open_txg(c.txg + 1).await;
                 Ok(())
             }
             Err(CommitError::Refused(m)) => {
                 // Definitely not applied: the space is ours to reuse (and the
                 // old region is still the registered one).
+                *vol.in_doubt.lock().unwrap() = None;
                 self.release_ptrs(&allocated).await;
-                release_log(&new_region).await;
+                if let Some(r) = &new_region {
+                    self.unallocate(r.start, r.len).await;
+                }
                 Err(FileSystemError::InvalidArgument(format!(
                     "commit refused: {}",
                     m
@@ -868,18 +966,51 @@ impl<D: BlockDevice> FileSystem<D> {
             Err(CommitError::Restamp(open)) => {
                 // Not applied either: rebuild (the records stay dirty)
                 // stamped with the committer's TXG.
+                *vol.in_doubt.lock().unwrap() = None;
                 self.release_ptrs(&allocated).await;
-                release_log(&new_region).await;
+                if let Some(r) = &new_region {
+                    self.unallocate(r.start, r.len).await;
+                }
                 self.note_open_txg(open).await;
                 Err(FileSystemError::Restamp(open))
             }
             // Unknown outcome: keep the space out of use (if it was applied,
             // it's referenced; if not, the committer still has it as free),
-            // and log nowhere: the old region may have been freed.
+            // log nowhere (the old region may have been freed), and leave it
+            // in doubt for `resolve_in_doubt`.
             Err(e) => {
                 self.set_cursor(vol, None);
                 Err(e.into())
             }
+        }
+    }
+
+    /// Settle `vol`'s commit in doubt, if it has one, by sending it again:
+    /// the committer acknowledges a commit it already applied (its root is
+    /// that commit's new root), applies one it never saw, or refuses one
+    /// that can't be applied any more. Until then, a sync built on `vol`'s
+    /// root (the one before that commit) would be refused as "moved on"
+    /// for good if it had been applied. Err: still unknown (no committer).
+    pub(crate) async fn resolve_in_doubt(
+        &self,
+        w: &WriterState,
+        vol: &crate::dataset::Dataset,
+    ) -> Result<(), FileSystemError> {
+        let Some(sent) = vol.in_doubt.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let outcome = self.send_commit(w, &vol.name, sent.commit.clone()).await;
+        let known = !matches!(outcome, Err(CommitError::Retry(_)));
+        match self.settle_commit(w, vol, sent, outcome).await {
+            Err(e) if known => {
+                // Not applied, and settled: the next sync builds anew.
+                eprintln!(
+                    "dataset '{}': an earlier commit wasn't applied: {}",
+                    vol.name, e
+                );
+                Ok(())
+            }
+            r => r,
         }
     }
 
@@ -1442,9 +1573,16 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(());
         }
         if current != c.base_root {
+            let at = |p: &Option<BlockPtr>| match p {
+                Some(p) => format!("{}@{}", p.lba, p.birth_txg),
+                None => "empty".into(),
+            };
             return Err(refuse(format!(
-                "dataset '{}' moved on (its root isn't the one this sync was built on)",
-                c.dataset
+                "dataset '{}' moved on (its root isn't the one this sync was built on: \
+                 it's {}, the sync was built on {})",
+                c.dataset,
+                at(&current),
+                at(&c.base_root)
             )));
         }
 

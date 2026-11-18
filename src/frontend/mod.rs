@@ -648,14 +648,18 @@ impl Settler {
         self.applied.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Make every applied write durable.
-    pub async fn settle<D: BlockDevice>(&self, fs: &FileSystem<D>) -> Result<(), FileSystemError> {
+    /// Make every applied write to dataset `name` durable.
+    pub async fn settle<D: BlockDevice>(
+        &self,
+        fs: &FileSystem<D>,
+        name: &str,
+    ) -> Result<(), FileSystemError> {
         let target = self.applied.load(Ordering::SeqCst);
         if self.durable.load(Ordering::SeqCst) >= target {
             return Ok(());
         }
         fs.kv_settle().await?;
-        fs.flush().await?;
+        fs.flush_for(name).await?;
         self.durable.fetch_max(target, Ordering::SeqCst);
         Ok(())
     }

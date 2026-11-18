@@ -168,6 +168,45 @@ struct Planned {
     ops: Vec<(u64, KeyedOp)>,
 }
 
+impl Planned {
+    /// The append didn't happen (or may not have): its changes are unlogged
+    /// again, so a later flush logs them (or a commit takes them).
+    fn restore(self) {
+        self.vol
+            .obj
+            .dirty
+            .lock()
+            .unwrap()
+            .restore_unlogged(self.idxs, self.ops);
+    }
+
+    /// `restore`, and log nothing more into this region: its slot may be
+    /// unwritten, and a record after a gap is never replayed.
+    fn put_back(self) {
+        *self.vol.cursor.lock().unwrap() = None;
+        self.restore();
+    }
+}
+
+/// Appends planned but not yet accounted for. Dropped while still holding
+/// some (the flush's future was dropped mid-way), it puts them back.
+struct Unaccounted(Vec<Planned>);
+
+impl Unaccounted {
+    /// Take them over: the caller accounts for each from now on.
+    fn give_back(mut self) -> Vec<Planned> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Unaccounted {
+    fn drop(&mut self) {
+        for p in self.0.drain(..) {
+            p.put_back();
+        }
+    }
+}
+
 impl<D: BlockDevice> FileSystem<D> {
     /// Size of a new log region, in blocks.
     pub(crate) fn log_region_blocks(&self) -> u64 {
@@ -182,8 +221,18 @@ impl<D: BlockDevice> FileSystem<D> {
     /// it's full, a log write failed), it commits instead, like `sync`.
     /// Elsewhere it is `sync`.
     pub async fn flush(&self) -> Result<(), FileSystemError> {
+        self.flush_scoped(None).await
+    }
+
+    /// `flush` for dataset `name` alone: other datasets' failures (a commit
+    /// of theirs refused, their lease unconfirmed) don't fail it.
+    pub async fn flush_for(&self, name: &str) -> Result<(), FileSystemError> {
+        self.flush_scoped(Some(name)).await
+    }
+
+    async fn flush_scoped(&self, only: Option<&str>) -> Result<(), FileSystemError> {
         let Some(w) = self.writer.clone() else {
-            return self.sync().await;
+            return self.sync_scoped(only).await;
         };
         let mut span = crate::trace::Span::new("zil.flush");
         // One flush appends at a time: a record must never follow a gap.
@@ -196,11 +245,15 @@ impl<D: BlockDevice> FileSystem<D> {
             .values()
             .cloned()
             .collect();
-        let mut planned: Vec<Planned> = Vec::new();
+        // From here until each append is accounted for, a caller that gives
+        // up (a dropped future: a gRPC client's deadline) mustn't leave
+        // records taken but neither logged nor unlogged, nor a reserved
+        // slot unwritten (see `Unaccounted`).
+        let mut planned = Unaccounted(Vec::new());
         let mut commit = false;
         for vol in vols {
             match self.plan_append(&vol) {
-                Ok(Some(p)) => planned.push(p),
+                Ok(Some(p)) => planned.0.push(p),
                 Ok(None) => {}
                 Err(()) => {
                     let why = match vol.cursor.lock().unwrap().as_ref() {
@@ -214,53 +267,43 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         span.note(
             "bytes",
-            planned.iter().map(|p| p.bytes.len()).sum::<usize>(),
+            planned.0.iter().map(|p| p.bytes.len()).sum::<usize>(),
         );
         span.mark("plan");
-        let mut written: Vec<Planned> = Vec::new();
-        for p in planned {
-            match self.write_record_blocks(p.lba, &p.bytes).await {
-                Ok(()) => written.push(p),
-                Err(e) => {
-                    eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
-                    // The slot is spent: later records would follow a gap.
-                    *p.vol.cursor.lock().unwrap() = None;
-                    p.vol
-                        .obj
-                        .dirty
-                        .lock()
-                        .unwrap()
-                        .restore_unlogged(p.idxs, p.ops);
-                    commit = true;
-                }
+        let mut failed = Vec::new();
+        for (i, p) in planned.0.iter().enumerate() {
+            if let Err(e) = self.write_record_blocks(p.lba, &p.bytes).await {
+                eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
+                failed.push(i);
             }
+        }
+        if !failed.is_empty() {
+            // Those slots are spent: later records would follow a gap.
+            for i in failed.into_iter().rev() {
+                planned.0.remove(i).put_back();
+            }
+            commit = true;
         }
         span.mark("log_write");
         if commit {
+            drop(planned.give_back());
             drop(io);
             // Commits what was logged too.
-            let r = self.sync().await;
+            let r = self.sync_scoped(only).await;
             span.mark("commit");
             return r;
         }
-        if written.is_empty() {
+        if planned.0.is_empty() {
             return Ok(());
         }
         let flushed = self.dev.flush().await;
         span.mark("dev_flush");
         if let Err(e) = flushed {
-            for p in written {
-                // These records may or may not be on disk. One that isn't
-                // would be a gap, hiding every later record from replay: log
-                // nothing more here (flushes commit until the next fold
-                // starts a region).
-                *p.vol.cursor.lock().unwrap() = None;
-                p.vol
-                    .obj
-                    .dirty
-                    .lock()
-                    .unwrap()
-                    .restore_unlogged(p.idxs, p.ops);
+            // These records may or may not be on disk. One that isn't would
+            // be a gap, hiding every later record from replay: log nothing
+            // more here (flushes commit until the next fold starts a region).
+            for p in planned.give_back() {
+                p.put_back();
             }
             return Err(e.into());
         }
@@ -274,26 +317,25 @@ impl<D: BlockDevice> FileSystem<D> {
         // writes durable (the log records stay, harmless: replay redoes them).
         if self.unaccounted_misses().iter().any(|&m| m) {
             span.note("fallback", "missed");
-            let vol = written[0].vol.clone();
-            for p in written {
-                p.vol
-                    .obj
-                    .dirty
-                    .lock()
-                    .unwrap()
-                    .restore_unlogged(p.idxs, p.ops);
+            let vol = planned.0[0].vol.clone();
+            for p in planned.give_back() {
+                p.restore();
             }
             drop(io);
-            let r = self.sync().await;
+            let r = self.sync_scoped(only).await;
             span.mark("commit");
             // The commit reported the misses, unless nothing was left for it
             // to commit (a commit in progress took the records).
+            let vol = only
+                .and_then(|n| self.open_datasets.lock().unwrap().get(n).cloned())
+                .unwrap_or(vol);
             let r = match r {
                 Ok(()) => self.writer_report_misses(&w, &vol).await,
                 e => e,
             };
             return r;
         }
+        let written = planned.give_back();
         drop(io);
         if written.iter().any(|p| {
             p.vol
@@ -314,13 +356,11 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stale = None;
         for p in written {
             if !w.lease_fresh(&p.vol.name) {
-                p.vol
-                    .obj
-                    .dirty
-                    .lock()
-                    .unwrap()
-                    .restore_unlogged(p.idxs, p.ops);
-                stale.get_or_insert(p.vol.name.clone());
+                let name = p.vol.name.clone();
+                p.restore();
+                if only.is_none_or(|n| n == name) {
+                    stale.get_or_insert(name);
+                }
             }
         }
         match stale {

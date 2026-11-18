@@ -235,11 +235,14 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(Txn::begin(self, &ds.obj).await?.header.entries)
     }
 
-    /// Commit early if too much is dirty (as volume writes do).
+    /// Commit early if too much is dirty (as volume writes do). Best
+    /// effort: whether the caller's own dataset is durable is the flush's
+    /// answer, and another dataset failing its sync mustn't fail this one.
     pub(crate) async fn kv_settle(&self) -> Result<(), FileSystemError> {
         if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
-            self.commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
-                .await?;
+            let _ = self
+                .commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
+                .await;
         }
         Ok(())
     }

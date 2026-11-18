@@ -1,0 +1,860 @@
+//! `raidish csi`: a Container Storage Interface driver, so Kubernetes pods
+//! can use raidish volumes as persistent volumes.
+//!
+//! It runs on every node next to `listen` (as root: it formats and mounts),
+//! and serves the Identity, Controller and Node services on one unix socket.
+//! The CSI sidecars (external-provisioner, external-attacher,
+//! node-driver-registrar) and kubelet are its clients.
+//!
+//! It adds no machinery of its own. The node agent (see `crate::agent`)
+//! already runs a volume on the first live node of its `nodes` list,
+//! exports it and attaches the kernel device, so:
+//!
+//! * CreateVolume / DeleteVolume create and delete a raidish volume (the
+//!   CSI volume id is its name). A new volume isn't placed anywhere.
+//! * ControllerPublishVolume(node) sets `nodes: [node]`, `automount: nvme`
+//!   and enables it. That node's agent takes the volume's `ds/` lease and
+//!   attaches it over NVMe/TCP. Since the list names only that node, the
+//!   volume never fails over somewhere its pod isn't.
+//! * ControllerUnpublishVolume disables it, and waits for the lease to be
+//!   let go (or to expire, if that node is dead).
+//! * NodeStageVolume waits for this node's agent to report the device,
+//!   formats it if it's blank and mounts it at the staging path;
+//!   NodePublishVolume bind-mounts that into the pod.
+//!
+//! Volumes are single-node (ReadWriteOnce / ReadWriteOncePod). Kubernetes'
+//! attach/detach controller won't publish one to a second node while it's
+//! still published to another, and the `ds/` lease would refuse a second
+//! writer anyway.
+
+pub mod pb {
+    #![allow(clippy::all, dead_code)]
+    tonic::include_proto!("csi.v1");
+}
+
+use crate::committer::{CommitClient, dataset_resource};
+use crate::inode::Transport;
+use crate::writer::CommitError;
+use pb::controller_server::{Controller, ControllerServer};
+use pb::identity_server::{Identity, IdentityServer};
+use pb::node_server::{Node, NodeServer};
+use pb::volume_capability::AccessType;
+use pb::volume_capability::access_mode::Mode;
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tonic::{Request, Response, Status};
+
+/// The driver's name (`provisioner:` in a StorageClass).
+pub const DRIVER_NAME: &str = "csi.raidish.io";
+
+/// Volumes are created in whole MiB.
+const SIZE_UNIT: u64 = 1 << 20;
+/// Size of a volume asked for with no capacity range.
+const DEFAULT_SIZE: u64 = 1 << 30;
+/// How long NodeStageVolume waits for the agent to attach the device before
+/// failing (kubelet calls it again).
+const ATTACH_WAIT: Duration = Duration::from_secs(90);
+/// How long ControllerUnpublishVolume waits for the volume to stop.
+const RELEASE_WAIT: Duration = Duration::from_secs(45);
+
+type Rpc<T> = Result<Response<T>, Status>;
+
+#[derive(Clone)]
+struct Driver {
+    /// This node's name in the cluster (`node-0`): the CSI node id.
+    node: String,
+    /// Every `listen` node (the committer and lease endpoints).
+    endpoints: Vec<String>,
+    committer: CommitClient,
+    /// This node's `listen` API (its agent's status).
+    agent: String,
+    http: reqwest::Client,
+}
+
+fn commit_status(e: CommitError) -> Status {
+    match e {
+        CommitError::Retry(m) => Status::unavailable(m),
+        CommitError::Refused(m) => Status::failed_precondition(m),
+        CommitError::Restamp(_) => Status::unavailable("try again"),
+    }
+}
+
+fn valid_name(name: &str) -> Result<(), Status> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "volume name '{}': up to 64 of A-Z a-z 0-9 . _ -",
+            name
+        )))
+    }
+}
+
+/// Access modes we can honour: one node at a time.
+fn supported(cap: &pb::VolumeCapability) -> Result<(), String> {
+    let mode = cap
+        .access_mode
+        .map(|m| Mode::try_from(m.mode).unwrap_or(Mode::Unknown))
+        .unwrap_or(Mode::Unknown);
+    match mode {
+        Mode::SingleNodeWriter
+        | Mode::SingleNodeReaderOnly
+        | Mode::SingleNodeSingleWriter
+        | Mode::SingleNodeMultiWriter => {}
+        m => {
+            return Err(format!(
+                "access mode {} isn't supported (single node only)",
+                m.as_str_name()
+            ));
+        }
+    }
+    match &cap.access_type {
+        Some(AccessType::Mount(m)) => {
+            let fs = fs_type(m);
+            if !matches!(fs, "ext4" | "xfs") {
+                return Err(format!("filesystem '{}' isn't supported (ext4, xfs)", fs));
+            }
+            Ok(())
+        }
+        Some(AccessType::Block(_)) => Ok(()),
+        None => Err("no access type".into()),
+    }
+}
+
+fn fs_type(m: &pb::volume_capability::MountVolume) -> &str {
+    if m.fs_type.is_empty() {
+        "ext4"
+    } else {
+        &m.fs_type
+    }
+}
+
+/// Run a command; its stderr on failure.
+async fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("{}: {}", cmd, e))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "{} {}: {}",
+            cmd,
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Is something mounted exactly at `path`?
+async fn is_mounted(path: &str) -> bool {
+    run("findmnt", &["-rn", "--mountpoint", path])
+        .await
+        .is_ok_and(|s| !s.is_empty())
+}
+
+async fn unmount(path: &str) -> Result<(), Status> {
+    if is_mounted(path).await {
+        run("umount", &[path]).await.map_err(Status::internal)?;
+    }
+    Ok(())
+}
+
+impl Driver {
+    async fn volume(&self, name: &str) -> Result<Option<crate::volume::VolumeInfo>, Status> {
+        let vols = self.committer.volumes().await.map_err(commit_status)?;
+        Ok(vols.into_iter().find(|v| v.name == name))
+    }
+
+    /// Who runs `name` now (its live `ds/` lease's node), if anyone.
+    async fn holder(&self, name: &str) -> Result<Option<String>, Status> {
+        let status = crate::cluster::lease::LeaseClient::new(self.endpoints.clone())
+            .status()
+            .await
+            .map_err(Status::unavailable)?;
+        let now = crate::cluster::now_ms();
+        Ok(status
+            .state
+            .leases
+            .get(&dataset_resource(name))
+            .filter(|l| !l.released && l.expires_ms > now)
+            .map(|l| crate::frontend::parse_desc(&l.desc).0))
+    }
+
+    /// The kernel device this node's agent attached `name` on, or why
+    /// there isn't one (yet).
+    async fn local_device(&self, name: &str) -> Result<String, String> {
+        let status: crate::agent::AgentStatus = self
+            .http
+            .get(format!("{}/api/v1/agent/status", self.agent))
+            .send()
+            .await
+            .map_err(|e| format!("asking the local agent: {}", e))?
+            .json()
+            .await
+            .map_err(|e| format!("asking the local agent: {}", e))?;
+        let Some(v) = status.volumes.into_iter().find(|v| v.name == name) else {
+            return Err("not running on this node yet".into());
+        };
+        match (v.device, v.note) {
+            (Some(d), _) if Path::new(&d).exists() => Ok(d),
+            (Some(d), _) => Err(format!("{} doesn't exist (yet)", d)),
+            (None, Some(n)) => Err(format!("attach failed: {}", n)),
+            (None, None) => Err(
+                "exported, but the agent attaches no devices (automount.helper is none?)".into(),
+            ),
+        }
+    }
+
+    async fn wait_device(&self, name: &str) -> Result<String, Status> {
+        let start = Instant::now();
+        let mut last = String::new();
+        while start.elapsed() < ATTACH_WAIT {
+            match self.local_device(name).await {
+                Ok(d) => return Ok(d),
+                Err(e) => last = e,
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Err(Status::deadline_exceeded(format!(
+            "volume '{}' isn't attached on {}: {}",
+            name, self.node, last
+        )))
+    }
+}
+
+#[tonic::async_trait]
+impl Identity for Driver {
+    async fn get_plugin_info(
+        &self,
+        _: Request<pb::GetPluginInfoRequest>,
+    ) -> Rpc<pb::GetPluginInfoResponse> {
+        Ok(Response::new(pb::GetPluginInfoResponse {
+            name: DRIVER_NAME.into(),
+            vendor_version: env!("CARGO_PKG_VERSION").into(),
+            manifest: HashMap::new(),
+        }))
+    }
+
+    async fn get_plugin_capabilities(
+        &self,
+        _: Request<pb::GetPluginCapabilitiesRequest>,
+    ) -> Rpc<pb::GetPluginCapabilitiesResponse> {
+        use pb::plugin_capability::{Service, Type, service};
+        Ok(Response::new(pb::GetPluginCapabilitiesResponse {
+            capabilities: vec![pb::PluginCapability {
+                r#type: Some(Type::Service(Service {
+                    r#type: service::Type::ControllerService as i32,
+                })),
+            }],
+        }))
+    }
+
+    async fn probe(&self, _: Request<pb::ProbeRequest>) -> Rpc<pb::ProbeResponse> {
+        let ready = self.committer.committer().await.is_some();
+        Ok(Response::new(pb::ProbeResponse { ready: Some(ready) }))
+    }
+}
+
+#[tonic::async_trait]
+impl Controller for Driver {
+    async fn create_volume(
+        &self,
+        req: Request<pb::CreateVolumeRequest>,
+    ) -> Rpc<pb::CreateVolumeResponse> {
+        let req = req.into_inner();
+        valid_name(&req.name)?;
+        if req.volume_content_source.is_some() {
+            return Err(Status::invalid_argument(
+                "volume content sources aren't supported",
+            ));
+        }
+        for cap in &req.volume_capabilities {
+            supported(cap).map_err(Status::invalid_argument)?;
+        }
+        let (required, limit) = req
+            .capacity_range
+            .map(|r| (r.required_bytes.max(0) as u64, r.limit_bytes.max(0) as u64))
+            .unwrap_or((0, 0));
+        let mut size = if required == 0 {
+            DEFAULT_SIZE
+        } else {
+            required
+        };
+        size = size.div_ceil(SIZE_UNIT) * SIZE_UNIT;
+        if limit != 0 && size > limit {
+            size = limit;
+        }
+        if size < required || size == 0 {
+            return Err(Status::out_of_range(format!(
+                "can't fit {} bytes in whole MiB under the limit {}",
+                required, limit
+            )));
+        }
+        match self.volume(&req.name).await? {
+            // Retried request: same volume.
+            Some(v) if v.size_bytes >= required && (limit == 0 || v.size_bytes <= limit) => {
+                size = v.size_bytes;
+            }
+            Some(v) => {
+                return Err(Status::already_exists(format!(
+                    "volume '{}' exists with {} bytes",
+                    req.name, v.size_bytes
+                )));
+            }
+            None => {
+                println!("csi: creating volume '{}' ({} bytes)", req.name, size);
+                self.committer
+                    .create_volume(&req.name, size)
+                    .await
+                    .map_err(commit_status)?;
+            }
+        }
+        Ok(Response::new(pb::CreateVolumeResponse {
+            volume: Some(pb::Volume {
+                capacity_bytes: size as i64,
+                volume_id: req.name,
+                ..Default::default()
+            }),
+        }))
+    }
+
+    async fn delete_volume(
+        &self,
+        req: Request<pb::DeleteVolumeRequest>,
+    ) -> Rpc<pb::DeleteVolumeResponse> {
+        let id = req.into_inner().volume_id;
+        valid_name(&id)?;
+        if self.volume(&id).await?.is_some() {
+            println!("csi: deleting volume '{}'", id);
+            self.committer
+                .delete_volume(&id)
+                .await
+                .map_err(commit_status)?;
+        }
+        Ok(Response::new(pb::DeleteVolumeResponse {}))
+    }
+
+    async fn controller_publish_volume(
+        &self,
+        req: Request<pb::ControllerPublishVolumeRequest>,
+    ) -> Rpc<pb::ControllerPublishVolumeResponse> {
+        let req = req.into_inner();
+        valid_name(&req.volume_id)?;
+        if req.node_id.is_empty() {
+            return Err(Status::invalid_argument("no node id"));
+        }
+        if let Some(cap) = &req.volume_capability {
+            supported(cap).map_err(Status::invalid_argument)?;
+        }
+        let Some(v) = self.volume(&req.volume_id).await? else {
+            return Err(Status::not_found(format!("no volume '{}'", req.volume_id)));
+        };
+        let mut props = v.props.clone();
+        let want = vec![req.node_id.clone()];
+        if props.enabled && props.automount == Some(Transport::Nvme) && props.nodes == want {
+            return Ok(Response::new(Default::default())); // already
+        }
+        if props.enabled
+            && props.automount.is_some()
+            && !props.nodes.is_empty()
+            && props.nodes != want
+        {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' is published to {}",
+                req.volume_id,
+                props.nodes.join(",")
+            )));
+        }
+        props.nodes = want;
+        props.automount = Some(Transport::Nvme);
+        props.enabled = true;
+        props.move_to = None;
+        println!(
+            "csi: publishing volume '{}' to {}",
+            req.volume_id, req.node_id
+        );
+        self.committer
+            .set_props(&req.volume_id, &props)
+            .await
+            .map_err(commit_status)?;
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn controller_unpublish_volume(
+        &self,
+        req: Request<pb::ControllerUnpublishVolumeRequest>,
+    ) -> Rpc<pb::ControllerUnpublishVolumeResponse> {
+        let req = req.into_inner();
+        valid_name(&req.volume_id)?;
+        let Some(v) = self.volume(&req.volume_id).await? else {
+            return Ok(Response::new(Default::default())); // gone: nothing to undo
+        };
+        let mine = req.node_id.is_empty() || v.props.nodes == [req.node_id.clone()];
+        if mine && v.props.enabled {
+            let mut props = v.props.clone();
+            props.enabled = false;
+            println!(
+                "csi: unpublishing volume '{}' from {}",
+                req.volume_id, req.node_id
+            );
+            self.committer
+                .set_props(&req.volume_id, &props)
+                .await
+                .map_err(commit_status)?;
+        }
+        // Done once nobody (or not that node) runs it any more.
+        let start = Instant::now();
+        loop {
+            match self.holder(&req.volume_id).await? {
+                None => break,
+                Some(h) if !req.node_id.is_empty() && h != req.node_id => break,
+                Some(h) if start.elapsed() > RELEASE_WAIT => {
+                    return Err(Status::deadline_exceeded(format!(
+                        "volume '{}' still runs on {}",
+                        req.volume_id, h
+                    )));
+                }
+                Some(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn validate_volume_capabilities(
+        &self,
+        req: Request<pb::ValidateVolumeCapabilitiesRequest>,
+    ) -> Rpc<pb::ValidateVolumeCapabilitiesResponse> {
+        let req = req.into_inner();
+        valid_name(&req.volume_id)?;
+        if self.volume(&req.volume_id).await?.is_none() {
+            return Err(Status::not_found(format!("no volume '{}'", req.volume_id)));
+        }
+        if let Some(e) = req
+            .volume_capabilities
+            .iter()
+            .find_map(|c| supported(c).err())
+        {
+            return Ok(Response::new(pb::ValidateVolumeCapabilitiesResponse {
+                confirmed: None,
+                message: e,
+            }));
+        }
+        Ok(Response::new(pb::ValidateVolumeCapabilitiesResponse {
+            confirmed: Some(pb::validate_volume_capabilities_response::Confirmed {
+                volume_context: req.volume_context,
+                volume_capabilities: req.volume_capabilities,
+                parameters: req.parameters,
+                ..Default::default()
+            }),
+            message: String::new(),
+        }))
+    }
+
+    async fn controller_get_capabilities(
+        &self,
+        _: Request<pb::ControllerGetCapabilitiesRequest>,
+    ) -> Rpc<pb::ControllerGetCapabilitiesResponse> {
+        use pb::controller_service_capability::{Rpc as R, Type, rpc};
+        let caps = [
+            rpc::Type::CreateDeleteVolume,
+            rpc::Type::PublishUnpublishVolume,
+        ]
+        .into_iter()
+        .map(|t| pb::ControllerServiceCapability {
+            r#type: Some(Type::Rpc(R { r#type: t as i32 })),
+        })
+        .collect();
+        Ok(Response::new(pb::ControllerGetCapabilitiesResponse {
+            capabilities: caps,
+        }))
+    }
+
+    async fn list_volumes(
+        &self,
+        _: Request<pb::ListVolumesRequest>,
+    ) -> Rpc<pb::ListVolumesResponse> {
+        Err(Status::unimplemented("ListVolumes"))
+    }
+    async fn controller_list_volume_health(
+        &self,
+        _: Request<pb::ControllerListVolumeHealthRequest>,
+    ) -> Rpc<pb::ControllerListVolumeHealthResponse> {
+        Err(Status::unimplemented("ControllerListVolumeHealth"))
+    }
+    async fn controller_get_volume_health(
+        &self,
+        _: Request<pb::ControllerGetVolumeHealthRequest>,
+    ) -> Rpc<pb::ControllerGetVolumeHealthResponse> {
+        Err(Status::unimplemented("ControllerGetVolumeHealth"))
+    }
+    async fn get_capacity(
+        &self,
+        _: Request<pb::GetCapacityRequest>,
+    ) -> Rpc<pb::GetCapacityResponse> {
+        Err(Status::unimplemented("GetCapacity"))
+    }
+    async fn create_snapshot(
+        &self,
+        _: Request<pb::CreateSnapshotRequest>,
+    ) -> Rpc<pb::CreateSnapshotResponse> {
+        Err(Status::unimplemented("CreateSnapshot"))
+    }
+    async fn delete_snapshot(
+        &self,
+        _: Request<pb::DeleteSnapshotRequest>,
+    ) -> Rpc<pb::DeleteSnapshotResponse> {
+        Err(Status::unimplemented("DeleteSnapshot"))
+    }
+    async fn list_snapshots(
+        &self,
+        _: Request<pb::ListSnapshotsRequest>,
+    ) -> Rpc<pb::ListSnapshotsResponse> {
+        Err(Status::unimplemented("ListSnapshots"))
+    }
+    async fn get_snapshot(
+        &self,
+        _: Request<pb::GetSnapshotRequest>,
+    ) -> Rpc<pb::GetSnapshotResponse> {
+        Err(Status::unimplemented("GetSnapshot"))
+    }
+    async fn controller_expand_volume(
+        &self,
+        _: Request<pb::ControllerExpandVolumeRequest>,
+    ) -> Rpc<pb::ControllerExpandVolumeResponse> {
+        Err(Status::unimplemented("ControllerExpandVolume"))
+    }
+    async fn controller_get_volume(
+        &self,
+        _: Request<pb::ControllerGetVolumeRequest>,
+    ) -> Rpc<pb::ControllerGetVolumeResponse> {
+        Err(Status::unimplemented("ControllerGetVolume"))
+    }
+    async fn controller_modify_volume(
+        &self,
+        _: Request<pb::ControllerModifyVolumeRequest>,
+    ) -> Rpc<pb::ControllerModifyVolumeResponse> {
+        Err(Status::unimplemented("ControllerModifyVolume"))
+    }
+    async fn controller_get_node_info(
+        &self,
+        _: Request<pb::ControllerGetNodeInfoRequest>,
+    ) -> Rpc<pb::ControllerGetNodeInfoResponse> {
+        Err(Status::unimplemented("ControllerGetNodeInfo"))
+    }
+}
+
+#[tonic::async_trait]
+impl Node for Driver {
+    async fn node_stage_volume(
+        &self,
+        req: Request<pb::NodeStageVolumeRequest>,
+    ) -> Rpc<pb::NodeStageVolumeResponse> {
+        let req = req.into_inner();
+        valid_name(&req.volume_id)?;
+        let cap = req
+            .volume_capability
+            .ok_or_else(|| Status::invalid_argument("no volume capability"))?;
+        supported(&cap).map_err(Status::invalid_argument)?;
+        let target = req.staging_target_path.as_str();
+        if target.is_empty() {
+            return Err(Status::invalid_argument("no staging path"));
+        }
+        let dev = self.wait_device(&req.volume_id).await?;
+        // A raw block volume is used straight from the device (NodePublish).
+        let Some(AccessType::Mount(m)) = &cap.access_type else {
+            return Ok(Response::new(pb::NodeStageVolumeResponse {}));
+        };
+        if is_mounted(target).await {
+            return Ok(Response::new(pb::NodeStageVolumeResponse {}));
+        }
+        let fs = fs_type(m);
+        // blkid exits 2 when it finds no signature at all: a new volume.
+        match tokio::process::Command::new("blkid")
+            .args(["-p", "-s", "TYPE", "-o", "value", &dev])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.code() == Some(2) => {
+                println!("csi: formatting '{}' ({}) as {}", req.volume_id, dev, fs);
+                let mkfs = format!("mkfs.{}", fs);
+                let args: &[&str] = match fs {
+                    "ext4" => &["-q", "-F", "-E", "nodiscard", &dev],
+                    _ => &["-q", "-K", &dev],
+                };
+                run(&mkfs, args).await.map_err(Status::internal)?;
+            }
+            Ok(o) if o.status.success() => {
+                let found = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if found != fs {
+                    return Err(Status::failed_precondition(format!(
+                        "volume '{}' holds {} (asked for {})",
+                        req.volume_id,
+                        if found.is_empty() {
+                            "something else"
+                        } else {
+                            &found
+                        },
+                        fs
+                    )));
+                }
+                // Repair what an unclean stop (or an I/O error that made the
+                // kernel abort the journal) left before mounting, like a boot
+                // does. e2fsck -p: 0 clean, 1 fixed, 2 fixed (reboot advised:
+                // nothing has it mounted); worse needs a human.
+                if fs == "ext4" {
+                    let out = tokio::process::Command::new("e2fsck")
+                        .args(["-p", &dev])
+                        .output()
+                        .await
+                        .map_err(|e| Status::internal(format!("e2fsck: {}", e)))?;
+                    match out.status.code() {
+                        Some(0) => {}
+                        Some(1 | 2) => println!(
+                            "csi: e2fsck repaired '{}': {}",
+                            req.volume_id,
+                            String::from_utf8_lossy(&out.stdout).trim()
+                        ),
+                        _ => {
+                            return Err(Status::internal(format!(
+                                "e2fsck {} needs manual repair: {}{}",
+                                dev,
+                                String::from_utf8_lossy(&out.stdout).trim(),
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            )));
+                        }
+                    }
+                }
+            }
+            Ok(o) => {
+                return Err(Status::internal(format!(
+                    "blkid {}: {}",
+                    dev,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )));
+            }
+            Err(e) => return Err(Status::internal(format!("blkid: {}", e))),
+        }
+        std::fs::create_dir_all(target).map_err(|e| Status::internal(e.to_string()))?;
+        let mut args = vec!["-t", fs];
+        let opts = m.mount_flags.join(",");
+        if !opts.is_empty() {
+            args.extend(["-o", &opts]);
+        }
+        args.extend([dev.as_str(), target]);
+        run("mount", &args).await.map_err(Status::internal)?;
+        println!("csi: staged '{}' ({}) at {}", req.volume_id, dev, target);
+        Ok(Response::new(pb::NodeStageVolumeResponse {}))
+    }
+
+    async fn node_unstage_volume(
+        &self,
+        req: Request<pb::NodeUnstageVolumeRequest>,
+    ) -> Rpc<pb::NodeUnstageVolumeResponse> {
+        let req = req.into_inner();
+        unmount(&req.staging_target_path).await?;
+        println!("csi: unstaged '{}'", req.volume_id);
+        Ok(Response::new(pb::NodeUnstageVolumeResponse {}))
+    }
+
+    async fn node_publish_volume(
+        &self,
+        req: Request<pb::NodePublishVolumeRequest>,
+    ) -> Rpc<pb::NodePublishVolumeResponse> {
+        let req = req.into_inner();
+        valid_name(&req.volume_id)?;
+        let cap = req
+            .volume_capability
+            .ok_or_else(|| Status::invalid_argument("no volume capability"))?;
+        supported(&cap).map_err(Status::invalid_argument)?;
+        let target = req.target_path.as_str();
+        if target.is_empty() {
+            return Err(Status::invalid_argument("no target path"));
+        }
+        if is_mounted(target).await {
+            return Ok(Response::new(pb::NodePublishVolumeResponse {}));
+        }
+        let source = match &cap.access_type {
+            Some(AccessType::Block(_)) => {
+                let dev = self.wait_device(&req.volume_id).await?;
+                if let Some(p) = Path::new(target).parent() {
+                    std::fs::create_dir_all(p).map_err(|e| Status::internal(e.to_string()))?;
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(target)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                dev
+            }
+            _ => {
+                if req.staging_target_path.is_empty() || !is_mounted(&req.staging_target_path).await
+                {
+                    return Err(Status::failed_precondition("volume isn't staged"));
+                }
+                std::fs::create_dir_all(target).map_err(|e| Status::internal(e.to_string()))?;
+                req.staging_target_path.clone()
+            }
+        };
+        let opts = if req.readonly { "bind,ro" } else { "bind" };
+        run("mount", &["-o", opts, &source, target])
+            .await
+            .map_err(Status::internal)?;
+        println!("csi: published '{}' at {}", req.volume_id, target);
+        Ok(Response::new(pb::NodePublishVolumeResponse {}))
+    }
+
+    async fn node_unpublish_volume(
+        &self,
+        req: Request<pb::NodeUnpublishVolumeRequest>,
+    ) -> Rpc<pb::NodeUnpublishVolumeResponse> {
+        let req = req.into_inner();
+        let target = req.target_path.as_str();
+        unmount(target).await?;
+        let p = Path::new(target);
+        let _ = if p.is_dir() {
+            std::fs::remove_dir(p)
+        } else {
+            std::fs::remove_file(p)
+        };
+        println!("csi: unpublished '{}' from {}", req.volume_id, target);
+        Ok(Response::new(pb::NodeUnpublishVolumeResponse {}))
+    }
+
+    async fn node_get_volume_stats(
+        &self,
+        req: Request<pb::NodeGetVolumeStatsRequest>,
+    ) -> Rpc<pb::NodeGetVolumeStatsResponse> {
+        let path = req.into_inner().volume_path;
+        if !is_mounted(&path).await {
+            return Err(Status::not_found(format!("{} isn't mounted", path)));
+        }
+        let out = run(
+            "df",
+            &["-B1", "--output=size,used,avail,itotal,iused,iavail", &path],
+        )
+        .await
+        .map_err(Status::internal)?;
+        let n: Vec<i64> = out
+            .lines()
+            .last()
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        if n.len() != 6 {
+            return Err(Status::internal(format!("df: {}", out)));
+        }
+        use pb::volume_usage::Unit;
+        Ok(Response::new(pb::NodeGetVolumeStatsResponse {
+            usage: vec![
+                pb::VolumeUsage {
+                    total: n[0],
+                    used: n[1],
+                    available: n[2],
+                    unit: Unit::Bytes as i32,
+                },
+                pb::VolumeUsage {
+                    total: n[3],
+                    used: n[4],
+                    available: n[5],
+                    unit: Unit::Inodes as i32,
+                },
+            ],
+        }))
+    }
+
+    async fn node_get_volume_health(
+        &self,
+        _: Request<pb::NodeGetVolumeHealthRequest>,
+    ) -> Rpc<pb::NodeGetVolumeHealthResponse> {
+        Err(Status::unimplemented("NodeGetVolumeHealth"))
+    }
+    async fn node_get_storage_health(
+        &self,
+        _: Request<pb::NodeGetStorageHealthRequest>,
+    ) -> Rpc<pb::NodeGetStorageHealthResponse> {
+        Err(Status::unimplemented("NodeGetStorageHealth"))
+    }
+    async fn node_expand_volume(
+        &self,
+        _: Request<pb::NodeExpandVolumeRequest>,
+    ) -> Rpc<pb::NodeExpandVolumeResponse> {
+        Err(Status::unimplemented("NodeExpandVolume"))
+    }
+
+    async fn node_get_capabilities(
+        &self,
+        _: Request<pb::NodeGetCapabilitiesRequest>,
+    ) -> Rpc<pb::NodeGetCapabilitiesResponse> {
+        use pb::node_service_capability::{Rpc as R, Type, rpc};
+        let caps = [rpc::Type::StageUnstageVolume, rpc::Type::GetVolumeStats]
+            .into_iter()
+            .map(|t| pb::NodeServiceCapability {
+                r#type: Some(Type::Rpc(R { r#type: t as i32 })),
+            })
+            .collect();
+        Ok(Response::new(pb::NodeGetCapabilitiesResponse {
+            capabilities: caps,
+        }))
+    }
+
+    async fn node_get_info(
+        &self,
+        _: Request<pb::NodeGetInfoRequest>,
+    ) -> Rpc<pb::NodeGetInfoResponse> {
+        Ok(Response::new(pb::NodeGetInfoResponse {
+            node_id: self.node.clone(),
+            ..Default::default()
+        }))
+    }
+}
+
+/// Serve the driver on the unix socket `endpoint` (`unix:///path` or a path).
+pub async fn serve(
+    endpoint: &str,
+    node: String,
+    agent: Option<String>,
+    endpoints: Vec<String>,
+) -> Result<(), String> {
+    if endpoints.is_empty() {
+        return Err("no cluster to ask: the pool has no remote disks".into());
+    }
+    let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
+    if let Some(dir) = Path::new(path).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
+    let _ = std::fs::remove_file(path);
+    let uds = tokio::net::UnixListener::bind(path).map_err(|e| format!("{}: {}", path, e))?;
+    let driver = Driver {
+        node: node.clone(),
+        committer: CommitClient::new(endpoints.clone()),
+        endpoints,
+        agent: agent
+            .unwrap_or_else(|| format!("{}://127.0.0.1:8881", crate::tls::scheme()))
+            .trim_end_matches('/')
+            .to_string(),
+        http: crate::tls::http_builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?,
+    };
+    println!("csi: {} on {} as {}", DRIVER_NAME, path, node);
+    tonic::transport::Server::builder()
+        .add_service(IdentityServer::new(driver.clone()))
+        .add_service(ControllerServer::new(driver.clone()))
+        .add_service(NodeServer::new(driver))
+        .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds))
+        .await
+        .map_err(|e| e.to_string())
+}

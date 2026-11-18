@@ -1377,3 +1377,319 @@ async fn a_new_committer_raises_the_birth_floor() {
     let open = s.committer.fs.open_txg().await.unwrap();
     assert!(s.committer.fs.birth_floor() >= open);
 }
+
+/// Applies every commit at once, but holds its answer back while `hold` is
+/// set (a slow committer: the writer is still waiting when it carries on).
+struct SlowAnswers {
+    inner: DirectSink<Pool>,
+    hold: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CommitSink for SlowAnswers {
+    fn writer(&self) -> (String, u64) {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let r = self.inner.commit(c).await;
+        let mut hold = self.hold.clone();
+        let _ = hold.wait_for(|h| !*h).await;
+        r
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(
+        &self,
+        volume: &str,
+        ds_owner: &str,
+        ds_epoch: u64,
+    ) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
+    }
+}
+
+#[tokio::test]
+async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(SlowAnswers {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource,
+            epoch,
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", "o", ds_epoch).await.unwrap();
+
+    // A sync whose answer is slow to come back...
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    let first = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.sync().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!first.is_finished());
+    // ...and more writes, and another sync, meanwhile.
+    fs.block_write("a", 200_000, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.sync().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    hold.send_replace(false);
+    let r1 = first.await.unwrap();
+    let r2 = second.await.unwrap();
+    eprintln!("first sync: {:?}, second sync: {:?}", r1, r2);
+
+    // Whatever happened to those two, the volume carries on.
+    fs.block_write("a", 400_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.sync().await.expect("a later sync");
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 3));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// Refuses every commit of dataset `bad`.
+struct RefuseOne {
+    inner: DirectSink<Pool>,
+    bad: &'static str,
+}
+
+#[async_trait]
+impl CommitSink for RefuseOne {
+    fn writer(&self) -> (String, u64) {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        if c.dataset == self.bad {
+            return Err(CommitError::Refused(format!("'{}' is refused", c.dataset)));
+        }
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(
+        &self,
+        volume: &str,
+        ds_owner: &str,
+        ds_epoch: u64,
+    ) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
+    }
+}
+
+#[tokio::test]
+async fn one_datasets_refused_sync_doesnt_fail_anothers_flush() {
+    let s = setup(&["a", "b"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(RefuseOne {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource,
+            epoch,
+        },
+        bad: "b",
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    for name in ["a", "b"] {
+        let e = lease(&s.auth, &dataset_resource(name), "o").await;
+        fs.attach_dataset(name, "o", e).await.unwrap();
+    }
+
+    // Both written; only `b`'s commits are refused.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
+    fs.flush_for("a").await.expect("a's flush, b refused");
+    assert!(fs.flush_for("b").await.is_err());
+    assert!(
+        fs.flush().await.is_err(),
+        "a flush of everything includes b"
+    );
+
+    // Again, now that `a` has an intent log and `b` still has none.
+    fs.block_write("a", 200_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.block_write("b", 200_000, &pattern(100_000, 4))
+        .await
+        .unwrap();
+    fs.flush_for("a").await.expect("a's second flush");
+    fs.block_write("a", 400_000, &pattern(100_000, 5))
+        .await
+        .unwrap();
+    fs.sync_for("a").await.expect("a's sync");
+    assert!(fs.sync().await.is_err());
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 3));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 5));
+}
+
+/// The wedge seen with Kubernetes on raidish etcd: a sync whose caller gives
+/// up while it waits for the committer's answer (kube-apiserver's gRPC
+/// deadline drops the etcd request's future, and the flush inside it), after
+/// the committer applied it. The writer never learns its root moved, and
+/// every later sync, built on the old root, was refused as "moved on".
+#[tokio::test]
+async fn a_sync_given_up_on_after_the_committer_applied_it_doesnt_wedge_the_volume() {
+    let s = setup(&["a", "b"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(SlowAnswers {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource,
+            epoch,
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    for name in ["a", "b"] {
+        let e = lease(&s.auth, &dataset_resource(name), "o").await;
+        fs.attach_dataset(name, "o", e).await.unwrap();
+    }
+
+    // Applied by the committer, answered too late: the caller is gone.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
+    let gave_up =
+        tokio::time::timeout(std::time::Duration::from_millis(300), fs.flush_for("a")).await;
+    assert!(gave_up.is_err(), "the flush should still be waiting");
+    hold.send_replace(false);
+
+    // Later writes and syncs carry on, on both datasets.
+    fs.block_write("a", 200_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.block_write("b", 200_000, &pattern(100_000, 4))
+        .await
+        .unwrap();
+    fs.sync().await.expect("the next sync");
+    fs.block_write("a", 400_000, &pattern(100_000, 5))
+        .await
+        .unwrap();
+    fs.flush_for("a").await.expect("a later flush");
+    fs.sync().await.expect("a later sync");
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "b", 0, 100_000).await, pattern(100_000, 2));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 3));
+    assert_eq!(read(&fs, "b", 200_000, 100_000).await, pattern(100_000, 4));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 5));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// The same, where the committer never got the commit before the caller
+/// gave up (it's sent again, and applied, by the next sync), or refused it.
+#[tokio::test]
+async fn a_sync_given_up_on_before_it_reached_the_committer_is_sent_again() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(HeldBack {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: resource,
+            epoch,
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let e = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", "o", e).await.unwrap();
+
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    let gave_up = tokio::time::timeout(std::time::Duration::from_millis(300), fs.sync()).await;
+    assert!(gave_up.is_err());
+    hold.send_replace(false);
+    fs.block_write("a", 200_000, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    fs.sync().await.expect("the next sync");
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// Holds commits back before they reach the committer.
+struct HeldBack {
+    inner: DirectSink<Pool>,
+    hold: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CommitSink for HeldBack {
+    fn writer(&self) -> (String, u64) {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let mut hold = self.hold.clone();
+        let _ = hold.wait_for(|h| !*h).await;
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(
+        &self,
+        volume: &str,
+        ds_owner: &str,
+        ds_epoch: u64,
+    ) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
+    }
+}

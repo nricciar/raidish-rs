@@ -337,6 +337,11 @@ pub struct FileSystem<D: BlockDevice> {
     /// Lets concurrent `sync` calls share one commit (group commit).
     commits_started: Arc<AtomicU64>,
     commits_done: Arc<AtomicU64>,
+    /// Per open dataset, the newest commit (by `commits_started` id) that
+    /// left it with nothing dirty from before that commit began: its writes
+    /// up to then are durable, whatever happened to other datasets in that
+    /// commit (see `sync_for`).
+    clean_at: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// Opened for inspection: never writes (no commits, no self-heal repairs),
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
@@ -395,6 +400,7 @@ impl<D: BlockDevice> FileSystem<D> {
             commit_lock: Arc::new(Mutex::new(())),
             commits_started: Arc::new(AtomicU64::new(0)),
             commits_done: Arc::new(AtomicU64::new(0)),
+            clean_at: Default::default(),
             read_only: false,
             degraded: Arc::new(std::sync::Mutex::new(vec![None; disks])),
             miss_seen: Arc::new(std::sync::Mutex::new(vec![0; disks])),
@@ -1107,13 +1113,50 @@ impl<D: BlockDevice> FileSystem<D> {
     /// to do. Concurrent flushes (fsync storms, multi-queue NVMe) therefore
     /// share commits instead of each running one.
     pub async fn sync(&self) -> Result<(), FileSystemError> {
+        self.sync_scoped(None).await
+    }
+
+    /// `sync` for dataset `name` alone: every write to it completed before
+    /// this call is durable. Other datasets' failures in the same commit
+    /// (one refused, out of space, its disk writes failing) don't fail it.
+    pub async fn sync_for(&self, name: &str) -> Result<(), FileSystemError> {
+        self.sync_scoped(Some(name)).await
+    }
+
+    /// `sync` (None) or `sync_for` (Some).
+    pub(crate) async fn sync_scoped(&self, only: Option<&str>) -> Result<(), FileSystemError> {
         let need = self.commits_started.load(Ordering::SeqCst) + 1;
+        let covered = || {
+            self.commits_done.load(Ordering::SeqCst) >= need
+                || only.is_some_and(|n| self.clean_since(n, need))
+        };
         let _guard = self.commit_lock.lock().await;
-        if self.commits_done.load(Ordering::SeqCst) >= need {
+        if covered() {
             return Ok(());
         }
-        self.commit_locked().await?;
-        Ok(())
+        match self.commit_locked().await {
+            Ok(_) => Ok(()),
+            Err(_) if covered() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether a commit numbered `need` or later left `name` clean.
+    fn clean_since(&self, name: &str, need: u64) -> bool {
+        self.clean_at
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|&id| id >= need)
+    }
+
+    /// Note that commit `id` left each of `names` clean (durably).
+    pub(crate) fn note_clean(&self, id: u64, names: &[String]) {
+        let mut c = self.clean_at.lock().unwrap();
+        for n in names {
+            let e = c.entry(n.clone()).or_insert(0);
+            *e = (*e).max(id);
+        }
     }
 
     /// Commit the open TXG:
@@ -1154,7 +1197,9 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(w) = self.writer.clone() {
             // A volume writer commits through the committer.
             let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
-            let r = self.writer_commit(&w).await;
+            let (r, clean) = self.writer_commit(&w).await;
+            // Each dataset's commit is durable once the committer took it.
+            self.note_clean(id, &clean);
             if r.is_ok() {
                 self.commits_done.fetch_max(id, Ordering::SeqCst);
             }
@@ -1171,7 +1216,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let txg = self.open_txg().await?;
         // Volumes sync all-or-nothing each, so whatever did sync is safe to
         // commit; a failure is reported after the TXG is durable.
-        let volumes = self.sync_datasets().await;
+        let (clean, volumes) = self.sync_datasets_noting().await;
         let files = self.sync_files().await;
         let volumes = volumes.and(files);
         span.mark("objects");
@@ -1192,6 +1237,7 @@ impl<D: BlockDevice> FileSystem<D> {
             Ok(uberblock) => {
                 *self.uberblock.lock().await = Some(uberblock);
                 self.finish_metaslab_sync(txg, synced).await;
+                self.note_clean(id, &clean);
                 span.mark("finish");
                 if volumes.is_ok() {
                     self.commits_done.fetch_max(id, Ordering::SeqCst);

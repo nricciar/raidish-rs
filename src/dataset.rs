@@ -212,6 +212,10 @@ pub struct Dataset {
     /// Where the log stood when the sync in progress took its records: the
     /// region and the first record not covered by it.
     pub(crate) fold_from: Mutex<Option<(crate::inode::LogRegion, u64)>>,
+    /// A writer's commit whose outcome it never learned (see
+    /// `FileSystem::resolve_in_doubt`): nothing new is built on this
+    /// dataset's root until it's settled.
+    pub(crate) in_doubt: Mutex<Option<crate::writer::InDoubt>>,
     /// Serializes the format's operations that read and rewrite several
     /// records (a B+tree's): readers share it, a change holds it alone.
     pub(crate) ops: tokio::sync::RwLock<()>,
@@ -224,6 +228,21 @@ impl Dataset {
 
     pub fn is_dirty(&self) -> bool {
         self.obj.is_dirty()
+    }
+}
+
+/// Ends a sync that was given up on (records back to dirty), unless
+/// disarmed (`taken = None`) by the sync ending normally.
+struct EndSyncOnDrop<'a> {
+    obj: &'a ObjTree,
+    taken: Option<Arc<BTreeMap<u64, Dirty>>>,
+}
+
+impl Drop for EndSyncOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            self.obj.end_sync(&taken, None);
+        }
     }
 }
 
@@ -335,6 +354,7 @@ impl<D: BlockDevice> FileSystem<D> {
             log: Mutex::new(dnode.log),
             cursor: Mutex::new(None),
             fold_from: Mutex::new(None),
+            in_doubt: Mutex::new(None),
             ops: tokio::sync::RwLock::new(()),
         });
         // Another task may have opened it meanwhile; keep the first.
@@ -505,7 +525,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// pool is too full for the data, holes (TRIM / zeroed records) are still
     /// committed on their own so a guest can free space, and the call returns
     /// `UnableToAllocateBlocks` because some data is still not durable.
-    pub(crate) async fn sync_datasets(&self) -> Result<(), FileSystemError> {
+    ///
+    /// Also returns the datasets it left clean (synced, or nothing dirty):
+    /// one failing doesn't hold the others back.
+    pub(crate) async fn sync_datasets_noting(&self) -> (Vec<String>, Result<(), FileSystemError>) {
+        let mut clean = Vec::new();
         let vols: Vec<Arc<Dataset>> = self
             .open_datasets
             .lock()
@@ -515,16 +539,33 @@ impl<D: BlockDevice> FileSystem<D> {
             .collect();
         let mut first_err = None;
         for vol in vols {
+            // A writer settles an earlier commit's unknown outcome first:
+            // a sync built on the root from before it would be refused for
+            // good if that commit was in fact applied.
+            if let Some(w) = &self.writer
+                && let Err(e) = self.resolve_in_doubt(w, &vol).await
+            {
+                eprintln!("dataset '{}': sync failed: {}", vol.name, e);
+                first_err.get_or_insert(e);
+                continue;
+            }
             let taken = {
                 // With the cursor held, no log append is half-planned: each
                 // one is wholly before this cut (covered by this sync) or
                 // after it (see `crate::zil`).
                 let cursor = vol.cursor.lock().unwrap();
                 let Some(taken) = vol.obj.begin_sync() else {
+                    clean.push(vol.name.clone());
                     continue;
                 };
                 *vol.fold_from.lock().unwrap() = cursor.as_ref().map(|c| (c.region.clone(), c.seq));
                 taken
+            };
+            // Given up on before `end_sync` (a dropped future), the records
+            // go back to dirty rather than vanish with the sync.
+            let mut unfinished = EndSyncOnDrop {
+                obj: &vol.obj,
+                taken: Some(taken.clone()),
             };
 
             let mut synced: Option<Arc<BTreeMap<u64, Dirty>>> = None;
@@ -542,13 +583,17 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
             }
 
+            unfinished.taken = None;
             vol.obj.end_sync(&taken, synced.as_deref());
-            if let Err(e) = result {
-                eprintln!("dataset '{}': sync failed: {}", vol.name, e);
-                first_err.get_or_insert(e);
+            match result {
+                Ok(()) => clean.push(vol.name.clone()),
+                Err(e) => {
+                    eprintln!("dataset '{}': sync failed: {}", vol.name, e);
+                    first_err.get_or_insert(e);
+                }
             }
         }
-        first_err.map_or(Ok(()), Err)
+        (clean, first_err.map_or(Ok(()), Err))
     }
 
     /// Blocks a sync of `records` may allocate, worst case.

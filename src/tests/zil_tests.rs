@@ -1223,3 +1223,70 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
     let fresh = s.pool.load().await;
     assert!(fresh.degraded_disks()[2].is_some());
 }
+
+/// After the committer replays a dead writer's kv log, the next writer to
+/// take the dataset carries on from the replayed tree.
+#[tokio::test]
+async fn kv_the_next_writer_carries_on_after_a_replay() {
+    let s = setup_kv().await;
+    let mut model = BTreeMap::new();
+    {
+        let wepoch = lease(&s.auth, "writer/1", "1").await;
+        let sink = Arc::new(DirectSink {
+            committer: s.committer.clone(),
+            writer: "writer/1".into(),
+            epoch: wepoch,
+        });
+        let fs = FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap();
+        let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
+        fs.attach_dataset("k", "o1", ds_epoch).await.unwrap();
+        for i in 0..400u32 {
+            let k = format!("base/{:05}", i).into_bytes();
+            let v = pattern(40 + (i as usize % 90), i as u8);
+            fs.kv_put("k", &k, &v).await.unwrap();
+            model.insert(k, v);
+        }
+        fs.flush().await.unwrap();
+        // Acknowledged from the log only, then the writer dies.
+        for i in 0..60u32 {
+            let k = format!("log/{:05}", i).into_bytes();
+            let v = pattern(30, i as u8);
+            fs.kv_put("k", &k, &v).await.unwrap();
+            model.insert(k, v);
+            fs.flush().await.unwrap();
+        }
+        drop(fs);
+        release(&s.auth, &dataset_resource("k"), "o1", ds_epoch).await;
+        release(&s.auth, "writer/1", "1", wepoch).await;
+    }
+
+    // A second writer, open before the replay (like every `listen` node's).
+    let wepoch = lease(&s.auth, "writer/2", "2").await;
+    let sink = Arc::new(DirectSink {
+        committer: s.committer.clone(),
+        writer: "writer/2".into(),
+        epoch: wepoch,
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink)
+        .await
+        .unwrap();
+    s.committer.reclaim().await;
+    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+
+    let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o2").await;
+    fs.attach_dataset("k", "o2", ds_epoch).await.unwrap();
+    assert_eq!(kv_all(&fs).await, model_vec(&model));
+    for i in 0..50u32 {
+        let k = format!("next/{:05}", i).into_bytes();
+        let v = pattern(20, i as u8);
+        fs.kv_put("k", &k, &v).await.unwrap();
+        model.insert(k, v);
+    }
+    fs.sync().await.expect("the next writer's sync");
+    let fresh = s.pool.load().await;
+    assert_eq!(kv_all(&fresh).await, model_vec(&model));
+    drop(fresh);
+    assert_clean(&s).await;
+}

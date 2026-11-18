@@ -332,7 +332,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             }
             out
         };
-        self.settler.settle(&self.fs).await?;
+        self.settler.settle(&self.fs, &self.name).await?;
         Ok(out)
     }
 
@@ -347,7 +347,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
     {
         let ds = self.ds().await?;
         let _r = ds.ops.read().await;
-        self.settler.settle(&self.fs).await?;
+        self.settler.settle(&self.fs, &self.name).await?;
         let t = Txn::begin(&self.fs, &ds.obj).await?;
         f(&t).await
     }

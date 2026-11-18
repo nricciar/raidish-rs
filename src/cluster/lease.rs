@@ -17,6 +17,10 @@ pub const LEASE_TTL: Duration = Duration::from_secs(10);
 /// How soon a failed renewal is tried again.
 const RETRY_PAUSE: Duration = Duration::from_millis(500);
 
+/// The longest one renewal attempt is waited on (several fit in the time a
+/// lease has left once a renewal is due).
+const RENEW_ATTEMPT: Duration = Duration::from_millis(2500);
+
 /// Talks to whichever `listen` node answers (non-leaders forward).
 #[derive(Clone)]
 pub struct LeaseClient {
@@ -39,18 +43,34 @@ impl LeaseClient {
         }
     }
 
-    /// Send `op` to the first endpoint that answers.
+    /// Send `op` to every endpoint at once; the first answer wins. One
+    /// node that's slow or half gone (shutting down, swapping) mustn't
+    /// hold the answer up: tried in turn, it took the whole of a renewal's
+    /// time, and a lease that was fine counted as lost. Every node forwards
+    /// to the leader, and each op is idempotent (a renewal, an acquire by
+    /// the same owner, a release), so a duplicate is harmless.
     pub async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut pending: FuturesUnordered<_> = self
+            .endpoints
+            .iter()
+            .map(|ep| async move {
+                let url = format!("{}/api/v1/cluster/lease", ep);
+                let r = match self.http.post(&url).json(op).send().await {
+                    Ok(resp) => match resp.json::<Result<Response, String>>().await {
+                        Ok(r) => r,
+                        Err(e) => Err(e.to_string()),
+                    },
+                    Err(e) => Err(e.to_string()),
+                };
+                r.map_err(|e| format!("{}: {}", ep, e))
+            })
+            .collect();
         let mut errors = Vec::new();
-        for ep in &self.endpoints {
-            let url = format!("{}/api/v1/cluster/lease", ep);
-            match self.http.post(&url).json(op).send().await {
-                Ok(resp) => match resp.json::<Result<Response, String>>().await {
-                    Ok(Ok(r)) => return Ok(r),
-                    Ok(Err(e)) => errors.push(format!("{}: {}", ep, e)),
-                    Err(e) => errors.push(format!("{}: {}", ep, e)),
-                },
-                Err(e) => errors.push(format!("{}: {}", ep, e)),
+        while let Some(r) = pending.next().await {
+            match r {
+                Ok(r) => return Ok(r),
+                Err(e) => errors.push(e),
             }
         }
         Err(if errors.is_empty() {
@@ -184,9 +204,12 @@ impl HeldLease {
                     ttl_ms: ttl.as_millis() as u64,
                 };
                 // Never wait on a renewal past the point where the lease
-                // has to count as gone.
+                // has to count as gone, nor on one attempt for long: a
+                // renewal lost on the way (a leader election) is sent again
+                // while there's still time.
                 let left = (ttl * 4 / 5).saturating_sub(valid_from.elapsed());
-                let result = match tokio::time::timeout(left, me.client.call(&op)).await {
+                let attempt = left.min(RENEW_ATTEMPT);
+                let result = match tokio::time::timeout(attempt, me.client.call(&op)).await {
                     Ok(r) => r,
                     Err(_) => Err("timed out".to_string()),
                 };

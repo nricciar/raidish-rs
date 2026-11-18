@@ -356,7 +356,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
             return Ok(false);
         };
         export.life.close(&format!("nvme: {}", nqn)).await;
-        self.target.fs.sync().await?;
+        self.target.fs.sync_for(volume).await?;
         Ok(true)
     }
 
@@ -985,7 +985,7 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
             }
         }
         // Through the intent log on a writer (see `crate::zil`).
-        IO_FLUSH => match fs.flush().await {
+        IO_FLUSH => match fs.flush_for(name).await {
             Ok(()) => Completion::ok(),
             Err(e) => fail("flush", e),
         },

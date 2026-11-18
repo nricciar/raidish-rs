@@ -523,8 +523,16 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
         if self.durable.borrow().writes >= target.writes {
             return Ok(());
         }
-        self.fs.kv_settle().await?;
-        self.fs.flush().await?;
+        // In a task of its own: a client that gives up (its gRPC deadline
+        // drops this request's future) doesn't cut the flush short; the
+        // next request finds it done or waits on it.
+        let (fs, name) = (self.fs.clone(), self.name.clone());
+        tokio::spawn(async move {
+            fs.kv_settle().await?;
+            fs.flush_for(&name).await
+        })
+        .await
+        .map_err(|e| crate::fs::FileSystemError::InvalidArgument(format!("flush: {}", e)))??;
         self.durable.send_if_modified(|d| {
             if d.writes < target.writes {
                 *d = target;

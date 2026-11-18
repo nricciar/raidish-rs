@@ -124,6 +124,24 @@ enum Commands {
         #[arg(long)]
         no_committer: bool,
     },
+    /// Serve the Kubernetes CSI driver (`csi.raidish.io`) on a unix socket:
+    /// pods get raidish volumes as persistent volumes. Runs as root on every
+    /// node, next to `listen`.
+    Csi {
+        /// The socket (`unix:///path` or a path).
+        #[arg(
+            long,
+            default_value = "/var/lib/kubelet/plugins/csi.raidish.io/csi.sock"
+        )]
+        endpoint: String,
+        /// This node's name in the cluster (`node-0`), the CSI node id.
+        #[arg(long)]
+        node: String,
+        /// This node's `listen` API, for its agent's status (default:
+        /// https://127.0.0.1:8881).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// The control plane: members, leader, leases.
     Cluster {
         #[command(subcommand)]
@@ -444,6 +462,23 @@ async fn open_fs<D: BlockDevice>(dev: D, read_only: bool, rewind: fs::Rewind) ->
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
+    // A one-shot command piped into `head` should end quietly once the
+    // reader is gone, as other command line tools do (Rust ignores SIGPIPE,
+    // so `println!` would panic instead). Servers keep ignoring it: a peer
+    // hanging up must not kill them.
+    if !matches!(
+        cli.command,
+        Commands::Listen { .. }
+            | Commands::Csi { .. }
+            | Commands::Nbd { .. }
+            | Commands::Nvme { .. }
+    ) {
+        // SAFETY: setting a signal disposition before any other thread
+        // could depend on it; SIG_DFL has no handler to be unsafe in.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     // Certificates are managed without (or before there is) a config.
     if let Commands::Cert { command } = &cli.command {
         let config_path = cli.config.clone();
@@ -712,6 +747,19 @@ pub async fn main() -> std::io::Result<()> {
             fail("no cluster to ask: the pool has no remote disks");
         }
         crate::cli_vm::run(command, endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
+        return Ok(());
+    }
+
+    if let Commands::Csi {
+        endpoint,
+        node,
+        agent,
+    } = &cli.command
+    {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        crate::csi::serve(endpoint, node.clone(), agent.clone(), endpoints)
             .await
             .unwrap_or_else(|e| fail(e));
         return Ok(());
@@ -1044,6 +1092,7 @@ pub async fn main() -> std::io::Result<()> {
         Commands::Listen { .. }
         | Commands::Vm { .. }
         | Commands::Cluster { .. }
+        | Commands::Csi { .. }
         | Commands::Cert { .. }
         | Commands::Token { .. }
         | Commands::Dataset { .. } => unreachable!(),

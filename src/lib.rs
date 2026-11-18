@@ -33,6 +33,8 @@ pub mod committer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod csi;
+#[cfg(not(target_arch = "wasm32"))]
 mod dashboard;
 pub mod dataset;
 pub mod disk;

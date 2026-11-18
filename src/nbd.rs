@@ -276,7 +276,7 @@ where
             return Ok(false);
         };
         export.life.close(&format!("nbd: export '{}'", name)).await;
-        self.fs.sync().await?;
+        self.fs.sync_for(name).await?;
         Ok(true)
     }
 
@@ -593,7 +593,7 @@ where
             NBD_CMD_FLUSH => {
                 tasks.spawn(async move {
                     // Through the intent log on a writer (see `crate::zil`).
-                    let error = match fs.flush().await {
+                    let error = match fs.flush_for(&name).await {
                         Ok(()) => 0,
                         Err(e) => {
                             eprintln!("nbd: flush: {}", e);
@@ -607,7 +607,7 @@ where
                 while let Some(res) = tasks.join_next().await {
                     res.map_err(std::io::Error::other)??;
                 }
-                if let Err(e) = fs.sync().await {
+                if let Err(e) = fs.sync_for(&name).await {
                     eprintln!("nbd: sync on disconnect: {}", e);
                 }
                 println!("Client disconnected");

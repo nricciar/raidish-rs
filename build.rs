@@ -29,6 +29,14 @@ fn main() {
             .build_server(true)
             .compile_protos(&["proto/etcd/api/etcdserverpb/rpc.proto"], &["proto"])
             .expect("compiling the etcd protos");
+        // The Container Storage Interface (`raidish csi`, see `crate::csi`):
+        // servers only, kubelet and the sidecars are the clients.
+        let wkt = protoc_bin_vendored::include_path().expect("vendored protobuf includes");
+        tonic_build::configure()
+            .build_client(false)
+            .build_server(true)
+            .compile_protos(&["proto/csi/csi.proto"], &[PathBuf::from("proto"), wkt])
+            .expect("compiling the CSI proto");
     }
 
     let bundle = !target.starts_with("wasm32")
