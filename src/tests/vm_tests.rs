@@ -460,9 +460,8 @@ const RUNNING: &str = r#"<domain type='kvm'>
 
 fn incoming() -> Incoming {
     Incoming {
-        uri: "qemu+tls://node1/system".into(),
+        uri: Some("qemu+tls://node1/system".into()),
         migrate_host: None,
-        tls: false,
         nbd_host: "10.0.0.2".into(),
         nbd_port: 10900,
         console: "10.0.0.2".into(),
@@ -544,4 +543,50 @@ fn metadata_round_trips_with_the_migrating_mark() {
     let xml = meta_xml(&settled);
     assert!(!xml.contains("migrating"), "{}", xml);
     assert_eq!(parse_meta(&xml).unwrap(), settled);
+}
+
+/// `vm: {}` is a whole VM node; migrations are TLS only.
+#[test]
+fn an_empty_vm_section_is_all_defaults() {
+    let c: crate::vm::VmConfig = serde_yaml::from_str("{}").unwrap();
+    assert!(c.check().is_ok());
+    assert_eq!(c.virsh().uri, "qemu:///system");
+    assert_eq!(c.migrate_timeout(), std::time::Duration::from_secs(300));
+    let tcp: crate::vm::VmConfig =
+        serde_yaml::from_str("migrate_uri: qemu+tcp://node1/system").unwrap();
+    assert!(tcp.check().unwrap_err().contains("TLS only"));
+    let tls: crate::vm::VmConfig =
+        serde_yaml::from_str("migrate_uri: qemu+tls://n1.example/system").unwrap();
+    assert!(tls.check().is_ok());
+}
+
+#[test]
+fn the_migration_target_defaults_to_its_host() {
+    let to = Incoming {
+        uri: None,
+        migrate_host: None,
+        nbd_host: "127.0.0.1".into(),
+        nbd_port: 10809,
+        console: "127.0.0.1".into(),
+        node: "node-1".into(),
+    }
+    .resolved("node1");
+    assert_eq!(to.uri.as_deref(), Some("qemu+tls://node1/system"));
+    assert_eq!(to.migrate_host.as_deref(), Some("node1"));
+    let v6 = Incoming {
+        uri: None,
+        migrate_host: None,
+        ..to.clone()
+    }
+    .resolved("fd00::1");
+    assert_eq!(v6.uri.as_deref(), Some("qemu+tls://[fd00::1]/system"));
+    // Overrides stay.
+    let o = Incoming {
+        uri: Some("qemu+tls://other/system".into()),
+        migrate_host: Some("10.0.0.9".into()),
+        ..to
+    }
+    .resolved("node1");
+    assert_eq!(o.uri.as_deref(), Some("qemu+tls://other/system"));
+    assert_eq!(o.migrate_host.as_deref(), Some("10.0.0.9"));
 }

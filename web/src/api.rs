@@ -394,6 +394,116 @@ pub async fn vms() -> Result<Vec<Vm>, String> {
     json(send(Request::get("/api/v1/vms")).await?).await
 }
 
+/// Why a move is ruled out, or isn't live (`level` `no`, `cold`, `warn`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Reason {
+    pub level: String,
+    pub text: String,
+}
+
+/// Moving a VM to one node: `live`, `cold` or `no`.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct Verdict {
+    pub node: String,
+    pub mode: String,
+    pub reasons: Vec<Reason>,
+}
+
+impl Verdict {
+    /// The reasons that set its mode, joined.
+    pub fn why(&self) -> String {
+        let want = match self.mode.as_str() {
+            "no" => "no",
+            "cold" => "cold",
+            _ => "warn",
+        };
+        self.reasons
+            .iter()
+            .filter(|r| r.level == want)
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Where a VM can move (`GET /api/v1/vms/<name>/check`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct CheckView {
+    pub running_on: Option<String>,
+    pub verdicts: Vec<Verdict>,
+}
+
+pub async fn vm_check(name: &str) -> Result<CheckView, String> {
+    json(send(Request::get(&format!("/api/v1/vms/{}/check", enc(name)))).await?).await
+}
+
+/// One check of a node's (`crate::node_facts::Probe`).
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct Probe {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub hint: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct PeerFacts {
+    pub host: String,
+    pub libvirt: Option<Probe>,
+    pub peer_io: Option<Probe>,
+    pub migrate_tls_error: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct HostFacts {
+    pub hostname: String,
+    pub cpu_model: String,
+    pub cpu_threads: u32,
+    pub memory_mb: u64,
+    pub kvm: bool,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct CpuFacts {
+    pub model: String,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct LibvirtFacts {
+    pub error: Option<String>,
+    pub libvirt_version: String,
+    pub qemu_version: String,
+    pub virt_type: String,
+    pub cpu: CpuFacts,
+    pub networks: Vec<String>,
+}
+
+/// What a node reported about itself (`crate::node_facts::NodeFacts`).
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct NodeFacts {
+    pub node: String,
+    pub collected_at: u64,
+    pub host: HostFacts,
+    pub peer_io: bool,
+    pub libvirt: Option<LibvirtFacts>,
+    pub peers: std::collections::BTreeMap<String, PeerFacts>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct FactsView {
+    pub nodes: std::collections::BTreeMap<String, NodeFacts>,
+    pub live: Vec<String>,
+}
+
+pub async fn node_facts() -> Result<FactsView, String> {
+    json(send(Request::get("/api/v1/nodes/facts")).await?).await
+}
+
 /// `start`, `stop`, `kill`, `restart`, `reboot` or `reset`.
 pub async fn vm_action(name: &str, action: &str) -> Result<(), String> {
     send(Request::post(&format!(

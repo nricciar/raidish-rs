@@ -28,7 +28,7 @@
 //! * `POST /api/v1/vm/incoming/<name>` (nodes only): ready for VM `name`
 //!   to migrate here? 409 until every one of its volumes is exported here
 //!   (proxied to the node it runs on), then how to reach this node; 422 if
-//!   it never will be (no VMs here, or no `vm.migrate_uri`).
+//!   it never will be (no VMs here).
 
 use crate::cluster::{Cluster, LeaseOp};
 use crate::committer::PutVm;
@@ -50,12 +50,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub struct VmsState {
     pub runtime: Option<Arc<VmRuntime>>,
     pub http: reqwest::Client,
+    /// This node's facts (`crate::node_facts`).
+    pub facts: crate::node_facts::FactsHandle,
 }
 
 impl VmsState {
-    pub fn new(runtime: Option<Arc<VmRuntime>>) -> Self {
+    pub fn new(runtime: Option<Arc<VmRuntime>>, facts: crate::node_facts::FactsHandle) -> Self {
         VmsState {
             runtime,
+            facts,
             http: crate::tls::http_builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(5))
@@ -446,6 +449,300 @@ async fn poke(st: &VmsState, cluster: &Cluster, spec: &VmSpec) {
 #[derive(Deserialize)]
 pub struct MoveTo {
     pub node: String,
+    /// Refuse unless it can move live.
+    #[serde(default)]
+    pub live: bool,
+}
+
+// ---- can it move there (MIG-4) --------------------------------------------
+
+/// The nodes whose `node/` lease is live.
+fn live_nodes(cluster: &Cluster) -> std::collections::BTreeSet<String> {
+    let now = crate::cluster::now_ms();
+    cluster
+        .status()
+        .state
+        .leases
+        .iter()
+        .filter(|(r, l)| r.starts_with("node/") && !l.released && l.expires_ms > now)
+        .map(|(r, _)| r["node/".len()..].to_string())
+        .collect()
+}
+
+/// Every node's facts, and which nodes are up (`GET /api/v1/nodes/facts`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FactsView {
+    pub nodes: BTreeMap<String, crate::node_facts::NodeFacts>,
+    /// Nodes up now; the others' facts are as they last were.
+    pub live: Vec<String>,
+}
+
+#[get("/api/v1/nodes/facts")]
+async fn nodes_facts(
+    _auth: crate::auth::CanRead,
+    st: &State<VmsState>,
+    volumes: &State<VolumesState>,
+    cluster: &State<Arc<Cluster>>,
+) -> Result<Json<FactsView>, ApiError> {
+    let mut nodes = volumes
+        .client
+        .node_facts()
+        .await
+        .map_err(crate::volumes_api::api_err)?;
+    // This node's own, as fresh as it has them.
+    if let Some(f) = st.facts.latest() {
+        nodes.insert(f.node.clone(), f);
+    }
+    Ok(Json(FactsView {
+        nodes,
+        live: live_nodes(cluster).into_iter().collect(),
+    }))
+}
+
+/// POST /api/v1/vm/check (nodes only): what this node says now about
+/// running a VM with that CPU (see `crate::vm_check::Live`).
+#[post("/api/v1/vm/check", data = "<ask>")]
+async fn check_here(
+    _node: crate::auth::IsNode,
+    ask: Json<crate::vm_check::LiveAsk>,
+    st: &State<VmsState>,
+) -> Json<crate::vm_check::Live> {
+    let cpu = match (&st.runtime, &ask.cpu) {
+        (Some(rt), Some(cpu)) => Some(rt.virsh.cpu_compare(cpu).await),
+        _ => None,
+    };
+    Json(crate::vm_check::Live {
+        cpu,
+        available_mb: Some(crate::node_facts::available_mb()),
+    })
+}
+
+/// What the node running a VM says about moving it (`POST
+/// /api/v1/vm/probe/<node>?vm=`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SourceNow {
+    /// Its facts, its libvirt TLS to `node` probed now.
+    pub facts: Option<crate::node_facts::NodeFacts>,
+    /// The VM's domain as it runs (its CPU as the guest has it).
+    pub domain: Option<String>,
+}
+
+/// POST /api/v1/vm/probe/<node>[?vm=] (nodes only): see `SourceNow`.
+#[post("/api/v1/vm/probe/<node>?<vm>")]
+async fn probe_now(
+    _n: crate::auth::IsNode,
+    node: &str,
+    vm: Option<&str>,
+    st: &State<VmsState>,
+) -> Json<SourceNow> {
+    Json(source_now(st, node, vm).await)
+}
+
+async fn source_now(st: &VmsState, to: &str, vm: Option<&str>) -> SourceNow {
+    let domain = match (&st.runtime, vm) {
+        (Some(rt), Some(vm)) => rt.virsh.dumpxml_live(vm).await.ok(),
+        _ => None,
+    };
+    SourceNow {
+        facts: st.facts.with_fresh_probe(to).await,
+        domain,
+    }
+}
+
+/// The source's say (see `SourceNow`) about moving `vm` to `to`.
+async fn fresh_source(
+    st: &VmsState,
+    cluster: &Cluster,
+    source: &str,
+    to: &str,
+    vm: &str,
+) -> SourceNow {
+    match peer_url(cluster, source) {
+        Ok(None) => source_now(st, to, Some(vm)).await,
+        Ok(Some(url)) => async {
+            st.http
+                .post(format!("{}/api/v1/vm/probe/{}?vm={}", url, to, vm))
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .ok()?
+                .json::<SourceNow>()
+                .await
+                .ok()
+        }
+        .await
+        .unwrap_or_default(),
+        Err(_) => SourceNow::default(),
+    }
+}
+
+/// Where a VM could move, and how (`GET /api/v1/vms/<name>/check`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CheckView {
+    pub vm: String,
+    /// Where it runs now (a move from there is checked as live); None: not
+    /// running, so a move is where it starts next.
+    pub running_on: Option<String>,
+    pub verdicts: Vec<crate::vm_check::Verdict>,
+}
+
+async fn check_vm(
+    st: &VmsState,
+    cluster: &Cluster,
+    volumes: &VolumesState,
+    name: &str,
+    only: Option<&str>,
+) -> Result<CheckView, ApiError> {
+    use crate::vm_check::{Mode, check, cpu_to_compare, needs};
+    let spec = spec(volumes, name).await?;
+    if !spec.usable() {
+        return Err(bad(spec.error.unwrap_or_default()));
+    }
+    let needs = needs(&spec.xml).map_err(bad)?;
+    let mut facts = volumes
+        .client
+        .node_facts()
+        .await
+        .map_err(crate::volumes_api::api_err)?;
+    let live = live_nodes(cluster);
+    let holder = holder(cluster, &spec.anchor);
+    let running_on = holder.filter(|_| cluster.status().state.vms.contains_key(name));
+    let source = running_on.as_ref().and_then(|n| facts.get(n)).cloned();
+    let mut names: std::collections::BTreeSet<String> = facts.keys().cloned().collect();
+    names.insert(cluster.name.clone());
+    names.extend(
+        cluster
+            .members
+            .peers
+            .keys()
+            .map(|id| crate::cluster::members::node_name(*id)),
+    );
+    let mut verdicts = Vec::new();
+    for node in names {
+        if only.is_some_and(|o| o != node) || running_on.as_deref() == Some(node.as_str()) {
+            continue;
+        }
+        let target = facts.remove(&node);
+        let up = live.contains(&node);
+        // The source's say, now: reaching this node's libvirt, and the VM
+        // as it runs (judged by that, as the migration will be).
+        let now = match (&running_on, up) {
+            (Some(s), true) => fresh_source(st, cluster, s, &node, name).await,
+            _ => SourceNow::default(),
+        };
+        let src = now.facts.or_else(|| source.clone());
+        let needs = now
+            .domain
+            .as_deref()
+            .and_then(|x| crate::vm_check::needs(x).ok())
+            .unwrap_or_else(|| needs.clone());
+        let cpu = cpu_to_compare(&needs, src.as_ref());
+        let live_ans = if !up {
+            None
+        } else {
+            match peer_url(cluster, &node) {
+                Ok(None) => Some(crate::vm_check::Live {
+                    cpu: match (&st.runtime, &cpu) {
+                        (Some(rt), Some(c)) => Some(rt.virsh.cpu_compare(c).await),
+                        _ => None,
+                    },
+                    available_mb: Some(crate::node_facts::available_mb()),
+                }),
+                Ok(Some(url)) => crate::agent::migrate_ask_live(&st.http, &url, cpu.clone()).await,
+                Err(_) => None,
+            }
+        };
+        let mut v = check(
+            &needs,
+            &node,
+            src.as_ref(),
+            target.as_ref(),
+            live_ans.as_ref(),
+        );
+        if !up {
+            v.mode = Mode::No;
+            v.reasons.insert(
+                0,
+                crate::vm_check::Reason {
+                    level: "no".into(),
+                    text: format!("{} is down", node),
+                },
+            );
+        }
+        verdicts.push(v);
+    }
+    if let Some(o) = only {
+        if verdicts.is_empty() && running_on.as_deref() != Some(o) {
+            return Err((Status::NotFound, format!("no node '{}'", o)));
+        }
+    }
+    Ok(CheckView {
+        vm: name.to_string(),
+        running_on,
+        verdicts,
+    })
+}
+
+/// GET /api/v1/vm/cpu-baseline[?nodes=a,b]: the CPU every one of those
+/// nodes (default: all that run VMs) can give a guest, migratable, as a
+/// `<cpu>` for a domain's XML. Worked out by this node's libvirt from the
+/// nodes' stored domcapabilities.
+#[get("/api/v1/vm/cpu-baseline?<nodes>")]
+async fn cpu_baseline(
+    _auth: crate::auth::CanRead,
+    nodes: Option<&str>,
+    st: &State<VmsState>,
+    volumes: &State<VolumesState>,
+) -> Result<String, ApiError> {
+    let rt = st.runtime.as_ref().ok_or_else(|| {
+        (
+            Status::UnprocessableEntity,
+            "this node runs no VMs (no libvirt to work it out): ask one that does".to_string(),
+        )
+    })?;
+    let facts = volumes
+        .client
+        .node_facts()
+        .await
+        .map_err(crate::volumes_api::api_err)?;
+    let want: Option<Vec<&str>> = nodes.map(|n| n.split(',').map(str::trim).collect());
+    let mut caps = Vec::new();
+    let mut used = Vec::new();
+    for (n, f) in &facts {
+        if want.as_ref().is_some_and(|w| !w.contains(&n.as_str())) {
+            continue;
+        }
+        if let Some(l) = f.libvirt.as_ref().filter(|l| !l.domcapabilities.is_empty()) {
+            caps.push(l.domcapabilities.clone());
+            used.push(n.clone());
+        }
+    }
+    if let Some(w) = &want {
+        if let Some(missing) = w.iter().find(|n| !used.iter().any(|u| u == *n)) {
+            return Err(bad(format!("no libvirt facts from '{}'", missing)));
+        }
+    }
+    if caps.is_empty() {
+        return Err(bad("no node has reported its libvirt yet".to_string()));
+    }
+    let cpu = rt.virsh.cpu_baseline(&caps).await.map_err(bad)?;
+    Ok(format!(
+        "<!-- every one of {} can run this -->\n{}",
+        used.join(", "),
+        cpu.trim_end()
+    ))
+}
+
+#[get("/api/v1/vms/<name>/check?<node>")]
+async fn check_route(
+    _auth: crate::auth::CanRead,
+    name: &str,
+    node: Option<&str>,
+    st: &State<VmsState>,
+    cluster: &State<Arc<Cluster>>,
+    volumes: &State<VolumesState>,
+) -> Result<Json<CheckView>, ApiError> {
+    check_vm(st, cluster, volumes, name, node).await.map(Json)
 }
 
 #[post("/api/v1/vms/<name>/move", data = "<to>")]
@@ -458,10 +755,28 @@ async fn move_vm(
     st: &State<VmsState>,
     cluster: &State<Arc<Cluster>>,
     volumes: &State<VolumesState>,
-) -> Result<Json<()>, ApiError> {
+) -> Result<Json<CheckView>, ApiError> {
     let spec = spec(volumes, name).await?;
     if !spec.usable() {
         return Err(bad(spec.error.unwrap_or_default()));
+    }
+    // Where it'd go, and how: refused if it can't run there (or, asked
+    // for live, if it can't move live).
+    let view = check_vm(st, cluster, volumes, name, Some(&to.node)).await?;
+    if let Some(v) = view.verdicts.first() {
+        use crate::vm_check::Mode;
+        if v.mode == Mode::No {
+            return Err((
+                Status::Conflict,
+                format!("VM '{}' can't run on {}: {}", name, to.node, v.why()),
+            ));
+        }
+        if to.live && view.running_on.is_some() && v.mode != Mode::Live {
+            return Err((
+                Status::Conflict,
+                format!("VM '{}' can't move to {} live: {}", name, to.node, v.why()),
+            ));
+        }
     }
     let vols = volumes
         .client
@@ -491,7 +806,7 @@ async fn move_vm(
         Some(auth.0.name.clone()),
     );
     poke(st, cluster, &spec).await;
-    Ok(Json(()))
+    Ok(Json(view))
 }
 
 #[post("/api/v1/vms/<name>/<action>", rank = 2)]
@@ -688,10 +1003,6 @@ async fn incoming(
         .runtime
         .as_ref()
         .ok_or_else(|| never("this node runs no VMs"))?;
-    let uri = rt
-        .migrate_uri
-        .clone()
-        .ok_or_else(|| never("this node takes no live migrations (no vm.migrate_uri)"))?;
     if rt.ident().is_none() {
         return Err(not_yet("the pool isn't open here yet".into()));
     }
@@ -723,9 +1034,8 @@ async fn incoming(
         )));
     }
     Ok(Json(crate::vm::Incoming {
-        uri,
+        uri: rt.migrate_uri.clone(),
         migrate_host: rt.migrate_host.clone(),
-        tls: rt.migrate_tls,
         nbd_host: rt.nbd.0.clone(),
         nbd_port: rt.nbd.1,
         console: rt.console.clone(),
@@ -736,6 +1046,11 @@ async fn incoming(
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
         incoming,
+        check_here,
+        check_route,
+        probe_now,
+        cpu_baseline,
+        nodes_facts,
         local,
         local_action,
         list,

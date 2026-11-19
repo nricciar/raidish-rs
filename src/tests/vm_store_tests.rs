@@ -86,3 +86,29 @@ async fn stores_checks_and_reopens() {
     assert_eq!(all["one"].spec().volumes, vec!["a"]);
     assert_eq!(all["two"].change, 4);
 }
+
+/// Node facts sit next to the definitions without being one.
+#[tokio::test]
+async fn node_facts_next_to_the_definitions() {
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    store_with_volumes(&fs, &["a"]).await;
+    let st = VmStore::open(fs.clone()).await.unwrap();
+    st.put("one", &xml(&["a"]), true, None).await.unwrap();
+    let mut f = crate::node_facts::NodeFacts {
+        node: "node-1".into(),
+        ..Default::default()
+    };
+    f.host.cpu_model = "AMD Ryzen 9 7900X3D".into();
+    st.put_node(&f).await.unwrap();
+    f.host.kvm = true;
+    st.put_node(&f).await.unwrap();
+    assert!(st.put_node(&Default::default()).await.is_err());
+    let nodes = st.nodes().await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert!(nodes["node-1"].host.kvm);
+    assert_eq!(
+        st.list().await.unwrap().keys().collect::<Vec<_>>(),
+        vec!["one"]
+    );
+}

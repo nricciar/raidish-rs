@@ -77,7 +77,7 @@ impl AutomountConfig {
     fn peer_bind(&self) -> String {
         self.peer_bind.clone().unwrap_or_else(|| "0.0.0.0".into())
     }
-    fn peer_port(&self) -> u16 {
+    pub fn peer_port(&self) -> u16 {
         self.peer_port.unwrap_or(crate::peer_io::DEFAULT_PORT)
     }
     fn helper(&self) -> Option<String> {
@@ -279,6 +279,8 @@ pub struct Agent {
     migrated: BTreeMap<String, migrate::Migrated>,
     /// VMs whose live migration to a node failed: they move there cold.
     migrate_failed: BTreeMap<String, String>,
+    /// This node's facts (`crate::node_facts`).
+    facts: crate::node_facts::FactsHandle,
 }
 
 /// Peer I/O's TLS and address.
@@ -321,6 +323,7 @@ impl Agent {
             migrations: BTreeMap::new(),
             migrated: BTreeMap::new(),
             migrate_failed: BTreeMap::new(),
+            facts: Default::default(),
             frontend: None,
             services: BTreeMap::new(),
             events,
@@ -351,6 +354,11 @@ impl Agent {
     }
 
     /// Run VMs too (see `crate::vm`).
+    pub fn with_facts(mut self, facts: crate::node_facts::FactsHandle) -> Self {
+        self.facts = facts;
+        self
+    }
+
     pub fn with_vms(mut self, vm: Arc<crate::vm::VmRuntime>) -> Self {
         self.vm = Some(vm);
         self
@@ -1593,7 +1601,8 @@ impl Agent {
         {
             return false;
         }
-        let Some(url) = peer_url(&self.cluster.members.peers, &to) else {
+        let peers = &self.cluster.members.peers;
+        let (Some(url), Some(host)) = (peer_url(peers, &to), peer_host(peers, &to)) else {
             return false;
         };
         let http = match crate::tls::http_builder()
@@ -1611,6 +1620,7 @@ impl Agent {
             leases: self.leases.clone(),
             http,
             url,
+            host,
             name: name.clone(),
             volumes: spec.volumes.clone(),
             me: self.node.clone(),
@@ -1618,13 +1628,10 @@ impl Agent {
             virsh: vm.virsh.clone(),
             meta: v.meta.clone(),
             timeout: vm.migrate_timeout,
+            facts: self.facts.clone(),
+            committer: self.committer.clone(),
         };
-        println!("agent: migrating VM '{}' to {} (live)", name, to);
-        self.events.info(
-            "vm.migrating",
-            format!("vm/{}", name),
-            format!("VM '{}' migrating live from {} to {}", name, self.node, to),
-        );
+        println!("agent: moving VM '{}' to {} (live, if it can be)", name, to);
         self.migrations.insert(
             name.clone(),
             migrate::Migration {
@@ -1651,8 +1658,13 @@ impl Agent {
             let m = self.migrations.remove(&name).unwrap();
             let result = match m.task.await {
                 Ok(r) => r,
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(migrate::Failure::Failed(e.to_string())),
             };
+            if let Err(migrate::Failure::Failed(e)) = &result {
+                self.facts.note_migration(&m.to, &Err(e.clone()));
+            } else if result.is_ok() {
+                self.facts.note_migration(&m.to, &Ok(()));
+            }
             match result {
                 Ok(()) => {
                     println!(
@@ -1681,7 +1693,22 @@ impl Agent {
                         },
                     );
                 }
-                Err(e) => {
+                Err(migrate::Failure::NotLive(why)) => {
+                    println!(
+                        "agent: VM '{}' can't move to {} live: {} (moving it cold)",
+                        name, m.to, why
+                    );
+                    self.events.info(
+                        "vm.moving_cold",
+                        format!("vm/{}", name),
+                        format!(
+                            "VM '{}' moves cold from {} to {}: {}",
+                            name, self.node, m.to, why
+                        ),
+                    );
+                    self.migrate_failed.insert(name, m.to);
+                }
+                Err(migrate::Failure::Failed(e)) => {
                     eprintln!(
                         "agent: migrating VM '{}' to {} failed: {} (moving it cold)",
                         name, m.to, e
@@ -2161,6 +2188,15 @@ impl Lost {
 
 /// The host of node `node`'s base URL among `peers` (by id: `node-<id>`).
 /// Node `node`'s API base URL (`https://node1:8881`).
+/// See `migrate::ask_live`.
+pub(crate) async fn migrate_ask_live(
+    http: &reqwest::Client,
+    url: &str,
+    cpu: Option<String>,
+) -> Option<crate::vm_check::Live> {
+    migrate::ask_live(http, url, cpu).await
+}
+
 fn peer_url(peers: &BTreeMap<u64, String>, node: &str) -> Option<String> {
     let id: u64 = node.strip_prefix("node-")?.parse().ok()?;
     Some(peers.get(&id)?.trim_end_matches('/').to_string())

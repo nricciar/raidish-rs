@@ -1,6 +1,7 @@
 //! The cluster's VM definitions (see `crate::vm`): one system dataset per
 //! pool (`.vms`, format `vms`), a B+tree of `V<name>` → definition,
-//! written by the committer only.
+//! written by the committer only. Next to them, `N<node>` → what that node
+//! last reported about itself (`crate::node_facts`).
 //!
 //! Every definition is checked as it's stored, under one lock, so what's
 //! stored always holds:
@@ -123,6 +124,39 @@ impl<D: BlockDevice> VmStore<D> {
         let _r = self.ds.ops.read().await;
         let t = Txn::begin(&self.fs, &self.ds.obj).await?;
         Self::all(&t).await
+    }
+
+    /// What each node last reported about itself, by name.
+    pub async fn nodes(
+        &self,
+    ) -> Result<BTreeMap<String, crate::node_facts::NodeFacts>, FileSystemError> {
+        let _r = self.ds.ops.read().await;
+        let t = Txn::begin(&self.fs, &self.ds.obj).await?;
+        t.range(Bound::Included(b"N"), Bound::Excluded(b"O"), MAX_VMS)
+            .await?
+            .iter()
+            .map(|(_, v)| parse::<crate::node_facts::NodeFacts>(v).map(|f| (f.node.clone(), f)))
+            .collect()
+    }
+
+    /// Store `facts` as what its node reports about itself.
+    pub async fn put_node(
+        &self,
+        facts: &crate::node_facts::NodeFacts,
+    ) -> Result<(), FileSystemError> {
+        if facts.node.is_empty() || facts.node.len() > 64 {
+            return Err(bad(format!("bad node name '{}'", facts.node)));
+        }
+        let mut k = b"N".to_vec();
+        k.extend(facts.node.as_bytes());
+        let _one = self.write.lock().await;
+        {
+            let _w = self.ds.ops.write().await;
+            let mut t = Txn::begin(&self.fs, &self.ds.obj).await?;
+            t.put(&k, &json(facts)?).await?;
+            t.apply_logged()?;
+        }
+        self.fs.sync().await
     }
 
     /// The VM using `volume`, if one does.

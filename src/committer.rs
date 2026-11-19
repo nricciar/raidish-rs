@@ -1226,6 +1226,33 @@ impl CommitClient {
         .await
     }
 
+    /// What each node last reported about itself (`crate::node_facts`).
+    pub async fn node_facts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::node_facts::NodeFacts>, CommitError> {
+        self.call(
+            reqwest::Method::GET,
+            "/api/v1/pool/nodes/facts",
+            None::<&()>,
+            Some(10),
+        )
+        .await
+    }
+
+    /// Store this node's facts (nodes only).
+    pub async fn put_node_facts(
+        &self,
+        facts: &crate::node_facts::NodeFacts,
+    ) -> Result<(), CommitError> {
+        self.call(
+            reqwest::Method::PUT,
+            "/api/v1/pool/nodes/facts",
+            Some(facts),
+            Some(10),
+        )
+        .await
+    }
+
     /// Store VM `req.name`'s definition (see `crate::vm_store::VmStore::put`).
     pub async fn put_vm(&self, req: &PutVm) -> Result<crate::vm_store::VmDef, CommitError> {
         self.call(
@@ -1718,6 +1745,37 @@ pub mod routes {
         }
     }
 
+    #[get("/api/v1/pool/nodes/facts")]
+    pub async fn node_facts(
+        _auth: crate::auth::CanRead,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<std::collections::BTreeMap<String, crate::node_facts::NodeFacts>, CommitError>>
+    {
+        match current(slot).await {
+            Some(c) => match c.vm_store().await {
+                Ok(st) => fs_err(st.nodes().await),
+                Err(e) => fs_err(Err(e)),
+            },
+            None => not_committer(),
+        }
+    }
+
+    /// A node's own facts (nodes only).
+    #[put("/api/v1/pool/nodes/facts", data = "<facts>")]
+    pub async fn put_node_facts(
+        _node: crate::auth::IsNode,
+        facts: Json<crate::node_facts::NodeFacts>,
+        slot: &State<CommitterSlot>,
+    ) -> Json<Result<(), CommitError>> {
+        match current(slot).await {
+            Some(c) => match c.vm_store().await {
+                Ok(st) => fs_err(st.put_node(&facts).await),
+                Err(e) => fs_err(Err(e)),
+            },
+            None => not_committer(),
+        }
+    }
+
     #[put("/api/v1/pool/vms", data = "<req>")]
     pub async fn put_vm(
         _auth: crate::auth::CanWrite,
@@ -2005,6 +2063,8 @@ pub mod routes {
             report_events,
             vms,
             put_vm,
+            node_facts,
+            put_node_facts,
             delete_vm
         ]
     }

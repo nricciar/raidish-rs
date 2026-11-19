@@ -50,6 +50,7 @@ pub async fn listen(
     auth: crate::auth::AuthState,
     nfs: Option<crate::nfs::peers::NfsServers>,
     vms: Option<Arc<crate::vm::VmRuntime>>,
+    facts: crate::node_facts::FactsHandle,
     events: crate::events::EventSink,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
@@ -117,7 +118,7 @@ pub async fn listen(
         .manage(server)
         .manage(files)
         .manage(volumes)
-        .manage(crate::vms_api::VmsState::new(vms))
+        .manage(crate::vms_api::VmsState::new(vms, facts))
         .manage(cluster)
         .manage(committer)
         .manage(agent)

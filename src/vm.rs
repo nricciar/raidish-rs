@@ -43,7 +43,10 @@ pub use crate::vm_def::{VmDisk, VmHardware, VmNic};
 /// The XML namespace of the metadata raidish puts on the domains it runs.
 pub const META_NS: &str = "https://raidish.dev/xmlns/vm/1";
 
-/// The `vm` section of the config. Absent: this node runs no VMs.
+/// The `vm` section of the config. Absent: this node runs no VMs. Present,
+/// even empty (`vm: {}`), it runs them through the local libvirt, and
+/// takes and makes live migrations, with nothing else set: every field is
+/// an override of a default.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct VmConfig {
     /// libvirt connection (default qemu:///system).
@@ -63,20 +66,15 @@ pub struct VmConfig {
     /// keep it on an address only this node can reach.
     pub console_listen: Option<String>,
     /// How other nodes' libvirt reaches this node's, for live migrations
-    /// to here (`qemu+tls://node1/system`). Absent: VMs moved here move
-    /// cold (shut down, started again).
+    /// to here (default `qemu+tls://<host>/system`, `<host>` as the other
+    /// nodes' configs name this node). TLS only.
     pub migrate_uri: Option<String>,
-    /// Where qemu's migration stream to this node connects (default:
-    /// libvirt's choice, this host's name).
+    /// Where qemu's (TLS) migration stream to this node connects (default:
+    /// that same host).
     pub migrate_host: Option<String>,
     /// How long a live migration from this node may take before it's
     /// aborted (default 300).
     pub migrate_timeout_s: Option<u64>,
-    /// Migrations to this node send their qemu stream over TLS (qemu's
-    /// `migrate_tls_x509_cert_dir` certificates; see `raidish cert
-    /// libvirt`).
-    #[serde(default)]
-    pub migrate_tls: bool,
 }
 
 impl VmConfig {
@@ -97,6 +95,16 @@ impl VmConfig {
     }
     pub fn migrate_timeout(&self) -> Duration {
         Duration::from_secs(self.migrate_timeout_s.unwrap_or(300))
+    }
+    /// What's wrong with it, if anything: migrations are TLS only.
+    pub fn check(&self) -> Result<(), String> {
+        match &self.migrate_uri {
+            Some(u) if !u.starts_with("qemu+tls://") => Err(format!(
+                "vm.migrate_uri '{}': live migrations are TLS only (qemu+tls://...)",
+                u
+            )),
+            _ => Ok(()),
+        }
     }
     pub fn virsh(&self) -> Virsh {
         Virsh {
@@ -128,20 +136,17 @@ pub struct VmRuntime {
     pub migrate_uri: Option<String>,
     pub migrate_host: Option<String>,
     pub migrate_timeout: Duration,
-    pub migrate_tls: bool,
 }
 
 /// How a node that takes a live migration is reached, as it answers
 /// `POST /api/v1/vm/incoming/<name>` (see `crate::agent`'s migrations).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Incoming {
-    /// Its libvirt, from the source's libvirt (`virsh migrate` p2p).
-    pub uri: String,
-    /// Where qemu's migration stream connects, if not libvirt's choice.
+    /// Its libvirt, from the source's libvirt (`virsh migrate` p2p), if
+    /// not the default (see `Incoming::resolved`).
+    pub uri: Option<String>,
+    /// Where qemu's migration stream connects, if not the default.
     pub migrate_host: Option<String>,
-    /// Send qemu's migration stream over TLS.
-    #[serde(default)]
-    pub tls: bool,
     /// Where its qemu finds its NBD exports.
     pub nbd_host: String,
     pub nbd_port: u16,
@@ -149,6 +154,23 @@ pub struct Incoming {
     pub console: String,
     /// Its name.
     pub node: String,
+}
+
+impl Incoming {
+    /// With the defaults filled in for a node reached as `host` (the host
+    /// of its URL in the source's config): libvirt at
+    /// `qemu+tls://<host>/system`, qemu's stream to `<host>`.
+    pub fn resolved(mut self, host: &str) -> Incoming {
+        let h = if host.contains(':') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        };
+        self.uri
+            .get_or_insert_with(|| format!("qemu+tls://{}/system", h));
+        self.migrate_host.get_or_insert_with(|| host.to_string());
+        self
+    }
 }
 
 /// Whose domains are whose (see `DomMeta::pool`).
@@ -395,15 +417,15 @@ pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
 // ---- a tiny XML tree, enough to rewrite a domain --------------------------
 
 #[derive(Clone, Debug)]
-enum Node {
+pub(crate) enum Node {
     El(El),
     /// Text, comments, CDATA... written back as they were read.
     Raw(Event<'static>),
 }
 
 #[derive(Clone, Debug, Default)]
-struct El {
-    name: String,
+pub(crate) struct El {
+    pub(crate) name: String,
     attrs: Vec<(String, String)>,
     kids: Vec<Node>,
 }
@@ -419,7 +441,7 @@ impl El {
             kids: Vec::new(),
         }
     }
-    fn attr(&self, k: &str) -> Option<&str> {
+    pub(crate) fn attr(&self, k: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(n, _)| n == k)
@@ -428,7 +450,7 @@ impl El {
     fn local(&self) -> &str {
         self.name.rsplit(':').next().unwrap_or(&self.name)
     }
-    fn child(&self, name: &str) -> Option<&El> {
+    pub(crate) fn child(&self, name: &str) -> Option<&El> {
         self.elements().find(|e| e.name == name)
     }
     fn child_mut(&mut self, name: &str) -> Option<&mut El> {
@@ -437,7 +459,17 @@ impl El {
             _ => None,
         })
     }
-    fn elements(&self) -> impl Iterator<Item = &El> {
+    /// Its text (what's between its tags, not its children's).
+    pub(crate) fn text(&self) -> String {
+        let mut t = String::new();
+        for k in &self.kids {
+            if let Node::Raw(Event::Text(x)) = k {
+                t.push_str(&x.unescape().map(|c| c.into_owned()).unwrap_or_default());
+            }
+        }
+        t.trim().to_string()
+    }
+    pub(crate) fn elements(&self) -> impl Iterator<Item = &El> {
         self.kids.iter().filter_map(|k| match k {
             Node::El(e) => Some(e),
             _ => None,
@@ -467,7 +499,7 @@ fn start_el(e: &BytesStart) -> Result<El, String> {
 }
 
 /// The root element of `xml`.
-fn parse_root(xml: &str) -> Result<El, String> {
+pub(crate) fn parse_root(xml: &str) -> Result<El, String> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut stack: Vec<El> = Vec::new();
     let mut root = None;
@@ -530,6 +562,11 @@ fn write_el(w: &mut quick_xml::Writer<Vec<u8>>, el: &El) -> std::io::Result<()> 
         }
     }
     w.write_event(Event::End(BytesEnd::new(el.name.as_str())))
+}
+
+/// `el` as XML.
+pub(crate) fn el_xml(el: &El) -> String {
+    to_string(el)
 }
 
 fn to_string(el: &El) -> String {
@@ -1224,6 +1261,12 @@ impl Virsh {
     }
 
     /// A running domain's XML as it can be migrated.
+    /// Running domain `name` as it runs: its CPU expanded to what the
+    /// guest really has (`--migratable` strips that back to the model).
+    pub async fn dumpxml_live(&self, name: &str) -> Result<String, String> {
+        self.run(&["dumpxml", name]).await
+    }
+
     pub async fn dumpxml_migratable(&self, name: &str) -> Result<String, String> {
         self.run(&["dumpxml", "--migratable", name]).await
     }
@@ -1254,7 +1297,8 @@ impl Virsh {
         to: &Incoming,
         timeout: Duration,
     ) -> Result<(), String> {
-        let (uri, host) = (to.uri.as_str(), to.migrate_host.as_deref());
+        let uri = to.uri.as_deref().ok_or("no libvirt URI for the target")?;
+        let host = to.migrate_host.as_deref();
         let path = std::env::temp_dir().join(format!(
             "raidish-migrate-{}-{}.xml",
             name,
@@ -1264,23 +1308,97 @@ impl Virsh {
             .await
             .map_err(|e| format!("{}: {}", path.display(), e))?;
         let path_s = path.to_string_lossy().into_owned();
-        let migrateuri = host.map(|h| format!("tcp://{}", h));
-        let mut args = vec!["migrate", "--live", "--p2p", "--xml", &path_s, name, uri];
+        let migrateuri = host.map(|h| {
+            if h.contains(':') {
+                format!("tcp://[{}]", h)
+            } else {
+                format!("tcp://{}", h)
+            }
+        });
+        // Always over TLS: libvirt to libvirt (the URI) and qemu's stream.
+        let mut args = vec![
+            "migrate", "--live", "--p2p", "--tls", "--xml", &path_s, name, uri,
+        ];
         if let Some(m) = &migrateuri {
             args.extend(["--migrateuri", m.as_str()]);
         }
-        if to.tls {
-            args.push("--tls");
-        }
         let r = tokio::time::timeout(timeout, self.run(&args)).await;
         let _ = tokio::fs::remove_file(&path).await;
+        // libvirt's reason, without the command line.
+        let prefix = format!("virsh {}: ", args.join(" "));
         match r {
-            Ok(r) => r.map(|_| ()),
+            Ok(r) => r
+                .map(|_| ())
+                .map_err(|e| e.strip_prefix(&prefix).map(str::to_string).unwrap_or(e)),
             Err(_) => {
                 let _ = self.run(&["domjobabort", name]).await;
                 Err(format!("didn't finish in {:?}; aborted", timeout))
             }
         }
+    }
+
+    /// `virsh version`, as it prints it.
+    pub async fn version(&self) -> Result<String, String> {
+        self.run(&["version"]).await
+    }
+
+    /// `virsh domcapabilities`: what this host's qemu offers a guest
+    /// (default arch and virt type).
+    pub async fn domcapabilities(&self) -> Result<String, String> {
+        self.run(&["domcapabilities"]).await
+    }
+
+    /// `virsh capabilities`: the host, and the machine types per arch.
+    pub async fn capabilities(&self) -> Result<String, String> {
+        self.run(&["capabilities"]).await
+    }
+
+    /// The active networks.
+    pub async fn networks(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .run(&["net-list", "--name"])
+            .await?
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+
+    /// `virsh` with `xml` in a temporary file, as `args` then that file.
+    async fn with_file(&self, args: &[&str], xml: &str) -> Result<String, String> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "raidish-virsh-{}-{}.xml",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        tokio::fs::write(&path, xml)
+            .await
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        let p = path.to_string_lossy().into_owned();
+        let mut a = args.to_vec();
+        a.push(&p);
+        let r = self.run(&a).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        r
+    }
+
+    /// Whether this host can give a guest the CPU `cpu_xml` (a `<cpu>`
+    /// element, or a domain holding one) describes: `virsh
+    /// hypervisor-cpu-compare`. Err with libvirt's reason if not.
+    pub async fn cpu_compare(&self, cpu_xml: &str) -> Result<String, String> {
+        let out = self
+            .with_file(&["hypervisor-cpu-compare", "--error"], cpu_xml)
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// The CPU every one of `domcaps` (each a `virsh domcapabilities`)
+    /// can give a guest, migratable: `virsh hypervisor-cpu-baseline`.
+    pub async fn cpu_baseline(&self, domcaps: &[String]) -> Result<String, String> {
+        let all = domcaps.concat();
+        self.with_file(&["hypervisor-cpu-baseline", "--migratable"], &all)
+            .await
     }
 
     pub async fn vnc_port(&self, name: &str) -> Option<u16> {

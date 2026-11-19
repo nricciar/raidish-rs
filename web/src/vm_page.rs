@@ -59,6 +59,7 @@ pub enum Msg {
     XmlInput(String),
     SaveXml,
     Saved(Result<(), String>),
+    Checked(Result<api::CheckView, String>),
 }
 
 pub struct VmPage {
@@ -83,6 +84,10 @@ pub struct VmPage {
     /// Being edited: the text.
     draft: Option<String>,
     saving: bool,
+    /// Where it can move, and how.
+    check: Option<api::CheckView>,
+    /// Where it was (node, running) when that was asked.
+    checked_at: Option<(Option<String>, bool)>,
     _timer: Interval,
 }
 
@@ -112,6 +117,8 @@ impl Component for VmPage {
             xml_error: None,
             draft: None,
             saving: false,
+            check: None,
+            checked_at: None,
             _timer: timer,
         }
     }
@@ -119,6 +126,9 @@ impl Component for VmPage {
     fn update(&mut self, ctx: &Context<Self>, msg: Msg) -> bool {
         let name = ctx.props().name.clone();
         match msg {
+            Msg::Checked(r) => {
+                self.check = r.ok();
+            }
             Msg::Load => {
                 if self.loading || tab_hidden() {
                     return false;
@@ -141,6 +151,15 @@ impl Component for VmPage {
                         self.error = None;
                         self.vm = vms.into_iter().find(|v| v.name == name);
                         self.missing = self.vm.is_none();
+                        // Where it can move: again once it's somewhere else
+                        // (or started, or stopped).
+                        let at = self.vm.as_ref().map(|v| (v.node.clone(), v.running()));
+                        if self.vm.is_some() && self.checked_at != at {
+                            self.checked_at = at;
+                            let n = name.clone();
+                            ctx.link()
+                                .send_future(async move { Msg::Checked(api::vm_check(&n).await) });
+                        }
                         let vm = self.vm.as_ref();
                         match vm.and_then(|v| v.cpu_s) {
                             Some(c) => {
@@ -223,6 +242,7 @@ impl Component for VmPage {
             Msg::Finished(r) => {
                 self.busy = false;
                 self.volumes.clear();
+                self.checked_at = None;
                 match r {
                     Ok(note) => {
                         self.dialog = None;
@@ -464,20 +484,71 @@ impl VmPage {
             .collect()
     }
 
+    /// How a move to `node` would go, if known.
+    fn verdict(&self, node: &str) -> Option<&api::Verdict> {
+        self.check
+            .as_ref()?
+            .verdicts
+            .iter()
+            .find(|v| v.node == node)
+    }
+
     fn move_dialog(&self, ctx: &Context<Self>, vm: &Vm) -> Option<Callback<MouseEvent>> {
         let here = vm.node.clone().unwrap_or_default();
-        let others: Vec<String> = self.nodes(ctx).into_iter().filter(|n| *n != here).collect();
+        // Not the nodes it can't run on at all.
+        let others: Vec<String> = self
+            .nodes(ctx)
+            .into_iter()
+            .filter(|n| *n != here)
+            .filter(|n| self.verdict(n).is_none_or(|v| v.mode != "no"))
+            .collect();
         if others.is_empty() || vm.error.is_some() {
             return None;
         }
-        let opts: Vec<(&str, &str)> = others.iter().map(|n| (n.as_str(), n.as_str())).collect();
+        let running = vm.running();
+        let labels: Vec<String> = others
+            .iter()
+            .map(|n| match self.verdict(n).map(|v| v.mode.as_str()) {
+                Some("live") if running => format!("{} · live", n),
+                Some("cold") if running => format!("{} · cold (shut down, started there)", n),
+                _ => n.clone(),
+            })
+            .collect();
+        let opts: Vec<(&str, &str)> = others
+            .iter()
+            .zip(&labels)
+            .map(|(n, l)| (n.as_str(), l.as_str()))
+            .collect();
+        // Live first.
+        let first = others
+            .iter()
+            .find(|n| self.verdict(n).is_some_and(|v| v.mode == "live"))
+            .unwrap_or(&others[0])
+            .clone();
+        let notes: Vec<(String, String)> = self
+            .check
+            .iter()
+            .flat_map(|c| c.verdicts.iter())
+            .filter(|v| running || v.mode == "no")
+            .filter(|v| v.mode != "live")
+            .map(|v| (v.node.clone(), v.why()))
+            .collect();
         let spec = Spec::new(&format!("Move {}?", vm.name), "Move")
-            .message(html! { <p>{ if vm.running() {
-                "Its disks move to that node. It's shut down here first, then started there."
-            } else {
-                "Its disks move to that node, and it runs there from now on."
-            } }</p> })
-            .field(Field::select("node", "To", opts[0].0, &opts));
+            .message(html! { <>
+                <p>{ if running {
+                    "Live where it says so: it keeps running while it moves. Cold: it's shut down here first, then started there."
+                } else {
+                    "Its disks move to that node, and it runs there from now on."
+                } }</p>
+                if !notes.is_empty() {
+                    <ul class="move-notes">
+                        { for notes.iter().map(|(n, why)| html! {
+                            <li><span class="mono">{ n.clone() }</span>{ ": " }{ why.clone() }</li>
+                        }) }
+                    </ul>
+                }
+            </> })
+            .field(Field::select("node", "To", &first, &opts));
         Some(
             ctx.link()
                 .callback(move |_| Msg::Ask(spec.clone(), Action::Move)),
@@ -684,7 +755,43 @@ impl VmPage {
                         <button class="btn small" onclick={mv}>{ "Move…" }</button>
                     }
                 </div>
+                { self.moves(vm) }
             </aside>
+        }
+    }
+
+    /// Each other node: can it move there, live or cold, and why not.
+    fn moves(&self, vm: &Vm) -> Html {
+        let Some(c) = &self.check else {
+            return html! {};
+        };
+        if c.verdicts.is_empty() {
+            return html! {};
+        }
+        let running = vm.running();
+        html! {
+            <div class="placement">
+                <div class="fact-label">{ if running { "Moving it" } else { "Starting it on" } }</div>
+                <ul class="moves">
+                    { for c.verdicts.iter().map(|v| {
+                        let (cls, text) = match (v.mode.as_str(), running) {
+                            ("no", _) => ("bad", "NO"),
+                            ("cold", true) => ("warn", "COLD"),
+                            ("live", true) => ("ok", "LIVE"),
+                            _ => ("ok", "OK"),
+                        };
+                        let why = if running || v.mode == "no" { v.why() } else { String::new() };
+                        let all = v.reasons.iter().map(|r| format!("{}: {}", r.level, r.text)).collect::<Vec<_>>().join("\n");
+                        html! {
+                            <li title={all}>
+                                <span class={classes!("tag", cls)}>{ text }</span>
+                                <span class="mono">{ v.node.clone() }</span>
+                                if !why.is_empty() { <span class="muted small">{ why }</span> }
+                            </li>
+                        }
+                    }) }
+                </ul>
+            </div>
         }
     }
 

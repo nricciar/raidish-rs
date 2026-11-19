@@ -163,6 +163,11 @@ enum Commands {
         #[command(subcommand)]
         command: crate::cli_vm::VmCommands,
     },
+    /// The nodes themselves: host, libvirt, what live migration needs.
+    Node {
+        #[command(subcommand)]
+        command: crate::cli_vm::NodeCommands,
+    },
     /// The cluster's certificate authority: issue node and client certs.
     Cert {
         #[command(subcommand)]
@@ -569,6 +574,7 @@ pub async fn main() -> std::io::Result<()> {
         let files: crate::files_api::WriterSlot = Default::default();
         let mut nfs_backend = None;
         let vms = config.vm.as_ref().map(|c| {
+            c.check().unwrap_or_else(|e| fail(e));
             println!("vm: running VMs through libvirt ({})", c.virsh().uri);
             Arc::new(crate::vm::VmRuntime {
                 virsh: c.virsh(),
@@ -582,7 +588,6 @@ pub async fn main() -> std::io::Result<()> {
                 migrate_uri: c.migrate_uri.clone(),
                 migrate_host: c.migrate_host.clone(),
                 migrate_timeout: c.migrate_timeout(),
-                migrate_tls: c.migrate_tls,
             })
         });
         let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
@@ -607,6 +612,31 @@ pub async fn main() -> std::io::Result<()> {
                         .map_err(|e| e.to_string())
                 }
             }));
+        }
+        // What this node is (host, libvirt, reaching the others), stored
+        // with the VM definitions (see `crate::node_facts`).
+        let facts: crate::node_facts::FactsHandle = Default::default();
+        {
+            let mut endpoints = vec![me.clone()];
+            for e in config.lease_endpoints().unwrap_or_default() {
+                if !endpoints.contains(&e) && !cluster::members::is_local_base(&e, port as u16) {
+                    endpoints.push(e);
+                }
+            }
+            let collector = crate::node_facts::Collector {
+                node: name.clone(),
+                peers: node.members.peers.clone(),
+                vm: vms.clone(),
+                roots: config
+                    .tls
+                    .as_ref()
+                    .map(|t| t.roots().unwrap_or_else(|e| fail(e)))
+                    .unwrap_or_default(),
+                peer_port: config.automount.peer_port(),
+                committer: crate::committer::CommitClient::new(endpoints),
+                state: facts.clone(),
+            };
+            tokio::spawn(collector.run());
         }
         if let (Some(spec), Some(map)) = (&spec, &pool_map) {
             // This node's own disks through its own disk server, so the
@@ -658,6 +688,7 @@ pub async fn main() -> std::io::Result<()> {
             if let Some(vms) = &vms {
                 agent = agent.with_vms(vms.clone());
             }
+            agent = agent.with_facts(facts.clone());
             // Peer I/O (proxied exports, handoffs) is node-to-node TLS.
             if let Some(tls) = &config.tls {
                 agent = agent
@@ -754,9 +785,21 @@ pub async fn main() -> std::io::Result<()> {
             auth,
             nfs_backend,
             vms,
+            facts,
             events,
         )
         .await;
+        return Ok(());
+    }
+
+    if let Commands::Node { command } = &cli.command {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            fail("no cluster to ask: the pool has no remote disks");
+        }
+        crate::cli_vm::run_node(command, endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
         return Ok(());
     }
 
@@ -1125,6 +1168,7 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Listen { .. }
         | Commands::Vm { .. }
+        | Commands::Node { .. }
         | Commands::Cluster { .. }
         | Commands::Csi { .. }
         | Commands::Cert { .. }

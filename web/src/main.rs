@@ -13,6 +13,7 @@ mod cluster;
 mod dialog;
 mod files;
 mod fmt;
+mod hosts;
 mod login;
 mod panels;
 mod session;

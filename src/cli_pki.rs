@@ -103,7 +103,10 @@ fn print_cert(c: &CertInfo) {
     let role = if c.is_ca {
         "CA".to_string()
     } else {
-        c.role.map(|r| r.to_string()).unwrap_or_else(|| "?".into())
+        c.role
+            .map(|r| r.to_string())
+            .or_else(|| c.ou.clone())
+            .unwrap_or_else(|| "?".into())
     };
     let sans = if c.sans.is_empty() {
         String::new()
@@ -185,7 +188,6 @@ pub fn run(command: &CertCommands, pool_paths: &PoolPaths) {
             println!(
                 "  chgrp libvirt-qemu /etc/pki/qemu/*-key.pem && chmod 640 /etc/pki/qemu/*-key.pem"
             );
-            println!("  # /etc/libvirt/qemu.conf: migrate_tls_x509_cert_dir = \"/etc/pki/qemu\"");
             println!("  # /etc/libvirt/libvirtd.conf (only raidish's libvirt certs may connect):");
             println!("  #   tls_allowed_dn_list = [\"*OU=libvirt*\"]");
             println!(
@@ -195,7 +197,11 @@ pub fn run(command: &CertCommands, pool_paths: &PoolPaths) {
                 "  systemctl stop libvirtd.service && systemctl enable --now libvirtd-tls.socket && systemctl start libvirtd"
             );
             println!(
-                "and in its raidish config: vm.migrate_uri qemu+tls://{}/system, vm.migrate_tls true",
+                "then `vm: {{}}` in its raidish config: the other nodes reach it as qemu+tls://{}/system",
+                name
+            );
+            println!(
+                "(`raidish node facts {}` checks it all from the cluster's side).",
                 name
             );
         }

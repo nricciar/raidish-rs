@@ -432,6 +432,7 @@ impl App {
                     } else {
                         <section class="card"><h2>{ "Block map" }</h2><p class="muted">{ "Walking the tree…" }</p></section>
                     }
+                    <crate::hosts::VmHosts />
                     <div class="grid two">
                         <Metaslabs snap={snap.clone()} />
                         <Timeline snap={snap.clone()} now={self.now} />

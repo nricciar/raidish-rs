@@ -4,6 +4,9 @@
 //! to one that takes migrations (B) is migrated live rather than shut down
 //! and started again:
 //!
+//! 0. Whether it can be is checked first (`crate::vm_check`, from both
+//!    nodes' facts and what B says about the VM's CPU now): if not, it
+//!    moves cold at once, saying why.
 //! 1. Its volumes are attached to A and B (`Request::Attach`): A keeps
 //!    writing them (the agent places a migrating VM's volumes here), B
 //!    exports them proxied to A (see `super::handoff`).
@@ -19,6 +22,8 @@
 
 use crate::cluster::LeaseOp;
 use crate::cluster::lease::LeaseClient;
+use crate::committer::CommitClient;
+use crate::node_facts::FactsHandle;
 use crate::vm::{DomMeta, Incoming, Virsh};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -31,7 +36,22 @@ pub(super) struct Migration {
     pub to: String,
     pub volumes: Vec<String>,
     pub started: Instant,
-    pub task: JoinHandle<Result<(), String>>,
+    pub task: JoinHandle<Result<(), Failure>>,
+}
+
+/// Why a live migration didn't happen.
+#[derive(Debug, Clone)]
+pub(super) enum Failure {
+    /// The check said it can't be live (nothing was tried).
+    NotLive(String),
+    /// It was tried and failed.
+    Failed(String),
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Self {
+        Failure::Failed(e)
+    }
 }
 
 /// Migrated away: its volumes being handed to `to`.
@@ -65,6 +85,8 @@ pub(super) struct Job {
     pub http: reqwest::Client,
     /// B's API (`https://node1:8881`).
     pub url: String,
+    /// B's host in that URL: its libvirt and qemu's stream, by default.
+    pub host: String,
     pub name: String,
     pub volumes: Vec<String>,
     pub me: String,
@@ -73,11 +95,20 @@ pub(super) struct Job {
     /// The domain's metadata here.
     pub meta: DomMeta,
     pub timeout: Duration,
+    /// This node's facts, and the committer for the target's.
+    pub facts: FactsHandle,
+    pub committer: CommitClient,
 }
 
 impl Job {
-    /// Steps 1–3 above. Ok once the guest runs on B.
-    pub async fn run(self) -> Result<(), String> {
+    /// Steps 0–3 above. Ok once the guest runs on B.
+    pub async fn run(self) -> Result<(), Failure> {
+        // Judged by what it runs as (its CPU as the guest has it).
+        let live_xml = self.virsh.dumpxml_live(&self.name).await?;
+        let verdict = self.check(&live_xml).await;
+        if verdict.mode != crate::vm_check::Mode::Live {
+            return Err(Failure::NotLive(verdict.why()));
+        }
         for node in [&self.me, &self.to] {
             for v in &self.volumes {
                 attach(&self.leases, v, node, true)
@@ -85,7 +116,7 @@ impl Job {
                     .map_err(|e| format!("attaching '{}' to {}: {}", v, node, e))?;
             }
         }
-        let to = self.ready().await?;
+        let to = self.ready().await?.resolved(&self.host);
         let xml = self.virsh.dumpxml_migratable(&self.name).await?;
         let meta = DomMeta {
             owner: String::new(),
@@ -94,9 +125,37 @@ impl Job {
             ..self.meta.clone()
         };
         let xml = crate::vm::retarget(&xml, &to, &meta)?;
-        self.virsh
+        Ok(self
+            .virsh
             .migrate(&self.name, &xml, &to, self.timeout)
-            .await
+            .await?)
+    }
+
+    /// Step 0: can it go live to B?
+    async fn check(&self, xml: &str) -> crate::vm_check::Verdict {
+        use crate::vm_check::{check, cpu_to_compare, needs};
+        let needs = match needs(xml) {
+            Ok(n) => n,
+            Err(e) => {
+                let mut n = crate::vm_check::Needs::default();
+                eprintln!("agent: reading VM '{}': {}", self.name, e);
+                n.virt_type = "kvm".into();
+                n
+            }
+        };
+        let me = self.facts.with_fresh_probe(&self.to).await;
+        let target = match self.committer.node_facts().await {
+            Ok(mut all) => all.remove(&self.to),
+            Err(_) => None,
+        };
+        let live = ask_live(&self.http, &self.url, cpu_to_compare(&needs, me.as_ref())).await;
+        check(
+            &needs,
+            &self.to,
+            me.as_ref(),
+            target.as_ref(),
+            live.as_ref(),
+        )
     }
 
     /// B, once it exports every volume (proxied here).
@@ -128,4 +187,23 @@ impl Job {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+}
+
+/// What the node at `url` says now about running a VM with CPU `cpu`
+/// (`POST /api/v1/vm/check`). None: it couldn't be asked.
+pub(crate) async fn ask_live(
+    http: &reqwest::Client,
+    url: &str,
+    cpu: Option<String>,
+) -> Option<crate::vm_check::Live> {
+    let r = http
+        .post(format!("{}/api/v1/vm/check", url))
+        .json(&crate::vm_check::LiveAsk { cpu })
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    r.json().await.ok()
 }

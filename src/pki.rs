@@ -81,6 +81,8 @@ impl std::str::FromStr for Role {
 pub struct CertInfo {
     pub name: String,
     pub role: Option<Role>,
+    /// The subject's OU as written (a role, or `libvirt`).
+    pub ou: Option<String>,
     pub is_ca: bool,
     pub sans: Vec<String>,
     pub issuer: String,
@@ -121,11 +123,12 @@ pub fn inspect_der(der: &[u8]) -> Result<CertInfo, String> {
         .and_then(|a| a.as_str().ok())
         .unwrap_or("")
         .to_string();
-    let role = subject
+    let ou = subject
         .iter_organizational_unit()
         .next()
         .and_then(|a| a.as_str().ok())
-        .and_then(|s| s.parse().ok());
+        .map(|s| s.to_string());
+    let role = ou.as_deref().and_then(|s| s.parse().ok());
     let is_ca = cert
         .basic_constraints()
         .ok()
@@ -156,6 +159,7 @@ pub fn inspect_der(der: &[u8]) -> Result<CertInfo, String> {
     Ok(CertInfo {
         name,
         role,
+        ou,
         is_ca,
         sans,
         issuer,

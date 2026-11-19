@@ -61,6 +61,8 @@ mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod nfs;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod node_facts;
+#[cfg(not(target_arch = "wasm32"))]
 mod nvme;
 mod object;
 pub mod open_file;
@@ -89,6 +91,8 @@ mod ui;
 pub mod vdev;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vm;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod vm_check;
 pub mod vm_def;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vm_store;

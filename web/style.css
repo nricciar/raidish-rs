@@ -513,3 +513,14 @@ main { padding-bottom: 48px; }
   .activity-table th:nth-child(5), .activity-table td:nth-child(5),
   .activity-table th:nth-child(6), .activity-table td:nth-child(6) { display: none; }
 }
+
+/* Where a VM can move, and the nodes as VM hosts (vm_page.rs, hosts.rs). */
+.moves, .hosts, .move-notes, .host-problems { list-style: none; margin: 6px 0 0; padding: 0; }
+.moves li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 3px 0; }
+.moves li .muted { flex-basis: 100%; padding-left: 4px; }
+.move-notes li { font-size: 12px; color: var(--muted); padding: 2px 0; }
+.hosts { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.hosts > li { background: var(--card-2); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.host-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
+.host-head .tag { margin-left: auto; }
+.host-problems li { color: var(--warn); overflow-wrap: anywhere; padding-top: 3px; }
