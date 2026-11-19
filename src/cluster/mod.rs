@@ -77,6 +77,14 @@ pub enum LeaseOp {
         owner: String,
         epoch: u64,
     },
+    Transfer {
+        resource: String,
+        from_owner: String,
+        from_epoch: u64,
+        to_owner: String,
+        to_desc: String,
+        ttl_ms: u64,
+    },
     Lend {
         idx: u32,
         writer: String,
@@ -101,6 +109,15 @@ pub enum LeaseOp {
     },
     SetServiceKey {
         key: String,
+    },
+    SetAttached {
+        volume: String,
+        nodes: Vec<String>,
+    },
+    Attach {
+        volume: String,
+        node: String,
+        on: bool,
     },
 }
 
@@ -139,6 +156,22 @@ impl LeaseOp {
                 resource,
                 owner,
                 epoch,
+            },
+            LeaseOp::Transfer {
+                resource,
+                from_owner,
+                from_epoch,
+                to_owner,
+                to_desc,
+                ttl_ms,
+            } => Request::Transfer {
+                resource,
+                from_owner,
+                from_epoch,
+                to_owner,
+                to_desc,
+                ttl_ms,
+                now_ms,
             },
             LeaseOp::Lend {
                 idx,
@@ -182,6 +215,8 @@ impl LeaseOp {
                 now_ms,
             },
             LeaseOp::SetServiceKey { key } => Request::SetServiceKey { key },
+            LeaseOp::SetAttached { volume, nodes } => Request::SetAttached { volume, nodes },
+            LeaseOp::Attach { volume, node, on } => Request::Attach { volume, node, on },
         }
     }
 }

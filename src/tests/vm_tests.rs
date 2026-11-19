@@ -115,6 +115,7 @@ fn renders_disks_console_name_and_metadata() {
             owner: "host:1:2".into(),
             pool: "00ff".into(),
             node: "node-0".into(),
+            migrating: false,
         }
     );
     let devices = root.child("devices").unwrap();
@@ -423,4 +424,124 @@ fn consoles_listen_where_configured() {
         g.child("listen").unwrap().attr("address"),
         Some("172.31.250.1")
     );
+}
+
+/// What `virsh dumpxml --migratable` of a domain raidish started on node-0
+/// looks like (trimmed).
+const RUNNING: &str = r#"<domain type='kvm'>
+  <name>web</name>
+  <uuid>4dea22b3-1d52-d8f3-2516-782e98ab3fa0</uuid>
+  <metadata>
+    <raidish:vm xmlns:raidish="https://raidish.dev/xmlns/vm/1" anchor="vm1" volumes="vm1,data" change="7" owner="host0:1:2" pool="00ff" node="node-0"/>
+  </metadata>
+  <memory unit='KiB'>65536</memory>
+  <devices>
+    <disk type='network' device='disk'>
+      <driver name='qemu' type='raw' cache='none' discard='unmap'/>
+      <source protocol='nbd' name='vm1'>
+        <host name='127.0.0.1' port='10809'/>
+      </source>
+      <target dev='vda' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
+    </disk>
+    <disk type='network' device='disk'>
+      <driver name='qemu' type='raw' cache='none' discard='unmap'/>
+      <source protocol='nbd' name='data'>
+        <host name='127.0.0.1' port='10809'/>
+      </source>
+      <target dev='vdb' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x05' slot='0x00' function='0x0'/>
+    </disk>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+  </devices>
+</domain>"#;
+
+fn incoming() -> Incoming {
+    Incoming {
+        uri: "qemu+tls://node1/system".into(),
+        migrate_host: None,
+        tls: false,
+        nbd_host: "10.0.0.2".into(),
+        nbd_port: 10900,
+        console: "10.0.0.2".into(),
+        node: "node-1".into(),
+    }
+}
+
+#[test]
+fn a_running_domain_is_retargeted_for_another_node() {
+    let root = parse_domain(RUNNING).unwrap();
+    let m = parse_meta(&to_string(
+        root.child("metadata").unwrap().elements().next().unwrap(),
+    ))
+    .unwrap();
+    let meta = DomMeta {
+        owner: String::new(),
+        node: "node-1".into(),
+        migrating: true,
+        ..m
+    };
+    let out = parse_domain(&retarget(RUNNING, &incoming(), &meta).unwrap()).unwrap();
+    // What libvirt's ABI check compares is untouched.
+    assert_eq!(
+        to_string(out.child("uuid").unwrap()),
+        "<uuid>4dea22b3-1d52-d8f3-2516-782e98ab3fa0</uuid>"
+    );
+    let devices = out.child("devices").unwrap();
+    for (d, bus) in devices
+        .elements()
+        .filter(|e| e.name == "disk")
+        .zip(["0x04", "0x05"])
+    {
+        assert_eq!(d.child("address").unwrap().attr("bus"), Some(bus));
+        let host = d.child("source").unwrap().child("host").unwrap();
+        assert_eq!(host.attr("name"), Some("10.0.0.2"));
+        assert_eq!(host.attr("port"), Some("10900"));
+    }
+    let g = devices.child("graphics").unwrap();
+    assert_eq!(g.attr("listen"), Some("10.0.0.2"));
+    assert_eq!(g.child("listen").unwrap().attr("address"), Some("10.0.0.2"));
+    // One raidish metadata element, the new one.
+    let md = out.child("metadata").unwrap();
+    assert_eq!(md.elements().count(), 1);
+    let got = parse_meta(&to_string(md.elements().next().unwrap())).unwrap();
+    assert_eq!(got, meta);
+    assert!(got.migrating && got.owner.is_empty());
+}
+
+#[test]
+fn retargeting_refuses_a_domain_whose_disks_dont_match() {
+    let root = parse_domain(RUNNING).unwrap();
+    let m = parse_meta(&to_string(
+        root.child("metadata").unwrap().elements().next().unwrap(),
+    ))
+    .unwrap();
+    let meta = DomMeta {
+        volumes: vec!["vm1".into(), "data".into(), "iso".into()],
+        ..m
+    };
+    assert!(retarget(RUNNING, &incoming(), &meta).is_err());
+}
+
+#[test]
+fn metadata_round_trips_with_the_migrating_mark() {
+    let m = DomMeta {
+        anchor: "vm1".into(),
+        volumes: vec!["vm1".into(), "data".into()],
+        change: 3,
+        owner: "h:1:2".into(),
+        pool: "00ff".into(),
+        node: "node-2".into(),
+        migrating: true,
+    };
+    assert_eq!(parse_meta(&meta_xml(&m)).unwrap(), m);
+    let settled = DomMeta {
+        migrating: false,
+        ..m
+    };
+    let xml = meta_xml(&settled);
+    assert!(!xml.contains("migrating"), "{}", xml);
+    assert_eq!(parse_meta(&xml).unwrap(), settled);
 }

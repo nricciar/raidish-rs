@@ -306,14 +306,14 @@ fn nqns_and_serials() {
         subsystem_nqn("vdisk0"),
         "nqn.2024-01.com.raidish:nvme:vdisk0"
     );
-    assert_eq!(Export::new("vdisk0", 0).serial, "RAIDISH-vdisk0");
+    assert_eq!(serial_of("vdisk0"), "RAIDISH-vdisk0");
     // Long names that would truncate to the same SN get distinct hashes.
     let (a, b) = (
-        Export::new("database-volume-1", 0),
-        Export::new("database-volume-2", 0),
+        serial_of("database-volume-1"),
+        serial_of("database-volume-2"),
     );
-    assert_ne!(a.serial, b.serial);
-    assert!(a.serial.len() <= 20);
+    assert_ne!(a, b);
+    assert!(a.len() <= 20);
 }
 
 #[tokio::test]
@@ -700,4 +700,69 @@ async fn pipelined_commands_on_one_queue() {
         let r = q.io(IO_READ, i * 3, 1, &[], 4096, false).await;
         assert!(r.data == pattern(4096, i as u8), "write {i}");
     }
+}
+
+/// Counts the I/O commands that reach the backend it wraps.
+struct Counting {
+    inner: Arc<dyn VolumeIo>,
+    n: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Counting {
+    fn hit(&self) {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl VolumeIo for Counting {
+    async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
+        self.hit();
+        self.inner.read(offset, buf).await
+    }
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
+        self.hit();
+        self.inner.write(offset, data).await
+    }
+    async fn zero(&self, offset: u64, len: usize) -> Result<(), FileSystemError> {
+        self.hit();
+        self.inner.zero(offset, len).await
+    }
+    async fn flush(&self) -> Result<(), FileSystemError> {
+        self.hit();
+        self.inner.flush().await
+    }
+    async fn sync(&self) -> Result<(), FileSystemError> {
+        self.inner.sync().await
+    }
+}
+
+/// An export's backend is switched under a connected I/O queue: the queue
+/// stays up and its commands go to the new backend, data intact.
+#[tokio::test]
+async fn an_exports_backend_switches_under_a_connected_queue() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let before = pattern(8192, 3);
+    assert!(q.io(IO_WRITE, 0, 2, &before, 0, true).await.ok());
+
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let io = server.export_io("vol").unwrap();
+    io.switch(Arc::new(Counting {
+        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+        n: n.clone(),
+    }))
+    .await;
+
+    let after = pattern(8192, 4);
+    assert!(q.io(IO_WRITE, 2, 2, &after, 0, true).await.ok());
+    assert!(q.io(IO_FLUSH, 0, 0, &[], 0, false).await.ok());
+    let r = q.io(IO_READ, 0, 4, &[], 16384, false).await;
+    assert!(r.ok());
+    assert!(r.data[..8192] == before[..] && r.data[8192..] == after[..]);
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
 }

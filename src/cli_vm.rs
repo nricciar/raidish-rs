@@ -36,7 +36,8 @@ pub enum VmCommands {
     Reboot { name: String },
     /// Hard reset.
     Reset { name: String },
-    /// Move it (its disks) to `node`: shut down here, started there.
+    /// Move it (its disks) to `node`: migrated live if both nodes can,
+    /// else shut down here and started there.
     Move { name: String, node: String },
 }
 

@@ -15,12 +15,12 @@
 
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
@@ -28,8 +28,8 @@ use tokio::task::JoinSet;
 const NBD_INIT_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
 const NBD_OPTS_MAGIC: u64 = 0x49484156454F5054; // "IHAVEOPT"
 const NBD_REP_MAGIC: u64 = 0x3e889045565a9;
-const NBD_REQUEST_MAGIC: u32 = 0x25609513;
-const NBD_REPLY_MAGIC: u32 = 0x67446698;
+pub(crate) const NBD_REQUEST_MAGIC: u32 = 0x25609513;
+pub(crate) const NBD_REPLY_MAGIC: u32 = 0x67446698;
 
 const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
 const NBD_FLAG_NO_ZEROES: u16 = 1 << 1;
@@ -49,12 +49,12 @@ const NBD_REP_ERR_UNKNOWN: u32 = 0x80000006;
 
 const NBD_INFO_EXPORT: u16 = 0;
 
-const NBD_CMD_READ: u16 = 0;
-const NBD_CMD_WRITE: u16 = 1;
-const NBD_CMD_DISC: u16 = 2;
-const NBD_CMD_FLUSH: u16 = 3;
-const NBD_CMD_TRIM: u16 = 4;
-const NBD_CMD_WRITE_ZEROES: u16 = 6;
+pub(crate) const NBD_CMD_READ: u16 = 0;
+pub(crate) const NBD_CMD_WRITE: u16 = 1;
+pub(crate) const NBD_CMD_DISC: u16 = 2;
+pub(crate) const NBD_CMD_FLUSH: u16 = 3;
+pub(crate) const NBD_CMD_TRIM: u16 = 4;
+pub(crate) const NBD_CMD_WRITE_ZEROES: u16 = 6;
 
 const NBD_FLAG_HAS_FLAGS: u16 = 1 << 0;
 const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
@@ -63,9 +63,9 @@ const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
 const TRANSMISSION_FLAGS: u16 =
     NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM | NBD_FLAG_SEND_WRITE_ZEROES;
 
-const EIO: u32 = 5;
+pub(crate) const EIO: u32 = 5;
 const EINVAL: u32 = 22;
-const ENOSPC: u32 = 28;
+pub(crate) const ENOSPC: u32 = 28;
 
 /// NBD error for a filesystem error: out of space is reported as such.
 fn errno(e: &crate::fs::FileSystemError) -> u32 {
@@ -200,6 +200,8 @@ struct Export {
     name: String,
     size: u64,
     life: ExportLife,
+    /// Where its I/O goes (this node's file system, for now).
+    io: Arc<SwitchableIo>,
 }
 
 /// An NBD server exporting any number of volumes of one file system.
@@ -244,15 +246,32 @@ where
         }
     }
 
-    /// Export volume `name` (under the same name).
+    /// Export volume `name` (under the same name), written by this node.
     pub async fn add_export(&self, name: &str) -> Result<(), FileSystemError> {
+        Self::check_name(name)?;
+        let size = self.fs.open_dataset(name).await?.size_bytes;
+        let io = Arc::new(LocalIo::new(self.fs.clone(), name));
+        self.add_export_io(name, size, io)
+    }
+
+    fn check_name(name: &str) -> Result<(), FileSystemError> {
         if name.is_empty() || name.len() > 4096 {
             return Err(FileSystemError::InvalidArgument(format!(
                 "bad export name '{}'",
                 name
             )));
         }
-        let size = self.fs.open_dataset(name).await?.size_bytes;
+        Ok(())
+    }
+
+    /// Export `name`, `size` bytes, with its I/O going to `io`.
+    pub fn add_export_io(
+        &self,
+        name: &str,
+        size: u64,
+        io: Arc<dyn VolumeIo>,
+    ) -> Result<(), FileSystemError> {
+        Self::check_name(name)?;
         let mut exports = self.exports.lock().unwrap();
         if exports.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);
@@ -263,9 +282,26 @@ where
                 name: name.to_string(),
                 size,
                 life: ExportLife::new(),
+                io: Arc::new(SwitchableIo::new(io)),
             }),
         );
         Ok(())
+    }
+
+    /// The backend of export `name`, to pause or switch it.
+    pub fn export_io(&self, name: &str) -> Option<Arc<SwitchableIo>> {
+        Some(self.exports.lock().unwrap().get(name)?.io.clone())
+    }
+
+    /// Export `name` for another node's proxy (see `crate::peer_io`): its
+    /// connections count as the export's, so removing it drains them too.
+    pub fn peer_export(&self, name: &str) -> Option<crate::peer_io::PeerExport> {
+        let export = self.exports.lock().unwrap().get(name)?.clone();
+        Some(crate::peer_io::PeerExport {
+            size: export.size,
+            io: export.io.clone(),
+            session: export.life.join()?,
+        })
     }
 
     /// Stop exporting `name`: new connections are refused, current ones are
@@ -276,7 +312,7 @@ where
             return Ok(false);
         };
         export.life.close(&format!("nbd: export '{}'", name)).await;
-        self.fs.sync_for(name).await?;
+        export.io.sync().await?;
         Ok(true)
     }
 
@@ -302,9 +338,9 @@ where
         loop {
             let (stream, addr) = listener.accept().await?;
             println!("Client connected from {}", addr);
-            let (fs, exports) = (self.fs.clone(), self.exports.clone());
+            let exports = self.exports.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, fs, exports).await {
+                if let Err(e) = handle_client(stream, exports).await {
                     eprintln!("Client error: {}", e);
                 }
             });
@@ -353,14 +389,7 @@ fn info_request_name(data: &[u8]) -> Option<String> {
     String::from_utf8(name.to_vec()).ok()
 }
 
-async fn handle_client<D>(
-    mut stream: TcpStream,
-    fs: Arc<FileSystem<D>>,
-    exports: Exports,
-) -> std::io::Result<()>
-where
-    D: BlockDevice + Send + Sync + 'static,
-{
+async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
 
     // Initial handshake
@@ -412,7 +441,7 @@ where
                 if !no_zeroes {
                     stream.write_all(&[0u8; 124]).await?;
                 }
-                return transmission_phase(stream, fs, &export.name, session).await;
+                return transmission_phase(stream, &export, session).await;
             }
             NBD_OPT_INFO | NBD_OPT_GO => {
                 let Some(name) = info_request_name(&option_data) else {
@@ -434,7 +463,7 @@ where
                 opt_reply(&mut stream, option, NBD_REP_ACK, &[]).await?;
 
                 if option == NBD_OPT_GO {
-                    return transmission_phase(stream, fs, &export.name, session).await;
+                    return transmission_phase(stream, &export, session).await;
                 }
             }
             NBD_OPT_LIST => {
@@ -461,8 +490,8 @@ where
 }
 
 /// Send one simple reply (header plus optional read payload) atomically.
-async fn reply(
-    writer: &Mutex<OwnedWriteHalf>,
+async fn reply<W: AsyncWrite + Unpin>(
+    writer: &Mutex<W>,
     handle: u64,
     error: u32,
     data: &[u8],
@@ -472,11 +501,18 @@ async fn reply(
     msg.extend_from_slice(&error.to_be_bytes());
     msg.extend_from_slice(&handle.to_be_bytes());
     msg.extend_from_slice(data);
-    writer.lock().await.write_all(&msg).await
+    // Flushed: over TLS (peer I/O) a write can leave the reply buffered in
+    // the TLS session until the next one, and a client waiting on its last
+    // request would wait for good.
+    let mut w = writer.lock().await;
+    w.write_all(&msg).await?;
+    w.flush().await
 }
 
 /// The fixed 28-byte request header: (cmd, handle, offset, length).
-async fn read_request(reader: &mut OwnedReadHalf) -> std::io::Result<(u16, u64, u64, u32)> {
+async fn read_request<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<(u16, u64, u64, u32)> {
     let mut hdr = [0u8; 28];
     reader.read_exact(&mut hdr).await?;
     let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
@@ -494,18 +530,31 @@ async fn read_request(reader: &mut OwnedReadHalf) -> std::io::Result<(u16, u64, 
     ))
 }
 
-async fn transmission_phase<D>(
+async fn transmission_phase(
     stream: TcpStream,
-    fs: Arc<FileSystem<D>>,
-    zvol_name: &str,
+    export: &Export,
+    session: ExportSession,
+) -> std::io::Result<()> {
+    let (reader, writer) = stream.into_split();
+    serve_requests(reader, writer, &export.name, export.io.clone(), session).await
+}
+
+/// The NBD transmission phase on any stream: requests for volume `name`
+/// served from `io` until the client disconnects or the export closes.
+/// Also what peer I/O (`crate::peer_io`) speaks between nodes.
+pub(crate) async fn serve_requests<R, W>(
+    mut reader: R,
+    writer: W,
+    name: &str,
+    io: Arc<SwitchableIo>,
     session: ExportSession,
 ) -> std::io::Result<()>
 where
-    D: BlockDevice + Send + Sync + 'static,
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
-    let name = Arc::new(zvol_name.to_string());
+    let name = Arc::new(name.to_string());
     let mut tasks = JoinSet::new();
     let mut closed = Some(session.close_signal());
 
@@ -546,12 +595,12 @@ where
             continue;
         }
 
-        let (fs, writer, name) = (fs.clone(), writer.clone(), name.clone());
+        let (io, writer) = (io.clone(), writer.clone());
         match cmd {
             NBD_CMD_READ => {
                 tasks.spawn(async move {
                     let mut buf = vec![0u8; length as usize];
-                    match fs.block_read(&name, offset, &mut buf).await {
+                    match io.read(offset, &mut buf).await {
                         Ok(n) => {
                             buf[n..].fill(0);
                             reply(&writer, handle, 0, &buf).await
@@ -567,7 +616,7 @@ where
                 let mut buf = vec![0u8; length as usize];
                 reader.read_exact(&mut buf).await?;
                 tasks.spawn(async move {
-                    let error = match fs.block_write(&name, offset, &buf).await {
+                    let error = match io.write(offset, &buf).await {
                         Ok(n) if n == buf.len() => 0,
                         Ok(_) => EIO,
                         Err(e) => {
@@ -580,7 +629,7 @@ where
             }
             NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
                 tasks.spawn(async move {
-                    let error = match fs.block_zero(&name, offset, length as usize).await {
+                    let error = match io.zero(offset, length as usize).await {
                         Ok(_) => 0,
                         Err(e) => {
                             eprintln!("nbd: zero {}+{}: {}", offset, length, e);
@@ -592,8 +641,7 @@ where
             }
             NBD_CMD_FLUSH => {
                 tasks.spawn(async move {
-                    // Through the intent log on a writer (see `crate::zil`).
-                    let error = match fs.flush_for(&name).await {
+                    let error = match io.flush().await {
                         Ok(()) => 0,
                         Err(e) => {
                             eprintln!("nbd: flush: {}", e);
@@ -607,7 +655,7 @@ where
                 while let Some(res) = tasks.join_next().await {
                     res.map_err(std::io::Error::other)??;
                 }
-                if let Err(e) = fs.sync_for(&name).await {
+                if let Err(e) = io.sync().await {
                     eprintln!("nbd: sync on disconnect: {}", e);
                 }
                 println!("Client disconnected");

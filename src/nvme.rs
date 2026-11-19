@@ -20,6 +20,7 @@
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::nbd::{DEFAULT_BIND, ExportLife, ExportSession, ensure_sync_loop, export_closed};
+use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -236,26 +237,33 @@ struct Export {
     nsze: u64,
     uuid: [u8; 16],
     life: ExportLife,
+    /// Where its I/O goes (this node's file system, for now).
+    io: Arc<SwitchableIo>,
 }
 
 impl Export {
-    fn new(volume: &str, size: u64) -> Self {
+    fn new(volume: &str, size: u64, io: Arc<dyn VolumeIo>) -> Self {
         let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
-        // SN is 20 bytes and must differ between subsystems: names too long
-        // to fit after the prefix are replaced by a hash.
-        let serial = if volume.len() <= 12 && volume.is_ascii() {
-            format!("RAIDISH-{}", volume)
-        } else {
-            format!("RAIDISH-{}", &hash.to_hex()[..12])
-        };
         Export {
             volume: volume.to_string(),
             nqn: subsystem_nqn(volume),
-            serial,
+            serial: serial_of(volume),
             nsze: size / LBA_SIZE,
             uuid: hash.as_bytes()[..16].try_into().unwrap(),
             life: ExportLife::new(),
+            io: Arc::new(SwitchableIo::new(io)),
         }
+    }
+}
+
+/// The namespace's serial number. SN is 20 bytes and must differ between
+/// subsystems: names too long to fit after the prefix are replaced by a hash.
+fn serial_of(volume: &str) -> String {
+    if volume.len() <= 12 && volume.is_ascii() {
+        format!("RAIDISH-{}", volume)
+    } else {
+        let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
+        format!("RAIDISH-{}", &hash.to_hex()[..12])
     }
 }
 
@@ -329,22 +337,63 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         }
     }
 
-    /// Export volume `volume` as subsystem `subsystem_nqn(volume)`.
+    /// Export volume `volume` as subsystem `subsystem_nqn(volume)`,
+    /// written by this node.
     pub async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
-        let nqn = subsystem_nqn(volume);
-        if volume.is_empty() || nqn.len() > MAX_NQN || volume.contains('\0') {
+        Self::check_name(volume)?;
+        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
+        let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
+        self.add_export_io(volume, size, io)
+    }
+
+    fn check_name(volume: &str) -> Result<(), FileSystemError> {
+        if volume.is_empty() || subsystem_nqn(volume).len() > MAX_NQN || volume.contains('\0') {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume name '{}' does not fit in an NQN",
                 volume
             )));
         }
-        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
+        Ok(())
+    }
+
+    /// Export `volume`, `size` bytes, with its I/O going to `io`.
+    pub fn add_export_io(
+        &self,
+        volume: &str,
+        size: u64,
+        io: Arc<dyn VolumeIo>,
+    ) -> Result<(), FileSystemError> {
+        Self::check_name(volume)?;
+        let nqn = subsystem_nqn(volume);
         let mut exports = self.target.exports.lock().unwrap();
         if exports.contains_key(&nqn) {
             return Err(FileSystemError::AlreadyExists);
         }
-        exports.insert(nqn, Arc::new(Export::new(volume, size)));
+        exports.insert(nqn, Arc::new(Export::new(volume, size, io)));
         Ok(())
+    }
+
+    /// The backend of `volume`'s export, to pause or switch it.
+    pub fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
+        let exports = self.target.exports.lock().unwrap();
+        Some(exports.get(&subsystem_nqn(volume))?.io.clone())
+    }
+
+    /// `volume`'s export for another node's proxy (see `crate::peer_io`):
+    /// its connections count as the export's, so removing it drains them.
+    pub fn peer_export(&self, volume: &str) -> Option<crate::peer_io::PeerExport> {
+        let export = self
+            .target
+            .exports
+            .lock()
+            .unwrap()
+            .get(&subsystem_nqn(volume))?
+            .clone();
+        Some(crate::peer_io::PeerExport {
+            size: export.nsze * LBA_SIZE,
+            io: export.io.clone(),
+            session: export.life.join()?,
+        })
     }
 
     /// Stop exporting `volume`: new connects are refused, its queues are
@@ -356,7 +405,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
             return Ok(false);
         };
         export.life.close(&format!("nvme: {}", nqn)).await;
-        self.target.fs.sync_for(volume).await?;
+        export.io.sync().await?;
         Ok(true)
     }
 
@@ -689,7 +738,7 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
         match &queue {
             None => Some(Completion::generic(SC_CMD_SEQ_ERROR)),
             Some(q) if q.qid == 0 => admin(conn, q, &sqe, &data),
-            Some(q) => Some(io(conn, q, &sqe, &data).await),
+            Some(q) => Some(io(q, &sqe, &data).await),
         }
     };
 
@@ -926,18 +975,12 @@ fn admin<D: BlockDevice>(
     })
 }
 
-async fn io<D: BlockDevice + Send + Sync + 'static>(
-    conn: &Conn<D>,
-    q: &QueueInfo,
-    sqe: &Sqe,
-    data: &[u8],
-) -> Completion {
+async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
     if sqe.nsid() != 1 {
         return Completion::generic(SC_INVALID_NS);
     }
     let export = &q.ctrl.export;
-    let fs = &conn.target.fs;
-    let name = &export.volume;
+    let io = &export.io;
 
     let range = |slba: u64, nlb: u64| -> Option<(u64, usize)> {
         let end = slba.checked_add(nlb)?;
@@ -964,7 +1007,7 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                         return Completion::generic(SC_INVALID_FIELD);
                     }
                     let mut buf = vec![0u8; len];
-                    match fs.block_read(name, offset, &mut buf).await {
+                    match io.read(offset, &mut buf).await {
                         Ok(_) => Completion::with_data(buf),
                         Err(e) => fail("read", e),
                     }
@@ -973,19 +1016,18 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                     if data.len() != len {
                         return Completion::generic(SC_DATA_XFER_ERROR);
                     }
-                    match fs.block_write(name, offset, data).await {
+                    match io.write(offset, data).await {
                         Ok(_) => Completion::ok(),
                         Err(e) => fail("write", e),
                     }
                 }
-                _ => match fs.block_zero(name, offset, len).await {
+                _ => match io.zero(offset, len).await {
                     Ok(_) => Completion::ok(),
                     Err(e) => fail("write zeroes", e),
                 },
             }
         }
-        // Through the intent log on a writer (see `crate::zil`).
-        IO_FLUSH => match fs.flush_for(name).await {
+        IO_FLUSH => match io.flush().await {
             Ok(()) => Completion::ok(),
             Err(e) => fail("flush", e),
         },
@@ -1004,7 +1046,7 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                     let Some((offset, len)) = range(le64(r, 8), nlb) else {
                         return Completion::generic(SC_LBA_RANGE);
                     };
-                    if let Err(e) = fs.block_zero(name, offset, len).await {
+                    if let Err(e) = io.zero(offset, len).await {
                         return fail("deallocate", e);
                     }
                 }

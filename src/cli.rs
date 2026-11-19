@@ -266,6 +266,15 @@ enum DatasetCommands {
 enum ClusterCommands {
     /// Show members, the leader and who holds which lease.
     Status,
+    /// Attach volume `volume` to these nodes at once (comma separated,
+    /// preferred writer first): each exports it, one writes it, the others
+    /// proxy to it; a writer taken off the list hands it to the next. No
+    /// nodes: back to its own placement.
+    Attach {
+        volume: String,
+        #[arg(long, value_delimiter = ',', default_value = "")]
+        nodes: Vec<String>,
+    },
 }
 
 impl Commands {
@@ -570,6 +579,10 @@ pub async fn main() -> std::io::Result<()> {
                 node: name.clone(),
                 pool: Default::default(),
                 restart: Default::default(),
+                migrate_uri: c.migrate_uri.clone(),
+                migrate_host: c.migrate_host.clone(),
+                migrate_timeout: c.migrate_timeout(),
+                migrate_tls: c.migrate_tls,
             })
         });
         let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
@@ -644,6 +657,12 @@ pub async fn main() -> std::io::Result<()> {
             agent = agent.with_events(events.clone());
             if let Some(vms) = &vms {
                 agent = agent.with_vms(vms.clone());
+            }
+            // Peer I/O (proxied exports, handoffs) is node-to-node TLS.
+            if let Some(tls) = &config.tls {
+                agent = agent
+                    .with_peer_io(tls)
+                    .unwrap_or_else(|e| fail(format!("peer I/O: {}", e)));
             }
             if let Some(services) = &config.services {
                 // Access keys come from tokens (see `crate::frontend::keys`),
@@ -777,6 +796,21 @@ pub async fn main() -> std::io::Result<()> {
                     .await
                     .unwrap_or_else(|e| fail(e));
                 print_cluster_status(&status);
+            }
+            ClusterCommands::Attach { volume, nodes } => {
+                let nodes: Vec<String> = nodes.iter().filter(|n| !n.is_empty()).cloned().collect();
+                let op = cluster::LeaseOp::SetAttached {
+                    volume: volume.clone(),
+                    nodes: nodes.clone(),
+                };
+                cluster::lease::LeaseClient::new(endpoints)
+                    .call(&op)
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                match nodes.is_empty() {
+                    true => println!("{}: placed as usual", volume),
+                    false => println!("{}: attached to {}", volume, nodes.join(", ")),
+                }
             }
         }
         return Ok(());
@@ -1597,5 +1631,8 @@ fn print_cluster_status(s: &cluster::Status) {
         if let Some(w) = &g.writer {
             println!("metaslab {:<5} lent to {} (epoch {})", idx, w, g.epoch);
         }
+    }
+    for (volume, nodes) in &s.state.attached {
+        println!("attached {} to {}", volume, nodes.join(", "));
     }
 }

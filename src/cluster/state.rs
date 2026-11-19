@@ -56,6 +56,20 @@ pub enum Request {
         owner: String,
         epoch: u64,
     },
+    /// Hand a lease straight to another owner: applied only if `from_owner`
+    /// holds the live `resource` lease at `from_epoch`. `to_owner` gets it at
+    /// a new epoch in the same step, so it's never free in between (a plain
+    /// release and acquire would let any other node take it), and the new
+    /// epoch fences whatever the old holder still tries to write.
+    Transfer {
+        resource: String,
+        from_owner: String,
+        from_epoch: u64,
+        to_owner: String,
+        to_desc: String,
+        ttl_ms: u64,
+        now_ms: u64,
+    },
     /// The NFSv4 state owner (the `nfs4` lease holder at `nfs_epoch`)
     /// records that NFSv4 client `client` (its owner string, hex) has
     /// state that may be reclaimed after a failover, or (`present: false`)
@@ -95,6 +109,18 @@ pub enum Request {
     /// The key S3/SQS access keys are derived with (see
     /// `crate::frontend::keys`): set once, by whichever node asks first.
     SetServiceKey { key: String },
+    /// The nodes volume `volume` is attached to (exported on), most
+    /// preferred writer first; empty: back to its own placement. Only
+    /// intent: who writes it is still its `ds/` lease (see `crate::agent`).
+    SetAttached { volume: String, nodes: Vec<String> },
+    /// Attach `volume` to `node` too (last in its list), or (`on: false`)
+    /// no longer: one node at a time, so callers attaching different nodes
+    /// at once (a CSI attacher) don't undo each other.
+    Attach {
+        volume: String,
+        node: String,
+        on: bool,
+    },
 }
 
 /// What applying a [`Request`] produced.
@@ -164,6 +190,10 @@ pub struct ClusterState {
     /// one. Secret: `crate::cluster::Cluster::status` leaves it out.
     #[serde(default)]
     pub service_key: Option<String>,
+    /// Volumes attached to several nodes at once (a live migration, a
+    /// multi-node block volume): name → nodes. Absent: placed as usual.
+    #[serde(default)]
+    pub attached: BTreeMap<String, Vec<String>>,
 }
 
 impl ClusterState {
@@ -324,6 +354,48 @@ impl ClusterState {
                 }
                 _ => Response::Lost,
             },
+            Request::Transfer {
+                resource,
+                from_owner,
+                from_epoch,
+                to_owner,
+                to_desc,
+                ttl_ms,
+                now_ms,
+            } => {
+                if to_owner.is_empty() || to_owner == from_owner {
+                    return Response::Refused("no new owner to transfer to".into());
+                }
+                if self.holds(resource, Some(from_owner), *from_epoch, *now_ms) {
+                    self.epoch += 1;
+                    let expires_ms = now_ms + ttl_ms;
+                    self.leases.insert(
+                        resource.clone(),
+                        Lease {
+                            owner: to_owner.clone(),
+                            desc: to_desc.clone(),
+                            epoch: self.epoch,
+                            expires_ms,
+                            released: false,
+                        },
+                    );
+                    return Response::Granted {
+                        epoch: self.epoch,
+                        expires_ms,
+                    };
+                }
+                match self.leases.get(resource) {
+                    // The same transfer again (clients send every request to
+                    // every node, see `LeaseClient::call`): it went through.
+                    Some(l) if l.owner == *to_owner && l.epoch > *from_epoch && l.live(*now_ms) => {
+                        Response::Granted {
+                            epoch: l.epoch,
+                            expires_ms: l.expires_ms,
+                        }
+                    }
+                    _ => Response::Lost,
+                }
+            }
             Request::NfsClient {
                 client,
                 present,
@@ -350,6 +422,32 @@ impl ClusterState {
                     self.vms.insert(name.clone(), *now_ms);
                 } else {
                     self.vms.remove(name);
+                }
+                Response::Recorded
+            }
+            Request::SetAttached { volume, nodes } => {
+                if nodes.is_empty() {
+                    self.attached.remove(volume);
+                } else {
+                    let mut seen = Vec::new();
+                    for n in nodes {
+                        if !seen.contains(n) {
+                            seen.push(n.clone());
+                        }
+                    }
+                    self.attached.insert(volume.clone(), seen);
+                }
+                Response::Recorded
+            }
+            Request::Attach { volume, node, on } => {
+                let nodes = self.attached.entry(volume.clone()).or_default();
+                match on {
+                    true if !nodes.contains(node) => nodes.push(node.clone()),
+                    true => {}
+                    false => nodes.retain(|n| n != node),
+                }
+                if nodes.is_empty() {
+                    self.attached.remove(volume);
                 }
                 Response::Recorded
             }

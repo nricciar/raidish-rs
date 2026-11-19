@@ -52,6 +52,24 @@ pub enum CertCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Issue host `name`'s libvirt certificate (TLS between nodes' libvirt
+    /// and for qemu's migration stream: live migration) into
+    /// `<dir>/libvirt/<name>/`, laid out as libvirt and qemu read theirs.
+    /// Copy its `etc` to `/` on that host.
+    Libvirt {
+        name: String,
+        /// Other host names or IP addresses its libvirt is reached by.
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        #[arg(long, default_value = "pki")]
+        dir: PathBuf,
+        /// Lifetime in days (default: never expires).
+        #[arg(long)]
+        days: Option<u32>,
+        /// Replace an existing certificate (rotation).
+        #[arg(long)]
+        force: bool,
+    },
     /// List the trusted CAs and every issued certificate, or show PEM files.
     Status {
         #[arg(long, default_value = "pki")]
@@ -138,6 +156,48 @@ pub fn run(command: &CertCommands, pool_paths: &PoolPaths) {
                 .unwrap_or_else(|e| fail(e));
             print_cert(&c);
             print_next(dir, name, *role);
+        }
+        CertCommands::Libvirt {
+            name,
+            sans,
+            dir,
+            days,
+            force,
+        } => {
+            let ca = Ca::load(dir).unwrap_or_else(|e| fail(e));
+            let c = ca
+                .issue_libvirt(name, sans, *days, *force)
+                .unwrap_or_else(|e| fail(e));
+            print_cert(&c);
+            let out = dir.join("libvirt").join(name);
+            println!();
+            println!(
+                "Wrote {}/etc/pki/{{CA,libvirt,qemu}}. On {}:",
+                out.display(),
+                name
+            );
+            println!(
+                "  tar -C {} -c etc | ssh root@{} tar -C / --no-same-owner -x",
+                out.display(),
+                name
+            );
+            println!("  # qemu reads its migration certificates as its own user:");
+            println!(
+                "  chgrp libvirt-qemu /etc/pki/qemu/*-key.pem && chmod 640 /etc/pki/qemu/*-key.pem"
+            );
+            println!("  # /etc/libvirt/qemu.conf: migrate_tls_x509_cert_dir = \"/etc/pki/qemu\"");
+            println!("  # /etc/libvirt/libvirtd.conf (only raidish's libvirt certs may connect):");
+            println!("  #   tls_allowed_dn_list = [\"*OU=libvirt*\"]");
+            println!(
+                "  # libvirtd's TLS socket (socket-activated libvirtd must be stopped to add it):"
+            );
+            println!(
+                "  systemctl stop libvirtd.service && systemctl enable --now libvirtd-tls.socket && systemctl start libvirtd"
+            );
+            println!(
+                "and in its raidish config: vm.migrate_uri qemu+tls://{}/system, vm.migrate_tls true",
+                name
+            );
         }
         CertCommands::IssueNodes { dir, days, force } => {
             let ca = Ca::load(dir).unwrap_or_else(|e| fail(e));

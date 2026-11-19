@@ -15,6 +15,11 @@
 //! `localhost` and `127.0.0.1`, because a node calls itself. All keys are
 //! ECDSA P-256, which browsers and rustls accept.
 //!
+//! `cert libvirt` issues a host's libvirt certificate (OU `libvirt`, which
+//! is no raidish role: it opens nothing of raidish's) laid out the way
+//! libvirtd and qemu read theirs, for TLS between nodes' libvirt and for
+//! qemu's migration stream (`<dir>/libvirt/<name>/etc/pki/...`).
+//!
 //! Certificates don't expire by default: they get the RFC 5280 "no
 //! well-defined expiration" date, 9999-12-31 23:59:59Z. Pass `days` to
 //! choose a lifetime.
@@ -372,6 +377,107 @@ impl Ca {
             false,
             true,
         )?;
+        inspect_der(cert.der())
+    }
+}
+
+/// Where `Ca::issue_libvirt` puts host `name`'s files, relative to the
+/// directory it writes (`<pki>/libvirt/<name>/`), and whether each is a
+/// key. The tree under it goes to `/` on that host.
+pub const LIBVIRT_FILES: &[(&str, bool)] = &[
+    ("etc/pki/CA/cacert.pem", false),
+    ("etc/pki/libvirt/servercert.pem", false),
+    ("etc/pki/libvirt/private/serverkey.pem", true),
+    ("etc/pki/libvirt/clientcert.pem", false),
+    ("etc/pki/libvirt/private/clientkey.pem", true),
+    ("etc/pki/qemu/ca-cert.pem", false),
+    ("etc/pki/qemu/server-cert.pem", false),
+    ("etc/pki/qemu/server-key.pem", true),
+    ("etc/pki/qemu/client-cert.pem", false),
+    ("etc/pki/qemu/client-key.pem", true),
+];
+
+impl Ca {
+    /// Issue host `name`'s libvirt certificate: server and client (libvirtd
+    /// takes connections and, migrating peer to peer, makes them; so does
+    /// qemu's migration stream), for `name` and `sans`, written under
+    /// `<dir>/libvirt/<name>/` as `LIBVIRT_FILES` lays out: copy its `etc`
+    /// to `/` on that host.
+    pub fn issue_libvirt(
+        &self,
+        name: &str,
+        sans: &[String],
+        days: Option<u32>,
+        force: bool,
+    ) -> Result<CertInfo, String> {
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return Err(format!("bad name '{}'", name));
+        }
+        let out = self.dir.join("libvirt").join(name);
+        let first = out.join(LIBVIRT_FILES[1].0);
+        if first.exists() && !force {
+            return Err(format!(
+                "{} already exists (pass --force to reissue)",
+                first.display()
+            ));
+        }
+        let mut alt: Vec<String> = Vec::new();
+        for s in std::iter::once(name).chain(sans.iter().map(|s| s.as_str())) {
+            if !alt.iter().any(|a| a == s) {
+                alt.push(s.to_string());
+            }
+        }
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(err)?;
+        params.subject_alt_names = alt
+            .iter()
+            .map(|s| match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Ok(SanType::IpAddress(ip)),
+                Err(_) => s.as_str().try_into().map(SanType::DnsName).map_err(err),
+            })
+            .collect::<Result<_, String>>()?;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, name);
+        dn.push(DnType::OrganizationalUnitName, "libvirt");
+        dn.push(DnType::OrganizationName, "raidish");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::ExplicitNoCa;
+        // gnutls (libvirt, qemu) wants KeyEncipherment on a server cert
+        // even for ECDSA keys it can't use it with.
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.use_authority_key_identifier_extension = true;
+        params.serial_number = Some(random_serial()?);
+        validity(&mut params, days);
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(err)?;
+        let cert = params.signed_by(&key, &self.cert, &self.key).map_err(err)?;
+        let ca = read(&Self::bundle_path(&self.dir))?;
+        let (cert_pem, key_pem) = (cert.pem(), key.serialize_pem());
+        for (path, secret) in LIBVIRT_FILES {
+            let is_ca = path.ends_with("/cacert.pem") || path.ends_with("/ca-cert.pem");
+            let body = match (*secret, is_ca) {
+                (true, _) => &key_pem,
+                (false, true) => &ca,
+                (false, false) => &cert_pem,
+            };
+            write_file(&out.join(path), body, *secret, true)?;
+        }
+        // The tree is unpacked as is on the host: its directories must be
+        // the 0755 /etc/pki's are, whatever this umask made them.
+        #[cfg(unix)]
+        for (path, _) in LIBVIRT_FILES {
+            use std::os::unix::fs::PermissionsExt;
+            let mut d = out.join(path);
+            while d.pop() && d != out {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755))
+                    .map_err(err)?;
+            }
+        }
         inspect_der(cert.der())
     }
 }

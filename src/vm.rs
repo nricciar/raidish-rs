@@ -62,6 +62,21 @@ pub struct VmConfig {
     /// to for the dashboard's console (default 127.0.0.1). Unpassworded:
     /// keep it on an address only this node can reach.
     pub console_listen: Option<String>,
+    /// How other nodes' libvirt reaches this node's, for live migrations
+    /// to here (`qemu+tls://node1/system`). Absent: VMs moved here move
+    /// cold (shut down, started again).
+    pub migrate_uri: Option<String>,
+    /// Where qemu's migration stream to this node connects (default:
+    /// libvirt's choice, this host's name).
+    pub migrate_host: Option<String>,
+    /// How long a live migration from this node may take before it's
+    /// aborted (default 300).
+    pub migrate_timeout_s: Option<u64>,
+    /// Migrations to this node send their qemu stream over TLS (qemu's
+    /// `migrate_tls_x509_cert_dir` certificates; see `raidish cert
+    /// libvirt`).
+    #[serde(default)]
+    pub migrate_tls: bool,
 }
 
 impl VmConfig {
@@ -79,6 +94,9 @@ impl VmConfig {
     }
     pub fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.shutdown_timeout_s.unwrap_or(60))
+    }
+    pub fn migrate_timeout(&self) -> Duration {
+        Duration::from_secs(self.migrate_timeout_s.unwrap_or(300))
     }
     pub fn virsh(&self) -> Virsh {
         Virsh {
@@ -106,6 +124,31 @@ pub struct VmRuntime {
     /// VMs to shut down (destroyed after the timeout) and start again from
     /// their current XML.
     pub restart: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// See `VmConfig::migrate_uri`, `migrate_host`, `migrate_timeout_s`.
+    pub migrate_uri: Option<String>,
+    pub migrate_host: Option<String>,
+    pub migrate_timeout: Duration,
+    pub migrate_tls: bool,
+}
+
+/// How a node that takes a live migration is reached, as it answers
+/// `POST /api/v1/vm/incoming/<name>` (see `crate::agent`'s migrations).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Incoming {
+    /// Its libvirt, from the source's libvirt (`virsh migrate` p2p).
+    pub uri: String,
+    /// Where qemu's migration stream connects, if not libvirt's choice.
+    pub migrate_host: Option<String>,
+    /// Send qemu's migration stream over TLS.
+    #[serde(default)]
+    pub tls: bool,
+    /// Where its qemu finds its NBD exports.
+    pub nbd_host: String,
+    pub nbd_port: u16,
+    /// Its VNC console address.
+    pub console: String,
+    /// Its name.
+    pub node: String,
 }
 
 /// Whose domains are whose (see `DomMeta::pool`).
@@ -842,18 +885,15 @@ pub fn render(
     // Metadata: ours only, right after the name.
     root.remove("metadata");
     let mut meta = El::new("metadata", &[]);
-    meta.kids.push(Node::El(El::new(
-        "raidish:vm",
-        &[
-            ("xmlns:raidish", META_NS),
-            ("anchor", &spec.anchor),
-            ("volumes", &spec.volumes.join(",")),
-            ("change", &spec.change.to_string()),
-            ("owner", owner),
-            ("pool", &ident.pool),
-            ("node", &ident.node),
-        ],
-    )));
+    meta.kids.push(Node::El(meta_el(&DomMeta {
+        anchor: spec.anchor.clone(),
+        volumes: spec.volumes.clone(),
+        change: spec.change,
+        owner: owner.to_string(),
+        pool: ident.pool.clone(),
+        node: ident.node.clone(),
+        migrating: false,
+    })));
     let at = root
         .kids
         .iter()
@@ -958,6 +998,38 @@ pub struct DomMeta {
     pub pool: String,
     #[serde(default)]
     pub node: String,
+    /// Migrated in, not yet re-stamped by the node it went to (see
+    /// `crate::agent`'s migrations): its `owner` isn't set yet.
+    #[serde(default)]
+    pub migrating: bool,
+}
+
+/// raidish's metadata element for `m`.
+fn meta_el(m: &DomMeta) -> El {
+    let volumes = m.volumes.join(",");
+    let change = m.change.to_string();
+    let mut attrs = vec![
+        ("xmlns:raidish", META_NS),
+        ("anchor", m.anchor.as_str()),
+        ("volumes", volumes.as_str()),
+        ("change", change.as_str()),
+        ("owner", m.owner.as_str()),
+        ("pool", m.pool.as_str()),
+        ("node", m.node.as_str()),
+    ];
+    if m.migrating {
+        attrs.push(("migrating", "1"));
+    }
+    El::new("raidish:vm", &attrs)
+}
+
+/// The metadata `virsh metadata --set` is given for `m`: unprefixed, no
+/// namespace declaration (libvirt puts it in `--uri`'s, as `--key`).
+pub fn meta_xml(m: &DomMeta) -> String {
+    let mut el = meta_el(m);
+    el.name = "vm".into();
+    el.attrs.retain(|(k, _)| k != "xmlns:raidish");
+    to_string(&el)
 }
 
 fn parse_meta(xml: &str) -> Option<DomMeta> {
@@ -978,7 +1050,86 @@ fn parse_meta(xml: &str) -> Option<DomMeta> {
         owner: el.attr("owner").unwrap_or_default().to_string(),
         pool: el.attr("pool").unwrap_or_default().to_string(),
         node: el.attr("node").unwrap_or_default().to_string(),
+        migrating: el.attr("migrating") == Some("1"),
     })
+}
+
+/// A running domain's migratable XML (`virsh dumpxml --migratable`) made
+/// fit for node `to`: its raidish (NBD) disks pointed at `to`'s exports,
+/// its VNC console on `to`'s address, and raidish's metadata `meta`.
+/// Nothing else changes (the UUID and device addresses libvirt's ABI check
+/// compares stay as they are).
+pub fn retarget(xml: &str, to: &Incoming, meta: &DomMeta) -> Result<String, String> {
+    let mut root = parse_domain(xml)?;
+    let port = to.nbd_port.to_string();
+    let md = match root.child_mut("metadata") {
+        Some(m) => m,
+        None => {
+            let at = root
+                .kids
+                .iter()
+                .position(|k| matches!(k, Node::El(e) if e.name == "name"))
+                .map_or(0, |i| i + 1);
+            root.kids.insert(at, Node::El(El::new("metadata", &[])));
+            root.child_mut("metadata").unwrap()
+        }
+    };
+    md.kids
+        .retain(|k| !matches!(k, Node::El(e) if e.local() == "vm"));
+    md.kids.push(Node::El(meta_el(meta)));
+    let devices = root.child_mut("devices").ok_or("no <devices>")?;
+    let mut disks = 0;
+    for k in devices.kids.iter_mut() {
+        let Node::El(d) = k else { continue };
+        match d.name.as_str() {
+            "disk" if d.attr("type") == Some("network") => {
+                let Some(src) = d.child_mut("source") else {
+                    continue;
+                };
+                if src.attr("protocol") != Some("nbd") {
+                    continue;
+                }
+                src.kids
+                    .retain(|k| !matches!(k, Node::El(e) if e.name == "host"));
+                src.kids.insert(
+                    0,
+                    Node::El(El::new(
+                        "host",
+                        &[("name", to.nbd_host.as_str()), ("port", port.as_str())],
+                    )),
+                );
+                disks += 1;
+            }
+            "graphics" if d.attr("type") == Some("vnc") => {
+                for (k, v) in d.attrs.iter_mut() {
+                    if k == "listen" {
+                        *v = to.console.clone();
+                    }
+                }
+                for l in d.kids.iter_mut() {
+                    if let Node::El(l) = l
+                        && l.name == "listen"
+                        && l.attr("type") == Some("address")
+                    {
+                        for (k, v) in l.attrs.iter_mut() {
+                            if k == "address" {
+                                *v = to.console.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if disks != meta.volumes.len() {
+        return Err(format!(
+            "found {} NBD disks, the VM has {} volumes",
+            disks,
+            meta.volumes.len()
+        ));
+    }
+    Ok(to_string(&root))
 }
 
 // ---- virsh ----------------------------------------------------------------
@@ -1070,6 +1221,66 @@ impl Virsh {
     }
     pub async fn reset(&self, name: &str) -> Result<(), String> {
         self.run(&["reset", name]).await.map(|_| ())
+    }
+
+    /// A running domain's XML as it can be migrated.
+    pub async fn dumpxml_migratable(&self, name: &str) -> Result<String, String> {
+        self.run(&["dumpxml", "--migratable", name]).await
+    }
+
+    /// Replace raidish's metadata on running domain `name`.
+    pub async fn set_meta(&self, name: &str, meta: &DomMeta) -> Result<(), String> {
+        self.run(&[
+            "metadata",
+            name,
+            "--uri",
+            META_NS,
+            "--key",
+            "raidish",
+            "--set",
+            &meta_xml(meta),
+            "--live",
+        ])
+        .await
+        .map(|_| ())
+    }
+
+    /// Live-migrate `name` to `to`'s libvirt (peer to peer) as `xml`;
+    /// aborted after `timeout`.
+    pub async fn migrate(
+        &self,
+        name: &str,
+        xml: &str,
+        to: &Incoming,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let (uri, host) = (to.uri.as_str(), to.migrate_host.as_deref());
+        let path = std::env::temp_dir().join(format!(
+            "raidish-migrate-{}-{}.xml",
+            name,
+            std::process::id()
+        ));
+        tokio::fs::write(&path, xml)
+            .await
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        let path_s = path.to_string_lossy().into_owned();
+        let migrateuri = host.map(|h| format!("tcp://{}", h));
+        let mut args = vec!["migrate", "--live", "--p2p", "--xml", &path_s, name, uri];
+        if let Some(m) = &migrateuri {
+            args.extend(["--migrateuri", m.as_str()]);
+        }
+        if to.tls {
+            args.push("--tls");
+        }
+        let r = tokio::time::timeout(timeout, self.run(&args)).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        match r {
+            Ok(r) => r.map(|_| ()),
+            Err(_) => {
+                let _ = self.run(&["domjobabort", name]).await;
+                Err(format!("didn't finish in {:?}; aborted", timeout))
+            }
+        }
     }
 
     pub async fn vnc_port(&self, name: &str) -> Option<u16> {

@@ -709,3 +709,224 @@ async fn a_held_lease_nobody_holds_any_more_is_given_back() {
     assert!(b.epoch > epoch);
     stop_node(&node).await;
 }
+
+fn transfer(from: &str, from_epoch: u64, to: &str, now_ms: u64) -> Request {
+    Request::Transfer {
+        resource: POOL.into(),
+        from_owner: from.into(),
+        from_epoch,
+        to_owner: to.into(),
+        to_desc: format!("test {}", to),
+        ttl_ms: 100,
+        now_ms,
+    }
+}
+
+#[test]
+fn transfer_hands_a_lease_over_at_a_new_epoch() {
+    let mut s = ClusterState::default();
+    s.apply(&acquire("a", 0, 100));
+    assert_eq!(
+        s.apply(&transfer("a", 1, "b", 50)),
+        Response::Granted {
+            epoch: 2,
+            expires_ms: 150
+        }
+    );
+    // b holds it now, at the new epoch (which fences a).
+    assert_eq!(s.pool_epoch(), 2);
+    assert!(s.holds(POOL, Some("b"), 2, 60));
+    assert_eq!(s.leases[POOL].desc, "test b");
+    // a's renewals and release are refused; b renews.
+    assert_eq!(s.apply(&renew("a", 1, 60, 100)), Response::Lost);
+    assert_eq!(
+        s.apply(&Request::Release {
+            resource: POOL.into(),
+            owner: "a".into(),
+            epoch: 1
+        }),
+        Response::Lost
+    );
+    assert!(s.holds(POOL, Some("b"), 2, 60));
+    assert!(matches!(
+        s.apply(&renew("b", 2, 60, 100)),
+        Response::Granted { epoch: 2, .. }
+    ));
+    // Nobody else can take it while b's is live.
+    assert!(
+        matches!(s.apply(&acquire("c", 70, 100)), Response::Held { ref owner, .. } if owner == "b")
+    );
+}
+
+#[test]
+fn transfer_repeated_is_the_same_transfer() {
+    let mut s = ClusterState::default();
+    s.apply(&acquire("a", 0, 100));
+    let first = s.apply(&transfer("a", 1, "b", 50));
+    // The duplicate a client sends to another node lands after it.
+    assert_eq!(s.apply(&transfer("a", 1, "b", 51)), first);
+    assert_eq!(s.pool_epoch(), 2);
+    // But not once b's lease is gone: then it's just refused.
+    assert_eq!(s.apply(&transfer("a", 1, "b", 500)), Response::Lost);
+}
+
+#[test]
+fn transfer_needs_the_live_lease() {
+    let mut s = ClusterState::default();
+    s.apply(&acquire("a", 0, 100));
+    // Wrong epoch, wrong owner, to itself, to nobody.
+    assert_eq!(s.apply(&transfer("a", 7, "b", 50)), Response::Lost);
+    assert_eq!(s.apply(&transfer("x", 1, "b", 50)), Response::Lost);
+    assert!(matches!(
+        s.apply(&transfer("a", 1, "a", 50)),
+        Response::Refused(_)
+    ));
+    assert!(matches!(
+        s.apply(&transfer("a", 1, "", 50)),
+        Response::Refused(_)
+    ));
+    // Expired (even though nobody took it, unlike a renewal): refused, the
+    // receiver might have assumed it was free to wait out.
+    assert_eq!(s.apply(&transfer("a", 1, "b", 150)), Response::Lost);
+    // Released: refused.
+    s.apply(&acquire("a", 200, 100));
+    let e = s.pool_epoch();
+    s.apply(&Request::Release {
+        resource: POOL.into(),
+        owner: "a".into(),
+        epoch: e,
+    });
+    assert_eq!(s.apply(&transfer("a", e, "b", 210)), Response::Lost);
+    // Nothing changed hands in any of it.
+    assert_eq!(s.pool_epoch(), e);
+    assert_eq!(s.leases[POOL].owner, "a");
+}
+
+/// A held lease, renewing in the background, is handed to another owner
+/// through a real cluster: the old holder stops renewing without counting
+/// it as lost, the new one renews it, and nobody else can take it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_lease_transfers_without_being_lost() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let nodes = vec![
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+        start_node("n3", &pool, ports[2], dir.path()).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(wait_until(10, || leader_of(&all).is_some()).await);
+    let client = LeaseClient::new(nodes.iter().map(|n| n.url.clone()).collect());
+
+    let a = Arc::new(
+        HeldLease::acquire(client.clone(), "ds/vol", "agent a")
+            .await
+            .unwrap(),
+    );
+    let a_lost = Arc::new(AtomicBool::new(false));
+    let flag = a_lost.clone();
+    a.hold(move |_| flag.store(true, Ordering::SeqCst));
+    // Let a renew a couple of times first.
+    tokio::time::sleep(lease::LEASE_TTL / 2).await;
+
+    let b_owner = lease::owner_id() + ":b";
+    let asked = std::time::Instant::now();
+    let epoch = a.transfer(&b_owner, "agent b").await.unwrap();
+    assert!(epoch > a.epoch);
+    // (A repeated transfer is `transfer_repeated_is_the_same_transfer`.)
+    // Having let go, the old holder can't transfer it again.
+    let b = Arc::new(HeldLease::adopt(
+        client.clone(),
+        "ds/vol",
+        &b_owner,
+        epoch,
+        asked,
+    ));
+    assert!(a.transfer("someone else", "x").await.is_err());
+    let b_lost = Arc::new(AtomicBool::new(false));
+    let flag = b_lost.clone();
+    b.hold(move |_| flag.store(true, Ordering::SeqCst));
+
+    // Past a whole TTL: b kept it alive, a never thought it lost it.
+    tokio::time::sleep(lease::LEASE_TTL + std::time::Duration::from_secs(1)).await;
+    assert!(
+        !a_lost.load(Ordering::SeqCst),
+        "the old holder saw a lost lease"
+    );
+    assert!(!b_lost.load(Ordering::SeqCst), "the new holder lost it");
+    assert!(b.fresh());
+    let status = client.status().await.unwrap();
+    let l = &status.state.leases["ds/vol"];
+    assert_eq!(
+        (l.owner.as_str(), l.epoch, l.desc.as_str()),
+        (b_owner.as_str(), epoch, "agent b")
+    );
+    assert!(!l.released);
+    let err = HeldLease::acquire(client.clone(), "ds/vol", "agent c")
+        .await
+        .err()
+        .unwrap();
+    assert!(err.contains("agent b"), "{}", err);
+
+    // Dropping a's handle (it let go) leaves b's lease alone.
+    drop(a);
+    tokio::time::sleep(lease::LEASE_TTL / 2).await;
+    let status = client.status().await.unwrap();
+    assert!(
+        status
+            .state
+            .holds("ds/vol", Some(&b_owner), epoch, crate::cluster::now_ms())
+    );
+
+    for n in &nodes {
+        stop_node(n).await;
+    }
+}
+
+#[test]
+fn attached_sets_are_intent_kept_in_order() {
+    let mut s = ClusterState::default();
+    let set = |nodes: &[&str]| Request::SetAttached {
+        volume: "vol".into(),
+        nodes: nodes.iter().map(|n| n.to_string()).collect(),
+    };
+    assert_eq!(
+        s.apply(&set(&["node-1", "node-2", "node-1"])),
+        Response::Recorded
+    );
+    assert_eq!(s.attached["vol"], vec!["node-1", "node-2"]);
+    s.apply(&set(&["node-2"]));
+    assert_eq!(s.attached["vol"], vec!["node-2"]);
+    s.apply(&set(&[]));
+    assert!(s.attached.is_empty());
+    // A state from before attachments existed still reads.
+    let old = r#"{"epoch":3,"leases":{}}"#;
+    let st: ClusterState = serde_json::from_str(old).unwrap();
+    assert!(st.attached.is_empty());
+}
+
+#[test]
+fn nodes_attach_and_detach_one_at_a_time() {
+    let mut s = ClusterState::default();
+    let at = |node: &str, on: bool| Request::Attach {
+        volume: "vol".into(),
+        node: node.into(),
+        on,
+    };
+    s.apply(&at("node-1", true));
+    s.apply(&at("node-2", true));
+    // Sent to every endpoint: applying it twice changes nothing.
+    s.apply(&at("node-2", true));
+    assert_eq!(s.attached["vol"], vec!["node-1", "node-2"]);
+    s.apply(&at("node-1", false));
+    s.apply(&at("node-1", false));
+    assert_eq!(s.attached["vol"], vec!["node-2"]);
+    s.apply(&at("node-2", false));
+    assert!(s.attached.is_empty());
+    // Detaching from nothing leaves nothing behind.
+    s.apply(&at("node-0", false));
+    assert!(s.attached.is_empty());
+}

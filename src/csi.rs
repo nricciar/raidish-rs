@@ -16,16 +16,29 @@
 //!   and enables it. That node's agent takes the volume's `ds/` lease and
 //!   attaches it over NVMe/TCP. Since the list names only that node, the
 //!   volume never fails over somewhere its pod isn't.
-//! * ControllerUnpublishVolume disables it, and waits for the lease to be
-//!   let go (or to expire, if that node is dead).
+//! * ControllerUnpublishVolume disables it, and waits for that node to let
+//!   the lease go (or for it to expire, if that node is dead).
 //! * NodeStageVolume waits for this node's agent to report the device,
 //!   formats it if it's blank and mounts it at the staging path;
-//!   NodePublishVolume bind-mounts that into the pod.
+//!   NodePublishVolume bind-mounts that into the pod. A raw block volume
+//!   (`volumeMode: Block`) skips staging: NodePublishVolume bind-mounts the
+//!   device itself onto the file kubelet hands it.
 //!
-//! Volumes are single-node (ReadWriteOnce / ReadWriteOncePod). Kubernetes'
-//! attach/detach controller won't publish one to a second node while it's
-//! still published to another, and the `ds/` lease would refuse a second
-//! writer anyway.
+//! A filesystem volume is single-node (ReadWriteOnce / ReadWriteOncePod):
+//! Kubernetes' attach/detach controller won't publish one to a second node
+//! while it's still published to another, and the `ds/` lease would refuse
+//! a second writer anyway.
+//!
+//! A raw block volume may also be ReadWriteMany (MULTI_NODE_MULTI_WRITER),
+//! for a VM's disk while it migrates between nodes. ControllerPublishVolume
+//! then attaches it to the node as well (`ClusterState::attached`, one node
+//! at a time) instead of replacing its node, and ControllerUnpublishVolume
+//! detaches it from just that node. Every attached node exports it and
+//! attaches its device: one writes it, the others proxy their I/O to that
+//! one, and when the writer's node is detached it hands the volume to
+//! another attached node with no I/O lost (see `crate::agent::handoff`).
+//! That needs peer I/O (every node with TLS); without it, the volume runs
+//! on its first node only and the others never see a device.
 
 pub mod pb {
     #![allow(clippy::all, dead_code)]
@@ -96,7 +109,15 @@ fn valid_name(name: &str) -> Result<(), Status> {
     }
 }
 
-/// Access modes we can honour: one node at a time.
+/// Whether `cap` asks for a volume on several nodes at once.
+fn multi_node(cap: &pb::VolumeCapability) -> bool {
+    cap.access_mode
+        .map(|m| Mode::try_from(m.mode).unwrap_or(Mode::Unknown))
+        == Some(Mode::MultiNodeMultiWriter)
+}
+
+/// Access modes we can honour: one node at a time, or (raw block only)
+/// several, each exporting it and one of them writing it.
 fn supported(cap: &pb::VolumeCapability) -> Result<(), String> {
     let mode = cap
         .access_mode
@@ -107,9 +128,20 @@ fn supported(cap: &pb::VolumeCapability) -> Result<(), String> {
         | Mode::SingleNodeReaderOnly
         | Mode::SingleNodeSingleWriter
         | Mode::SingleNodeMultiWriter => {}
+        Mode::MultiNodeMultiWriter => {
+            // A filesystem mounted on two nodes at once would be torn up:
+            // only a raw device (a VM's disk moving between nodes) is.
+            if !matches!(cap.access_type, Some(AccessType::Block(_))) {
+                return Err(format!(
+                    "access mode {} is for raw block volumes only (volumeMode: Block)",
+                    mode.as_str_name()
+                ));
+            }
+        }
         m => {
             return Err(format!(
-                "access mode {} isn't supported (single node only)",
+                "access mode {} isn't supported (single node, or multi-node \
+                 multi-writer raw block)",
                 m.as_str_name()
             ));
         }
@@ -169,6 +201,72 @@ async fn unmount(path: &str) -> Result<(), Status> {
 }
 
 impl Driver {
+    fn leases(&self) -> crate::cluster::lease::LeaseClient {
+        crate::cluster::lease::LeaseClient::new(self.endpoints.clone())
+    }
+
+    /// The nodes `name` is attached to (see `ClusterState::attached`).
+    async fn attached(&self, name: &str) -> Result<Vec<String>, Status> {
+        let status = self.leases().status().await.map_err(Status::unavailable)?;
+        Ok(status.state.attached.get(name).cloned().unwrap_or_default())
+    }
+
+    /// Attach `name` to `node` too, or no longer.
+    async fn attach(&self, name: &str, node: &str, on: bool) -> Result<(), Status> {
+        let op = crate::cluster::LeaseOp::Attach {
+            volume: name.to_string(),
+            node: node.to_string(),
+            on,
+        };
+        self.leases()
+            .call(&op)
+            .await
+            .map(|_| ())
+            .map_err(Status::unavailable)
+    }
+
+    /// Publish `v` to `node` as well as wherever else it's published: a
+    /// multi-node raw block volume. Every node it's attached to exports it;
+    /// one of them writes it and the others proxy to that one, and the
+    /// writer hands it over (connections and all) when it's unpublished
+    /// there (see `crate::agent`).
+    async fn publish_shared(
+        &self,
+        v: &crate::volume::VolumeInfo,
+        node: &str,
+    ) -> Result<(), Status> {
+        let attached = self.attached(&v.name).await?;
+        let mut props = v.props.clone();
+        let running = props.enabled && props.automount.is_some();
+        // Published to one node (before it was asked for on several): that
+        // node stays first, its writer.
+        if attached.is_empty()
+            && running
+            && let Some(first) = props.nodes.first()
+            && first != node
+        {
+            self.attach(&v.name, first, true).await?;
+        }
+        if !attached.iter().any(|n| n == node) {
+            println!("csi: attaching volume '{}' to {} too", v.name, node);
+            self.attach(&v.name, node, true).await?;
+        }
+        if !running || props.automount != Some(Transport::Nvme) {
+            if !running {
+                props.nodes = vec![node.to_string()];
+            }
+            props.automount = Some(Transport::Nvme);
+            props.enabled = true;
+            props.move_to = None;
+            println!("csi: publishing volume '{}' to {}", v.name, node);
+            self.committer
+                .set_props(&v.name, &props)
+                .await
+                .map_err(commit_status)?;
+        }
+        Ok(())
+    }
+
     async fn volume(&self, name: &str) -> Result<Option<crate::volume::VolumeInfo>, Status> {
         let vols = self.committer.volumes().await.map_err(commit_status)?;
         Ok(vols.into_iter().find(|v| v.name == name))
@@ -358,6 +456,18 @@ impl Controller for Driver {
         let Some(v) = self.volume(&req.volume_id).await? else {
             return Err(Status::not_found(format!("no volume '{}'", req.volume_id)));
         };
+        if req.volume_capability.as_ref().is_some_and(multi_node) {
+            self.publish_shared(&v, &req.node_id).await?;
+            return Ok(Response::new(Default::default()));
+        }
+        let attached = self.attached(&req.volume_id).await?;
+        if !attached.is_empty() && attached != [req.node_id.clone()] {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' is published to {}",
+                req.volume_id,
+                attached.join(",")
+            )));
+        }
         let mut props = v.props.clone();
         let want = vec![req.node_id.clone()];
         if props.enabled && props.automount == Some(Transport::Nvme) && props.nodes == want {
@@ -398,8 +508,19 @@ impl Controller for Driver {
         let Some(v) = self.volume(&req.volume_id).await? else {
             return Ok(Response::new(Default::default())); // gone: nothing to undo
         };
-        let mine = req.node_id.is_empty() || v.props.nodes == [req.node_id.clone()];
-        if mine && v.props.enabled {
+        let attached = self.attached(&req.volume_id).await?;
+        let shared = attached.contains(&req.node_id);
+        // Unpublished from the last of several nodes, or from its one node.
+        let last = match shared {
+            true => attached.len() == 1,
+            false => {
+                attached.is_empty()
+                    && (req.node_id.is_empty() || v.props.nodes == [req.node_id.clone()])
+            }
+        };
+        // Stopped before it's detached from its last node: detached first,
+        // it would fall back to its own placement and start somewhere.
+        if last && v.props.enabled {
             let mut props = v.props.clone();
             props.enabled = false;
             println!(
@@ -410,6 +531,15 @@ impl Controller for Driver {
                 .set_props(&req.volume_id, &props)
                 .await
                 .map_err(commit_status)?;
+        }
+        // Still published elsewhere: if this node writes it, it hands it to
+        // one of them.
+        if shared {
+            println!(
+                "csi: detaching volume '{}' from {}",
+                req.volume_id, req.node_id
+            );
+            self.attach(&req.volume_id, &req.node_id, false).await?;
         }
         // Done once nobody (or not that node) runs it any more.
         let start = Instant::now();
@@ -738,6 +868,26 @@ impl Node for Driver {
         if !is_mounted(&path).await {
             return Err(Status::not_found(format!("{} isn't mounted", path)));
         }
+        use pb::volume_usage::Unit;
+        // A raw block volume is published as the device itself: its size is
+        // all there is to report (df would describe the /dev it came from).
+        use std::os::unix::fs::FileTypeExt;
+        if std::fs::metadata(&path).is_ok_and(|m| m.file_type().is_block_device()) {
+            let out = run("blockdev", &["--getsize64", &path])
+                .await
+                .map_err(Status::internal)?;
+            let total: i64 = out
+                .trim()
+                .parse()
+                .map_err(|_| Status::internal(format!("blockdev: {}", out)))?;
+            return Ok(Response::new(pb::NodeGetVolumeStatsResponse {
+                usage: vec![pb::VolumeUsage {
+                    total,
+                    unit: Unit::Bytes as i32,
+                    ..Default::default()
+                }],
+            }));
+        }
         let out = run(
             "df",
             &["-B1", "--output=size,used,avail,itotal,iused,iavail", &path],
@@ -754,7 +904,6 @@ impl Node for Driver {
         if n.len() != 6 {
             return Err(Status::internal(format!("df: {}", out)));
         }
-        use pb::volume_usage::Unit;
         Ok(Response::new(pb::NodeGetVolumeStatsResponse {
             usage: vec![
                 pb::VolumeUsage {
@@ -858,3 +1007,7 @@ pub async fn serve(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[path = "tests/csi_tests.rs"]
+mod tests;

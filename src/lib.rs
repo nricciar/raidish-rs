@@ -65,6 +65,8 @@ mod nvme;
 mod object;
 pub mod open_file;
 #[cfg(not(target_arch = "wasm32"))]
+mod peer_io;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pki;
 mod raidz;
 mod rt;
@@ -93,6 +95,8 @@ pub mod vm_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod vms_api;
 mod volume;
+#[cfg(not(target_arch = "wasm32"))]
+mod volume_io;
 #[cfg(not(target_arch = "wasm32"))]
 mod volumes_api;
 pub mod websocket;

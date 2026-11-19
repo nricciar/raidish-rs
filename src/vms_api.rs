@@ -15,7 +15,8 @@
 //! * `POST /api/v1/vms/<name>/start` / `stop`: should (not) run; the node
 //!   with its disks acts on it.
 //! * `POST /api/v1/vms/<name>/move` (`{"node"}`): move its disks, and so the
-//!   VM (shut down here, started there).
+//!   VM: migrated live if both nodes can (see `crate::agent`'s
+//!   migrations), else shut down here and started there.
 //! * `POST /api/v1/vms/<name>/<reboot|reset|restart|kill>`: on its node.
 //!   `restart` shuts it down and lets it start again from the current
 //!   XML; `kill` stops it at once (destroy).
@@ -24,6 +25,10 @@
 //!   the VM passes the connection on to the one with it.
 //! * `GET /api/v1/vm/local`, `POST /api/v1/vm/local/<name>/<action>`: this
 //!   node's libvirt, for the above.
+//! * `POST /api/v1/vm/incoming/<name>` (nodes only): ready for VM `name`
+//!   to migrate here? 409 until every one of its volumes is exported here
+//!   (proxied to the node it runs on), then how to reach this node; 422 if
+//!   it never will be (no VMs here, or no `vm.migrate_uri`).
 
 use crate::cluster::{Cluster, LeaseOp};
 use crate::committer::PutVm;
@@ -668,8 +673,69 @@ async fn bridge_ws(stream: ws::stream::DuplexStream, url: String) -> ws::result:
     }
 }
 
+/// Is this node ready for VM `name` to migrate here (see the module doc)?
+#[post("/api/v1/vm/incoming/<name>")]
+async fn incoming(
+    _node: crate::auth::IsNode,
+    name: &str,
+    st: &State<VmsState>,
+    volumes: &State<VolumesState>,
+    agent: &State<crate::agent::AgentState>,
+) -> Result<Json<crate::vm::Incoming>, ApiError> {
+    let not_yet = |m: String| (Status::Conflict, m);
+    let never = |m: &str| (Status::UnprocessableEntity, m.to_string());
+    let rt = st
+        .runtime
+        .as_ref()
+        .ok_or_else(|| never("this node runs no VMs"))?;
+    let uri = rt
+        .migrate_uri
+        .clone()
+        .ok_or_else(|| never("this node takes no live migrations (no vm.migrate_uri)"))?;
+    if rt.ident().is_none() {
+        return Err(not_yet("the pool isn't open here yet".into()));
+    }
+    let spec = spec(volumes, name).await?;
+    if !spec.usable() {
+        return Err(bad(spec.error.unwrap_or_default()));
+    }
+    let proxied: Vec<String> = agent
+        .read()
+        .unwrap()
+        .volumes
+        .iter()
+        .filter(|v| v.proxied && v.transport == crate::inode::Transport::Nbd)
+        .map(|v| v.name.clone())
+        .collect();
+    let missing: Vec<&String> = spec
+        .volumes
+        .iter()
+        .filter(|v| !proxied.contains(v))
+        .collect();
+    if !missing.is_empty() {
+        return Err(not_yet(format!(
+            "not exported here yet: {}",
+            missing
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(Json(crate::vm::Incoming {
+        uri,
+        migrate_host: rt.migrate_host.clone(),
+        tls: rt.migrate_tls,
+        nbd_host: rt.nbd.0.clone(),
+        nbd_port: rt.nbd.1,
+        console: rt.console.clone(),
+        node: rt.node.clone(),
+    }))
+}
+
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
+        incoming,
         local,
         local_action,
         list,

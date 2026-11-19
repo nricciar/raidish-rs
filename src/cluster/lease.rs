@@ -115,6 +115,9 @@ pub struct HeldLease {
     pub epoch: u64,
     /// Set by `release`: the renew loop stops quietly.
     released: std::sync::atomic::AtomicBool,
+    /// Set while `transfer` is in flight: a renewal refused meanwhile (the
+    /// transfer went through first) isn't a lost lease.
+    handing_off: std::sync::atomic::AtomicBool,
     /// When the last successful grant or renewal was *sent* (the lease is
     /// good for a TTL from then, at the earliest).
     renewed: std::sync::Mutex<Instant>,
@@ -136,14 +139,9 @@ impl HeldLease {
             ttl_ms: LEASE_TTL.as_millis() as u64,
         };
         match client.call(&op).await? {
-            Response::Granted { epoch, .. } => Ok(HeldLease {
-                client,
-                resource: resource.into(),
-                owner,
-                epoch,
-                released: Default::default(),
-                renewed: std::sync::Mutex::new(sent),
-            }),
+            Response::Granted { epoch, .. } => {
+                Ok(HeldLease::adopt(client, resource, &owner, epoch, sent))
+            }
             Response::Held {
                 owner,
                 desc,
@@ -156,6 +154,69 @@ impl HeldLease {
                 expires_ms.saturating_sub(super::now_ms()) as f64 / 1000.0
             )),
             other => Err(format!("unexpected lease reply: {:?}", other)),
+        }
+    }
+
+    /// A lease this process was granted some other way: handed over by
+    /// its previous holder ([`HeldLease::transfer`] to `owner`, which this
+    /// process chose). `sent` is no later than when the grant was made (when
+    /// this process asked for it, say): the lease counts from then.
+    pub fn adopt(
+        client: LeaseClient,
+        resource: &str,
+        owner: &str,
+        epoch: u64,
+        sent: Instant,
+    ) -> HeldLease {
+        HeldLease {
+            client,
+            resource: resource.into(),
+            owner: owner.into(),
+            epoch,
+            released: Default::default(),
+            handing_off: Default::default(),
+            renewed: std::sync::Mutex::new(sent),
+        }
+    }
+
+    /// Hand this lease straight to `to_owner` (see `Request::Transfer`):
+    /// it's never free in between. On success this holder has let go (its
+    /// renewals stop quietly, `on_lost` doesn't run) and the new holder's
+    /// epoch is returned, for it to [`HeldLease::adopt`]. On failure this
+    /// holder still has it, unless the error says it was lost; or, when
+    /// no node answered, it may have gone through: try again (the same
+    /// transfer repeated succeeds with the same epoch).
+    #[allow(dead_code)] // the volume handoff (MIG-1) is its user
+    pub async fn transfer(&self, to_owner: &str, to_desc: &str) -> Result<u64, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.released.load(SeqCst) {
+            return Err(format!("lease on {} was released", self.resource));
+        }
+        self.handing_off.store(true, SeqCst);
+        let op = LeaseOp::Transfer {
+            resource: self.resource.clone(),
+            from_owner: self.owner.clone(),
+            from_epoch: self.epoch,
+            to_owner: to_owner.into(),
+            to_desc: to_desc.into(),
+            ttl_ms: LEASE_TTL.as_millis() as u64,
+        };
+        let r = self.client.call(&op).await;
+        match r {
+            Ok(Response::Granted { epoch, .. }) => {
+                self.released.store(true, SeqCst);
+                self.handing_off.store(false, SeqCst);
+                Ok(epoch)
+            }
+            other => {
+                self.handing_off.store(false, SeqCst);
+                Err(match other {
+                    Ok(Response::Lost) => format!("lease on {} was lost", self.resource),
+                    Ok(Response::Refused(why)) => why,
+                    Ok(other) => format!("unexpected lease reply: {:?}", other),
+                    Err(e) => e,
+                })
+            }
         }
     }
 
@@ -220,6 +281,12 @@ impl HeldLease {
                         pause = ttl / 3;
                     }
                     Ok(_) if me.released.load(std::sync::atomic::Ordering::SeqCst) => return,
+                    // Refused while a transfer is in flight: it went through
+                    // (`transfer` sets `released`), or it didn't and the
+                    // next renewal finds out.
+                    Ok(_) if me.handing_off.load(std::sync::atomic::Ordering::SeqCst) => {
+                        pause = RETRY_PAUSE;
+                    }
                     Ok(other) => {
                         on_lost(format!("lease on {} lost ({:?})", me.resource, other));
                         return;

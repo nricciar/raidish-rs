@@ -92,3 +92,63 @@ fn roles_order() {
     assert_eq!("admin".parse::<Role>().unwrap(), Role::Admin);
     assert!("root".parse::<Role>().is_err());
 }
+
+/// A host's libvirt certificate: libvirt's and qemu's layout, server and
+/// client, and no raidish role (it opens nothing of raidish's).
+#[test]
+fn libvirt_certificates_in_libvirts_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    Ca::init(dir.path(), "test CA", None, false).unwrap();
+    let ca = Ca::load(dir.path()).unwrap();
+    let c = ca
+        .issue_libvirt("node1", &["10.0.0.5".into()], None, false)
+        .unwrap();
+    assert_eq!(c.name, "node1");
+    assert_eq!(c.role, None);
+    assert_eq!(c.sans, vec!["node1".to_string(), "10.0.0.5".to_string()]);
+    let (_, x) = X509Certificate::from_der(&c.der).unwrap();
+    assert!(
+        x.subject().to_string().contains("OU=libvirt"),
+        "{}",
+        x.subject()
+    );
+    let eku = x.extended_key_usage().unwrap().unwrap().value;
+    assert!(eku.server_auth && eku.client_auth);
+
+    let root = dir.path().join("libvirt/node1");
+    use std::os::unix::fs::PermissionsExt;
+    let cert = std::fs::read_to_string(root.join("etc/pki/libvirt/servercert.pem")).unwrap();
+    let bundle = std::fs::read_to_string(dir.path().join("ca.pem")).unwrap();
+    for (path, secret) in LIBVIRT_FILES {
+        let p = root.join(path);
+        let body = std::fs::read_to_string(&p).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        if *secret {
+            assert!(body.contains("PRIVATE KEY"), "{}", path);
+            assert_eq!(mode, 0o600, "{}", path);
+        } else if path.ends_with("cacert.pem") || path.ends_with("ca-cert.pem") {
+            assert_eq!(body, bundle, "{}", path);
+        } else {
+            assert_eq!(body, cert, "{}", path);
+        }
+    }
+    // Directories as /etc/pki's are, whatever the umask.
+    for d in [
+        "etc",
+        "etc/pki",
+        "etc/pki/CA",
+        "etc/pki/libvirt",
+        "etc/pki/libvirt/private",
+        "etc/pki/qemu",
+    ] {
+        let mode = std::fs::metadata(root.join(d))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "{}", d);
+    }
+    // Reissuing needs --force.
+    assert!(ca.issue_libvirt("node1", &[], None, false).is_err());
+    assert!(ca.issue_libvirt("node1", &[], None, true).is_ok());
+}
