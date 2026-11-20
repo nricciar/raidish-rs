@@ -45,7 +45,8 @@ pub mod pb {
     tonic::include_proto!("csi.v1");
 }
 
-use crate::committer::{CommitClient, dataset_resource};
+use crate::committer::CommitClient;
+use crate::committer::PoolAdmin;
 use crate::inode::Transport;
 use crate::writer::CommitError;
 use pb::controller_server::{Controller, ControllerServer};
@@ -86,27 +87,24 @@ struct Driver {
 }
 
 fn commit_status(e: CommitError) -> Status {
-    match e {
-        CommitError::Retry(m) => Status::unavailable(m),
-        CommitError::Refused(m) => Status::failed_precondition(m),
-        CommitError::Restamp(_) => Status::unavailable("try again"),
+    use crate::types::ErrorKind as K;
+    let msg = e.to_string();
+    match e.kind() {
+        K::NotFound => Status::not_found(msg),
+        K::Exists => Status::already_exists(msg),
+        K::Invalid | K::NotDir | K::NotFile => Status::invalid_argument(msg),
+        K::Conflict | K::NotEmpty => Status::failed_precondition(msg),
+        K::NoSpace => Status::resource_exhausted(msg),
+        K::Unavailable => Status::unavailable(msg),
+        K::Forbidden => Status::permission_denied(msg),
+        K::Internal => Status::internal(msg),
     }
 }
 
-fn valid_name(name: &str) -> Result<(), Status> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(Status::invalid_argument(format!(
-            "volume name '{}': up to 64 of A-Z a-z 0-9 . _ -",
-            name
-        )))
-    }
+/// The same rule as everywhere else (`crate::types::DatasetName`), so a
+/// volume made any other way can be used here too.
+fn valid_name(name: &str) -> Result<crate::types::DatasetName, Status> {
+    crate::types::DatasetName::user(name).map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 /// Whether `cap` asks for a volume on several nodes at once.
@@ -169,21 +167,9 @@ fn fs_type(m: &pb::volume_capability::MountVolume) -> &str {
 
 /// Run a command; its stderr on failure.
 async fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("{}: {}", cmd, e))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(format!(
-            "{} {}: {}",
-            cmd,
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
+    let mut c = tokio::process::Command::new(cmd);
+    c.args(args);
+    crate::proc::run(c).await
 }
 
 /// Is something mounted exactly at `path`?
@@ -279,12 +265,7 @@ impl Driver {
             .await
             .map_err(Status::unavailable)?;
         let now = crate::cluster::now_ms();
-        Ok(status
-            .state
-            .leases
-            .get(&dataset_resource(name))
-            .filter(|l| !l.released && l.expires_ms > now)
-            .map(|l| crate::frontend::parse_desc(&l.desc).0))
+        Ok(status.state.dataset_node(name, now).map(str::to_string))
     }
 
     /// The kernel device this node's agent attached `name` on, or why
@@ -302,11 +283,12 @@ impl Driver {
         let Some(v) = status.volumes.into_iter().find(|v| v.name == name) else {
             return Err("not running on this node yet".into());
         };
-        match (v.device, v.note) {
-            (Some(d), _) if Path::new(&d).exists() => Ok(d),
-            (Some(d), _) => Err(format!("{} doesn't exist (yet)", d)),
-            (None, Some(n)) => Err(format!("attach failed: {}", n)),
-            (None, None) => Err(
+        use crate::agent::Attach;
+        match v.attach {
+            Attach::Attached { device } if Path::new(&device).exists() => Ok(device),
+            Attach::Attached { device } => Err(format!("{} doesn't exist (yet)", device)),
+            Attach::Failed { error } => Err(format!("attach failed: {}", error)),
+            Attach::Exported => Err(
                 "exported, but the agent attaches no devices (automount.helper is none?)".into(),
             ),
         }
@@ -369,7 +351,7 @@ impl Controller for Driver {
         req: Request<pb::CreateVolumeRequest>,
     ) -> Rpc<pb::CreateVolumeResponse> {
         let req = req.into_inner();
-        valid_name(&req.name)?;
+        let name = valid_name(&req.name)?;
         if req.volume_content_source.is_some() {
             return Err(Status::invalid_argument(
                 "volume content sources aren't supported",
@@ -411,7 +393,7 @@ impl Controller for Driver {
             None => {
                 println!("csi: creating volume '{}' ({} bytes)", req.name, size);
                 self.committer
-                    .create_volume(&req.name, size)
+                    .create_volume(&name, size)
                     .await
                     .map_err(commit_status)?;
             }
@@ -708,12 +690,10 @@ impl Node for Driver {
         }
         let fs = fs_type(m);
         // blkid exits 2 when it finds no signature at all: a new volume.
-        match tokio::process::Command::new("blkid")
-            .args(["-p", "-s", "TYPE", "-o", "value", &dev])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.code() == Some(2) => {
+        let mut blkid = tokio::process::Command::new("blkid");
+        blkid.args(["-p", "-s", "TYPE", "-o", "value", &dev]);
+        match crate::proc::ran(blkid).await {
+            Ok(o) if o.code == Some(2) => {
                 println!("csi: formatting '{}' ({}) as {}", req.volume_id, dev, fs);
                 let mkfs = format!("mkfs.{}", fs);
                 let args: &[&str] = match fs {
@@ -722,8 +702,8 @@ impl Node for Driver {
                 };
                 run(&mkfs, args).await.map_err(Status::internal)?;
             }
-            Ok(o) if o.status.success() => {
-                let found = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            Ok(o) if o.ok() => {
+                let found = o.stdout.trim().to_string();
                 if found != fs {
                     return Err(Status::failed_precondition(format!(
                         "volume '{}' holds {} (asked for {})",
@@ -741,24 +721,22 @@ impl Node for Driver {
                 // does. e2fsck -p: 0 clean, 1 fixed, 2 fixed (reboot advised:
                 // nothing has it mounted); worse needs a human.
                 if fs == "ext4" {
-                    let out = tokio::process::Command::new("e2fsck")
-                        .args(["-p", &dev])
-                        .output()
-                        .await
-                        .map_err(|e| Status::internal(format!("e2fsck: {}", e)))?;
-                    match out.status.code() {
+                    let mut e2fsck = tokio::process::Command::new("e2fsck");
+                    e2fsck.args(["-p", &dev]);
+                    let out = crate::proc::ran(e2fsck).await.map_err(Status::internal)?;
+                    match out.code {
                         Some(0) => {}
                         Some(1 | 2) => println!(
                             "csi: e2fsck repaired '{}': {}",
                             req.volume_id,
-                            String::from_utf8_lossy(&out.stdout).trim()
+                            out.stdout.trim()
                         ),
                         _ => {
                             return Err(Status::internal(format!(
                                 "e2fsck {} needs manual repair: {}{}",
                                 dev,
-                                String::from_utf8_lossy(&out.stdout).trim(),
-                                String::from_utf8_lossy(&out.stderr).trim()
+                                out.stdout.trim(),
+                                out.stderr.trim()
                             )));
                         }
                     }
@@ -768,10 +746,10 @@ impl Node for Driver {
                 return Err(Status::internal(format!(
                     "blkid {}: {}",
                     dev,
-                    String::from_utf8_lossy(&o.stderr).trim()
+                    o.stderr.trim()
                 )));
             }
-            Err(e) => return Err(Status::internal(format!("blkid: {}", e))),
+            Err(e) => return Err(Status::internal(e)),
         }
         std::fs::create_dir_all(target).map_err(|e| Status::internal(e.to_string()))?;
         let mut args = vec!["-t", fs];
@@ -992,11 +970,7 @@ pub async fn serve(
             .unwrap_or_else(|| format!("{}://127.0.0.1:8881", crate::tls::scheme()))
             .trim_end_matches('/')
             .to_string(),
-        http: crate::tls::http_builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?,
+        http: crate::tls::http_client(Some(Duration::from_secs(10)))?,
     };
     println!("csi: {} on {} as {}", DRIVER_NAME, path, node);
     tonic::transport::Server::builder()

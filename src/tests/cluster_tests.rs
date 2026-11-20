@@ -1,26 +1,26 @@
 use super::lease::{HeldLease, LeaseClient};
-use super::state::{ClusterState, POOL, Request, Response};
+use super::state::{ClusterState, LeaseOp, POOL, Request, Response};
 use super::*;
 use crate::test_util::wait_until;
+use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep, ms};
 
 fn acquire(owner: &str, now_ms: u64, ttl_ms: u64) -> Request {
-    Request::Acquire {
-        resource: POOL.into(),
+    LeaseOp::Acquire {
+        resource: POOL,
         owner: owner.into(),
-        desc: format!("test {}", owner),
+        holder: crate::types::Holder::default().with_detail(format!("test {}", owner)),
         ttl_ms,
-        now_ms,
     }
+    .stamp(now_ms)
 }
 
-fn renew(owner: &str, epoch: u64, now_ms: u64, ttl_ms: u64) -> Request {
-    Request::Renew {
-        resource: POOL.into(),
-        owner: owner.into(),
-        epoch,
+fn renew(owner: &str, epoch: Epoch, now_ms: u64, ttl_ms: u64) -> Request {
+    LeaseOp::Renew {
+        resource: POOL,
+        holder: Holding::new(owner, epoch),
         ttl_ms,
-        now_ms,
     }
+    .stamp(now_ms)
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn lease_grant_hold_expire() {
     assert_eq!(
         s.apply(&acquire("a", 0, 100)),
         Response::Granted {
-            epoch: 1,
+            epoch: ep(1),
             expires_ms: 100
         }
     );
@@ -42,15 +42,15 @@ fn lease_grant_hold_expire() {
     assert_eq!(
         s.apply(&acquire("a", 60, 100)),
         Response::Granted {
-            epoch: 1,
+            epoch: ep(1),
             expires_ms: 160
         }
     );
     // Renew extends.
     assert_eq!(
-        s.apply(&renew("a", 1, 100, 100)),
+        s.apply(&renew("a", ep(1), 100, 100)),
         Response::Granted {
-            epoch: 1,
+            epoch: ep(1),
             expires_ms: 200
         }
     );
@@ -58,12 +58,12 @@ fn lease_grant_hold_expire() {
     assert_eq!(
         s.apply(&acquire("b", 200, 100)),
         Response::Granted {
-            epoch: 2,
+            epoch: ep(2),
             expires_ms: 300
         }
     );
     // The old holder can't renew any more.
-    assert_eq!(s.apply(&renew("a", 1, 210, 100)), Response::Lost);
+    assert_eq!(s.apply(&renew("a", ep(1), 210, 100)), Response::Lost);
     assert_eq!(s.pool_epoch(), 2);
 }
 
@@ -73,9 +73,9 @@ fn renew_after_expiry_without_takeover() {
     s.apply(&acquire("a", 0, 100));
     // Nobody took it, so the epoch is still ours.
     assert_eq!(
-        s.apply(&renew("a", 1, 500, 100)),
+        s.apply(&renew("a", ep(1), 500, 100)),
         Response::Granted {
-            epoch: 1,
+            epoch: ep(1),
             expires_ms: 600
         }
     );
@@ -85,39 +85,39 @@ fn renew_after_expiry_without_takeover() {
 fn release_frees_but_keeps_epoch() {
     let mut s = ClusterState::default();
     s.apply(&acquire("a", 0, 1000));
-    let release = Request::Release {
-        resource: POOL.into(),
-        owner: "a".into(),
-        epoch: 1,
-    };
+    let release = LeaseOp::Release {
+        resource: POOL,
+        holder: Holding::new("a", ep(1)),
+    }
+    .stamp(0);
     assert_eq!(s.apply(&release), Response::Released);
     assert_eq!(s.pool_epoch(), 1, "the floor never goes back");
     assert!(matches!(
         s.apply(&acquire("b", 10, 1000)),
-        Response::Granted { epoch: 2, .. }
+        Response::Granted { epoch, .. } if epoch == 2
     ));
     // Renewing a released lease fails.
-    assert_eq!(s.apply(&renew("a", 1, 20, 1000)), Response::Lost);
+    assert_eq!(s.apply(&renew("a", ep(1), 20, 1000)), Response::Lost);
 }
 
 #[test]
 fn epochs_increase_across_resources() {
     let mut s = ClusterState::default();
     s.apply(&acquire("a", 0, 10));
-    let other = Request::Acquire {
-        resource: "vol/vm1".into(),
+    let other = LeaseOp::Acquire {
+        resource: crate::types::res("ds/vm1"),
         owner: "b".into(),
-        desc: String::new(),
+        holder: crate::types::Holder::default().with_detail(String::new()),
         ttl_ms: 10,
-        now_ms: 0,
-    };
+    }
+    .stamp(0);
     assert!(matches!(
         s.apply(&other),
-        Response::Granted { epoch: 2, .. }
+        Response::Granted { epoch, .. } if epoch == 2
     ));
     assert!(matches!(
         s.apply(&acquire("c", 100, 10)),
-        Response::Granted { epoch: 3, .. }
+        Response::Granted { epoch, .. } if epoch == 3
     ));
 }
 
@@ -294,13 +294,21 @@ async fn three_nodes_elect_grant_and_fail_over() {
 
     // Any node takes lease requests (followers forward).
     let client = LeaseClient::new(nodes.iter().map(|n| n.url.clone()).collect());
-    let a = HeldLease::acquire(client.clone(), POOL, "writer a")
-        .await
-        .unwrap();
-    let err = HeldLease::acquire(client.clone(), POOL, "writer b")
-        .await
-        .err()
-        .unwrap();
+    let a = HeldLease::acquire(
+        client.clone(),
+        POOL,
+        crate::types::Holder::default().with_detail("writer a"),
+    )
+    .await
+    .unwrap();
+    let err = HeldLease::acquire(
+        client.clone(),
+        POOL,
+        crate::types::Holder::default().with_detail("writer b"),
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(err.contains("writer a"), "{}", err);
 
     // Every node's fencing floor learns the epoch.
@@ -318,9 +326,8 @@ async fn three_nodes_elect_grant_and_fail_over() {
     let survivors = LeaseClient::new(rest.iter().map(|n| n.url.clone()).collect());
     let renewed = survivors
         .call(&LeaseOp::Renew {
-            resource: POOL.into(),
-            owner: a.owner.clone(),
-            epoch: a.epoch,
+            resource: POOL,
+            holder: Holding::new(a.owner.clone(), a.epoch),
             ttl_ms: 300,
         })
         .await
@@ -329,17 +336,20 @@ async fn three_nodes_elect_grant_and_fail_over() {
 
     // Released: a new writer gets a newer epoch.
     a.release().await;
-    let b = HeldLease::acquire(survivors.clone(), POOL, "writer b")
-        .await
-        .unwrap();
+    let b = HeldLease::acquire(
+        survivors.clone(),
+        POOL,
+        crate::types::Holder::default().with_detail("writer b"),
+    )
+    .await
+    .unwrap();
     assert!(b.epoch > a.epoch);
     assert!(wait_until(5, || rest.iter().all(|n| n.floor.pool_floor() == b.epoch)).await);
     // The old writer's lease is gone for good.
     let lost = survivors
         .call(&LeaseOp::Renew {
-            resource: POOL.into(),
-            owner: a.owner.clone(),
-            epoch: a.epoch,
+            resource: POOL,
+            holder: Holding::new(a.owner.clone(), a.epoch),
             ttl_ms: 1000,
         })
         .await
@@ -348,9 +358,9 @@ async fn three_nodes_elect_grant_and_fail_over() {
 
     // A lease that isn't renewed expires and can be taken over.
     let short = |owner: &str| LeaseOp::Acquire {
-        resource: "short".into(),
+        resource: crate::types::res("ds/short"),
         owner: owner.into(),
-        desc: owner.into(),
+        holder: crate::types::Holder::default().with_detail(owner),
         ttl_ms: 300,
     };
     let Response::Granted { epoch: c, .. } = survivors.call(&short("c")).await.unwrap() else {
@@ -407,9 +417,13 @@ async fn a_followers_lease_survives_losing_the_leader() {
     );
     let client = LeaseClient::new(endpoints);
     let held = Arc::new(
-        HeldLease::acquire(client, "node/follower", "follower")
-            .await
-            .unwrap(),
+        HeldLease::acquire(
+            client,
+            crate::types::res("node/follower"),
+            crate::types::Holder::default().with_detail("follower"),
+        )
+        .await
+        .unwrap(),
     );
     let lost = Arc::new(std::sync::Mutex::new(None::<String>));
     let l = lost.clone();
@@ -418,7 +432,7 @@ async fn a_followers_lease_survives_losing_the_leader() {
     // Wait for a renewal, then stop the leader just before the next one.
     let expires = |n: &TestNode| {
         n.cluster
-            .lease_state("node/follower")
+            .lease_state(&crate::types::res("node/follower"))
             .map_or(0, |l| l.expires_ms)
     };
     assert!(wait_until(5, || expires(follower) > 0).await);
@@ -459,7 +473,13 @@ async fn single_node_restarts_with_its_state() {
     let node = start_node("solo", &pool, port, dir.path()).await;
     let client = LeaseClient::new(vec![node.url.clone()]);
     assert!(wait_until(10, || leader_of(&[&node]).is_some()).await);
-    let a = HeldLease::acquire(client.clone(), POOL, "a").await.unwrap();
+    let a = HeldLease::acquire(
+        client.clone(),
+        POOL,
+        crate::types::Holder::default().with_detail("a"),
+    )
+    .await
+    .unwrap();
     stop_node(&node).await;
     drop(node);
 
@@ -467,7 +487,13 @@ async fn single_node_restarts_with_its_state() {
     let node = start_node("solo", &pool, port, dir.path()).await;
     assert_eq!(node.floor.pool_floor(), a.epoch);
     assert!(wait_until(10, || leader_of(&[&node]).is_some()).await);
-    let err = HeldLease::acquire(client.clone(), POOL, "b").await.err();
+    let err = HeldLease::acquire(
+        client.clone(),
+        POOL,
+        crate::types::Holder::default().with_detail("b"),
+    )
+    .await
+    .err();
     assert!(err.is_some(), "a's lease is still live");
     stop_node(&node).await;
 }
@@ -493,7 +519,13 @@ async fn node_with_a_different_layout_is_refused() {
     let good: Vec<&TestNode> = nodes[..2].iter().collect();
     assert!(wait_until(10, || leader_of(&good).is_some()).await);
     let client = LeaseClient::new(vec![nodes[0].url.clone(), nodes[1].url.clone()]);
-    let a = HeldLease::acquire(client, POOL, "a").await.unwrap();
+    let a = HeldLease::acquire(
+        client,
+        POOL,
+        crate::types::Holder::default().with_detail("a"),
+    )
+    .await
+    .unwrap();
     assert!(wait_until(5, || good.iter().all(|n| n.floor.pool_floor() == a.epoch)).await);
     // The odd one never joins in.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -542,15 +574,29 @@ async fn swapped_nodes_are_detected() {
         vote: openraft::Vote::new(1, 2),
         last_log_id: None,
     };
-    let resp = reqwest::Client::new()
-        .post(format!("{}/api/v1/raft/vote", nodes[1].url))
-        .header(FINGERPRINT_HEADER, &nodes[1].cluster.members.fingerprint)
-        .header(TO_HEADER, "0")
-        .json(&vote)
-        .send()
-        .await
-        .unwrap();
+    let ask = |version: Option<&str>| {
+        let mut req = reqwest::Client::new()
+            .post(format!("{}/api/v1/raft/vote", nodes[1].url))
+            .header(FINGERPRINT_HEADER, &nodes[1].cluster.members.fingerprint)
+            .header(TO_HEADER, "0")
+            .json(&vote);
+        if let Some(v) = version {
+            req = req.header(PROTOCOL_HEADER, v);
+        }
+        req.send()
+    };
+    let resp = ask(Some(&RAFT_PROTOCOL.to_string())).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    // So is one in another (or no) Raft protocol version, first.
+    for v in [None, Some("0")] {
+        let resp = ask(v).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UPGRADE_REQUIRED,
+            "{:?}",
+            v
+        );
+    }
 
     // The agreeing two still work.
     let good: Vec<&TestNode> = nodes[..2].iter().collect();
@@ -560,15 +606,19 @@ async fn swapped_nodes_are_detected() {
     }
 }
 
-fn lend(idx: u32, writer: &str, writer_epoch: u64, pool_epoch: u64, now_ms: u64) -> Request {
-    Request::Lend {
+fn lend(
+    idx: MetaslabIdx,
+    writer: &str,
+    writer_epoch: Epoch,
+    pool_epoch: Epoch,
+    now_ms: u64,
+) -> Request {
+    LeaseOp::Lend {
         idx,
-        writer: writer.into(),
-        writer_epoch,
-        pool_owner: "c".into(),
-        pool_epoch,
-        now_ms,
+        writer: LeaseRef::new(crate::types::res(writer), writer_epoch),
+        pool: Holding::new("c", pool_epoch),
     }
+    .stamp(now_ms)
 }
 
 #[test]
@@ -576,54 +626,53 @@ fn metaslab_lend_and_return() {
     use super::state::Domain;
     let mut s = ClusterState::default();
     s.apply(&acquire("c", 0, 1000)); // committer: epoch 1
-    let w = Request::Acquire {
-        resource: "writer/2".into(),
+    let w = LeaseOp::Acquire {
+        resource: crate::types::res("writer/2"),
         owner: "w".into(),
-        desc: String::new(),
+        holder: crate::types::Holder::default().with_detail(String::new()),
         ttl_ms: 1000,
-        now_ms: 0,
-    };
-    assert!(matches!(s.apply(&w), Response::Granted { epoch: 2, .. }));
-    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 1);
+    }
+    .stamp(0);
+    assert!(matches!(s.apply(&w), Response::Granted { epoch, .. } if epoch == 2));
+    assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 1);
 
     assert_eq!(
-        s.apply(&lend(3, "writer/2", 2, 1, 10)),
-        Response::Fenced { epoch: 3 }
+        s.apply(&lend(ms(3), "writer/2", ep(2), ep(1), 10)),
+        Response::Fenced { epoch: ep(3) }
     );
-    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 3);
+    assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 3);
     assert_eq!(s.fence_epoch(Domain::Pool), 1);
     // Not twice, not by someone who isn't the committer, not to a writer
     // that isn't live.
     assert!(matches!(
-        s.apply(&lend(3, "writer/2", 2, 1, 20)),
+        s.apply(&lend(ms(3), "writer/2", ep(2), ep(1), 20)),
         Response::Refused(_)
     ));
     assert!(matches!(
-        s.apply(&lend(4, "writer/2", 2, 9, 20)),
+        s.apply(&lend(ms(4), "writer/2", ep(2), ep(9), 20)),
         Response::Refused(_)
     ));
     assert!(matches!(
-        s.apply(&lend(4, "writer/2", 1, 1, 20)),
+        s.apply(&lend(ms(4), "writer/2", ep(1), ep(1), 20)),
         Response::Refused(_)
     ));
     assert!(matches!(
-        s.apply(&lend(4, "writer/2", 2, 1, 5000)),
+        s.apply(&lend(ms(4), "writer/2", ep(2), ep(1), 5000)),
         Response::Refused(_)
     ));
 
     // A new committer doesn't move a lent metaslab's fence.
     s.apply(&acquire("c2", 2000, 1000)); // epoch 4
-    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 3);
-    assert_eq!(s.fence_epoch(Domain::Metaslab(4)), 4);
-    let ret = Request::Return {
-        idx: 3,
-        pool_owner: "c2".into(),
-        pool_epoch: 4,
-        now_ms: 2100,
-    };
-    assert_eq!(s.apply(&ret), Response::Fenced { epoch: 5 });
-    assert_eq!(s.fence_epoch(Domain::Metaslab(3)), 5);
-    assert!(s.lent_to(3).is_none());
+    assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 3);
+    assert_eq!(s.fence_epoch(Domain::Metaslab(ms(4))), 4);
+    let ret = LeaseOp::Return {
+        idx: ms(3),
+        pool: Holding::new("c2", ep(4)),
+    }
+    .stamp(2100);
+    assert_eq!(s.apply(&ret), Response::Fenced { epoch: ep(5) });
+    assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 5);
+    assert!(s.lent_to(ms(3)).is_none());
 }
 
 /// NFSv4 client records are written only by the `nfs4` lease holder.
@@ -631,22 +680,25 @@ fn metaslab_lend_and_return() {
 fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
     use super::state::NFS4;
     let mut s = ClusterState::default();
-    let grant = s.apply(&Request::Acquire {
-        resource: NFS4.into(),
-        owner: "n1".into(),
-        desc: "nfs4 node-1".into(),
-        ttl_ms: 10_000,
-        now_ms: 1000,
-    });
+    let grant = s.apply(
+        &LeaseOp::Acquire {
+            resource: NFS4,
+            owner: "n1".into(),
+            holder: crate::types::Holder::default().with_detail("nfs4 node-1"),
+            ttl_ms: 10_000,
+        }
+        .stamp(1000),
+    );
     let Response::Granted { epoch, .. } = grant else {
         panic!("{:?}", grant)
     };
-    let rec = |owner: &str, epoch: u64, present: bool, now_ms: u64| Request::NfsClient {
-        client: "6162".into(),
-        present,
-        nfs_owner: owner.into(),
-        nfs_epoch: epoch,
-        now_ms,
+    let rec = |owner: &str, epoch: Epoch, present: bool, now_ms: u64| {
+        LeaseOp::NfsClient {
+            client: "6162".into(),
+            present,
+            nfs: Holding::new(owner, epoch),
+        }
+        .stamp(now_ms)
     };
     assert_eq!(s.apply(&rec("n1", epoch, true, 2000)), Response::Recorded);
     assert!(s.nfs_clients.contains_key("6162"));
@@ -656,7 +708,7 @@ fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
         Response::Refused(_)
     ));
     assert!(matches!(
-        s.apply(&rec("n1", epoch - 1, false, 2000)),
+        s.apply(&rec("n1", ep(epoch.get() - 1), false, 2000)),
         Response::Refused(_)
     ));
     assert!(matches!(
@@ -682,9 +734,13 @@ async fn a_held_lease_nobody_holds_any_more_is_given_back() {
     // Taken and renewed in the background, then dropped without `release`
     // (as a start that fails part way does).
     let a = Arc::new(
-        HeldLease::acquire(client.clone(), "writer/x", "a")
-            .await
-            .unwrap(),
+        HeldLease::acquire(
+            client.clone(),
+            crate::types::res("writer/x"),
+            crate::types::Holder::default().with_detail("a"),
+        )
+        .await
+        .unwrap(),
     );
     a.hold(|m| panic!("lost: {}", m));
     let epoch = a.epoch;
@@ -693,7 +749,13 @@ async fn a_held_lease_nobody_holds_any_more_is_given_back() {
     // would expire.
     let t = std::time::Instant::now();
     let b = loop {
-        match HeldLease::acquire(client.clone(), "writer/x", "b").await {
+        match HeldLease::acquire(
+            client.clone(),
+            crate::types::res("writer/x"),
+            crate::types::Holder::default().with_detail("b"),
+        )
+        .await
+        {
             Ok(b) => break b,
             Err(e) => {
                 assert!(
@@ -710,16 +772,15 @@ async fn a_held_lease_nobody_holds_any_more_is_given_back() {
     stop_node(&node).await;
 }
 
-fn transfer(from: &str, from_epoch: u64, to: &str, now_ms: u64) -> Request {
-    Request::Transfer {
-        resource: POOL.into(),
-        from_owner: from.into(),
-        from_epoch,
+fn transfer(from: &str, from_epoch: Epoch, to: &str, now_ms: u64) -> Request {
+    LeaseOp::Transfer {
+        resource: POOL,
+        from: Holding::new(from, from_epoch),
         to_owner: to.into(),
-        to_desc: format!("test {}", to),
+        to_holder: crate::types::Holder::default().with_detail(format!("test {}", to)),
         ttl_ms: 100,
-        now_ms,
     }
+    .stamp(now_ms)
 }
 
 #[test]
@@ -727,30 +788,32 @@ fn transfer_hands_a_lease_over_at_a_new_epoch() {
     let mut s = ClusterState::default();
     s.apply(&acquire("a", 0, 100));
     assert_eq!(
-        s.apply(&transfer("a", 1, "b", 50)),
+        s.apply(&transfer("a", ep(1), "b", 50)),
         Response::Granted {
-            epoch: 2,
+            epoch: ep(2),
             expires_ms: 150
         }
     );
     // b holds it now, at the new epoch (which fences a).
     assert_eq!(s.pool_epoch(), 2);
-    assert!(s.holds(POOL, Some("b"), 2, 60));
-    assert_eq!(s.leases[POOL].desc, "test b");
+    assert!(s.holds(&POOL, &Holding::new("b", ep(2)), 60));
+    assert_eq!(s.leases[&POOL].holder.detail, "test b");
     // a's renewals and release are refused; b renews.
-    assert_eq!(s.apply(&renew("a", 1, 60, 100)), Response::Lost);
+    assert_eq!(s.apply(&renew("a", ep(1), 60, 100)), Response::Lost);
     assert_eq!(
-        s.apply(&Request::Release {
-            resource: POOL.into(),
-            owner: "a".into(),
-            epoch: 1
-        }),
+        s.apply(
+            &LeaseOp::Release {
+                resource: POOL,
+                holder: Holding::new("a", ep(1)),
+            }
+            .stamp(0)
+        ),
         Response::Lost
     );
-    assert!(s.holds(POOL, Some("b"), 2, 60));
+    assert!(s.holds(&POOL, &Holding::new("b", ep(2)), 60));
     assert!(matches!(
-        s.apply(&renew("b", 2, 60, 100)),
-        Response::Granted { epoch: 2, .. }
+        s.apply(&renew("b", ep(2), 60, 100)),
+        Response::Granted { epoch, .. } if epoch == 2
     ));
     // Nobody else can take it while b's is live.
     assert!(
@@ -762,12 +825,12 @@ fn transfer_hands_a_lease_over_at_a_new_epoch() {
 fn transfer_repeated_is_the_same_transfer() {
     let mut s = ClusterState::default();
     s.apply(&acquire("a", 0, 100));
-    let first = s.apply(&transfer("a", 1, "b", 50));
+    let first = s.apply(&transfer("a", ep(1), "b", 50));
     // The duplicate a client sends to another node lands after it.
-    assert_eq!(s.apply(&transfer("a", 1, "b", 51)), first);
+    assert_eq!(s.apply(&transfer("a", ep(1), "b", 51)), first);
     assert_eq!(s.pool_epoch(), 2);
     // But not once b's lease is gone: then it's just refused.
-    assert_eq!(s.apply(&transfer("a", 1, "b", 500)), Response::Lost);
+    assert_eq!(s.apply(&transfer("a", ep(1), "b", 500)), Response::Lost);
 }
 
 #[test]
@@ -775,31 +838,33 @@ fn transfer_needs_the_live_lease() {
     let mut s = ClusterState::default();
     s.apply(&acquire("a", 0, 100));
     // Wrong epoch, wrong owner, to itself, to nobody.
-    assert_eq!(s.apply(&transfer("a", 7, "b", 50)), Response::Lost);
-    assert_eq!(s.apply(&transfer("x", 1, "b", 50)), Response::Lost);
+    assert_eq!(s.apply(&transfer("a", ep(7), "b", 50)), Response::Lost);
+    assert_eq!(s.apply(&transfer("x", ep(1), "b", 50)), Response::Lost);
     assert!(matches!(
-        s.apply(&transfer("a", 1, "a", 50)),
+        s.apply(&transfer("a", ep(1), "a", 50)),
         Response::Refused(_)
     ));
     assert!(matches!(
-        s.apply(&transfer("a", 1, "", 50)),
+        s.apply(&transfer("a", ep(1), "", 50)),
         Response::Refused(_)
     ));
     // Expired (even though nobody took it, unlike a renewal): refused, the
     // receiver might have assumed it was free to wait out.
-    assert_eq!(s.apply(&transfer("a", 1, "b", 150)), Response::Lost);
+    assert_eq!(s.apply(&transfer("a", ep(1), "b", 150)), Response::Lost);
     // Released: refused.
     s.apply(&acquire("a", 200, 100));
     let e = s.pool_epoch();
-    s.apply(&Request::Release {
-        resource: POOL.into(),
-        owner: "a".into(),
-        epoch: e,
-    });
+    s.apply(
+        &LeaseOp::Release {
+            resource: POOL,
+            holder: Holding::new("a", e),
+        }
+        .stamp(0),
+    );
     assert_eq!(s.apply(&transfer("a", e, "b", 210)), Response::Lost);
     // Nothing changed hands in any of it.
     assert_eq!(s.pool_epoch(), e);
-    assert_eq!(s.leases[POOL].owner, "a");
+    assert_eq!(s.leases[&POOL].owner, "a");
 }
 
 /// A held lease, renewing in the background, is handed to another owner
@@ -822,9 +887,13 @@ async fn a_held_lease_transfers_without_being_lost() {
     let client = LeaseClient::new(nodes.iter().map(|n| n.url.clone()).collect());
 
     let a = Arc::new(
-        HeldLease::acquire(client.clone(), "ds/vol", "agent a")
-            .await
-            .unwrap(),
+        HeldLease::acquire(
+            client.clone(),
+            crate::types::res("ds/vol"),
+            crate::types::Holder::default().with_detail("agent a"),
+        )
+        .await
+        .unwrap(),
     );
     let a_lost = Arc::new(AtomicBool::new(false));
     let flag = a_lost.clone();
@@ -834,18 +903,31 @@ async fn a_held_lease_transfers_without_being_lost() {
 
     let b_owner = lease::owner_id() + ":b";
     let asked = std::time::Instant::now();
-    let epoch = a.transfer(&b_owner, "agent b").await.unwrap();
+    let epoch = a
+        .transfer(
+            &b_owner,
+            crate::types::Holder::default().with_detail("agent b"),
+        )
+        .await
+        .unwrap();
     assert!(epoch > a.epoch);
     // (A repeated transfer is `transfer_repeated_is_the_same_transfer`.)
     // Having let go, the old holder can't transfer it again.
     let b = Arc::new(HeldLease::adopt(
         client.clone(),
-        "ds/vol",
+        crate::types::res("ds/vol"),
         &b_owner,
         epoch,
         asked,
     ));
-    assert!(a.transfer("someone else", "x").await.is_err());
+    assert!(
+        a.transfer(
+            "someone else",
+            crate::types::Holder::default().with_detail("x")
+        )
+        .await
+        .is_err()
+    );
     let b_lost = Arc::new(AtomicBool::new(false));
     let flag = b_lost.clone();
     b.hold(move |_| flag.store(true, Ordering::SeqCst));
@@ -859,27 +941,31 @@ async fn a_held_lease_transfers_without_being_lost() {
     assert!(!b_lost.load(Ordering::SeqCst), "the new holder lost it");
     assert!(b.fresh());
     let status = client.status().await.unwrap();
-    let l = &status.state.leases["ds/vol"];
+    let l = &status.state.leases[&crate::types::res("ds/vol")];
     assert_eq!(
-        (l.owner.as_str(), l.epoch, l.desc.as_str()),
+        (l.owner.as_str(), l.epoch, l.holder.detail.as_str()),
         (b_owner.as_str(), epoch, "agent b")
     );
     assert!(!l.released);
-    let err = HeldLease::acquire(client.clone(), "ds/vol", "agent c")
-        .await
-        .err()
-        .unwrap();
+    let err = HeldLease::acquire(
+        client.clone(),
+        crate::types::res("ds/vol"),
+        crate::types::Holder::default().with_detail("agent c"),
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(err.contains("agent b"), "{}", err);
 
     // Dropping a's handle (it let go) leaves b's lease alone.
     drop(a);
     tokio::time::sleep(lease::LEASE_TTL / 2).await;
     let status = client.status().await.unwrap();
-    assert!(
-        status
-            .state
-            .holds("ds/vol", Some(&b_owner), epoch, crate::cluster::now_ms())
-    );
+    assert!(status.state.holds(
+        &crate::types::res("ds/vol"),
+        &Holding::new(b_owner.clone(), epoch),
+        crate::cluster::now_ms()
+    ));
 
     for n in &nodes {
         stop_node(n).await;
@@ -889,9 +975,12 @@ async fn a_held_lease_transfers_without_being_lost() {
 #[test]
 fn attached_sets_are_intent_kept_in_order() {
     let mut s = ClusterState::default();
-    let set = |nodes: &[&str]| Request::SetAttached {
-        volume: "vol".into(),
-        nodes: nodes.iter().map(|n| n.to_string()).collect(),
+    let set = |nodes: &[&str]| {
+        LeaseOp::SetAttached {
+            volume: "vol".into(),
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+        }
+        .stamp(0)
     };
     assert_eq!(
         s.apply(&set(&["node-1", "node-2", "node-1"])),
@@ -911,10 +1000,13 @@ fn attached_sets_are_intent_kept_in_order() {
 #[test]
 fn nodes_attach_and_detach_one_at_a_time() {
     let mut s = ClusterState::default();
-    let at = |node: &str, on: bool| Request::Attach {
-        volume: "vol".into(),
-        node: node.into(),
-        on,
+    let at = |node: &str, on: bool| {
+        LeaseOp::Attach {
+            volume: "vol".into(),
+            node: node.into(),
+            on,
+        }
+        .stamp(0)
     };
     s.apply(&at("node-1", true));
     s.apply(&at("node-2", true));
@@ -929,4 +1021,107 @@ fn nodes_attach_and_detach_one_at_a_time() {
     // Detaching from nothing leaves nothing behind.
     s.apply(&at("node-0", false));
     assert!(s.attached.is_empty());
+}
+
+// ---- HttpLeases: which nodes a call asks ----
+
+fn released() -> String {
+    serde_json::to_string(&Ok::<Response, String>(Response::Released)).unwrap()
+}
+
+fn release_op() -> LeaseOp {
+    LeaseOp::Release {
+        resource: POOL,
+        holder: Holding::new("o", ep(1)),
+    }
+}
+
+/// A node that answers promptly is the only one asked: the others aren't
+/// sent copies to forward (each would be applied again).
+#[tokio::test]
+async fn lease_calls_ask_one_node_while_it_answers() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::Ordering::SeqCst;
+    let quick = std::time::Duration::ZERO;
+    let (a, a_hits) = fake_json_server(Some(released()), quick).await;
+    let (b, b_hits) = fake_json_server(Some(released()), quick).await;
+    let (c, c_hits) = fake_json_server(Some(released()), quick).await;
+    let client = LeaseClient::new(vec![a, b, c]);
+    for _ in 0..5 {
+        assert_eq!(
+            client.call(&release_op()).await.unwrap(),
+            Response::Released
+        );
+    }
+    assert_eq!(a_hits.load(SeqCst), 5);
+    assert_eq!(b_hits.load(SeqCst) + c_hits.load(SeqCst), 0);
+}
+
+/// A node that fails sends the call to the others, and the one that
+/// answers is asked first from then on; one that's slow is hedged against.
+#[tokio::test]
+async fn lease_calls_move_to_the_node_that_answers() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::Ordering::SeqCst;
+    let quick = std::time::Duration::ZERO;
+    let (dead, dead_hits) = fake_json_server(None, quick).await;
+    let (slow, _) = fake_json_server(Some(released()), std::time::Duration::from_secs(4)).await;
+    let (good, good_hits) = fake_json_server(Some(released()), quick).await;
+
+    // The first node hangs up: the call goes on to the others.
+    let client = LeaseClient::new(vec![dead.clone(), good.clone()]);
+    assert_eq!(
+        client.call(&release_op()).await.unwrap(),
+        Response::Released
+    );
+    assert_eq!((dead_hits.load(SeqCst), good_hits.load(SeqCst)), (1, 1));
+    // ...and next time only the one that answered is asked.
+    assert_eq!(
+        client.call(&release_op()).await.unwrap(),
+        Response::Released
+    );
+    assert_eq!((dead_hits.load(SeqCst), good_hits.load(SeqCst)), (1, 2));
+
+    // The first node is slow: the others are asked once it's had its
+    // chance, well before it would answer.
+    let client = LeaseClient::new(vec![slow, good]);
+    let t = std::time::Instant::now();
+    assert_eq!(
+        client.call(&release_op()).await.unwrap(),
+        Response::Released
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        t.elapsed()
+    );
+
+    // None answers: every node's reason.
+    let client = LeaseClient::new(vec![dead.clone(), dead]);
+    let e = client.call(&release_op()).await.unwrap_err();
+    assert_eq!(e.split("; ").count(), 2, "{}", e);
+}
+
+/// A Raft data directory is stamped with the protocol it's written in, and
+/// one of another version (or from before versions) isn't opened.
+#[test]
+fn raft_data_of_another_version_is_refused() {
+    use super::store::Store;
+    let fence = || Arc::new(crate::fence::ServerFence::default());
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("fresh");
+    Store::open(&fresh, fence()).unwrap();
+    let stamp = std::fs::read_to_string(fresh.join("version")).unwrap();
+    assert_eq!(stamp.trim(), RAFT_PROTOCOL.to_string());
+    Store::open(&fresh, fence()).unwrap();
+
+    std::fs::write(fresh.join("version"), "999\n").unwrap();
+    let e = Store::open(&fresh, fence()).err().unwrap();
+    assert!(e.contains("protocol 999"), "{}", e);
+
+    let old = dir.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("log.json"), "{}").unwrap();
+    let e = Store::open(&old, fence()).err().unwrap();
+    assert!(e.contains("older raidish"), "{}", e);
 }

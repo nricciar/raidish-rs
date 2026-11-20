@@ -92,7 +92,7 @@ pub fn create_token(
         sub: sub.to_string(),
         role: role.to_string(),
         iat,
-        exp: ttl.map(|t| iat + t),
+        exp: ttl.map(|t| iat.saturating_add(t)),
     };
     let payload = B64.encode(serde_json::to_vec(&claims).map_err(|e| e.to_string())?);
     let key = ring::signature::EcdsaKeyPair::from_pkcs8(
@@ -218,31 +218,7 @@ impl Verifier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Via {
-    /// Plain HTTP: TLS is off, so there's no authentication.
-    Open,
-    Cert,
-    Token(String),
-}
-
-/// Who a request is from.
-#[derive(Debug, Clone, Serialize)]
-pub struct Principal {
-    pub name: String,
-    pub role: Role,
-    pub via: Via,
-    /// A token's expiry (unix seconds).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exp: Option<i64>,
-}
-
-impl Principal {
-    pub fn can_write(&self) -> bool {
-        self.role >= Role::Admin
-    }
-}
+pub use crate::api_types::{Principal, Via};
 
 /// Server-side state: None without TLS (no authentication).
 pub struct AuthState(pub Option<Verifier>);

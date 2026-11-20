@@ -206,10 +206,18 @@ impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
         }
         self.inner.flush().await
     }
-    async fn read_block(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+    async fn read_block(
+        &self,
+        b: u64,
+        buf: &mut crate::disk::Block,
+    ) -> Result<(), crate::disk::DiskError> {
         self.inner.read_block(b, buf).await
     }
-    async fn read_blocks(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+    async fn read_blocks(
+        &self,
+        b: u64,
+        buf: &mut [crate::disk::Block],
+    ) -> Result<(), crate::disk::DiskError> {
         self.inner.read_blocks(b, buf).await
     }
     async fn write_block(
@@ -220,7 +228,11 @@ impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
         self.check()?;
         self.inner.write_block(b, buf).await
     }
-    async fn write_blocks(&self, b: u64, buf: &[u8]) -> Result<(), crate::disk::DiskError> {
+    async fn write_blocks(
+        &self,
+        b: u64,
+        buf: &[crate::disk::Block],
+    ) -> Result<(), crate::disk::DiskError> {
         self.check()?;
         self.inner.write_blocks(b, buf).await
     }
@@ -453,4 +465,63 @@ impl TestPool {
             .collect();
         self.open(&p, fast_disk_options()).await
     }
+}
+
+/// A stand-in HTTP server: answers every request with `body` (JSON) after
+/// `delay`, or, `body` None, hangs up without answering. Its URL, and how
+/// many requests it has had.
+pub async fn fake_json_server(
+    body: Option<String>,
+    delay: std::time::Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (body, h) = (body.clone(), h.clone());
+            tokio::spawn(async move {
+                let mut rd = BufReader::new(sock);
+                // One request after another on the connection (keep-alive).
+                loop {
+                    let mut len = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if rd.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let l = line.trim_end();
+                        if l.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut req = vec![0u8; len];
+                    if rd.read_exact(&mut req).await.is_err() {
+                        return;
+                    }
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let Some(body) = &body else { return };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if rd.get_mut().write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, hits)
 }

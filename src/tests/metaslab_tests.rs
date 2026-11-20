@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::{TOTAL_BLOCKS, TestPool};
+use crate::types::Txg;
 use crate::vdev::Pool;
 
 /// Alignment of the default test pool (raidz2: 3 data shards).
@@ -51,11 +52,11 @@ fn encode_decode_round_trip() {
     let a = ms.take_aligned(30).unwrap();
     let b = ms.take_aligned(60).unwrap();
     let c = ms.take_aligned(9).unwrap();
-    ms.freeing.push(b.clone());
-    ms.deferred.push_back((7, vec![c.clone()]));
+    ms.freeing.push(b);
+    ms.deferred.push_back((Txg::from_raw(7), vec![c]));
 
     let bytes = ms.encode();
-    let decoded = MetaslabState::decode(start, 1026, ALIGN, &bytes, 42);
+    let decoded = MetaslabState::decode(start, 1026, ALIGN, &bytes, Txg::from_raw(42));
 
     assert_eq!(decoded.free_extents, ms.free_extents);
     // freeing + deferred both come back as deferred, released at the given TXG.
@@ -87,7 +88,7 @@ async fn txg_advances_and_survives_reload() {
     fs.write_file(Path::new("/a"), b"hello").await.unwrap();
     fs.write_file(Path::new("/b"), b"world").await.unwrap();
     let t1 = fs.uberblock().await.unwrap().txg;
-    assert_eq!(t1, t0 + 2);
+    assert_eq!(t1, t0.after(2));
     drop(fs);
 
     let fs = pool.load().await;
@@ -225,7 +226,7 @@ async fn uncommitted_slot_write_is_ignored() {
         fs.layout.metaslab_size_blocks,
         ALIGN,
     );
-    fs.write_slot(fs.layout.slot_lba(0, inactive), txg + 1, &bogus.encode())
+    fs.write_slot(fs.layout.slot_lba(0, inactive), txg.next(), &bogus.encode())
         .await
         .unwrap();
     fs.dev.flush().await.unwrap();
@@ -260,9 +261,6 @@ async fn unable_to_allocate_rolls_back() {
     let fs = pool.format().await;
     let before = free_map(&fs).await;
     let err = fs.allocate_blocks_stripe_aligned(TOTAL_BLOCKS * 2).await;
-    assert!(matches!(
-        err,
-        Err(FileSystemError::UnableToAllocateBlocks(_))
-    ));
+    assert!(matches!(err, Err(FileSystemError::NoSpace(_))));
     assert_eq!(free_map(&fs).await, before);
 }

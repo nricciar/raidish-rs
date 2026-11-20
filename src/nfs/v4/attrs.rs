@@ -5,6 +5,7 @@ use super::err;
 use super::state::LEASE_SECS;
 use crate::inode::{ObjType, SetAttrs};
 use crate::nfs::backend::Attr;
+use crate::nfs::backend::NfsStat;
 use crate::nfs::xdr::{Reader, Writer};
 
 pub const SUPPORTED_ATTRS: u32 = 0;
@@ -236,7 +237,7 @@ pub fn encode(w: &mut Writer, want: &[u32], a: &Attr, x: &Extra<'_>) {
                 v.u32(LEASE_SECS);
             }
             RDATTR_ERROR => {
-                v.u32(err::OK);
+                v.stat(err::OK);
             }
             ACLSUPPORT => {
                 v.u32(0);
@@ -245,7 +246,7 @@ pub fn encode(w: &mut Writer, want: &[u32], a: &Attr, x: &Extra<'_>) {
                 v.opaque(x.fh);
             }
             FILEID | MOUNTED_ON_FILEID => {
-                v.u64(a.id);
+                v.u64(a.id.get());
             }
             FILES_AVAIL | FILES_FREE | FILES_TOTAL => {
                 v.u64(files);
@@ -326,7 +327,7 @@ pub fn encode(w: &mut Writer, want: &[u32], a: &Attr, x: &Extra<'_>) {
 
 /// A user or group as an NFSv4 owner string: numbers, as `sec=sys`
 /// clients send them (and `root` / `nobody`). Anything else: `BADOWNER`.
-fn id_of(s: &str) -> Result<u32, u32> {
+fn id_of(s: &str) -> Result<u32, NfsStat> {
     let name = s.split('@').next().unwrap_or("");
     match name {
         "root" => Ok(0),
@@ -344,7 +345,7 @@ pub struct Settable {
     pub bitmap: Vec<u32>,
 }
 
-pub fn decode(r: &mut Reader<'_>, now: u64) -> Result<Settable, u32> {
+pub fn decode(r: &mut Reader<'_>, now: u64) -> Result<Settable, NfsStat> {
     let bm = read_bitmap(r).map_err(|_| err::BADXDR)?;
     let vals = r.opaque(1 << 16).map_err(|_| err::BADXDR)?;
     let mut v = Reader::new(vals);
@@ -354,7 +355,7 @@ pub fn decode(r: &mut Reader<'_>, now: u64) -> Result<Settable, u32> {
         bitmap: Vec::new(),
     };
     let bad = |_| err::BADXDR;
-    let settime = |v: &mut Reader<'_>| -> Result<u64, u32> {
+    let settime = |v: &mut Reader<'_>| -> Result<u64, NfsStat> {
         match v.u32().map_err(bad)? {
             0 => Ok(now), // SET_TO_SERVER_TIME4
             1 => {
@@ -430,7 +431,7 @@ mod tests {
     #[test]
     fn only_supported_attributes_are_returned() {
         let a = Attr {
-            id: 7,
+            id: crate::types::fid(7),
             kind: ObjType::File,
             mode: 0o644,
             nlink: 1,

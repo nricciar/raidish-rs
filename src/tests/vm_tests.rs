@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::Bytes;
 
 const DUMPXML: &str = r#"<domain type='kvm'>
   <name>old-name</name>
@@ -55,7 +56,7 @@ fn a_domain_is_its_pools_and_nodes() {
     let xml = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     let meta = root.child("metadata").unwrap();
-    let m = parse_meta(&to_string(meta.elements().next().unwrap())).unwrap();
+    let m = parse_meta(&el_xml(meta.elements().next().unwrap())).unwrap();
     assert!(ident().owns(&m));
     for other in [
         VmIdent {
@@ -77,20 +78,20 @@ fn a_domain_is_its_pools_and_nodes() {
 #[test]
 fn finds_raidish_disks_anchor_first() {
     let s = VmSpec::parse("web", DUMPXML, 7);
-    assert_eq!(s.error, None);
-    assert_eq!(s.anchor, "vm1");
-    assert_eq!(s.volumes, vec!["vm1", "data", "iso"]);
+    assert_eq!(s.error(), None);
+    assert_eq!(s.anchor(), Some("vm1"));
+    assert_eq!(s.volumes(), vec!["vm1", "data", "iso"]);
 }
 
 #[test]
 fn no_raidish_disk_is_an_error() {
     let s = VmSpec::parse("x", "<domain><name>x</name><devices/></domain>", 1);
-    assert!(s.error.is_some());
+    assert!(s.error().is_some());
     assert!(!s.usable());
     let s = VmSpec::parse("x", "<notadomain/>", 1);
-    assert!(s.error.unwrap().contains("domain"));
+    assert!(s.error().unwrap().contains("domain"));
     let s = VmSpec::parse("x", "<domain><devices>", 1);
-    assert!(s.error.is_some());
+    assert!(s.error().is_some());
 }
 
 #[test]
@@ -99,23 +100,22 @@ fn renders_disks_console_name_and_metadata() {
     let xml = render(&s, ("127.0.0.1", 10809), "127.0.0.1", "host:1:2", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     assert_eq!(
-        to_string(root.child("name").unwrap()),
+        el_xml(root.child("name").unwrap()),
         "<name>web</name>".to_string()
     );
     // Only our metadata.
     let meta = root.child("metadata").unwrap();
     assert_eq!(meta.elements().count(), 1);
-    let m = parse_meta(&to_string(meta.elements().next().unwrap())).unwrap();
+    let m = parse_meta(&el_xml(meta.elements().next().unwrap())).unwrap();
     assert_eq!(
         m,
         DomMeta {
             anchor: "vm1".into(),
             volumes: vec!["vm1".into(), "data".into(), "iso".into()],
             change: 7,
-            owner: "host:1:2".into(),
+            owner: DomOwner::Lease("host:1:2".into()),
             pool: "00ff".into(),
             node: "node-0".into(),
-            migrating: false,
         }
     );
     let devices = root.child("devices").unwrap();
@@ -155,7 +155,7 @@ fn renders_disks_console_name_and_metadata() {
     assert!(root.child("uuid").is_some());
     // And it parses back to the same VM.
     let again = VmSpec::parse("web", &xml, 7);
-    assert_eq!(again.volumes, s.volumes);
+    assert_eq!(again.volumes(), s.volumes());
 }
 
 #[test]
@@ -168,23 +168,14 @@ fn escapes_survive_a_round_trip() {
 }
 
 #[test]
-fn names() {
-    assert!(valid_name("web-1.prod_x"));
-    assert!(!valid_name(""));
-    assert!(!valid_name(".hidden"));
-    assert!(!valid_name("a/b"));
-    assert!(!valid_name("a b"));
-}
-
-#[test]
 fn parses_virsh_list() {
     let out = " 3    web    running\n -    old    shut off\n 12   db     in shutdown\n\n";
     let l = parse_list(out);
     assert_eq!(l.len(), 3);
     assert_eq!(l[0].id, Some(3));
     assert_eq!(l[1].id, None);
-    assert_eq!(l[1].state, "shut off");
-    assert_eq!(l[2].state, "in shutdown");
+    assert_eq!(l[1].state, DomState::ShutOff);
+    assert_eq!(l[2].state, DomState::InShutdown);
 }
 
 #[test]
@@ -203,7 +194,7 @@ fn reads_the_hardware() {
     let s = VmSpec::parse("web", DUMPXML, 7);
     let hw = &s.hw;
     assert_eq!(hw.vcpus, Some(2));
-    assert_eq!(hw.memory_kib, Some(2 * 1024 * 1024));
+    assert_eq!(hw.memory, Some(Bytes::from_mib(2048)));
     assert_eq!(hw.arch.as_deref(), Some("x86_64"));
     assert_eq!(hw.machine.as_deref(), Some("q35"));
     assert_eq!(hw.disks.len(), 4);
@@ -225,7 +216,8 @@ fn memory_units() {
     let mem = |x: &str| {
         VmSpec::parse("m", &format!("<domain>{}<devices/></domain>", x), 1)
             .hw
-            .memory_kib
+            .memory
+            .map(Bytes::kib)
     };
     assert_eq!(mem("<memory>1024</memory>"), Some(1024));
     assert_eq!(mem("<memory unit='MiB'>2</memory>"), Some(2048));
@@ -244,17 +236,17 @@ fn a_new_vms_template_is_a_usable_vm() {
     let new = NewVm {
         name: "web1".into(),
         vcpus: 4,
-        memory_mib: 4096,
+        memory: Bytes::from_mib(4096),
         disk: disk_volume("web1"),
         iso: Some("debian-iso".into()),
         network: Some("default".into()),
     };
     let s = VmSpec::parse("web1", &template(&new), 1);
-    assert_eq!(s.error, None);
-    assert_eq!(s.anchor, "web1-disk0");
-    assert_eq!(s.volumes, vec!["web1-disk0", "debian-iso"]);
+    assert_eq!(s.error(), None);
+    assert_eq!(s.anchor(), Some("web1-disk0"));
+    assert_eq!(s.volumes(), vec!["web1-disk0", "debian-iso"]);
     assert_eq!(s.hw.vcpus, Some(4));
-    assert_eq!(s.hw.memory_kib, Some(4096 * 1024));
+    assert_eq!(s.hw.memory, Some(Bytes::from_mib(4096)));
     assert_eq!(s.hw.boot, vec!["hd", "cdrom"]);
     assert_eq!(s.hw.disks[1].device, "cdrom");
     assert_eq!(s.hw.nics[0].source.as_deref(), Some("default"));
@@ -268,8 +260,8 @@ fn a_new_vms_template_is_a_usable_vm() {
         ..new
     };
     let s = VmSpec::parse("web1", &template(&bare), 1);
-    assert_eq!(s.error, None);
-    assert_eq!(s.volumes, vec!["web1-disk0"]);
+    assert_eq!(s.error(), None);
+    assert_eq!(s.volumes(), vec!["web1-disk0"]);
     assert!(s.hw.nics.is_empty());
 }
 
@@ -363,6 +355,40 @@ fn refuses_what_reaches_the_host() {
             "<sysinfo type='fwcfg'><entry name='opt/x' file='/etc/shadow'/></sysinfo>",
             "",
         ),
+        // Text as CDATA is still text.
+        (
+            "<os><type>hvm</type><loader><![CDATA[/etc/shadow]]></loader></os>",
+            "",
+        ),
+        (
+            "<os><type>hvm</type><nvram><![CDATA[/etc/passwd]]></nvram></os>",
+            "",
+        ),
+        (
+            "",
+            "<rng model='virtio'><backend model='random'><![CDATA[/dev/sda]]></backend></rng>",
+        ),
+        // A second of what's checked: libvirt might read that one.
+        (
+            "<sysinfo type='smbios'/><sysinfo type='fwcfg'><entry name='opt/x' file='/etc/shadow'/></sysinfo>",
+            "",
+        ),
+        (
+            "<os><type>hvm</type></os><os><type>hvm</type><loader>/etc/shadow</loader></os>",
+            "",
+        ),
+        (
+            "",
+            "<tpm model='tpm-tis'><backend type='emulator'/><backend type='passthrough'/></tpm>",
+        ),
+        (
+            "",
+            "<disk type='file' device='disk'><source file='raidish:w'/><source file='/etc/shadow'/><target dev='vdb'/></disk>",
+        ),
+        (
+            "",
+            "<disk type='file' device='disk'><source file='raidish:w'/><backingStore/><backingStore type='file'><source file='/etc/shadow'/></backingStore></disk>",
+        ),
     ] {
         let s = with(extra, devices);
         assert!(!s.usable(), "allowed: {} {}", extra, devices);
@@ -389,7 +415,7 @@ fn allows_what_stays_in_the_guest() {
          <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>\
          <audio id='1' type='none'/><controller type='usb'/><memballoon model='virtio'/>",
     );
-    assert_eq!(s.error, None);
+    assert_eq!(s.error(), None);
     let xml = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
     for gone in ["seclabel", "resource", "/usr/bin/evil", "/etc/x.sock"] {
         assert!(!xml.contains(gone), "{} in {}", gone, xml);
@@ -409,7 +435,7 @@ fn a_volume_belongs_to_one_vm() {
     }
     mark_conflicts(&mut specs);
     assert!(specs["a"].usable());
-    assert!(specs["b"].error.as_ref().unwrap().contains("VM 'a'"));
+    assert!(specs["b"].error().unwrap().contains("VM 'a'"));
     assert!(specs["c"].usable());
 }
 
@@ -472,20 +498,19 @@ fn incoming() -> Incoming {
 #[test]
 fn a_running_domain_is_retargeted_for_another_node() {
     let root = parse_domain(RUNNING).unwrap();
-    let m = parse_meta(&to_string(
+    let m = parse_meta(&el_xml(
         root.child("metadata").unwrap().elements().next().unwrap(),
     ))
     .unwrap();
     let meta = DomMeta {
-        owner: String::new(),
+        owner: DomOwner::Migrating,
         node: "node-1".into(),
-        migrating: true,
         ..m
     };
     let out = parse_domain(&retarget(RUNNING, &incoming(), &meta).unwrap()).unwrap();
     // What libvirt's ABI check compares is untouched.
     assert_eq!(
-        to_string(out.child("uuid").unwrap()),
+        el_xml(out.child("uuid").unwrap()),
         "<uuid>4dea22b3-1d52-d8f3-2516-782e98ab3fa0</uuid>"
     );
     let devices = out.child("devices").unwrap();
@@ -505,15 +530,15 @@ fn a_running_domain_is_retargeted_for_another_node() {
     // One raidish metadata element, the new one.
     let md = out.child("metadata").unwrap();
     assert_eq!(md.elements().count(), 1);
-    let got = parse_meta(&to_string(md.elements().next().unwrap())).unwrap();
+    let got = parse_meta(&el_xml(md.elements().next().unwrap())).unwrap();
     assert_eq!(got, meta);
-    assert!(got.migrating && got.owner.is_empty());
+    assert_eq!(got.owner, DomOwner::Migrating);
 }
 
 #[test]
 fn retargeting_refuses_a_domain_whose_disks_dont_match() {
     let root = parse_domain(RUNNING).unwrap();
-    let m = parse_meta(&to_string(
+    let m = parse_meta(&el_xml(
         root.child("metadata").unwrap().elements().next().unwrap(),
     ))
     .unwrap();
@@ -530,14 +555,13 @@ fn metadata_round_trips_with_the_migrating_mark() {
         anchor: "vm1".into(),
         volumes: vec!["vm1".into(), "data".into()],
         change: 3,
-        owner: "h:1:2".into(),
+        owner: DomOwner::Migrating,
         pool: "00ff".into(),
         node: "node-2".into(),
-        migrating: true,
     };
     assert_eq!(parse_meta(&meta_xml(&m)).unwrap(), m);
     let settled = DomMeta {
-        migrating: false,
+        owner: DomOwner::Lease("h:1:2".into()),
         ..m
     };
     let xml = meta_xml(&settled);
@@ -554,7 +578,9 @@ fn an_empty_vm_section_is_all_defaults() {
     assert_eq!(c.migrate_timeout(), std::time::Duration::from_secs(300));
     let tcp: crate::vm::VmConfig =
         serde_yaml::from_str("migrate_uri: qemu+tcp://node1/system").unwrap();
-    assert!(tcp.check().unwrap_err().contains("TLS only"));
+    let e = tcp.check().unwrap_err();
+    assert_eq!(e.kind(), crate::types::ErrorKind::Invalid);
+    assert!(e.to_string().contains("TLS only"));
     let tls: crate::vm::VmConfig =
         serde_yaml::from_str("migrate_uri: qemu+tls://n1.example/system").unwrap();
     assert!(tls.check().is_ok());
@@ -589,4 +615,23 @@ fn the_migration_target_defaults_to_its_host() {
     .resolved("node1");
     assert_eq!(o.uri.as_deref(), Some("qemu+tls://other/system"));
     assert_eq!(o.migrate_host.as_deref(), Some("10.0.0.9"));
+}
+
+/// A definition raidish refuses is the caller's mistake (400); virsh
+/// failing is this host's (500); a timeout means try again (503).
+#[test]
+fn vm_errors_say_whose_fault_they_are() {
+    use crate::types::ErrorKind;
+    use crate::vm::VmError;
+    let e = crate::vm_check::needs("<notadomain/>").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Invalid);
+    assert_eq!(e.kind().http_status(), 400);
+    let e = VmError::Virsh {
+        cmd: "migrate".into(),
+        reason: "no route".into(),
+    };
+    assert_eq!(e.kind().http_status(), 500);
+    assert_eq!(e.to_string(), "virsh migrate: no route");
+    let e = VmError::Timeout(std::time::Duration::from_secs(3));
+    assert_eq!(e.kind().http_status(), 503);
 }

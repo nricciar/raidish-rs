@@ -14,16 +14,18 @@
 //! seconds while there is dirty data.
 
 use crate::disk::BlockDevice;
+use crate::export::{BlockExporter, ExportLife, ExportTable, Exported};
+pub(crate) use crate::export::{ExportSession, export_closed};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
-use std::any::Any;
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::time::Duration;
+use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo, ensure_sync_loop};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+
+/// The NBD port.
+pub const NBD_PORT: u16 = 10809;
 
 const NBD_INIT_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
 const NBD_OPTS_MAGIC: u64 = 0x49484156454F5054; // "IHAVEOPT"
@@ -69,132 +71,18 @@ pub(crate) const ENOSPC: u32 = 28;
 
 /// NBD error for a filesystem error: out of space is reported as such.
 fn errno(e: &crate::fs::FileSystemError) -> u32 {
-    match e {
-        crate::fs::FileSystemError::UnableToAllocateBlocks(_) => ENOSPC,
+    match e.kind() {
+        crate::types::ErrorKind::NoSpace => ENOSPC,
         _ => EIO,
     }
 }
 
-/// How often dirty volume data is committed without an explicit FLUSH.
-pub const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// Largest READ/WRITE payload we accept (the kernel caps NBD I/O at 32 MiB).
 const MAX_REQUEST_BYTES: u32 = 32 << 20;
 /// Largest option payload we accept during haggling (names are <= 4 KiB).
 const MAX_OPTION_BYTES: u32 = 64 << 10;
 /// Address the block servers bind to unless told otherwise.
 pub const DEFAULT_BIND: &str = "127.0.0.1";
-/// How long removing an export waits for its connections to wind down.
-pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// File systems that already have a background sync loop, by address. Weak,
-/// so a dropped file system (and its loop) doesn't pin the entry.
-static SYNC_LOOPS: StdMutex<Vec<Weak<dyn Any + Send + Sync>>> = StdMutex::new(Vec::new());
-
-/// Start the background TXG sync for `fs` unless one is already running.
-/// Shared by every NBD server and NVMe/TCP target on the same file system;
-/// the loop ends once the file system is dropped.
-pub(crate) fn ensure_sync_loop<D>(fs: &Arc<FileSystem<D>>, who: &'static str)
-where
-    D: BlockDevice + Send + Sync + 'static,
-{
-    {
-        let mut loops = SYNC_LOOPS.lock().unwrap();
-        loops.retain(|w| w.strong_count() > 0);
-        let ptr = Arc::as_ptr(fs) as *const ();
-        if loops.iter().any(|w| w.as_ptr() as *const () == ptr) {
-            return;
-        }
-        let any: Arc<dyn Any + Send + Sync> = fs.clone();
-        loops.push(Arc::downgrade(&any));
-    }
-    let weak = Arc::downgrade(fs);
-    let fold = fs.fold_wanted.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SYNC_INTERVAL);
-        loop {
-            // Every SYNC_INTERVAL, or early when an intent log fills up.
-            tokio::select! {
-                _ = tick.tick() => {}
-                _ = fold.wait() => {}
-            }
-            let Some(fs) = weak.upgrade() else { return };
-            if fs.has_dirty_datasets()
-                && let Err(e) = fs.sync().await
-            {
-                eprintln!("{}: background sync failed: {}", who, e);
-            }
-            // Only now: flushes still appending to the old region while the
-            // fold ran don't ask for another one. If the fold didn't move
-            // the log on, the next flush asks again.
-            fold.take();
-            drop(fs);
-        }
-    });
-}
-
-/// Lifetime of one export as seen by its connections: they `join` it when
-/// they attach and watch for `close`, which waits until they have all gone.
-pub(crate) struct ExportLife {
-    closed: watch::Sender<bool>,
-    alive: StdMutex<Option<mpsc::Sender<()>>>,
-    drained: Mutex<mpsc::Receiver<()>>,
-}
-
-/// A connection's hold on an export; dropping it lets `close` finish.
-pub(crate) struct ExportSession {
-    _alive: mpsc::Sender<()>,
-    closed: watch::Receiver<bool>,
-}
-
-impl ExportSession {
-    /// Another handle on the close signal, for a different task to wait on.
-    pub(crate) fn close_signal(&self) -> watch::Receiver<bool> {
-        self.closed.clone()
-    }
-}
-
-/// Resolves once the export is closing (never, for `None`).
-pub(crate) async fn export_closed(rx: &mut Option<watch::Receiver<bool>>) {
-    match rx {
-        // An error means the export itself is gone: closed too.
-        Some(rx) => drop(rx.wait_for(|closed| *closed).await),
-        None => std::future::pending().await,
-    }
-}
-
-impl ExportLife {
-    pub(crate) fn new() -> Self {
-        let (tx, rx) = mpsc::channel(1);
-        ExportLife {
-            closed: watch::Sender::new(false),
-            alive: StdMutex::new(Some(tx)),
-            drained: Mutex::new(rx),
-        }
-    }
-
-    /// Attach a connection; `None` once the export is closing.
-    pub(crate) fn join(&self) -> Option<ExportSession> {
-        let alive = self.alive.lock().unwrap().clone()?;
-        Some(ExportSession {
-            _alive: alive,
-            closed: self.closed.subscribe(),
-        })
-    }
-
-    /// Refuse new connections, tell current ones to stop, and wait (up to
-    /// `DRAIN_TIMEOUT`) for them to finish their in-flight requests.
-    pub(crate) async fn close(&self, what: &str) {
-        self.alive.lock().unwrap().take();
-        self.closed.send_replace(true);
-        let mut drained = self.drained.lock().await;
-        if tokio::time::timeout(DRAIN_TIMEOUT, drained.recv())
-            .await
-            .is_err()
-        {
-            eprintln!("{}: connections did not close in {:?}", what, DRAIN_TIMEOUT);
-        }
-    }
-}
 
 struct Export {
     name: String,
@@ -202,6 +90,21 @@ struct Export {
     life: ExportLife,
     /// Where its I/O goes (this node's file system, for now).
     io: Arc<SwitchableIo>,
+}
+
+impl Exported for Export {
+    fn volume(&self) -> &str {
+        &self.name
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn life(&self) -> &ExportLife {
+        &self.life
+    }
+    fn io(&self) -> &Arc<SwitchableIo> {
+        &self.io
+    }
 }
 
 /// An NBD server exporting any number of volumes of one file system.
@@ -231,7 +134,6 @@ where
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-#[allow(dead_code)]
 impl<D> NbdServer<D>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -242,16 +144,8 @@ where
             fs,
             bind: bind.into(),
             port,
-            exports: Arc::new(StdMutex::new(BTreeMap::new())),
+            exports: Arc::new(ExportTable::new("nbd", str::to_string)),
         }
-    }
-
-    /// Export volume `name` (under the same name), written by this node.
-    pub async fn add_export(&self, name: &str) -> Result<(), FileSystemError> {
-        Self::check_name(name)?;
-        let size = self.fs.open_dataset(name).await?.size_bytes;
-        let io = Arc::new(LocalIo::new(self.fs.clone(), name));
-        self.add_export_io(name, size, io)
     }
 
     fn check_name(name: &str) -> Result<(), FileSystemError> {
@@ -262,63 +156,6 @@ where
             )));
         }
         Ok(())
-    }
-
-    /// Export `name`, `size` bytes, with its I/O going to `io`.
-    pub fn add_export_io(
-        &self,
-        name: &str,
-        size: u64,
-        io: Arc<dyn VolumeIo>,
-    ) -> Result<(), FileSystemError> {
-        Self::check_name(name)?;
-        let mut exports = self.exports.lock().unwrap();
-        if exports.contains_key(name) {
-            return Err(FileSystemError::AlreadyExists);
-        }
-        exports.insert(
-            name.to_string(),
-            Arc::new(Export {
-                name: name.to_string(),
-                size,
-                life: ExportLife::new(),
-                io: Arc::new(SwitchableIo::new(io)),
-            }),
-        );
-        Ok(())
-    }
-
-    /// The backend of export `name`, to pause or switch it.
-    pub fn export_io(&self, name: &str) -> Option<Arc<SwitchableIo>> {
-        Some(self.exports.lock().unwrap().get(name)?.io.clone())
-    }
-
-    /// Export `name` for another node's proxy (see `crate::peer_io`): its
-    /// connections count as the export's, so removing it drains them too.
-    pub fn peer_export(&self, name: &str) -> Option<crate::peer_io::PeerExport> {
-        let export = self.exports.lock().unwrap().get(name)?.clone();
-        Some(crate::peer_io::PeerExport {
-            size: export.size,
-            io: export.io.clone(),
-            session: export.life.join()?,
-        })
-    }
-
-    /// Stop exporting `name`: new connections are refused, current ones are
-    /// closed once their in-flight requests finish, then everything is
-    /// committed. Returns false if there was no such export.
-    pub async fn remove_export(&self, name: &str) -> Result<bool, FileSystemError> {
-        let Some(export) = self.exports.lock().unwrap().remove(name) else {
-            return Ok(false);
-        };
-        export.life.close(&format!("nbd: export '{}'", name)).await;
-        export.io.sync().await?;
-        Ok(true)
-    }
-
-    /// Names of the current exports, sorted.
-    pub fn exports(&self) -> Vec<String> {
-        self.exports.lock().unwrap().keys().cloned().collect()
     }
 
     /// Bind `bind:port` and serve until the listener fails.
@@ -333,33 +170,76 @@ where
         println!(
             "NBD server listening on {} (exports: {})",
             listener.local_addr()?,
-            self.exports().join(", ")
+            self.exports.keys().join(", ")
         );
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            println!("Client connected from {}", addr);
-            let exports = self.exports.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, exports).await {
-                    eprintln!("Client error: {}", e);
+        let exports = self.exports.clone();
+        crate::net::accept_loop(listener, "nbd", move |stream, addr| {
+            let exports = exports.clone();
+            async move {
+                if let Err(e) = handle_client(stream, addr, exports).await {
+                    eprintln!("nbd: {}: {}", addr, e);
                 }
-            });
-        }
+            }
+        })
+        .await;
+        Ok(())
     }
 }
 
-type Exports = Arc<StdMutex<BTreeMap<String, Arc<Export>>>>;
+#[async_trait::async_trait]
+impl<D> BlockExporter for NbdServer<D>
+where
+    D: BlockDevice + Send + Sync + 'static,
+{
+    async fn add_export(&self, name: &str) -> Result<(), FileSystemError> {
+        Self::check_name(name)?;
+        let size = self.fs.open_dataset(name).await?.size_bytes;
+        let io = Arc::new(LocalIo::new(self.fs.clone(), name));
+        self.add_export_io(name, size, io)
+    }
+
+    fn add_export_io(
+        &self,
+        name: &str,
+        size: u64,
+        io: Arc<dyn VolumeIo>,
+    ) -> Result<(), FileSystemError> {
+        Self::check_name(name)?;
+        self.exports.insert(Export {
+            name: name.to_string(),
+            size,
+            life: ExportLife::new(),
+            io: Arc::new(SwitchableIo::new(io)),
+        })
+    }
+
+    fn export_io(&self, name: &str) -> Option<Arc<SwitchableIo>> {
+        self.exports.export_io(name)
+    }
+
+    fn peer_export(&self, name: &str) -> Option<crate::peer_io::PeerExport> {
+        self.exports.peer_export(name)
+    }
+
+    async fn remove_export(&self, name: &str) -> Result<bool, FileSystemError> {
+        self.exports.remove(name).await
+    }
+
+    #[cfg(test)]
+    fn exports(&self) -> Vec<String> {
+        self.exports.keys()
+    }
+}
+
+type Exports = Arc<ExportTable<Export>>;
 
 /// Export by name; "" means the only export, if there is exactly one.
 fn lookup(exports: &Exports, name: &str) -> Option<Arc<Export>> {
-    let exports = exports.lock().unwrap();
     if name.is_empty() {
-        return match exports.len() {
-            1 => exports.values().next().cloned(),
-            _ => None,
-        };
+        exports.only()
+    } else {
+        exports.by_key(name)
     }
-    exports.get(name).cloned()
 }
 
 /// Send one option reply.
@@ -389,7 +269,26 @@ fn info_request_name(data: &[u8]) -> Option<String> {
     String::from_utf8(name.to_vec()).ok()
 }
 
-async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Result<()> {
+/// Unknown-export refusals, logged at most once a minute per name: a
+/// client retrying in a loop mustn't flood the log.
+static REFUSALS: std::sync::LazyLock<crate::net::LogThrottle> =
+    std::sync::LazyLock::new(|| crate::net::LogThrottle::new(std::time::Duration::from_secs(60)));
+
+fn refused(addr: std::net::SocketAddr, name: &str) {
+    if let Some(more) = REFUSALS.allow(name) {
+        let also = match more {
+            0 => String::new(),
+            n => format!(" (and {} more times since last said)", n),
+        };
+        eprintln!("nbd: {} asked for unknown export '{}'{}", addr, name, also);
+    }
+}
+
+async fn handle_client(
+    mut stream: TcpStream,
+    addr: std::net::SocketAddr,
+    exports: Exports,
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
 
     // Initial handshake
@@ -430,7 +329,7 @@ async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Resu
                 // No way to report an error here: unknown names just hang up.
                 let name = String::from_utf8_lossy(&option_data);
                 let Some(export) = lookup(&exports, &name) else {
-                    eprintln!("nbd: client asked for unknown export '{}'", name);
+                    refused(addr, &name);
                     return Ok(());
                 };
                 let Some(session) = export.life.join() else {
@@ -441,7 +340,7 @@ async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Resu
                 if !no_zeroes {
                     stream.write_all(&[0u8; 124]).await?;
                 }
-                return transmission_phase(stream, &export, session).await;
+                return transmission_phase(stream, addr, &export, session).await;
             }
             NBD_OPT_INFO | NBD_OPT_GO => {
                 let Some(name) = info_request_name(&option_data) else {
@@ -451,6 +350,9 @@ async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Resu
                 let found = lookup(&exports, &name);
                 let session = found.as_ref().and_then(|e| e.life.join());
                 let (Some(export), Some(session)) = (found, session) else {
+                    if option == NBD_OPT_GO {
+                        refused(addr, &name);
+                    }
                     opt_reply(&mut stream, option, NBD_REP_ERR_UNKNOWN, &[]).await?;
                     continue;
                 };
@@ -463,7 +365,7 @@ async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Resu
                 opt_reply(&mut stream, option, NBD_REP_ACK, &[]).await?;
 
                 if option == NBD_OPT_GO {
-                    return transmission_phase(stream, &export, session).await;
+                    return transmission_phase(stream, addr, &export, session).await;
                 }
             }
             NBD_OPT_LIST => {
@@ -471,7 +373,7 @@ async fn handle_client(mut stream: TcpStream, exports: Exports) -> std::io::Resu
                     opt_reply(&mut stream, option, NBD_REP_ERR_INVALID, &[]).await?;
                     continue;
                 }
-                let names: Vec<String> = exports.lock().unwrap().keys().cloned().collect();
+                let names = exports.keys();
                 for name in names {
                     let mut data = Vec::with_capacity(4 + name.len());
                     data.extend_from_slice(&(name.len() as u32).to_be_bytes());
@@ -532,11 +434,15 @@ async fn read_request<R: AsyncRead + Unpin>(
 
 async fn transmission_phase(
     stream: TcpStream,
+    addr: std::net::SocketAddr,
     export: &Export,
     session: ExportSession,
 ) -> std::io::Result<()> {
+    println!("nbd: {} attached to '{}'", addr, export.name);
     let (reader, writer) = stream.into_split();
-    serve_requests(reader, writer, &export.name, export.io.clone(), session).await
+    let r = serve_requests(reader, writer, &export.name, export.io.clone(), session).await;
+    println!("nbd: {} detached from '{}'", addr, export.name);
+    r
 }
 
 /// The NBD transmission phase on any stream: requests for volume `name`
@@ -658,7 +564,6 @@ where
                 if let Err(e) = io.sync().await {
                     eprintln!("nbd: sync on disconnect: {}", e);
                 }
-                println!("Client disconnected");
                 return Ok(());
             }
             _ => {

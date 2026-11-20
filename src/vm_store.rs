@@ -23,11 +23,13 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::vm::{VmSpec, valid_name};
+use crate::vm::VmSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
+
+pub use crate::api_types::VmDef;
 
 /// The store's dataset.
 pub const VMS_DATASET: &str = ".vms";
@@ -37,14 +39,6 @@ pub const MAX_XML: usize = 1 << 20;
 const MAX_VMS: usize = 100_000;
 
 const META: &[u8] = b"M";
-
-/// A stored definition.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct VmDef {
-    pub name: String,
-    pub xml: String,
-    pub change: u64,
-}
 
 impl VmDef {
     pub fn spec(&self) -> VmSpec {
@@ -64,12 +58,10 @@ fn key(name: &str) -> Vec<u8> {
     k
 }
 
-fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, FileSystemError> {
-    serde_json::to_vec(v).map_err(|e| FileSystemError::InvalidArgument(e.to_string()))
-}
+use crate::service_tree::enc_json as json;
 
 fn parse<T: for<'de> Deserialize<'de>>(b: &[u8]) -> Result<T, FileSystemError> {
-    serde_json::from_slice(b).map_err(|e| FileSystemError::InvalidArgument(format!("vms: {}", e)))
+    crate::service_tree::dec_json(b, "vms record")
 }
 
 fn bad(m: String) -> FileSystemError {
@@ -87,23 +79,7 @@ pub struct VmStore<D: BlockDevice> {
 impl<D: BlockDevice> VmStore<D> {
     /// Open the pool's store, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
-        if !fs.datasets().await?.datasets.contains_key(VMS_DATASET) {
-            let blksz = fs.default_kv_blksz();
-            match fs
-                .create_btree(
-                    VMS_DATASET,
-                    DatasetFormat::Vms,
-                    blksz,
-                    crate::kv::NODE_CAPACITY,
-                    Default::default(),
-                )
-                .await
-            {
-                Ok(_) | Err(FileSystemError::AlreadyExists) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let ds = fs.open_btree(VMS_DATASET, DatasetFormat::Vms).await?;
+        let ds = crate::service_tree::ensure_btree(&fs, VMS_DATASET, DatasetFormat::Vms).await?;
         Ok(Arc::new(VmStore {
             fs,
             ds,
@@ -129,20 +105,20 @@ impl<D: BlockDevice> VmStore<D> {
     /// What each node last reported about itself, by name.
     pub async fn nodes(
         &self,
-    ) -> Result<BTreeMap<String, crate::node_facts::NodeFacts>, FileSystemError> {
+    ) -> Result<BTreeMap<String, crate::api_types::NodeFacts>, FileSystemError> {
         let _r = self.ds.ops.read().await;
         let t = Txn::begin(&self.fs, &self.ds.obj).await?;
         t.range(Bound::Included(b"N"), Bound::Excluded(b"O"), MAX_VMS)
             .await?
             .iter()
-            .map(|(_, v)| parse::<crate::node_facts::NodeFacts>(v).map(|f| (f.node.clone(), f)))
+            .map(|(_, v)| parse::<crate::api_types::NodeFacts>(v).map(|f| (f.node.clone(), f)))
             .collect()
     }
 
     /// Store `facts` as what its node reports about itself.
     pub async fn put_node(
         &self,
-        facts: &crate::node_facts::NodeFacts,
+        facts: &crate::api_types::NodeFacts,
     ) -> Result<(), FileSystemError> {
         if facts.node.is_empty() || facts.node.len() > 64 {
             return Err(bad(format!("bad node name '{}'", facts.node)));
@@ -165,7 +141,7 @@ impl<D: BlockDevice> VmStore<D> {
             .list()
             .await?
             .into_values()
-            .find(|d| d.spec().volumes.iter().any(|v| v == volume))
+            .find(|d| d.spec().volumes().iter().any(|v| v == volume))
             .map(|d| d.name))
     }
 
@@ -179,20 +155,17 @@ impl<D: BlockDevice> VmStore<D> {
         create: bool,
         change: Option<u64>,
     ) -> Result<VmDef, FileSystemError> {
-        if !valid_name(name) {
-            return Err(bad(format!(
-                "bad VM name '{}' (letters, digits, '-', '_', '.')",
-                name
-            )));
+        if let Err(e) = crate::types::VmName::try_from(name) {
+            return Err(bad(e.to_string()));
         }
         if xml.len() > MAX_XML {
             return Err(bad(format!("a VM definition is at most {} bytes", MAX_XML)));
         }
         let spec = VmSpec::parse(name, xml, 0);
-        if let Some(e) = spec.error {
+        if let Some(e) = spec.error() {
             return Err(bad(format!("VM '{}': {}", name, e)));
         }
-        for v in &spec.volumes {
+        for v in spec.volumes() {
             match self.fs.dataset_entry(v).await {
                 Ok(e) if e.format == DatasetFormat::Block => {}
                 Ok(e) => {
@@ -231,8 +204,9 @@ impl<D: BlockDevice> VmStore<D> {
                 _ => {}
             }
             for other in all.values().filter(|d| d.name != name) {
-                let theirs = other.spec().volumes;
-                if let Some(v) = spec.volumes.iter().find(|v| theirs.contains(v)) {
+                let other = other.spec();
+                let theirs = other.volumes();
+                if let Some(v) = spec.volumes().iter().find(|v| theirs.contains(v)) {
                     return Err(FileSystemError::Conflict(format!(
                         "VM '{}': volume '{}' is VM '{}''s (a volume belongs to one VM)",
                         name, v, other.name

@@ -1,6 +1,6 @@
 //! `raidish vm ...`: VMs through any `listen` node's API (see `crate::vms_api`).
 
-use crate::vm::{VmSpec, valid_name};
+use crate::vm::VmSpec;
 use crate::vms_api::VmView;
 use clap::Subcommand;
 use std::time::Duration;
@@ -76,42 +76,35 @@ impl Api {
         &self,
         req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
-        let mut errors = Vec::new();
-        for ep in &self.endpoints {
-            match req(&self.http, ep.trim_end_matches('/')).send().await {
-                Ok(r) if r.status().is_success() => return Ok(r),
-                Ok(r) if r.status().is_client_error() => {
-                    let s = r.status();
-                    return Err(format!("{}: {}", s, r.text().await.unwrap_or_default()));
+        use crate::net::{Answer, try_each};
+        let eps = self.endpoints.iter().map(|e| e.trim_end_matches('/'));
+        try_each(eps, |ep| {
+            let sent = req(&self.http, ep).send();
+            async move {
+                match sent.await {
+                    Ok(r) if r.status().is_success() => Answer::Got(r),
+                    // The caller's mistake: every node would say so.
+                    Ok(r) if r.status().is_client_error() => {
+                        let s = r.status();
+                        Answer::Refused(format!("{}: {}", s, r.text().await.unwrap_or_default()))
+                    }
+                    Ok(r) => {
+                        let s = r.status();
+                        Answer::Unreachable(format!("{} {}", s, r.text().await.unwrap_or_default()))
+                    }
+                    Err(e) => Answer::Unreachable(e.to_string()),
                 }
-                Ok(r) => {
-                    let s = r.status();
-                    errors.push(format!(
-                        "{}: {} {}",
-                        ep,
-                        s,
-                        r.text().await.unwrap_or_default()
-                    ))
-                }
-                Err(e) => errors.push(format!("{}: {}", ep, e)),
             }
-        }
-        Err(if errors.is_empty() {
-            "no cluster endpoints".into()
-        } else {
-            errors.join("; ")
         })
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
 pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), String> {
     let api = Api {
         endpoints,
-        http: crate::tls::http_builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?,
+        http: crate::tls::http_client(Some(Duration::from_secs(30)))?,
     };
     match command {
         VmCommands::List => {
@@ -141,16 +134,12 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
             println!("VM '{}' deleted (its volumes stay)", name);
         }
         VmCommands::Import { name, xml, replace } => {
-            if !valid_name(name) {
-                return Err(format!(
-                    "bad VM name '{}' (letters, digits, '-', '_', '.')",
-                    name
-                ));
-            }
+            crate::types::VmName::try_from(name.as_str()).map_err(|e| e.to_string())?;
+
             let body = std::fs::read_to_string(xml).map_err(|e| format!("{}: {}", xml, e))?;
             let spec = VmSpec::parse(name, &body, 0);
-            if let Some(e) = &spec.error {
-                return Err(e.clone());
+            if let Some(e) = spec.error() {
+                return Err(e.to_string());
             }
             let def: crate::vm_store::VmDef = api
                 .send(|c, b| {
@@ -165,8 +154,8 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
                 "VM '{}' defined (change {}): anchor volume '{}', volumes {}",
                 name,
                 def.change,
-                spec.anchor,
-                spec.volumes.join(", ")
+                spec.anchor().unwrap_or_default(),
+                spec.volumes().join(", ")
             );
             println!(
                 "if libvirt still has a domain '{}' defined on some host, undefine it there \
@@ -199,7 +188,11 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
                 (None, Some(from)) => println!("VM '{}' already runs on {}", name, from),
             }
             if let Some(v) = view.verdicts.first() {
-                for r in v.reasons.iter().filter(|r| r.level == "warn") {
+                for r in v
+                    .reasons
+                    .iter()
+                    .filter(|r| r.level == crate::vm_check::ReasonLevel::Warn)
+                {
                     println!("  warning: {}", r.text);
                 }
             }
@@ -266,7 +259,7 @@ fn print_check(view: &crate::vms_api::CheckView) {
         println!("  {:<10} {}", v.node, mode);
         for r in &v.reasons {
             // Not running: the live-only reasons don't matter.
-            if r.level == "cold" && view.running_on.is_none() {
+            if r.level == crate::vm_check::ReasonLevel::Cold && view.running_on.is_none() {
                 continue;
             }
             println!("    {:<5} {}", r.level, r.text);
@@ -278,11 +271,7 @@ fn print_check(view: &crate::vms_api::CheckView) {
 pub async fn run_node(command: &NodeCommands, endpoints: Vec<String>) -> Result<(), String> {
     let api = Api {
         endpoints,
-        http: crate::tls::http_builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?,
+        http: crate::tls::http_client(Some(Duration::from_secs(30)))?,
     };
     match command {
         NodeCommands::Facts { node } => {
@@ -338,7 +327,7 @@ fn print_facts(f: &crate::node_facts::NodeFacts, view: &crate::vms_api::FactsVie
             &h.cpu_model
         },
         h.cpu_threads,
-        h.memory_mb,
+        h.memory.mib(),
         if h.kvm { "yes" } else { "no" }
     );
     println!(
@@ -436,7 +425,7 @@ fn print_vms(vms: &[VmView]) {
     );
     for v in vms {
         let mut notes = Vec::new();
-        if let Some(e) = &v.spec.error {
+        if let Some(e) = v.spec.error() {
             notes.push(format!("error: {}", e));
         }
         if let Some(e) = &v.start_error {
@@ -449,7 +438,7 @@ fn print_vms(vms: &[VmView]) {
             notes.push("restart pending (XML changed)".into());
         }
         let state = match (&v.state, &v.unreachable) {
-            (Some(s), _) => s.clone(),
+            (Some(s), _) => s.to_string(),
             (None, Some(_)) => "unknown".into(),
             (None, None) => "stopped".into(),
         };
@@ -460,9 +449,8 @@ fn print_vms(vms: &[VmView]) {
             v.node.as_deref().unwrap_or("-"),
             state,
             v.vcpus.map_or("-".into(), |n| n.to_string()),
-            v.memory_kib
-                .map_or("-".into(), |k| format!("{}M", k / 1024)),
-            v.spec.volumes.join(","),
+            v.memory.map_or("-".into(), |m| format!("{}M", m.mib())),
+            v.spec.volumes().join(","),
             if notes.is_empty() {
                 String::new()
             } else {

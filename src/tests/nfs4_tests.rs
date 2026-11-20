@@ -3,7 +3,7 @@
 use super::attrs::{self, bitmap_of, read_bitmap, write_bitmap};
 use super::{err, op};
 use crate::fs::FileSystem;
-use crate::nfs::backend::Backend;
+use crate::nfs::backend::{Backend, NfsStat};
 use crate::nfs::rpc::Client;
 use crate::nfs::v3::NFS_PROG;
 use crate::nfs::xdr::{Reader, Writer};
@@ -280,7 +280,7 @@ async fn sessions_and_their_rules() {
     a.u64().unwrap();
     a.u64().unwrap(); // fsid
     assert_eq!(a.u32().unwrap(), super::state::LEASE_SECS);
-    assert_eq!(a.u64().unwrap(), root_id);
+    assert_eq!(a.u64().unwrap(), root_id.get());
 
     // Replays: the cached reply, byte for byte; uncached ones refused.
     let ask = || getattr(putroot(Ops::new()), &[attrs::CHANGE]);
@@ -1040,9 +1040,9 @@ fn seek_op(o: Ops, offset: u64, data: bool) -> Ops {
 }
 
 /// The SEEK result: (eof, offset), or the status.
-fn seek_result(res: &Res) -> Result<(bool, u64), u32> {
+fn seek_result(res: &Res) -> Result<(bool, u64), NfsStat> {
     if res.status != 0 {
-        return Err(res.status);
+        return Err(NfsStat::from_code(res.status));
     }
     let mut r = res.reader();
     skip_sequence(&mut r);

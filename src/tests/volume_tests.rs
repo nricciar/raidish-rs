@@ -399,10 +399,7 @@ async fn full_pool_fails_cleanly_without_leaking() {
 
     let b = pattern(60 * MB as usize, 2);
     fs.block_write("vol", 200 * MB, &b).await.unwrap();
-    assert!(matches!(
-        fs.sync().await,
-        Err(FileSystemError::UnableToAllocateBlocks(_))
-    ));
+    assert!(matches!(fs.sync().await, Err(FileSystemError::NoSpace(_))));
 
     // Nothing allocated, nothing freed, data still served from memory.
     assert_eq!(
@@ -479,7 +476,7 @@ async fn concurrent_flushes_share_commits() {
     while let Some(r) = tasks.join_next().await {
         r.unwrap();
     }
-    let commits = fs.uberblock().await.unwrap().txg - txg_before;
+    let commits = fs.uberblock().await.unwrap().txg.since(txg_before);
     assert!(commits < 32, "{} commits for 32 flushes", commits);
     drop(fs);
 

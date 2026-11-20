@@ -5,97 +5,109 @@
 //! pool over the `listen` nodes' websocket block protocol (the web
 //! dashboard). The servers and the command line are native only.
 
-// On wasm most of the crate is only reachable through `inspect`.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
-
 #[cfg(not(target_arch = "wasm32"))]
 #[macro_use]
 extern crate rocket;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub mod agent;
+pub(crate) mod agent;
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod auth;
-pub mod blkptr;
-pub mod btree;
+mod api_error;
+pub mod api_types;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod auth;
+pub(crate) mod blkptr;
+pub(crate) mod btree;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_vm;
+pub mod cluster;
 #[cfg(not(target_arch = "wasm32"))]
-mod cluster;
+pub(crate) mod committer;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod committer;
+pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod config;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod csi;
+pub(crate) mod csi;
 #[cfg(not(target_arch = "wasm32"))]
 mod dashboard;
-pub mod dataset;
+pub(crate) mod dataset;
 pub mod disk;
 pub mod disks;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod etcd;
+pub(crate) mod etcd;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod events;
-pub mod fence;
-pub mod file_writer;
+pub(crate) mod events;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod files_api;
+mod export;
+pub(crate) mod fence;
+pub(crate) mod file_writer;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod frontend;
+pub(crate) mod files_api;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod frontend;
 pub mod fs;
 mod fsck;
 pub mod inode;
 pub mod inspect;
-pub mod kv;
+pub(crate) mod kv;
 mod metaslab;
 mod mirror;
 #[cfg(not(target_arch = "wasm32"))]
 mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod nfs;
+mod net;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod node_facts;
+pub(crate) mod nfs;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod node_facts;
 #[cfg(not(target_arch = "wasm32"))]
 mod nvme;
 mod object;
-pub mod open_file;
+#[cfg(not(target_arch = "wasm32"))]
+mod object_lease;
+pub(crate) mod open_file;
 #[cfg(not(target_arch = "wasm32"))]
 mod peer_io;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod pki;
+pub(crate) mod pki;
+#[cfg(not(target_arch = "wasm32"))]
+mod proc;
 mod raidz;
 mod rt;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod s3;
+pub(crate) mod s3;
 mod scan;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod send;
+pub(crate) mod send;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod sigv4;
-pub mod snapshot;
+mod server;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod sqs;
+pub(crate) mod service_tree;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod sigv4;
+pub(crate) mod snapshot;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod sqs;
 mod stripe;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod tls;
+pub(crate) mod tls;
 mod trace;
+pub mod types;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
 pub mod vdev;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod vm;
+pub(crate) mod vm;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod vm_check;
+pub(crate) mod vm_check;
 pub mod vm_def;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod vm_store;
+pub(crate) mod vm_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod vms_api;
 mod volume;
@@ -103,9 +115,11 @@ mod volume;
 mod volume_io;
 #[cfg(not(target_arch = "wasm32"))]
 mod volumes_api;
-pub mod websocket;
-pub mod writer;
-pub mod zil;
+pub(crate) mod websocket;
+pub(crate) mod writer;
+#[cfg(not(target_arch = "wasm32"))]
+mod xml;
+pub(crate) mod zil;
 
 #[cfg(test)]
 #[path = "tests/util.rs"]

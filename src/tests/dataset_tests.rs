@@ -18,7 +18,7 @@ async fn format_makes_the_default_posix_dataset() {
     // The root directory is its own parent.
     assert_eq!(
         fs.read_dnode(fs.root_dir()).await.unwrap().parent,
-        fs.root_dir()
+        Some(fs.root_dir())
     );
 }
 
@@ -44,7 +44,7 @@ async fn the_dataset_directory_is_not_in_the_namespace() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let ds = fs.read_dnode(fs.datasets_object()).await.unwrap();
-    assert_eq!(ds.kind, ObjType::Datasets);
+    assert_eq!(ds.kind(), ObjType::Datasets);
     // Not a directory: path lookups can't walk into it.
     assert!(fs.read_dir(&ds).await.is_err());
     let root = fs.read_dnode(fs.root_dir()).await.unwrap();
@@ -77,8 +77,8 @@ async fn a_volume_is_a_block_dataset_not_an_entry_in_root() {
     let e = fs.dataset_entry("vol").await.unwrap();
     assert_eq!((e.root, e.format), (id, DatasetFormat::Block));
     let d = fs.read_dnode(id).await.unwrap();
-    assert_eq!(d.kind, ObjType::Volume);
-    assert_eq!(d.parent, fs.datasets_object());
+    assert_eq!(d.kind(), ObjType::Volume);
+    assert_eq!(d.parent, Some(fs.datasets_object()));
     // Not in `/`; a file of the same name is something else.
     assert!(fs.ls(Path::new("")).await.unwrap().files.is_empty());
     fs.write_file(Path::new("/vol"), b"a file").await.unwrap();
@@ -148,5 +148,8 @@ async fn snapshots_and_clones_are_datasets_too() {
 
 #[test]
 fn the_lease_is_per_dataset() {
-    assert_eq!(crate::committer::dataset_resource("vol"), "ds/vol");
+    assert_eq!(
+        crate::committer::dataset_resource("vol").to_string(),
+        "ds/vol"
+    );
 }

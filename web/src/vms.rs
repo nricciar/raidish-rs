@@ -3,7 +3,7 @@
 //! the VM page (`crate::vm_page`). The list is libvirt's live answer from
 //! the node holding each VM's disks, re-read every few seconds.
 
-use crate::api::{self, Vm};
+use crate::api::{self, VmView};
 use crate::app::Route;
 use crate::dialog::{Dialog, Spec};
 use crate::fmt;
@@ -24,7 +24,7 @@ pub struct Props {
 
 pub enum Msg {
     Load,
-    Loaded(Result<Vec<Vm>, String>),
+    Loaded(Result<Vec<VmView>, String>),
     Do(String, &'static str),
     /// Confirmed (or not needing it): do it.
     Confirmed,
@@ -35,7 +35,7 @@ pub enum Msg {
 }
 
 pub struct Vms {
-    vms: Option<Vec<Vm>>,
+    vms: Option<Vec<VmView>>,
     error: Option<String>,
     loading: bool,
     notice: Option<String>,
@@ -233,25 +233,30 @@ pub fn confirm(action: &str, name: &str) -> Option<Spec> {
 }
 
 /// A VM's state as a tag (with why, on hover, when it's not running).
-pub fn state_tag(vm: &Vm) -> Html {
+pub fn state_tag(vm: &VmView) -> Html {
     let (class, text, title) = state(vm);
     html! { <span class={classes!("tag", class)} title={title.unwrap_or_default()}>{ text }</span> }
 }
 
 /// (tag class, label, explanation).
-pub fn state(vm: &Vm) -> (&'static str, String, Option<String>) {
-    if vm.error.is_some() {
-        ("bad", "INVALID".to_string(), vm.error.clone())
+pub fn state(vm: &VmView) -> (&'static str, String, Option<String>) {
+    if vm.spec.disks.error().is_some() {
+        (
+            "bad",
+            "INVALID".to_string(),
+            vm.spec.disks.error().map(str::to_string),
+        )
     } else if let Some(s) = &vm.state {
-        if !vm.want_running && s == "running" {
+        let running = *s == raidish::vm_def::DomState::Running;
+        if !vm.want_running && running {
             return (
                 "warn",
                 "STOPPING".into(),
                 Some("shutting down (destroyed if it doesn't stop in time)".into()),
             );
         }
-        let class = if s == "running" { "ok" } else { "warn" };
-        (class, s.to_uppercase(), None)
+        let class = if running { "ok" } else { "warn" };
+        (class, s.as_str().to_uppercase(), None)
     } else if vm.unreachable.is_some() {
         ("warn", "UNKNOWN".into(), vm.unreachable.clone())
     } else if vm.start_error.is_some() {
@@ -276,10 +281,10 @@ impl Vms {
         });
     }
 
-    fn row(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn row(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
-        let name = vm.name.clone();
+        let name = vm.spec.name.clone();
         let href = Route::Vms(Some(name.clone())).href();
         let act = |a: &'static str| {
             let n = name.clone();
@@ -299,7 +304,13 @@ impl Vms {
             let r = Route::Vms(Some(name.clone()));
             Callback::from(move |_: MouseEvent| r.go())
         };
-        let disks = vm.hw.disks.iter().filter(|d| d.device != "cdrom").count();
+        let disks = vm
+            .spec
+            .hw
+            .disks
+            .iter()
+            .filter(|d| d.device != "cdrom")
+            .count();
         html! {
             <tr class="vm-row" onclick={open}>
                 <td>
@@ -311,14 +322,14 @@ impl Vms {
                 <td>{ state_tag(vm) }</td>
                 <td>{ vm.node.clone().unwrap_or_else(|| "—".into()) }</td>
                 <td class="num">{ vm.vcpus().map_or("—".into(), |v| v.to_string()) }</td>
-                <td class="num">{ vm.memory_kib().map_or("—".into(), |k| fmt::bytes(k * 1024)) }</td>
+                <td class="num">{ vm.memory().map_or("—".into(), |m| fmt::bytes(m.get())) }</td>
                 <td class="small muted">{ match disks { 0 => "—".to_string(), 1 => "1 disk".into(), n => format!("{} disks", n) } }</td>
                 <td class="acts">
                     <span class="row-actions">
                         if vm.console {
                             <button class="btn small" onclick={console}>{ "Console" }</button>
                         }
-                        if can_write && vm.error.is_none() {
+                        if can_write && vm.spec.disks.error().is_none() {
                             if vm.want_running {
                                 <button class="btn ghost small" onclick={act("stop")} title="shut the guest down">{ "Stop" }</button>
                             } else {

@@ -16,8 +16,9 @@ use std::sync::Arc;
 type NodeId = u64;
 type Shared = Arc<Cluster>;
 
-/// Refuses Raft RPCs from a node whose pool layout differs from ours: its
-/// node ids would mean different nodes.
+/// Refuses Raft RPCs from a node that speaks another Raft protocol version
+/// (426), or whose pool layout differs from ours (409): its node ids would
+/// mean different nodes.
 pub struct SameLayout;
 
 #[rocket::async_trait]
@@ -28,6 +29,19 @@ impl<'r> FromRequest<'r> for SameLayout {
         let Some(cluster) = req.rocket().state::<Shared>() else {
             return Outcome::Error((Status::ServiceUnavailable, "no cluster".into()));
         };
+        let version = req.headers().get_one(super::PROTOCOL_HEADER);
+        if version.and_then(|v| v.parse().ok()) != Some(super::RAFT_PROTOCOL) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "cluster: refusing Raft traffic in protocol {:?}: this node speaks {} \
+                     (every node must run the same raidish)",
+                    version,
+                    super::RAFT_PROTOCOL
+                )
+            });
+            return Outcome::Error((Status::UpgradeRequired, "other raft protocol".into()));
+        }
         let theirs = req
             .headers()
             .get_one(super::FINGERPRINT_HEADER)

@@ -1,4 +1,5 @@
 use crate::cluster::Cluster;
+use crate::committer::PoolAdmin;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::disks::{Caddy, DiskSet};
 use crate::fs::FileSystem;
@@ -39,7 +40,7 @@ impl DiskServer {
 pub async fn listen(
     disks: Arc<DiskSet>,
     pool: Option<Pool>,
-    port: u32,
+    port: u16,
     cluster: Arc<Cluster>,
     floor: Arc<EpochFloor>,
     pool_map: Option<crate::inspect::PoolMap>,
@@ -55,7 +56,7 @@ pub async fn listen(
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
-    let disks = disks.disks.clone();
+    let disks = disks.caddies().clone();
     // Read-only: this process only serves raw blocks; the pool's writer is
     // whoever formats/serves it remotely.
     let pool = pool.map(Arc::new);
@@ -77,19 +78,18 @@ pub async fn listen(
         node: cluster.name.clone(),
         writer: files,
         read_only,
-        // Any node takes lease requests (followers forward to the leader).
-        leases: Arc::new(crate::cluster::lease::LeaseClient::new(vec![format!(
-            "{}://127.0.0.1:{}",
-            crate::tls::scheme(),
-            port
-        )])),
+        // This node's own member (followers forward to the leader).
+        leases: Arc::new(crate::cluster::lease::LeaseClient::local(cluster.clone())),
     };
     // Volume management is done by the committer: ask every node for it.
     let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
     let mut endpoints = vec![me];
     endpoints.extend(cluster.members.peers.values().cloned());
     let volumes = crate::volumes_api::VolumesState {
-        client: crate::committer::CommitClient::new(endpoints),
+        admin: crate::committer::Admin::new(
+            committer.clone(),
+            crate::committer::CommitClient::new(endpoints),
+        ),
     };
     let server = DiskServer { disks, floor };
 
@@ -168,7 +168,7 @@ async fn activity(
     volumes: &State<crate::volumes_api::VolumesState>,
 ) -> Result<rocket::serde::json::Json<crate::events::EventPage>, (rocket::http::Status, String)> {
     volumes
-        .client
+        .admin
         .events(&q)
         .await
         .map(rocket::serde::json::Json)
@@ -194,7 +194,7 @@ async fn refresh_fence_map(pool: Arc<Pool>, fence: Arc<EpochFloor>) {
             if last != Some(key) {
                 let layout = crate::metaslab::MetaslabLayout::from_superblock(&sb);
                 fence.set_map(Some(crate::fence::FenceMap::new(
-                    pool.topology.clone(),
+                    pool.topology().clone(),
                     layout,
                 )));
                 last = Some(key);
@@ -209,20 +209,22 @@ async fn refresh_fence_map(pool: Arc<Pool>, fence: Arc<EpochFloor>) {
     }
 }
 
-/// The `X-Raidish-Epoch` header of an HTTP block write (0 if absent).
-pub struct HeaderEpoch(u64);
+/// The `X-Raidish-Epoch` header of an HTTP block write (`Epoch::NONE` if
+/// absent). A header that isn't an epoch is a bad request, not "no lease".
+pub struct HeaderEpoch(crate::types::Epoch);
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for HeaderEpoch {
     type Error = ();
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ()> {
-        let epoch = req
-            .headers()
-            .get_one("X-Raidish-Epoch")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        Outcome::Success(HeaderEpoch(epoch))
+        match req.headers().get_one("X-Raidish-Epoch") {
+            None => Outcome::Success(HeaderEpoch(crate::types::Epoch::NONE)),
+            Some(v) => match v.parse() {
+                Ok(e) => Outcome::Success(HeaderEpoch(e)),
+                Err(_) => Outcome::Error((Status::BadRequest, ())),
+            },
+        }
     }
 }
 
@@ -235,14 +237,14 @@ async fn get_block(
     block_id: u64,
     server: &State<DiskServer>,
 ) -> Result<Vec<u8>, Status> {
-    let mut buf = vec![0u8; BLOCK_SIZE];
+    let mut buf = [0u8; BLOCK_SIZE];
     server
         .local_disk(disk_index)?
         .read_block(block_id, &mut buf)
         .await
         .map_err(|_| Status::InternalServerError)?;
 
-    Ok(buf)
+    Ok(buf.to_vec())
 }
 
 /// HTTP: PUT /api/v1/disks/{disk_index}/blocks/{block_id}
@@ -321,17 +323,28 @@ async fn flush_disks(
 /// the server stops reading, which pushes back on the client.
 const WS_MAX_IN_FLIGHT: usize = 256;
 
-#[get("/ws")]
+#[get("/ws?<v>")]
 async fn ws_endpoint(
     who: crate::auth::Principal,
     ws: WebSocket,
+    v: Option<u32>,
     server: &State<DiskServer>,
-) -> ws::Channel<'static> {
+) -> Result<ws::Channel<'static>, (rocket::http::Status, String)> {
+    use crate::websocket::BLOCK_PROTOCOL;
+    if v != Some(BLOCK_PROTOCOL) {
+        let asked = v.map_or("no block protocol version".to_string(), |v| {
+            format!("block protocol {}", v)
+        });
+        return Err((
+            rocket::http::Status::BadRequest,
+            format!("{} asked for; this node speaks {}", asked, BLOCK_PROTOCOL),
+        ));
+    }
     let can_write = who.can_write();
     let disks = server.disks.clone();
     let floor = server.floor.clone();
 
-    ws.channel(move |stream| {
+    Ok(ws.channel(move |stream| {
         Box::pin(async move {
             let (mut sink, mut source) = stream.split();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(WS_MAX_IN_FLIGHT);
@@ -368,11 +381,11 @@ async fn ws_endpoint(
             let _ = writer.await;
             Ok(())
         })
-    })
+    }))
 }
 
 /// Serve one encoded request against `disks` and encode the reply.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) async fn handle_ws_message(
     data: &[u8],
     disks: &Arc<Vec<Caddy>>,
@@ -443,12 +456,13 @@ async fn serve_request(
 
     match op {
         WsOp::Read => {
-            let mut buffer = vec![0u8; count as usize * BLOCK_SIZE];
+            let mut buffer = crate::disk::zeroed_blocks(count as usize);
             disk.read_blocks(block, &mut buffer).await?;
-            Ok(buffer)
+            Ok(buffer.into_flattened())
         }
         WsOp::Write => {
             let data = request.write_data().ok_or(WsStatus::InvalidRequest)?;
+            let data = crate::disk::as_blocks(data).map_err(|_| WsStatus::InvalidRequest)?;
             disk.write_blocks(block, data).await?;
             Ok(Vec::new())
         }

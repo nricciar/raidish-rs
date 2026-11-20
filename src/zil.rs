@@ -439,7 +439,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Record that `vol`'s registered log is now `log`, keeping the
     /// metaslabs its regions are in from being given back meanwhile.
     pub(crate) fn set_dataset_log(&self, w: &WriterState, vol: &Dataset, log: Option<DatasetLog>) {
-        let ms = |r: &LogRegion| self.layout.metaslab_for_block(r.start).map(|i| i as u32);
+        let ms = |r: &LogRegion| self.layout.metaslab_for_block(r.start);
         let mut cur = vol.log.lock().unwrap();
         for r in cur.iter().flat_map(|l| &l.regions) {
             if let Some(i) = ms(r) {
@@ -646,8 +646,8 @@ impl<D: BlockDevice> FileSystem<D> {
 }
 
 /// The extent of a log region, as a commit's allocation.
-pub(crate) fn region_alloc(r: &LogRegion) -> (u64, u64) {
-    (r.start, r.len)
+pub(crate) fn region_alloc(r: &LogRegion) -> crate::types::Extent {
+    crate::types::Extent::new(r.start, r.len)
 }
 
 #[cfg(test)]

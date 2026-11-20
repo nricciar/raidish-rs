@@ -153,7 +153,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 name,
                 size_bytes: d.size,
                 volblocksize: d.blksz,
-                props: d.props.unwrap_or_default(),
+                props: d.props().cloned().unwrap_or_default(),
             });
         }
         Ok(out)

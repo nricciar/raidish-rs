@@ -11,10 +11,10 @@
 //!
 //! A handoff, A (the writer) to B:
 //!
-//! 1. A asks B: `RAIDISH-HANDOFF <volume> <epoch> <transport>`. B pauses
+//! 1. A asks B: `RAIDISH-HANDOFF/1 <volume> <epoch> <transport>`. B pauses
 //!    its proxied export (requests in flight finish, A still serves
-//!    them; new ones wait) and answers `READY <owner>\t<desc>`: the lease
-//!    owner and description it will hold the volume's lease as.
+//!    them; new ones wait) and answers `READY <owner>\t<holder>`: the lease
+//!    owner and holder (JSON) it will hold the volume's lease as.
 //! 2. A stops serving it: its export is removed (local clients and B's
 //!    proxy connection drain), the dataset is synced and detached.
 //! 3. A transfers the `ds/` lease to B's owner (`Request::Transfer`) and
@@ -28,11 +28,13 @@
 use super::{Lost, hold};
 use crate::cluster::lease::{HeldLease, LeaseClient, owner_id};
 use crate::committer::dataset_resource;
+use crate::export::BlockExporter;
 use crate::fs::FileSystem;
 use crate::inode::Transport;
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
 use crate::peer_io::{PeerExport, PeerIo, PeerLines, PeerOut, PeerVolumes, read_line};
+use crate::types::Epoch;
 use crate::vdev::Pool;
 use crate::volume_io::{LocalIo, OwnedPaused, SwitchableIo};
 use async_trait::async_trait;
@@ -56,20 +58,26 @@ pub(super) struct WriterParts {
 }
 
 impl WriterParts {
-    pub async fn add_export(&self, name: &str, t: Transport) -> Result<(), String> {
+    /// The server exporting over `t`.
+    pub fn exporter(&self, t: Transport) -> &dyn BlockExporter {
         match t {
-            Transport::Nbd => self.nbd.add_export(name).await,
-            Transport::Nvme => self.nvme.add_export(name).await,
+            Transport::Nbd => &*self.nbd,
+            Transport::Nvme => &*self.nvme,
         }
-        .map_err(|e| e.to_string())
+    }
+
+    pub async fn add_export(&self, name: &str, t: Transport) -> Result<(), String> {
+        self.exporter(t)
+            .add_export(name)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn remove_export(&self, name: &str, t: Transport) -> Result<bool, String> {
-        match t {
-            Transport::Nbd => self.nbd.remove_export(name).await,
-            Transport::Nvme => self.nvme.remove_export(name).await,
-        }
-        .map_err(|e| e.to_string())
+        self.exporter(t)
+            .remove_export(name)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -99,20 +107,20 @@ pub(super) enum Slot {
 /// What the agent shares with its peer I/O listener.
 pub(super) struct Shared {
     pub leases: LeaseClient,
-    /// This node's lease description (`agent <node> @<address>`).
-    pub desc: Mutex<String>,
+    /// What this node's leases say of it.
+    pub desc: Mutex<crate::types::Holder>,
     pub writer: Mutex<Option<WriterParts>>,
     pub slots: Mutex<BTreeMap<String, Slot>>,
     /// The volumes this node writes, by `ds/` lease epoch: what peers may
     /// proxy to.
-    pub writing: Mutex<BTreeMap<String, u64>>,
+    pub writing: Mutex<BTreeMap<String, Epoch>>,
 }
 
 impl Shared {
     pub fn new(leases: LeaseClient) -> Self {
         Shared {
             leases,
-            desc: Mutex::new(String::new()),
+            desc: Mutex::new(Default::default()),
             writer: Mutex::new(None),
             slots: Mutex::new(BTreeMap::new()),
             writing: Mutex::new(BTreeMap::new()),
@@ -140,13 +148,13 @@ pub(super) async fn take_over(
     name: &str,
     transport: Transport,
     owner: &str,
-    epoch: u64,
+    epoch: Epoch,
     asked: Instant,
     proxy: Option<(&Proxy, &mut OwnedPaused)>,
 ) -> Result<(Arc<HeldLease>, Lost), String> {
     let lease = Arc::new(HeldLease::adopt(
         leases.clone(),
-        &dataset_resource(name),
+        dataset_resource(name),
         owner,
         epoch,
         asked,
@@ -156,8 +164,7 @@ pub(super) async fn take_over(
     if let Err(e) =
         w.fs.attach_dataset_leased(
             name,
-            &lease.owner,
-            lease.epoch,
+            lease.holding(),
             Some(lost.watch()),
             Some(Arc::new(move || l.fresh())),
         )
@@ -185,7 +192,7 @@ pub(super) async fn take_over(
 
 #[async_trait]
 impl PeerVolumes for Shared {
-    fn export(&self, volume: &str, epoch: u64) -> Result<PeerExport, String> {
+    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String> {
         match self.writing.lock().unwrap().get(volume) {
             Some(e) if *e == epoch => {}
             Some(e) => {
@@ -202,16 +209,16 @@ impl PeerVolumes for Shared {
             .unwrap()
             .clone()
             .ok_or("no writer here")?;
-        w.nbd
-            .peer_export(volume)
-            .or_else(|| w.nvme.peer_export(volume))
+        [Transport::Nbd, Transport::Nvme]
+            .into_iter()
+            .find_map(|t| w.exporter(t).peer_export(volume))
             .ok_or_else(|| format!("{} isn't exported here", volume))
     }
 
     async fn handoff(
         &self,
         volume: &str,
-        epoch: u64,
+        epoch: Epoch,
         transport: &str,
         mut rd: PeerLines,
         mut wr: PeerOut,
@@ -262,7 +269,7 @@ impl PeerVolumes for Shared {
             None => None,
         };
         let owner = owner_id();
-        let desc = self.desc.lock().unwrap().clone();
+        let desc = serde_json::to_string(&*self.desc.lock().unwrap()).unwrap_or_default();
         if wr
             .write_all(format!("READY {}\t{}\n", owner, desc).as_bytes())
             .await
@@ -276,7 +283,7 @@ impl PeerVolumes for Shared {
         let new_epoch = match line {
             Ok(Ok(l)) => l
                 .strip_prefix("TRANSFERRED ")
-                .and_then(|e| e.parse::<u64>().ok()),
+                .and_then(|e| e.parse::<Epoch>().ok()),
             _ => None,
         };
         let Some(new_epoch) = new_epoch else {

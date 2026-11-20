@@ -11,8 +11,10 @@
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use async_trait::async_trait;
-use std::sync::Arc;
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock, RwLockWriteGuard};
+use std::any::Any;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 
 /// How long a request on a retired backend waits for its replacement
 /// before it fails after all.
@@ -91,12 +93,12 @@ pub struct SwitchableIo {
 }
 
 /// Requests are held back while this lives; see [`SwitchableIo::pause`].
-#[allow(dead_code)] // pausing and switching: the volume handoff's (MIG-1)
+#[cfg(test)]
 pub struct Paused<'a> {
-    backend: RwLockWriteGuard<'a, Arc<dyn VolumeIo>>,
+    backend: tokio::sync::RwLockWriteGuard<'a, Arc<dyn VolumeIo>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Paused<'_> {
     /// Serve the held-back requests, and all later ones, from `io`.
     pub fn set(&mut self, io: Arc<dyn VolumeIo>) {
@@ -108,7 +110,6 @@ impl Paused<'_> {
     }
 }
 
-#[allow(dead_code)]
 impl SwitchableIo {
     pub fn new(io: Arc<dyn VolumeIo>) -> Self {
         SwitchableIo {
@@ -117,13 +118,15 @@ impl SwitchableIo {
     }
 
     /// Hold new requests back once those in flight have finished.
+    #[cfg(test)]
     pub async fn pause(&self) -> Paused<'_> {
         Paused {
             backend: self.backend.write().await,
         }
     }
 
-    /// `pause`, not tied to a borrow of this (held across other work).
+    /// Hold new requests back once those in flight have finished, until
+    /// the result is dropped (held across other work).
     pub async fn pause_owned(&self) -> OwnedPaused {
         OwnedPaused {
             backend: self.backend.clone().write_owned().await,
@@ -131,12 +134,14 @@ impl SwitchableIo {
     }
 
     /// Serve requests from `io` from now on (after those in flight).
+    #[cfg(test)]
     pub async fn switch(&self, io: Arc<dyn VolumeIo>) {
         self.pause().await.set(io);
     }
 }
 
-/// `Paused`, owned: see [`SwitchableIo::pause_owned`].
+/// Requests are held back while this lives; see
+/// [`SwitchableIo::pause_owned`].
 pub struct OwnedPaused {
     backend: OwnedRwLockWriteGuard<Arc<dyn VolumeIo>>,
 }
@@ -208,6 +213,57 @@ impl VolumeIo for SwitchableIo {
         self.run(|io| Box::pin(async move { io.sync().await }))
             .await
     }
+}
+
+// ---- the background sync ----
+
+/// How often dirty volume data is committed without an explicit FLUSH.
+pub const SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// File systems that already have a background sync loop, by address. Weak,
+/// so a dropped file system (and its loop) doesn't pin the entry.
+static SYNC_LOOPS: StdMutex<Vec<Weak<dyn Any + Send + Sync>>> = StdMutex::new(Vec::new());
+
+/// Start the background TXG sync for `fs` unless one is already running.
+/// Shared by every NBD server and NVMe/TCP target on the same file system;
+/// the loop ends once the file system is dropped.
+pub(crate) fn ensure_sync_loop<D>(fs: &Arc<FileSystem<D>>, who: &'static str)
+where
+    D: BlockDevice + Send + Sync + 'static,
+{
+    {
+        let mut loops = SYNC_LOOPS.lock().unwrap();
+        loops.retain(|w| w.strong_count() > 0);
+        let ptr = Arc::as_ptr(fs) as *const ();
+        if loops.iter().any(|w| w.as_ptr() as *const () == ptr) {
+            return;
+        }
+        let any: Arc<dyn Any + Send + Sync> = fs.clone();
+        loops.push(Arc::downgrade(&any));
+    }
+    let weak = Arc::downgrade(fs);
+    let fold = fs.fold_wanted.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SYNC_INTERVAL);
+        loop {
+            // Every SYNC_INTERVAL, or early when an intent log fills up.
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = fold.wait() => {}
+            }
+            let Some(fs) = weak.upgrade() else { return };
+            if fs.has_dirty_datasets()
+                && let Err(e) = fs.sync().await
+            {
+                eprintln!("{}: background sync failed: {}", who, e);
+            }
+            // Only now: flushes still appending to the old region while the
+            // fold ran don't ask for another one. If the fold didn't move
+            // the log on, the next flush asks again.
+            fold.take();
+            drop(fs);
+        }
+    });
 }
 
 #[cfg(test)]

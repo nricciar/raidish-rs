@@ -5,6 +5,8 @@ use crate::inode::{Dnode, FileIndex};
 use crate::metaslab::{MetaslabLayout, MetaslabState};
 use crate::object::{ObjTree, Sizing, TreeRoot};
 use crate::raidz::RaidZError;
+use crate::types::ErrorKind;
+use crate::types::Txg;
 use crate::vdev::Topology;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,7 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-pub const FS_ID: &str = "RAIDISHV23";
+/// The on-disk format: a superblock's magic. Bumped by every format change.
+pub const FS_ID: u64 = u64::from_be_bytes(*b"RAIDIS24");
+/// A self-describing label block's magic ("RAID").
+pub const LABEL_MAGIC: u32 = 0x52414944;
 /// Version of the uberblock layout written.
 pub const UBERBLOCK_VERSION: u32 = 2;
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
@@ -64,7 +69,8 @@ pub enum FileSystemError {
     SerializationError(bincode::Error),
     DiskError(DiskError),
     RaidZError(RaidZError),
-    UnableToAllocateBlocks(u64),
+    /// Not enough free space (for what's said).
+    NoSpace(String),
     NotFormatted,
     FileNotFound,
     ChecksumMismatch,
@@ -73,7 +79,11 @@ pub enum FileSystemError {
     NotADirectory,
     NotAFile,
     AlreadyExists,
+    /// A directory (or the like) that still has entries.
+    NotEmpty(String),
     InvalidArgument(String),
+    /// Failed somewhere else (a remote committer) for an internal reason.
+    Internal(String),
     /// The pool was formatted with a different layout than configured.
     TopologyMismatch(String),
     /// Refused because the target changed meanwhile, or is open for writing
@@ -83,7 +93,7 @@ pub enum FileSystemError {
     Unavailable(String),
     /// A writer's blocks were stamped below the birth floor: rebuild them
     /// stamped with this TXG.
-    Restamp(u64),
+    Restamp(Txg),
 }
 
 impl fmt::Display for FileSystemError {
@@ -93,9 +103,9 @@ impl fmt::Display for FileSystemError {
             FileSystemError::DiskError(err) => write!(f, "Disk error: {}", err),
             FileSystemError::RaidZError(err) => write!(f, "RaidZ error: {}", err),
             FileSystemError::TopologyMismatch(why) => write!(f, "topology mismatch: {}", why),
-            FileSystemError::UnableToAllocateBlocks(count) => {
-                write!(f, "Unable to allocate {} blocks", count)
-            }
+            FileSystemError::NoSpace(what) => write!(f, "No space left for {}", what),
+            FileSystemError::NotEmpty(what) => write!(f, "{} isn't empty", what),
+            FileSystemError::Internal(why) => write!(f, "Internal error: {}", why),
             FileSystemError::NotFormatted => write!(f, "Not formatted"),
             FileSystemError::FileNotFound => write!(f, "File not found"),
             FileSystemError::ChecksumMismatch => write!(f, "Checksum mismatch"),
@@ -111,6 +121,78 @@ impl fmt::Display for FileSystemError {
                 write!(f, "Stamped below the birth floor (now TXG {})", t)
             }
         }
+    }
+}
+
+impl FileSystemError {
+    /// What sort of failure it is (see [`ErrorKind`]).
+    pub fn kind(&self) -> ErrorKind {
+        use FileSystemError as E;
+        match self {
+            E::FileNotFound | E::DirectoryNotFound => ErrorKind::NotFound,
+            E::AlreadyExists => ErrorKind::Exists,
+            E::NotEmpty(_) => ErrorKind::NotEmpty,
+            E::NotADirectory => ErrorKind::NotDir,
+            E::NotAFile => ErrorKind::NotFile,
+            E::InvalidArgument(_) => ErrorKind::Invalid,
+            E::Conflict(_) => ErrorKind::Conflict,
+            E::Unavailable(_) | E::NotFormatted | E::Restamp(_) => ErrorKind::Unavailable,
+            E::NoSpace(_) => ErrorKind::NoSpace,
+            // Disks out of reach (or our epoch behind): try again later.
+            E::DiskError(d) | E::RaidZError(crate::raidz::RaidZError::DiskError(d))
+                if d.is_transient() =>
+            {
+                ErrorKind::Unavailable
+            }
+            E::RaidZError(crate::raidz::RaidZError::IncompleteStripe(_)) => ErrorKind::Unavailable,
+            E::SerializationError(_)
+            | E::DiskError(_)
+            | E::RaidZError(_)
+            | E::ChecksumMismatch
+            | E::InvalidMagic
+            | E::TopologyMismatch(_)
+            | E::Internal(_) => ErrorKind::Internal,
+        }
+    }
+
+    /// What it says, without its kind's prefix: what [`Self::from_kind`]
+    /// takes back.
+    pub fn message(&self) -> String {
+        use FileSystemError as E;
+        match self {
+            E::NotEmpty(m)
+            | E::InvalidArgument(m)
+            | E::Conflict(m)
+            | E::Unavailable(m)
+            | E::NoSpace(m)
+            | E::Internal(m)
+            | E::TopologyMismatch(m) => m.clone(),
+            e => e.to_string(),
+        }
+    }
+
+    /// An error of `kind` saying `msg`, as reported from elsewhere: the
+    /// variant `kind` names, so it matches as if it were local.
+    pub fn from_kind(kind: ErrorKind, msg: String) -> Self {
+        use FileSystemError as E;
+        match kind {
+            ErrorKind::NotFound => E::FileNotFound,
+            ErrorKind::Exists => E::AlreadyExists,
+            ErrorKind::NotEmpty => E::NotEmpty(msg),
+            ErrorKind::NotDir => E::NotADirectory,
+            ErrorKind::NotFile => E::NotAFile,
+            ErrorKind::Invalid | ErrorKind::Forbidden => E::InvalidArgument(msg),
+            ErrorKind::Conflict => E::Conflict(msg),
+            ErrorKind::Unavailable => E::Unavailable(msg),
+            ErrorKind::NoSpace => E::NoSpace(msg),
+            ErrorKind::Internal => E::Internal(msg),
+        }
+    }
+}
+
+impl From<crate::types::NameError> for FileSystemError {
+    fn from(e: crate::types::NameError) -> Self {
+        FileSystemError::InvalidArgument(e.to_string())
     }
 }
 
@@ -134,7 +216,8 @@ impl From<RaidZError> for FileSystemError {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Superblock {
-    pub magic: String,
+    /// [`FS_ID`].
+    pub magic: u64,
     pub block_size: u32,
     pub total_blocks: u64,
     pub metaslab_count: u64,
@@ -163,7 +246,7 @@ pub enum Rewind {
     /// for salvage).
     Readable,
     /// The uberblock of exactly this TXG.
-    Txg(u64),
+    Txg(Txg),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -176,17 +259,60 @@ pub struct LoadOptions {
 pub struct Uberblock {
     pub magic: u64,
     pub version: u32,
-    pub txg: u64,       // transaction group
+    pub txg: Txg,       // transaction group
     pub timestamp: u64, // optional but useful
     /// The object table (see `crate::inode`).
     pub objects: TreeRoot,
     /// Per member disk: the earliest TXG it may have missed writes from
     /// (None = in sync). Cleared by a successful resilver.
-    pub degraded: Vec<Option<u64>>,
+    pub degraded: Vec<Option<Txg>>,
     /// The next pool-wide object number (inode id). Never reused.
     pub next_object: u64,
     /// The dataset directory's object number (see `crate::dataset`).
     pub datasets: FileId,
+}
+
+impl Uberblock {
+    /// One that no import takes (it overwrites a ring slot).
+    fn blank() -> Self {
+        Uberblock {
+            magic: 0,
+            version: 0,
+            txg: Txg::ZERO,
+            timestamp: 0,
+            objects: TreeRoot {
+                ptr: None,
+                levels: 0,
+            },
+            degraded: Vec::new(),
+            next_object: 0,
+            datasets: FileId::from_raw(0),
+        }
+    }
+
+    /// Whether it's a pool state to import: its magic and version, and the
+    /// TXG its label was written in (`txg`).
+    pub fn validate(&self, txg: Txg) -> Result<(), String> {
+        if self.magic != UBERBLOCK_MAGIC {
+            return Err("not an uberblock".into());
+        }
+        if self.version != UBERBLOCK_VERSION {
+            return Err(format!("uberblock version {}", self.version));
+        }
+        if self.txg != txg {
+            return Err(format!("TXG {} in a label of TXG {}", self.txg, txg));
+        }
+        if self.txg == Txg::ZERO {
+            return Err("TXG 0".into());
+        }
+        if self.datasets.get() == 0 || self.datasets.get() >= self.next_object {
+            return Err(format!(
+                "dataset directory object {} (next object {})",
+                self.datasets, self.next_object
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Identity of a member disk, stored (twice) in its label area outside the
@@ -209,14 +335,9 @@ pub enum LabelState {
     Foreign,
 }
 
-/// A random-enough 64-bit id (no RNG dependency needed).
-/// Milliseconds since the epoch (wasm too).
-pub(crate) fn now_ms() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
+pub(crate) use crate::types::now_ms;
 
+/// A random-enough 64-bit id (no RNG dependency needed).
 pub(crate) fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(
@@ -238,19 +359,19 @@ pub(crate) fn new_guid(salt: u64) -> u64 {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BlockHeader {
     pub magic: u32,
-    pub txg: u64,
+    pub txg: Txg,
     pub checksum: [u8; 32],
     pub payload_len: u32,
 }
 
 /// Validate a self-describing label block in place; returns (txg, payload length).
-pub(crate) fn parse_label(buf: &[u8]) -> Result<(u64, usize), FileSystemError> {
+pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
     let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
-    if header.magic != 0x52414944 {
+    if header.magic != LABEL_MAGIC {
         return Err(FileSystemError::InvalidMagic);
     }
     let payload_len = header.payload_len as usize;
-    if BLOCK_HEADER_SIZE + payload_len > buf.len() {
+    if payload_len > buf.len().saturating_sub(BLOCK_HEADER_SIZE) {
         return Err(FileSystemError::ChecksumMismatch);
     }
     let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len];
@@ -263,9 +384,9 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(u64, usize), FileSystemError> {
 /// Read a pool device's superblock without loading the pool (None: not
 /// formatted, or unreadable).
 pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
-    let header = HeaderLayout::new(dev.pool().map_or(1, |p| p.align));
+    let header = HeaderLayout::new(dev.pool().map_or(1, |p| p.align()));
     for mirror in 0..header.superblock_blocks {
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = [0u8; BLOCK_SIZE];
         if dev
             .read_block(SUPERBLOCK_LBA + mirror, &mut buf)
             .await
@@ -302,12 +423,14 @@ impl FoldWanted {
     }
 
     /// Wait for a request.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn wait(&self) {
         self.notify.notified().await
     }
 
     /// Clear the request once a fold has run; later flushes may raise a
     /// new one.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn take(&self) -> bool {
         self.raised.swap(false, Ordering::SeqCst)
     }
@@ -346,7 +469,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
     /// See `Uberblock::degraded`; persisted with every commit.
-    pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+    pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<Txg>>>>,
     /// Per-disk missed-write counts already folded into `degraded`.
     pub(crate) miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Record alignment in blocks (the pool's, or 1 for a plain device).
@@ -376,8 +499,8 @@ pub struct FileSystem<D: BlockDevice> {
 
 impl<D: BlockDevice> FileSystem<D> {
     fn empty(dev: D) -> Self {
-        let align = dev.pool().map_or(1, |p| p.align);
-        let disks = dev.pool().map_or(0, |p| p.disks.len());
+        let align = dev.pool().map_or(1, |p| p.align());
+        let disks = dev.pool().map_or(0, |p| p.disks().len());
         FileSystem {
             dev,
             superblock: Arc::new(RwLock::new(None)),
@@ -421,8 +544,8 @@ impl<D: BlockDevice> FileSystem<D> {
     /// each request carries its fencing domain's epoch.
     fn publish_fence_map(&self) {
         if let Some(pool) = self.dev.pool() {
-            pool.disks.fence.set_map(crate::fence::FenceMap::new(
-                pool.topology.clone(),
+            pool.disks().fence().set_map(crate::fence::FenceMap::new(
+                pool.topology().clone(),
                 self.layout,
             ));
         }
@@ -432,7 +555,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// pool (the committer, or a standalone pool holder) hands them out.
     pub(crate) fn alloc_object(&self) -> FileId {
         debug_assert!(self.writer.is_none(), "writers don't assign object numbers");
-        self.next_object.fetch_add(1, Ordering::SeqCst)
+        FileId::from_raw(self.next_object.fetch_add(1, Ordering::SeqCst))
     }
 
     /// From now on, commits must stamp every new block with TXG `txg` or
@@ -440,24 +563,24 @@ impl<D: BlockDevice> FileSystem<D> {
     /// block a later commit adds is born after the snapshot (and a block's
     /// birth says whether a snapshot has it). Writers whose blocks are
     /// stamped lower (their view of the TXG lags) are told to restamp.
-    pub(crate) fn raise_birth_floor(&self, txg: u64) {
-        self.birth_floor.fetch_max(txg, Ordering::SeqCst);
+    pub(crate) fn raise_birth_floor(&self, txg: Txg) {
+        self.birth_floor.fetch_max(txg.get(), Ordering::SeqCst);
     }
 
-    pub(crate) fn birth_floor(&self) -> u64 {
-        self.birth_floor.load(Ordering::SeqCst)
+    pub(crate) fn birth_floor(&self) -> Txg {
+        Txg::from_raw(self.birth_floor.load(Ordering::SeqCst))
     }
 
     /// Leaf disks of the pool underneath (0 for a plain device).
     pub fn disk_count(&self) -> usize {
-        self.dev.pool().map_or(0, |p| p.disks.len())
+        self.dev.pool().map_or(0, |p| p.disks().len())
     }
 
     /// Every disk's missed-write count right now.
     pub(crate) fn miss_counts(&self) -> Vec<u64> {
         match self.dev.pool() {
-            Some(pool) => (0..pool.disks.len())
-                .map(|d| pool.disks.miss_count(d))
+            Some(pool) => (0..pool.disks().len())
+                .map(|d| pool.disks().miss_count(d))
                 .collect(),
             None => Vec::new(),
         }
@@ -482,12 +605,12 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// TXG that blocks written right now belong to.
-    pub(crate) async fn open_txg(&self) -> Result<u64, FileSystemError> {
+    pub(crate) async fn open_txg(&self) -> Result<Txg, FileSystemError> {
         self.uberblock
             .lock()
             .await
             .as_ref()
-            .map(|u| u.txg + 1)
+            .map(|u| u.txg.next())
             .ok_or(FileSystemError::NotFormatted)
     }
 
@@ -497,17 +620,9 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // In-memory TXG 0; everything written by format belongs to TXG 1.
         let zero_uber = Uberblock {
-            magic: 0,
-            version: 0,
-            txg: 0,
-            timestamp: 0,
-            objects: TreeRoot {
-                ptr: None,
-                levels: 0,
-            },
             degraded: vec![None; fs.disk_count()],
             next_object: 1,
-            datasets: 0,
+            ..Uberblock::blank()
         };
         fs.uberblock = Arc::new(Mutex::new(Some(zero_uber.clone())));
         // Disks that failed during format must not count as missed writes
@@ -521,7 +636,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let layout = MetaslabLayout::compute(total_blocks, header.spacemap_start, fs.align);
         let superblock = Superblock {
-            magic: FS_ID.to_string(),
+            magic: FS_ID,
             block_size: BLOCK_SIZE as u32,
             total_blocks,
             metaslab_count: layout.metaslab_count,
@@ -531,7 +646,7 @@ impl<D: BlockDevice> FileSystem<D> {
             data_start: layout.data_start,
             pool_guid: new_guid(total_blocks),
             align: fs.align,
-            topology: fs.dev.pool().map(|p| p.topology.clone()),
+            topology: fs.dev.pool().map(|p| p.topology().clone()),
         };
         for mirror_idx in 0..header.superblock_blocks {
             fs.write_block_checked_txg(SUPERBLOCK_LBA + mirror_idx, &superblock)
@@ -543,7 +658,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for d in 0..fs.disk_count() {
             if fs.write_disk_label(d).await.is_err() {
                 eprintln!("format: disk {} label write failed; marking it degraded", d);
-                fs.degraded.lock().unwrap()[d] = Some(0);
+                fs.degraded.lock().unwrap()[d] = Some(Txg::ZERO);
             }
         }
 
@@ -565,12 +680,12 @@ impl<D: BlockDevice> FileSystem<D> {
         }));
         // The dataset directory, and the default posix dataset's root.
         let datasets = fs.alloc_object();
-        fs.datasets_obj.store(datasets, Ordering::SeqCst);
+        fs.datasets_obj.store(datasets.get(), Ordering::SeqCst);
         fs.write_dnode(datasets, Some(Dnode::datasets(fs.file_blksz())))
             .await?;
         let root = fs.alloc_object();
         let mut dir = Dnode::directory(fs.file_blksz());
-        dir.parent = root;
+        dir.parent = Some(root);
         fs.write_dnode(root, Some(dir)).await?;
         let mut index = DatasetIndex::default();
         index.datasets.insert(
@@ -578,13 +693,13 @@ impl<D: BlockDevice> FileSystem<D> {
             DatasetEntry {
                 root,
                 format: DatasetFormat::Posix,
-                guid: new_guid(root),
-                created_txg: 1,
+                guid: new_guid(root.get()),
+                created_txg: Txg::from_raw(1),
                 created_ms: now_ms(),
             },
         );
         fs.write_datasets(&index).await?;
-        fs.root_dir.store(root, Ordering::SeqCst);
+        fs.root_dir.store(root.get(), Ordering::SeqCst);
         fs.commit_txg().await?;
 
         Ok(fs)
@@ -599,12 +714,12 @@ impl<D: BlockDevice> FileSystem<D> {
     /// unreadable).
     async fn dnode_in(&self, table: &ObjTree, id: FileId) -> Option<Dnode> {
         let buf = self
-            .object_record(table, id / crate::inode::DNODES_PER_LEAF)
+            .object_record(table, id.get() / crate::inode::DNODES_PER_LEAF)
             .await
             .ok()??;
         let slots = crate::inode::decode_leaf(&buf).ok()?;
         slots
-            .get((id % crate::inode::DNODES_PER_LEAF) as usize)
+            .get((id.get() % crate::inode::DNODES_PER_LEAF) as usize)
             .cloned()
             .flatten()
     }
@@ -670,7 +785,7 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         if let Some(pool) = fs.dev.pool()
-            && superblock.topology.as_ref() != Some(&pool.topology)
+            && superblock.topology.as_ref() != Some(pool.topology())
         {
             return Err(FileSystemError::TopologyMismatch(format!(
                 "pool was formatted as {}, configured as {}",
@@ -678,7 +793,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     .topology
                     .as_ref()
                     .map_or("a plain device".to_string(), |t| t.summary()),
-                pool.topology.summary()
+                pool.topology().summary()
             )));
         }
         let Some(newest) = ring.first().cloned() else {
@@ -688,7 +803,8 @@ impl<D: BlockDevice> FileSystem<D> {
         fs.publish_fence_map();
         // Fixed once formatted, so every TXG in the ring has the same one;
         // choosing a rewind target walks namespaces from it.
-        fs.datasets_obj.store(newest.datasets, Ordering::SeqCst);
+        fs.datasets_obj
+            .store(newest.datasets.get(), Ordering::SeqCst);
 
         let uber = match opts.rewind {
             Rewind::None => newest.clone(),
@@ -785,7 +901,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let root_id = Self::default_root(&index)?;
         let root = fs.read_dnode(root_id).await?;
         fs.read_dir(&root).await?;
-        fs.root_dir.store(root_id, Ordering::SeqCst);
+        fs.root_dir.store(root_id.get(), Ordering::SeqCst);
 
         if rewound && !fs.read_only {
             let older: Vec<TreeRoot> = ring
@@ -810,10 +926,9 @@ impl<D: BlockDevice> FileSystem<D> {
             eprintln!("rewind: committed as TXG {}", txg);
             // The discarded TXGs must never be imported again: their space
             // is free now and about to be reused.
-            for u in ring
-                .iter()
-                .filter(|u| u.txg > uber.txg && u.txg % UBERBLOCK_SLOTS != txg % UBERBLOCK_SLOTS)
-            {
+            for u in ring.iter().filter(|u| {
+                u.txg > uber.txg && u.txg.slot(UBERBLOCK_SLOTS) != txg.slot(UBERBLOCK_SLOTS)
+            }) {
                 if let Err(e) = fs.invalidate_uberblock_slot(u.txg).await {
                     eprintln!(
                         "WARNING: rewind: could not erase discarded TXG {}: {}",
@@ -1167,7 +1282,7 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// Only after step 4 does in-memory state advance (active slots, deferred
     /// frees). On failure, the TXG stays open and can be retried.
-    pub(crate) async fn commit_txg(&self) -> Result<u64, FileSystemError> {
+    pub(crate) async fn commit_txg(&self) -> Result<Txg, FileSystemError> {
         let _guard = self.commit_lock.lock().await;
         self.commit_locked().await
     }
@@ -1193,7 +1308,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.commit_lock.lock().await
     }
 
-    pub(crate) async fn commit_locked(&self) -> Result<u64, FileSystemError> {
+    pub(crate) async fn commit_locked(&self) -> Result<Txg, FileSystemError> {
         if let Some(w) = self.writer.clone() {
             // A volume writer commits through the committer.
             let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1281,15 +1396,15 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Fold missed writes since the last commit into `degraded`. A miss seen
     /// now happened during TXG `txg` or late in `txg - 1` (the previous
     /// commit's uberblock write), so the disk needs everything from `txg - 1`.
-    fn account_misses(&self, txg: u64) -> Vec<Option<u64>> {
+    fn account_misses(&self, txg: Txg) -> Vec<Option<Txg>> {
         let mut degraded = self.degraded.lock().unwrap();
         if let Some(pool) = self.dev.pool() {
             let mut seen = self.miss_seen.lock().unwrap();
-            for d in 0..pool.disks.len() {
-                let count = pool.disks.miss_count(d);
+            for d in 0..pool.disks().len() {
+                let count = pool.disks().miss_count(d);
                 if count != seen[d] {
                     seen[d] = count;
-                    let since = txg.saturating_sub(1);
+                    let since = txg.prev();
                     if degraded[d].is_none() {
                         eprintln!("disk {} missed writes; degraded since TXG {}", d, since);
                     }
@@ -1302,7 +1417,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Mark `disk` as needing everything from TXG `since` (persisted at the
     /// next commit).
-    pub(crate) fn mark_degraded(&self, disk: usize, since: u64) {
+    pub(crate) fn mark_degraded(&self, disk: usize, since: Txg) {
         let mut degraded = self.degraded.lock().unwrap();
         degraded[disk] = Some(degraded[disk].map_or(since, |t| t.min(since)));
     }
@@ -1318,7 +1433,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .collect()
     }
 
-    pub fn degraded_disks(&self) -> Vec<Option<u64>> {
+    pub fn degraded_disks(&self) -> Vec<Option<Txg>> {
         self.degraded.lock().unwrap().clone()
     }
 
@@ -1339,8 +1454,8 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let mut readable = false;
         for copy in 0..crate::disks::DISK_LABEL_BLOCKS {
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            if pool.disks.read_label(disk, copy, &mut buf).await.is_err() {
+            let mut buf = [0u8; BLOCK_SIZE];
+            if pool.disks().read_label(disk, copy, &mut buf).await.is_err() {
                 continue;
             }
             readable = true;
@@ -1370,13 +1485,13 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or(FileSystemError::NotFormatted)?;
         label.disk_guid = new_guid(disk as u64);
         let payload = bincode::serialize(&label)?;
-        let txg = self.uberblock().await.map_or(0, |u| u.txg);
+        let txg = self.uberblock().await.map_or(Txg::ZERO, |u| u.txg);
         let mut buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(txg, &payload, &mut buf)?;
         for copy in 0..crate::disks::DISK_LABEL_BLOCKS {
-            pool.disks.write_label(disk, copy, &buf).await?;
+            pool.disks().write_label(disk, copy, &buf).await?;
         }
-        pool.disks.flush_disk(disk).await?;
+        pool.disks().flush_disk(disk).await?;
         Ok(())
     }
 
@@ -1402,8 +1517,8 @@ impl<D: BlockDevice> FileSystem<D> {
                     "disk {} has no label for this pool (new or replaced?); fencing it until resilvered",
                     d
                 );
-                pool.disks.set_fenced(d, true);
-                self.mark_degraded(d, 0);
+                pool.disks().set_fenced(d, true);
+                self.mark_degraded(d, Txg::ZERO);
             }
         }
         state
@@ -1411,9 +1526,9 @@ impl<D: BlockDevice> FileSystem<D> {
 
     async fn write_uberblock(
         &self,
-        txg: u64,
+        txg: Txg,
         objects: TreeRoot,
-        degraded: Vec<Option<u64>>,
+        degraded: Vec<Option<Txg>>,
     ) -> Result<Uberblock, FileSystemError> {
         // Everything the uberblock points at must be durable first.
         self.dev.flush().await?;
@@ -1431,7 +1546,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Rotate through the ring; one copy per block of the slot.
         let slot_blocks = self.header.uberblock_slot_blocks;
-        let base_lba = self.header.uberblock_start + (txg % UBERBLOCK_SLOTS) * slot_blocks;
+        let base_lba = self.header.uberblock_start + txg.slot(UBERBLOCK_SLOTS) * slot_blocks;
 
         let payload = bincode::serialize(&uberblock)?;
         assert!(payload.len() <= BLOCK_PAYLOAD_SIZE);
@@ -1450,24 +1565,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Overwrite the ring slot holding TXG `txg` with an invalid (zero-magic)
     /// uberblock, so it can't be imported any more.
-    async fn invalidate_uberblock_slot(&self, txg: u64) -> Result<(), FileSystemError> {
+    async fn invalidate_uberblock_slot(&self, txg: Txg) -> Result<(), FileSystemError> {
         let slot_blocks = self.header.uberblock_slot_blocks;
-        let base_lba = self.header.uberblock_start + (txg % UBERBLOCK_SLOTS) * slot_blocks;
-        let blank = Uberblock {
-            magic: 0,
-            version: 0,
-            txg: 0,
-            timestamp: 0,
-            objects: TreeRoot {
-                ptr: None,
-                levels: 0,
-            },
-            degraded: Vec::new(),
-            next_object: 0,
-            datasets: 0,
-        };
+        let base_lba = self.header.uberblock_start + txg.slot(UBERBLOCK_SLOTS) * slot_blocks;
+        let blank = Uberblock::blank();
         let mut buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(0, &bincode::serialize(&blank)?, &mut buf)?;
+        self.prepare_block_buffer(Txg::ZERO, &bincode::serialize(&blank)?, &mut buf)?;
         for copy in 0..slot_blocks {
             self.dev.write_block(base_lba + copy, &buf).await?;
         }
@@ -1488,7 +1591,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn write_raw_block_txg(
         &self,
         lba: BlockId,
-        txg: u64,
+        txg: Txg,
         data: &[u8],
     ) -> Result<(), FileSystemError> {
         let mut block_buf = [0u8; BLOCK_SIZE];
@@ -1509,13 +1612,13 @@ impl<D: BlockDevice> FileSystem<D> {
 
     fn prepare_block_buffer(
         &self,
-        txg: u64,
+        txg: Txg,
         data: &[u8],
         buf: &mut [u8; BLOCK_SIZE],
     ) -> Result<(), FileSystemError> {
         let checksum = *blake3::hash(data).as_bytes();
         let header = BlockHeader {
-            magic: 0x52414944,
+            magic: LABEL_MAGIC,
             txg,
             checksum,
             payload_len: data.len() as u32,
@@ -1549,7 +1652,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for i in 0..self.header.uberblock_blocks() {
             let lba = self.header.uberblock_start + i;
             for (txg, ub) in self.read_label_versions::<Uberblock>(lba).await {
-                if ub.magic != UBERBLOCK_MAGIC || ub.version != UBERBLOCK_VERSION || ub.txg != txg {
+                if ub.validate(txg).is_err() {
                     continue;
                 }
                 if !found.iter().any(|u| u.txg == txg) {
@@ -1566,11 +1669,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// writes still returns well-formed (older) labels, and on a mirror (or
     /// a single-data-shard raidz) every copy of an uberblock slot may come
     /// from that one disk, so the normal read alone could roll the pool back.
-    async fn read_label_versions<T: for<'a> Deserialize<'a>>(&self, lba: BlockId) -> Vec<(u64, T)> {
+    async fn read_label_versions<T: for<'a> Deserialize<'a>>(&self, lba: BlockId) -> Vec<(Txg, T)> {
         let mut blocks = Vec::new();
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = [0u8; BLOCK_SIZE];
         if self.dev.read_block(lba, &mut buf).await.is_ok() {
-            blocks.push(buf);
+            blocks.push(buf.to_vec());
         }
         if let Ok(c) = self.dev.reconstruct_candidates(lba).await {
             for b in c.rebuilt.into_iter().flatten() {
@@ -1594,8 +1697,8 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn read_block_checked<T: for<'a> Deserialize<'a>>(
         &self,
         lba: BlockId,
-    ) -> Result<(u64, T), FileSystemError> {
-        let mut buf = vec![0u8; BLOCK_SIZE];
+    ) -> Result<(Txg, T), FileSystemError> {
+        let mut buf = [0u8; BLOCK_SIZE];
         self.dev.read_block(lba, &mut buf).await?;
 
         // parse_label bounds-checks the header (a corrupt length used to panic).

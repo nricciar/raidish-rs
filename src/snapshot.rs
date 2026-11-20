@@ -43,8 +43,9 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Dnode, Lineage, ObjType, SnapRef};
+use crate::inode::{Body, Dnode, Head, Snap, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
+use crate::types::Txg;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ use std::sync::Arc;
 pub struct SnapshotInfo {
     /// `volume@snapshot`.
     pub name: String,
-    pub txg: u64,
+    pub txg: Txg,
     /// Names these contents in any pool (kept by send/receive).
     pub guid: u64,
     /// When it was taken, ns since the epoch.
@@ -64,58 +65,42 @@ pub struct SnapshotInfo {
     pub clones: Vec<String>,
 }
 
-/// Split `volume@snapshot`.
-pub fn split_name(full: &str) -> Result<(&str, &str), FileSystemError> {
-    match full.split_once('@') {
-        Some((v, s)) if !v.is_empty() && !s.is_empty() => Ok((v, s)),
-        _ => Err(FileSystemError::InvalidArgument(format!(
-            "'{}': expected volume@snapshot",
-            full
-        ))),
+impl SnapshotInfo {
+    /// The snapshot's own name (after the `@`).
+    pub fn short(&self) -> &str {
+        self.name.split_once('@').map_or(&self.name, |(_, s)| s)
     }
 }
 
 fn check_snap_name(name: &str) -> Result<(), FileSystemError> {
-    let ok = !name.is_empty()
-        && name.len() <= 128
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c));
-    if ok {
-        Ok(())
-    } else {
-        Err(FileSystemError::InvalidArgument(format!(
-            "snapshot name '{}' (letters, digits and - _ . : only)",
-            name
-        )))
-    }
+    crate::types::SnapshotName::try_from(name)?;
+    Ok(())
 }
 
 /// A head's snapshots and origin.
 fn head_lineage(d: &Dnode) -> (Option<SnapRef>, Vec<SnapRef>) {
-    match &d.lineage {
-        Some(Lineage::Head { origin, snapshots }) => (origin.clone(), snapshots.clone()),
-        _ => (None, Vec::new()),
+    match d.head() {
+        Some(h) => (h.origin.clone(), h.snapshots.clone()),
+        None => (None, Vec::new()),
     }
 }
 
 fn set_head_lineage(d: &mut Dnode, origin: Option<SnapRef>, snapshots: Vec<SnapRef>) {
-    d.lineage = if origin.is_none() && snapshots.is_empty() {
-        None
-    } else {
-        Some(Lineage::Head { origin, snapshots })
-    };
+    if let Some(h) = d.head_mut() {
+        h.origin = origin;
+        h.snapshots = snapshots;
+    }
 }
 
 /// Blocks born at or before this belong to `d`'s snapshots or origin: a
 /// head never frees them itself.
-pub(crate) fn held_txg(d: &Dnode) -> u64 {
+pub(crate) fn held_txg(d: &Dnode) -> Txg {
     let (origin, snapshots) = head_lineage(d);
     snapshots
         .last()
         .map(|s| s.txg)
         .or(origin.map(|o| o.txg))
-        .unwrap_or(0)
+        .unwrap_or(Txg::ZERO)
 }
 
 /// The short name of snapshot `r` (`volume@snapshot` → `snapshot`).
@@ -131,7 +116,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(FileSystemError::NotAFile);
         }
         let d = self.read_dnode(e.root).await?;
-        if d.kind != e.format.root_kind() {
+        if d.kind() != e.format.root_kind() {
             return Err(FileSystemError::NotAFile);
         }
         Ok((e.root, d))
@@ -139,19 +124,19 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Blocks born at or before this are object `id`'s snapshots' (or
     /// origin's), if it is a volume that has any.
-    pub(crate) async fn held_txg_of(&self, id: FileId) -> Result<u64, FileSystemError> {
+    pub(crate) async fn held_txg_of(&self, id: FileId) -> Result<Txg, FileSystemError> {
         Ok(held_txg(&self.read_dnode(id).await?))
     }
 
     /// Free the blocks of `ptrs` a head may free itself (born after `held`).
     pub(crate) async fn free_unheld(
         &self,
-        ptrs: Vec<(u64, u64, u64)>,
-        held: u64,
+        ptrs: Vec<crate::types::Born>,
+        held: Txg,
     ) -> Result<(), FileSystemError> {
-        for (start, len, birth) in ptrs {
-            if birth > held {
-                self.free(start, len).await?;
+        for b in ptrs {
+            if b.birth > held {
+                self.free(b.extent.start, b.extent.len).await?;
             }
         }
         Ok(())
@@ -165,7 +150,7 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         tree: &TreeRoot,
         blksz: usize,
-        after: u64,
+        after: Txg,
         next: Option<&TreeRoot>,
     ) -> Result<Vec<BlockPtr>, FileSystemError> {
         // Scratch trees for their indirect caches.
@@ -202,7 +187,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Snapshot volume `name` as `snap` (`name@snap`), as last committed
     /// (everything written here so far is committed first). Returns its
     /// TXG.
-    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<u64, FileSystemError> {
+    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, FileSystemError> {
         self.create_snapshot_as(name, snap, None, None).await
     }
 
@@ -214,7 +199,7 @@ impl<D: BlockDevice> FileSystem<D> {
         snap: &str,
         guid: Option<u64>,
         created_ns: Option<u64>,
-    ) -> Result<u64, FileSystemError> {
+    ) -> Result<Txg, FileSystemError> {
         check_snap_name(snap)?;
         if self.writer.is_some() {
             return Err(FileSystemError::InvalidArgument(
@@ -226,28 +211,26 @@ impl<D: BlockDevice> FileSystem<D> {
         // snapshot is exactly TXG `txg`, and every block committed from
         // now on (stamped with the open TXG or later) is born after it.
         let txg = self.commit_locked().await?;
-        self.raise_birth_floor(txg + 1);
+        self.raise_birth_floor(txg.next());
         let (id, mut head) = self.head(name).await?;
         let (origin, mut snapshots) = head_lineage(&head);
         if snapshots.iter().any(|s| short(s) == snap) {
             return Err(FileSystemError::AlreadyExists);
         }
-        let mut s = Dnode::volume(head.blksz, head.size, head.tree.levels);
-        s.kind = ObjType::Snapshot;
-        s.tree = head.tree.clone();
-        s.props = None;
-        s.parent = id;
-        if let Some(t) = created_ns {
-            s.attrs.ctime_ns = t;
-            s.attrs.mtime_ns = t;
-        }
         let sid = self.alloc_object();
-        let guid = guid.unwrap_or_else(|| crate::fs::new_guid(sid ^ txg));
-        s.lineage = Some(Lineage::Snapshot {
+        let guid = guid.unwrap_or_else(|| crate::fs::new_guid(sid.get() ^ txg.get()));
+        let mut s = Dnode::volume(head.blksz, head.size, head.tree.levels);
+        s.body = Body::Snapshot(Snap {
             txg,
             guid,
             clones: Vec::new(),
         });
+        s.tree = head.tree.clone();
+        s.parent = Some(id);
+        if let Some(t) = created_ns {
+            s.attrs.ctime_ns = t;
+            s.attrs.mtime_ns = t;
+        }
         self.write_dnode(sid, Some(s)).await?;
         snapshots.push(SnapRef {
             name: format!("{}@{}", name, snap),
@@ -270,7 +253,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for (i, r) in snapshots.iter().enumerate() {
             let d = self.read_dnode(r.id).await?;
             let prev = if i == 0 {
-                origin.as_ref().map_or(0, |o| o.txg)
+                origin.as_ref().map_or(Txg::ZERO, |o| o.txg)
             } else {
                 snapshots[i - 1].txg
             };
@@ -281,12 +264,13 @@ impl<D: BlockDevice> FileSystem<D> {
             let unique = self
                 .unique_blocks(&d.tree, d.blksz as usize, prev, Some(&next))
                 .await?;
-            let clones = match &d.lineage {
-                Some(Lineage::Snapshot { clones, .. }) => clones
+            let clones = match d.snap() {
+                Some(s) => s
+                    .clones
                     .iter()
                     .map(|c| names.get(c).cloned().unwrap_or_else(|| format!("#{}", c)))
                     .collect(),
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             out.push(SnapshotInfo {
                 name: r.name.clone(),
@@ -313,7 +297,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or(FileSystemError::FileNotFound)?;
         let r = snapshots[i].clone();
         let d = self.read_dnode(r.id).await?;
-        if let Some(Lineage::Snapshot { clones, .. }) = &d.lineage
+        if let Some(Snap { clones, .. }) = d.snap()
             && !clones.is_empty()
         {
             let names = self.dataset_names().await?;
@@ -328,7 +312,7 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let prev = if i == 0 {
-            origin.as_ref().map_or(0, |o| o.txg)
+            origin.as_ref().map_or(Txg::ZERO, |o| o.txg)
         } else {
             snapshots[i - 1].txg
         };
@@ -373,22 +357,27 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut s = self.read_dnode(r.id).await?;
         let format = self.dataset_entry(name).await?.format;
         let mut c = head.clone();
-        c.kind = format.root_kind();
+        c.body = Body::tree_root(
+            format.root_kind(),
+            Head {
+                props: crate::inode::DatasetProps {
+                    // A new volume: placed and started only when asked to.
+                    enabled: false,
+                    move_to: None,
+                    ..head.props().cloned().unwrap_or_default()
+                },
+                log: None,
+                origin: Some(r.clone()),
+                snapshots: Vec::new(),
+            },
+        );
         c.blksz = s.blksz;
         c.size = s.size;
         c.tree = s.tree.clone();
         c.attrs = crate::inode::Attrs::new(head.attrs.mode);
-        c.log = None;
-        c.props = head.props.clone().map(|mut p| {
-            // A new volume: placed and started only when asked to.
-            p.enabled = false;
-            p.move_to = None;
-            p
-        });
-        set_head_lineage(&mut c, Some(r.clone()), Vec::new());
         let cid = self.create_dataset_locked(new, format, c).await?;
-        if let Some(Lineage::Snapshot { clones, .. }) = &mut s.lineage {
-            clones.push(cid);
+        if let Some(s) = s.snap_mut() {
+            s.clones.push(cid);
         }
         self.write_dnode(r.id, Some(s)).await?;
         self.commit_locked().await?;
@@ -407,7 +396,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 name
             )));
         };
-        if head.log.is_some() {
+        if head.log().is_some() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume '{}' has an intent log (it's running, or its writer's log \
                  is yet to be replayed)",
@@ -475,7 +464,7 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         id: FileId,
         d: &Dnode,
-    ) -> Result<u64, FileSystemError> {
+    ) -> Result<Txg, FileSystemError> {
         let (origin, snapshots) = head_lineage(d);
         if !snapshots.is_empty() {
             return Err(FileSystemError::InvalidArgument(format!(
@@ -488,11 +477,11 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let Some(o) = origin else {
-            return Ok(0);
+            return Ok(Txg::ZERO);
         };
         if let Ok(mut s) = self.read_dnode(o.id).await {
-            if let Some(Lineage::Snapshot { clones, .. }) = &mut s.lineage {
-                clones.retain(|&c| c != id);
+            if let Some(s) = s.snap_mut() {
+                s.clones.retain(|&c| c != id);
             }
             self.write_dnode(o.id, Some(s)).await?;
         }

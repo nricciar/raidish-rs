@@ -33,12 +33,13 @@
 //! (`ClusterState::vms`). Whether it *does* is never stored: it is what
 //! libvirt on the anchor's node says.
 
-use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::{BytesText, Event};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-pub use crate::vm_def::{VmDisk, VmHardware, VmNic};
+pub use crate::vm_def::{DomState, VmDisk, VmDisks, VmHardware, VmNic, VmSpec};
+pub(crate) use crate::xml::{El, Node, el_xml, parse_root};
 
 /// The XML namespace of the metadata raidish puts on the domains it runs.
 pub const META_NS: &str = "https://raidish.dev/xmlns/vm/1";
@@ -97,9 +98,9 @@ impl VmConfig {
         Duration::from_secs(self.migrate_timeout_s.unwrap_or(300))
     }
     /// What's wrong with it, if anything: migrations are TLS only.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), VmError> {
         match &self.migrate_uri {
-            Some(u) if !u.starts_with("qemu+tls://") => Err(format!(
+            Some(u) if !u.starts_with("qemu+tls://") => invalid(format!(
                 "vm.migrate_uri '{}': live migrations are TLS only (qemu+tls://...)",
                 u
             )),
@@ -119,7 +120,7 @@ pub struct VmRuntime {
     pub virsh: Virsh,
     pub shutdown_timeout: Duration,
     /// Wakes the agent to reconcile now rather than at its next tick.
-    pub poke: tokio::sync::Notify,
+    poke: tokio::sync::Notify,
     /// Where qemu finds this node's NBD exports.
     pub nbd: (String, u16),
     /// Where VNC consoles listen (see `VmConfig::console_listen`).
@@ -128,10 +129,10 @@ pub struct VmRuntime {
     pub node: String,
     /// The pool's GUID (hex), once the agent has read it: until then no
     /// domain is this node's.
-    pub pool: std::sync::RwLock<Option<String>>,
+    pool: std::sync::RwLock<Option<String>>,
     /// VMs to shut down (destroyed after the timeout) and start again from
     /// their current XML.
-    pub restart: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    restart: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// See `VmConfig::migrate_uri`, `migrate_host`, `migrate_timeout_s`.
     pub migrate_uri: Option<String>,
     pub migrate_host: Option<String>,
@@ -187,6 +188,55 @@ impl VmIdent {
 }
 
 impl VmRuntime {
+    /// Node `node`'s VMs as `c` says to run them; `nbd`: where qemu finds
+    /// the node's NBD exports unless `c` says otherwise.
+    pub fn new(c: &VmConfig, nbd: (String, u16), node: String) -> Self {
+        VmRuntime {
+            virsh: c.virsh(),
+            shutdown_timeout: c.shutdown_timeout(),
+            poke: Default::default(),
+            nbd: c.nbd(nbd),
+            console: c.console_listen(),
+            node,
+            pool: Default::default(),
+            restart: Default::default(),
+            migrate_uri: c.migrate_uri.clone(),
+            migrate_host: c.migrate_host.clone(),
+            migrate_timeout: c.migrate_timeout(),
+        }
+    }
+
+    /// Have the agent reconcile now.
+    pub fn poke(&self) {
+        self.poke.notify_one();
+    }
+
+    /// Until someone calls `poke`.
+    pub async fn poked(&self) {
+        self.poke.notified().await
+    }
+
+    /// The pool's GUID is known: domains can be told apart as this node's.
+    pub fn set_pool(&self, guid: u64) {
+        *self.pool.write().unwrap() = Some(format!("{:016x}", guid));
+    }
+
+    /// Shut VM `name` down and start it again from its current XML.
+    pub fn restart(&self, name: &str) {
+        self.restart.lock().unwrap().insert(name.to_string());
+    }
+
+    /// Whether VM `name` is to be restarted.
+    pub fn restarting(&self, name: &str) -> bool {
+        self.restart.lock().unwrap().contains(name)
+    }
+
+    /// Forget the restarts of VMs `running` no longer says are up (done:
+    /// their old domain is gone).
+    pub fn restarts_done(&self, running: impl Fn(&str) -> bool) {
+        self.restart.lock().unwrap().retain(|n| running(n));
+    }
+
     /// Who this node is to libvirt; None until the pool's GUID is known.
     pub fn ident(&self) -> Option<VmIdent> {
         Some(VmIdent {
@@ -217,73 +267,14 @@ impl VmRuntime {
     }
 }
 
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && !name.starts_with('.')
-}
-
-/// A VM as its XML defines it.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct VmSpec {
-    pub name: String,
-    /// The definition's change number (see `crate::vm_store`): a running
-    /// VM started from an older one has a restart pending.
-    pub change: u64,
-    /// The volume that places the VM (its first raidish disk).
-    pub anchor: String,
-    /// Every raidish volume it uses, the anchor first.
-    pub volumes: Vec<String>,
-    /// Why the XML is unusable, if it is (then anchor/volumes are empty).
-    pub error: Option<String>,
-    /// What the XML configures (as far as it could be read).
-    #[serde(default)]
-    pub hw: VmHardware,
-    #[serde(skip)]
-    pub xml: String,
-}
-
 /// An element's text.
-fn text(el: &El) -> String {
-    el.kids
-        .iter()
-        .filter_map(|k| match k {
-            Node::Raw(Event::Text(t)) => t.unescape().ok().map(|t| t.into_owned()),
-            _ => None,
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-/// `<memory unit='...'>n</memory>` in KiB (libvirt's units; KiB by default).
-fn memory_kib(el: &El) -> Option<u64> {
-    let n: u64 = text(el).parse().ok()?;
-    let bytes: u64 = match el.attr("unit").unwrap_or("KiB") {
-        "b" | "bytes" => 1,
-        "KB" => 1000,
-        "k" | "KiB" => 1 << 10,
-        "MB" => 1_000_000,
-        "M" | "MiB" => 1 << 20,
-        "GB" => 1_000_000_000,
-        "G" | "GiB" => 1 << 30,
-        "TB" => 1_000_000_000_000,
-        "T" | "TiB" => 1 << 40,
-        _ => return None,
-    };
-    n.checked_mul(bytes).map(|b| b / 1024)
-}
-
 fn hardware(root: &El) -> VmHardware {
     let mut hw = VmHardware {
-        vcpus: root.child("vcpu").and_then(|v| text(v).parse().ok()),
-        memory_kib: root
+        vcpus: root.child("vcpu").and_then(|v| v.text().parse().ok()),
+        memory: root
             .child("currentMemory")
             .or_else(|| root.child("memory"))
-            .and_then(memory_kib),
+            .and_then(|m| crate::vm_def::libvirt_memory(&m.text(), m.attr("unit"))),
         ..Default::default()
     };
     if let Some(os) = root.child("os") {
@@ -354,9 +345,9 @@ impl VmSpec {
         let mut spec = VmSpec {
             name: name.to_string(),
             change,
-            anchor: String::new(),
-            volumes: Vec::new(),
-            error: None,
+            disks: VmDisks::Unusable {
+                error: String::new(),
+            },
             hw: VmHardware::default(),
             xml: xml.to_string(),
         };
@@ -364,24 +355,35 @@ impl VmSpec {
         if let Ok(root) = &root {
             spec.hw = hardware(root);
         }
-        match root.and_then(|root| {
+        spec.disks = match root.and_then(|root| {
             check_domain(&root)?;
             raidish_disks(&root)
         }) {
-            Ok(vols) if vols.is_empty() => {
-                spec.error = Some("no raidish disk (<source file='raidish:VOLUME'/>)".into())
-            }
-            Ok(vols) => {
-                spec.anchor = vols[0].clone();
-                spec.volumes = vols;
-            }
-            Err(e) => spec.error = Some(e),
-        }
+            Ok(vols) => VmDisks::of(vols),
+            Err(e) => VmDisks::Unusable {
+                error: e.to_string(),
+            },
+        };
         spec
     }
 
     pub fn usable(&self) -> bool {
-        self.error.is_none()
+        self.error().is_none()
+    }
+
+    /// The volume that places it (its first raidish disk), if usable.
+    pub fn anchor(&self) -> Option<&str> {
+        self.disks.anchor()
+    }
+
+    /// Every raidish volume it uses, the anchor first (none if unusable).
+    pub fn volumes(&self) -> &[String] {
+        self.disks.volumes()
+    }
+
+    /// Why the XML is unusable, if it is.
+    pub fn error(&self) -> Option<&str> {
+        self.disks.error()
     }
 }
 
@@ -396,7 +398,7 @@ pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
             continue;
         }
         let taken: Vec<String> = spec
-            .volumes
+            .volumes()
             .iter()
             .filter_map(|v| {
                 owner
@@ -405,10 +407,12 @@ pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
             })
             .collect();
         if !taken.is_empty() {
-            spec.error = Some(taken.join("; "));
+            spec.disks = VmDisks::Unusable {
+                error: taken.join("; "),
+            };
             continue;
         }
-        for v in &spec.volumes {
+        for v in spec.volumes() {
             owner.insert(v.clone(), spec.name.clone());
         }
     }
@@ -416,163 +420,70 @@ pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
 
 // ---- a tiny XML tree, enough to rewrite a domain --------------------------
 
-#[derive(Clone, Debug)]
-pub(crate) enum Node {
-    El(El),
-    /// Text, comments, CDATA... written back as they were read.
-    Raw(Event<'static>),
+/// Why a VM couldn't be read, checked or run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmError {
+    /// The definition (or other XML) isn't one raidish will run:
+    /// malformed, or reaching beyond its VM.
+    Invalid(String),
+    /// virsh ran `cmd` and libvirt said no; `reason` is libvirt's.
+    Virsh { cmd: String, reason: String },
+    /// virsh couldn't be run (or its scratch file written).
+    Host(String),
+    /// It didn't finish in time, and was aborted.
+    Timeout(Duration),
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct El {
-    pub(crate) name: String,
-    attrs: Vec<(String, String)>,
-    kids: Vec<Node>,
-}
-
-impl El {
-    fn new(name: &str, attrs: &[(&str, &str)]) -> El {
-        El {
-            name: name.into(),
-            attrs: attrs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            kids: Vec::new(),
+impl VmError {
+    pub fn invalid(e: impl ToString) -> Self {
+        VmError::Invalid(e.to_string())
+    }
+    pub fn kind(&self) -> crate::types::ErrorKind {
+        use crate::types::ErrorKind;
+        match self {
+            VmError::Invalid(_) => ErrorKind::Invalid,
+            VmError::Timeout(_) => ErrorKind::Unavailable,
+            VmError::Virsh { .. } | VmError::Host(_) => ErrorKind::Internal,
         }
     }
-    pub(crate) fn attr(&self, k: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(n, _)| n == k)
-            .map(|(_, v)| v.as_str())
-    }
-    fn local(&self) -> &str {
-        self.name.rsplit(':').next().unwrap_or(&self.name)
-    }
-    pub(crate) fn child(&self, name: &str) -> Option<&El> {
-        self.elements().find(|e| e.name == name)
-    }
-    fn child_mut(&mut self, name: &str) -> Option<&mut El> {
-        self.kids.iter_mut().find_map(|k| match k {
-            Node::El(e) if e.name == name => Some(e),
-            _ => None,
-        })
-    }
-    /// Its text (what's between its tags, not its children's).
-    pub(crate) fn text(&self) -> String {
-        let mut t = String::new();
-        for k in &self.kids {
-            if let Node::Raw(Event::Text(x)) = k {
-                t.push_str(&x.unescape().map(|c| c.into_owned()).unwrap_or_default());
-            }
-        }
-        t.trim().to_string()
-    }
-    pub(crate) fn elements(&self) -> impl Iterator<Item = &El> {
-        self.kids.iter().filter_map(|k| match k {
-            Node::El(e) => Some(e),
-            _ => None,
-        })
-    }
-    fn remove(&mut self, name: &str) {
-        self.kids
-            .retain(|k| !matches!(k, Node::El(e) if e.name == name));
-    }
 }
 
-fn start_el(e: &BytesStart) -> Result<El, String> {
-    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-    let mut attrs = Vec::new();
-    for a in e.attributes() {
-        let a = a.map_err(|e| e.to_string())?;
-        attrs.push((
-            String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-            a.unescape_value().map_err(|e| e.to_string())?.into_owned(),
-        ));
-    }
-    Ok(El {
-        name,
-        attrs,
-        kids: Vec::new(),
-    })
-}
-
-/// The root element of `xml`.
-pub(crate) fn parse_root(xml: &str) -> Result<El, String> {
-    let mut reader = quick_xml::Reader::from_str(xml);
-    let mut stack: Vec<El> = Vec::new();
-    let mut root = None;
-    loop {
-        let ev = reader
-            .read_event()
-            .map_err(|e| format!("XML at byte {}: {}", reader.buffer_position(), e))?;
-        match ev {
-            Event::Start(s) => stack.push(start_el(&s)?),
-            Event::Empty(s) => {
-                let el = start_el(&s)?;
-                match stack.last_mut() {
-                    Some(p) => p.kids.push(Node::El(el)),
-                    None => root = Some(el),
-                }
-            }
-            Event::End(_) => {
-                let el = stack.pop().ok_or("XML: unbalanced end tag")?;
-                match stack.last_mut() {
-                    Some(p) => p.kids.push(Node::El(el)),
-                    None => root = Some(el),
-                }
-            }
-            Event::Eof => break,
-            Event::Decl(_) | Event::DocType(_) | Event::PI(_) if stack.is_empty() => {}
-            ev => {
-                if let Some(p) = stack.last_mut() {
-                    p.kids.push(Node::Raw(ev.into_owned()));
-                }
-            }
+impl std::fmt::Display for VmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmError::Invalid(m) | VmError::Host(m) => f.write_str(m),
+            VmError::Virsh { cmd, reason } => write!(f, "virsh {}: {}", cmd, reason),
+            VmError::Timeout(t) => write!(f, "didn't finish in {:?}; aborted", t),
         }
     }
-    if !stack.is_empty() {
-        return Err("XML: unclosed element".into());
-    }
-    root.ok_or_else(|| "XML: no root element".into())
 }
 
-fn parse_domain(xml: &str) -> Result<El, String> {
+impl std::error::Error for VmError {}
+
+/// Malformed XML is a definition raidish won't run.
+impl From<crate::xml::XmlError> for VmError {
+    fn from(e: crate::xml::XmlError) -> Self {
+        VmError::Invalid(e.to_string())
+    }
+}
+
+/// For callers that only report it.
+impl From<VmError> for String {
+    fn from(e: VmError) -> String {
+        e.to_string()
+    }
+}
+
+fn invalid<T>(m: impl ToString) -> Result<T, VmError> {
+    Err(VmError::invalid(m))
+}
+
+fn parse_domain(xml: &str) -> Result<El, VmError> {
     let root = parse_root(xml)?;
     if root.name != "domain" {
-        return Err(format!("expected a <domain>, found <{}>", root.name));
+        return invalid(format!("expected a <domain>, found <{}>", root.name));
     }
     Ok(root)
-}
-
-fn write_el(w: &mut quick_xml::Writer<Vec<u8>>, el: &El) -> std::io::Result<()> {
-    let mut start = BytesStart::new(el.name.as_str());
-    for (k, v) in &el.attrs {
-        start.push_attribute((k.as_str(), v.as_str()));
-    }
-    if el.kids.is_empty() {
-        return w.write_event(Event::Empty(start));
-    }
-    w.write_event(Event::Start(start))?;
-    for k in &el.kids {
-        match k {
-            Node::El(e) => write_el(w, e)?,
-            Node::Raw(ev) => w.write_event(ev.clone())?,
-        }
-    }
-    w.write_event(Event::End(BytesEnd::new(el.name.as_str())))
-}
-
-/// `el` as XML.
-pub(crate) fn el_xml(el: &El) -> String {
-    to_string(el)
-}
-
-fn to_string(el: &El) -> String {
-    let mut w = quick_xml::Writer::new(Vec::new());
-    write_el(&mut w, el).expect("writing to memory");
-    String::from_utf8(w.into_inner()).expect("utf-8 in, utf-8 out")
 }
 
 /// The raidish volume a `<disk>` uses, if it is one.
@@ -692,18 +603,18 @@ const PLAIN_DEVICES: &[&str] = &[
     "graphics",
 ];
 
-fn refuse(what: impl std::fmt::Display) -> Result<(), String> {
-    Err(format!("{} isn't allowed in a VM definition", what))
+fn refuse(what: impl std::fmt::Display) -> Result<(), VmError> {
+    invalid(format!("{} isn't allowed in a VM definition", what))
 }
 
-fn kids_in(el: &El, allowed: &[&str]) -> Result<(), String> {
+fn kids_in(el: &El, allowed: &[&str]) -> Result<(), VmError> {
     match el.elements().find(|k| !allowed.contains(&k.name.as_str())) {
         Some(k) => refuse(format!("<{}> in <{}>", k.name, el.name)),
         None => Ok(()),
     }
 }
 
-fn type_in(el: &El, allowed: &[&str]) -> Result<(), String> {
+fn type_in(el: &El, allowed: &[&str]) -> Result<(), VmError> {
     let t = el.attr("type").unwrap_or("");
     if allowed.contains(&t) {
         Ok(())
@@ -720,7 +631,7 @@ fn shipped_file(path: &str) -> bool {
 /// No element from another XML namespace (`qemu:commandline` and the
 /// like: libvirt hands those to the hypervisor as they are) and no
 /// namespace declarations below the root, whatever the prefix.
-fn no_foreign(el: &El, root: bool) -> Result<(), String> {
+fn no_foreign(el: &El, root: bool) -> Result<(), VmError> {
     if el.name.contains(':') {
         return refuse(format!("<{}>", el.name));
     }
@@ -738,11 +649,25 @@ fn no_foreign(el: &El, root: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn check_device(d: &El) -> Result<(), String> {
+/// Refuse `el` having more than one child named any of `names`: libvirt
+/// reads one of them, and which isn't ours to guess, so the one checked
+/// must be the only one.
+fn single(el: &El, names: &[&str]) -> Result<(), VmError> {
+    for n in names {
+        if el.elements().filter(|e| e.name == *n).count() > 1 {
+            return invalid(format!("<{}> has more than one <{}>", el.name, n));
+        }
+    }
+    Ok(())
+}
+
+fn check_device(d: &El) -> Result<(), VmError> {
+    single(d, &["source", "backend", "target", "driver"])?;
     match d.name.as_str() {
         "disk" => {
             if disk_volume(d).is_some() {
                 kids_in(d, DISK_KIDS)?;
+                single(d, &["backingStore"])?;
                 // `virsh dumpxml` of a running domain says `<backingStore/>`
                 // (none); one with anything in it is a host file.
                 if let Some(b) = d.child("backingStore")
@@ -757,7 +682,7 @@ fn check_device(d: &El) -> Result<(), String> {
                 // An empty drive.
                 return kids_in(d, &["driver", "target", "readonly", "address", "alias"]);
             }
-            Err(format!(
+            invalid(format!(
                 "disk {} isn't a raidish volume (<source file='raidish:VOLUME'/>): \
                  host files and devices can't be given to a VM",
                 d.child("target")
@@ -788,7 +713,7 @@ fn check_device(d: &El) -> Result<(), String> {
                     Some("builtin") => {}
                     Some("random")
                         if matches!(
-                            text(b).as_str(),
+                            b.text().as_str(),
                             "" | "/dev/urandom" | "/dev/random" | "/dev/hwrng"
                         ) => {}
                     _ => return refuse("an <rng> backend other than the host's random device"),
@@ -805,7 +730,7 @@ fn check_device(d: &El) -> Result<(), String> {
         }
         "redirdev" => type_in(d, &["spicevmc"]),
         n if PLAIN_DEVICES.contains(&n) => Ok(()),
-        n => Err(format!(
+        n => invalid(format!(
             "<{}> devices aren't allowed in a VM definition (they reach the host)",
             n
         )),
@@ -813,7 +738,7 @@ fn check_device(d: &El) -> Result<(), String> {
 }
 
 /// Refuse a domain that would reach beyond its VM (see the module docs).
-fn check_domain(root: &El) -> Result<(), String> {
+fn check_domain(root: &El) -> Result<(), VmError> {
     no_foreign(root, true)?;
     if let Some(t) = root.attr("type")
         && !matches!(t, "kvm" | "qemu")
@@ -821,26 +746,30 @@ fn check_domain(root: &El) -> Result<(), String> {
         return refuse(format!("<domain type='{}'>", t));
     }
     kids_in(root, DOMAIN_KIDS)?;
-    if let Some(si) = root.child("sysinfo")
-        && si.attr("type").is_some_and(|t| t != "smbios")
-    {
-        // fwcfg entries are host files.
-        return refuse(format!(
-            "<sysinfo type='{}'>",
-            si.attr("type").unwrap_or("")
-        ));
+    single(root, &["os", "devices", "name", "metadata"])?;
+    for si in root.elements().filter(|e| e.name == "sysinfo") {
+        if si.attr("type").is_some_and(|t| t != "smbios") {
+            // fwcfg entries are host files.
+            return refuse(format!(
+                "<sysinfo type='{}'>",
+                si.attr("type").unwrap_or("")
+            ));
+        }
     }
     if let Some(os) = root.child("os") {
         kids_in(os, OS_KIDS)?;
         for l in os.elements().filter(|e| e.name == "loader") {
-            if !text(l).is_empty() && !shipped_file(&text(l)) {
-                return refuse(format!("firmware from '{}' (only /usr/share/...)", text(l)));
+            if !l.text().is_empty() && !shipped_file(&l.text()) {
+                return refuse(format!(
+                    "firmware from '{}' (only /usr/share/...)",
+                    l.text()
+                ));
             }
         }
         for n in os.elements().filter(|e| e.name == "nvram") {
             // Where the variables go is libvirt's choice: a path would
             // have it write wherever that says.
-            if !text(n).is_empty() || n.elements().next().is_some() {
+            if !n.text().is_empty() || n.elements().next().is_some() {
                 return refuse("an <nvram> path (leave it empty: libvirt picks one)");
             }
             if let Some(t) = n.attr("template")
@@ -863,18 +792,16 @@ fn check_domain(root: &El) -> Result<(), String> {
 
 /// Every raidish volume in the domain's disks, the anchor (first non-cdrom
 /// one) first.
-fn raidish_disks(root: &El) -> Result<Vec<String>, String> {
+fn raidish_disks(root: &El) -> Result<Vec<String>, VmError> {
     let Some(devices) = root.child("devices") else {
         return Ok(Vec::new());
     };
     let mut disks: Vec<(bool, String)> = Vec::new();
     for d in devices.elements().filter(|e| e.name == "disk") {
         if let Some(v) = disk_volume(d) {
-            if crate::dataset::check_dataset_name(&v).is_err() || v.starts_with('.') {
-                return Err(format!("bad volume name '{}'", v));
-            }
+            crate::types::DatasetName::user(&v).map_err(VmError::invalid)?;
             if disks.iter().any(|(_, x)| *x == v) {
-                return Err(format!("volume '{}' is used twice", v));
+                return invalid(format!("volume '{}' is used twice", v));
             }
             disks.push((d.attr("device") == Some("cdrom"), v));
         }
@@ -896,7 +823,10 @@ pub fn render(
     console: &str,
     owner: &str,
     ident: &VmIdent,
-) -> Result<String, String> {
+) -> Result<String, VmError> {
+    let VmDisks::Usable { anchor, volumes } = &spec.disks else {
+        return invalid(spec.error().unwrap_or("unusable"));
+    };
     let mut root = parse_domain(&spec.xml)?;
     // Checked when it was stored; checked again here, so nothing that got
     // past that (or predates it) reaches libvirt.
@@ -923,13 +853,12 @@ pub fn render(
     root.remove("metadata");
     let mut meta = El::new("metadata", &[]);
     meta.kids.push(Node::El(meta_el(&DomMeta {
-        anchor: spec.anchor.clone(),
-        volumes: spec.volumes.clone(),
+        anchor: anchor.clone(),
+        volumes: volumes.clone(),
         change: spec.change,
-        owner: owner.to_string(),
+        owner: DomOwner::Lease(owner.to_string()),
         pool: ident.pool.clone(),
         node: ident.node.clone(),
-        migrating: false,
     })));
     let at = root
         .kids
@@ -1016,7 +945,7 @@ pub fn render(
         &[("type", "address"), ("address", console)],
     )));
     devices.kids.push(Node::El(g));
-    Ok(to_string(&root))
+    Ok(el_xml(&root))
 }
 
 /// What raidish's metadata on a running domain says.
@@ -1025,9 +954,8 @@ pub struct DomMeta {
     pub anchor: String,
     pub volumes: Vec<String>,
     pub change: u64,
-    /// The anchor's lease owner when it was started (see `render`).
-    #[serde(default)]
-    pub owner: String,
+    /// Whose it is (see `DomOwner`).
+    pub owner: DomOwner,
     /// The pool (its GUID, hex) and node that started it: a node acts only
     /// on its own domains, whatever else shares its libvirt (another
     /// node, another cluster's).
@@ -1035,10 +963,25 @@ pub struct DomMeta {
     pub pool: String,
     #[serde(default)]
     pub node: String,
+}
+
+/// Which lease a domain runs under.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DomOwner {
+    /// Started (or re-stamped after a migration) under the anchor's lease
+    /// held by this owner (see `render`).
+    Lease(String),
     /// Migrated in, not yet re-stamped by the node it went to (see
-    /// `crate::agent`'s migrations): its `owner` isn't set yet.
-    #[serde(default)]
-    pub migrating: bool,
+    /// `crate::agent`'s migrations).
+    Migrating,
+}
+
+impl DomOwner {
+    /// Started under `owner`'s lease?
+    pub fn is(&self, owner: &str) -> bool {
+        matches!(self, DomOwner::Lease(o) if o == owner)
+    }
 }
 
 /// raidish's metadata element for `m`.
@@ -1050,12 +993,12 @@ fn meta_el(m: &DomMeta) -> El {
         ("anchor", m.anchor.as_str()),
         ("volumes", volumes.as_str()),
         ("change", change.as_str()),
-        ("owner", m.owner.as_str()),
         ("pool", m.pool.as_str()),
         ("node", m.node.as_str()),
     ];
-    if m.migrating {
-        attrs.push(("migrating", "1"));
+    match &m.owner {
+        DomOwner::Lease(o) => attrs.push(("owner", o.as_str())),
+        DomOwner::Migrating => attrs.push(("migrating", "1")),
     }
     El::new("raidish:vm", &attrs)
 }
@@ -1066,7 +1009,7 @@ pub fn meta_xml(m: &DomMeta) -> String {
     let mut el = meta_el(m);
     el.name = "vm".into();
     el.attrs.retain(|(k, _)| k != "xmlns:raidish");
-    to_string(&el)
+    el_xml(&el)
 }
 
 fn parse_meta(xml: &str) -> Option<DomMeta> {
@@ -1084,10 +1027,12 @@ fn parse_meta(xml: &str) -> Option<DomMeta> {
             .map(str::to_string)
             .collect(),
         change: el.attr("change").and_then(|c| c.parse().ok()).unwrap_or(0),
-        owner: el.attr("owner").unwrap_or_default().to_string(),
+        owner: match el.attr("migrating") {
+            Some("1") => DomOwner::Migrating,
+            _ => DomOwner::Lease(el.attr("owner").unwrap_or_default().to_string()),
+        },
         pool: el.attr("pool").unwrap_or_default().to_string(),
         node: el.attr("node").unwrap_or_default().to_string(),
-        migrating: el.attr("migrating") == Some("1"),
     })
 }
 
@@ -1096,7 +1041,7 @@ fn parse_meta(xml: &str) -> Option<DomMeta> {
 /// its VNC console on `to`'s address, and raidish's metadata `meta`.
 /// Nothing else changes (the UUID and device addresses libvirt's ABI check
 /// compares stay as they are).
-pub fn retarget(xml: &str, to: &Incoming, meta: &DomMeta) -> Result<String, String> {
+pub fn retarget(xml: &str, to: &Incoming, meta: &DomMeta) -> Result<String, VmError> {
     let mut root = parse_domain(xml)?;
     let port = to.nbd_port.to_string();
     let md = match root.child_mut("metadata") {
@@ -1114,7 +1059,9 @@ pub fn retarget(xml: &str, to: &Incoming, meta: &DomMeta) -> Result<String, Stri
     md.kids
         .retain(|k| !matches!(k, Node::El(e) if e.local() == "vm"));
     md.kids.push(Node::El(meta_el(meta)));
-    let devices = root.child_mut("devices").ok_or("no <devices>")?;
+    let devices = root
+        .child_mut("devices")
+        .ok_or_else(|| VmError::invalid("no <devices>"))?;
     let mut disks = 0;
     for k in devices.kids.iter_mut() {
         let Node::El(d) = k else { continue };
@@ -1160,13 +1107,13 @@ pub fn retarget(xml: &str, to: &Incoming, meta: &DomMeta) -> Result<String, Stri
         }
     }
     if disks != meta.volumes.len() {
-        return Err(format!(
+        return invalid(format!(
             "found {} NBD disks, the VM has {} volumes",
             disks,
             meta.volumes.len()
         ));
     }
-    Ok(to_string(&root))
+    Ok(el_xml(&root))
 }
 
 // ---- virsh ----------------------------------------------------------------
@@ -1177,8 +1124,7 @@ pub struct Domain {
     pub name: String,
     /// libvirt's id while it runs.
     pub id: Option<u32>,
-    /// `running`, `paused`, `in shutdown`, `shut off`, ...
-    pub state: String,
+    pub state: DomState,
 }
 
 /// A domain this node runs for raidish, as `/api/v1/vm/local` reports it.
@@ -1188,7 +1134,7 @@ pub struct LocalVm {
     pub domain: Domain,
     pub meta: DomMeta,
     pub vcpus: Option<u32>,
-    pub memory_kib: Option<u64>,
+    pub memory: Option<crate::types::Bytes>,
     /// CPU time used, seconds.
     pub cpu_s: Option<f64>,
     /// The VNC console's port on 127.0.0.1.
@@ -1202,30 +1148,22 @@ pub struct Virsh {
 }
 
 impl Virsh {
-    async fn run(&self, args: &[&str]) -> Result<String, String> {
-        let out = tokio::process::Command::new(&self.bin)
-            .arg("-q")
-            .arg("-c")
-            .arg(&self.uri)
-            .args(args)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| format!("{}: {}", self.bin, e))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let err = err.trim().trim_start_matches("error: ");
-            return Err(format!(
-                "virsh {}: {}",
-                args.join(" "),
-                err.replace('\n', "; ")
-            ));
+    async fn run(&self, args: &[&str]) -> Result<String, VmError> {
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.arg("-q").arg("-c").arg(&self.uri).args(args);
+        let out = crate::proc::ran(cmd).await.map_err(VmError::Host)?;
+        if !out.ok() {
+            let err = out.stderr.trim().trim_start_matches("error: ");
+            return Err(VmError::Virsh {
+                cmd: args.join(" "),
+                reason: err.replace('\n', "; "),
+            });
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out.stdout)
     }
 
     /// Every domain libvirt knows of on this node.
-    pub async fn list(&self) -> Result<Vec<Domain>, String> {
+    pub async fn list(&self) -> Result<Vec<Domain>, VmError> {
         Ok(parse_list(&self.run(&["list", "--all"]).await?))
     }
 
@@ -1236,43 +1174,43 @@ impl Virsh {
     }
 
     /// Start `xml` as a transient domain.
-    pub async fn create(&self, name: &str, xml: &str) -> Result<(), String> {
+    pub async fn create(&self, name: &str, xml: &str) -> Result<(), VmError> {
         let path =
             std::env::temp_dir().join(format!("raidish-vm-{}-{}.xml", name, std::process::id()));
         tokio::fs::write(&path, xml)
             .await
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
+            .map_err(|e| VmError::Host(format!("{}: {}", path.display(), e)))?;
         let r = self.run(&["create", &path.to_string_lossy()]).await;
         let _ = tokio::fs::remove_file(&path).await;
         r.map(|_| ())
     }
 
-    pub async fn shutdown(&self, name: &str) -> Result<(), String> {
+    pub async fn shutdown(&self, name: &str) -> Result<(), VmError> {
         self.run(&["shutdown", name]).await.map(|_| ())
     }
-    pub async fn destroy(&self, name: &str) -> Result<(), String> {
+    pub async fn destroy(&self, name: &str) -> Result<(), VmError> {
         self.run(&["destroy", name]).await.map(|_| ())
     }
-    pub async fn reboot(&self, name: &str) -> Result<(), String> {
+    pub async fn reboot(&self, name: &str) -> Result<(), VmError> {
         self.run(&["reboot", name]).await.map(|_| ())
     }
-    pub async fn reset(&self, name: &str) -> Result<(), String> {
+    pub async fn reset(&self, name: &str) -> Result<(), VmError> {
         self.run(&["reset", name]).await.map(|_| ())
     }
 
     /// A running domain's XML as it can be migrated.
     /// Running domain `name` as it runs: its CPU expanded to what the
     /// guest really has (`--migratable` strips that back to the model).
-    pub async fn dumpxml_live(&self, name: &str) -> Result<String, String> {
+    pub async fn dumpxml_live(&self, name: &str) -> Result<String, VmError> {
         self.run(&["dumpxml", name]).await
     }
 
-    pub async fn dumpxml_migratable(&self, name: &str) -> Result<String, String> {
+    pub async fn dumpxml_migratable(&self, name: &str) -> Result<String, VmError> {
         self.run(&["dumpxml", "--migratable", name]).await
     }
 
     /// Replace raidish's metadata on running domain `name`.
-    pub async fn set_meta(&self, name: &str, meta: &DomMeta) -> Result<(), String> {
+    pub async fn set_meta(&self, name: &str, meta: &DomMeta) -> Result<(), VmError> {
         self.run(&[
             "metadata",
             name,
@@ -1296,8 +1234,11 @@ impl Virsh {
         xml: &str,
         to: &Incoming,
         timeout: Duration,
-    ) -> Result<(), String> {
-        let uri = to.uri.as_deref().ok_or("no libvirt URI for the target")?;
+    ) -> Result<(), VmError> {
+        let uri = to
+            .uri
+            .as_deref()
+            .ok_or_else(|| VmError::Host("no libvirt URI for the target".into()))?;
         let host = to.migrate_host.as_deref();
         let path = std::env::temp_dir().join(format!(
             "raidish-migrate-{}-{}.xml",
@@ -1306,7 +1247,7 @@ impl Virsh {
         ));
         tokio::fs::write(&path, xml)
             .await
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
+            .map_err(|e| VmError::Host(format!("{}: {}", path.display(), e)))?;
         let path_s = path.to_string_lossy().into_owned();
         let migrateuri = host.map(|h| {
             if h.contains(':') {
@@ -1324,37 +1265,38 @@ impl Virsh {
         }
         let r = tokio::time::timeout(timeout, self.run(&args)).await;
         let _ = tokio::fs::remove_file(&path).await;
-        // libvirt's reason, without the command line.
-        let prefix = format!("virsh {}: ", args.join(" "));
         match r {
-            Ok(r) => r
-                .map(|_| ())
-                .map_err(|e| e.strip_prefix(&prefix).map(str::to_string).unwrap_or(e)),
+            // libvirt's reason, without the command line.
+            Ok(Err(VmError::Virsh { reason, .. })) => Err(VmError::Virsh {
+                cmd: "migrate".into(),
+                reason,
+            }),
+            Ok(r) => r.map(|_| ()),
             Err(_) => {
                 let _ = self.run(&["domjobabort", name]).await;
-                Err(format!("didn't finish in {:?}; aborted", timeout))
+                Err(VmError::Timeout(timeout))
             }
         }
     }
 
     /// `virsh version`, as it prints it.
-    pub async fn version(&self) -> Result<String, String> {
+    pub async fn version(&self) -> Result<String, VmError> {
         self.run(&["version"]).await
     }
 
     /// `virsh domcapabilities`: what this host's qemu offers a guest
     /// (default arch and virt type).
-    pub async fn domcapabilities(&self) -> Result<String, String> {
+    pub async fn domcapabilities(&self) -> Result<String, VmError> {
         self.run(&["domcapabilities"]).await
     }
 
     /// `virsh capabilities`: the host, and the machine types per arch.
-    pub async fn capabilities(&self) -> Result<String, String> {
+    pub async fn capabilities(&self) -> Result<String, VmError> {
         self.run(&["capabilities"]).await
     }
 
     /// The active networks.
-    pub async fn networks(&self) -> Result<Vec<String>, String> {
+    pub async fn networks(&self) -> Result<Vec<String>, VmError> {
         Ok(self
             .run(&["net-list", "--name"])
             .await?
@@ -1365,7 +1307,7 @@ impl Virsh {
     }
 
     /// `virsh` with `xml` in a temporary file, as `args` then that file.
-    async fn with_file(&self, args: &[&str], xml: &str) -> Result<String, String> {
+    async fn with_file(&self, args: &[&str], xml: &str) -> Result<String, VmError> {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "raidish-virsh-{}-{}.xml",
@@ -1374,7 +1316,7 @@ impl Virsh {
         ));
         tokio::fs::write(&path, xml)
             .await
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
+            .map_err(|e| VmError::Host(format!("{}: {}", path.display(), e)))?;
         let p = path.to_string_lossy().into_owned();
         let mut a = args.to_vec();
         a.push(&p);
@@ -1386,7 +1328,7 @@ impl Virsh {
     /// Whether this host can give a guest the CPU `cpu_xml` (a `<cpu>`
     /// element, or a domain holding one) describes: `virsh
     /// hypervisor-cpu-compare`. Err with libvirt's reason if not.
-    pub async fn cpu_compare(&self, cpu_xml: &str) -> Result<String, String> {
+    pub async fn cpu_compare(&self, cpu_xml: &str) -> Result<String, VmError> {
         let out = self
             .with_file(&["hypervisor-cpu-compare", "--error"], cpu_xml)
             .await?;
@@ -1395,7 +1337,7 @@ impl Virsh {
 
     /// The CPU every one of `domcaps` (each a `virsh domcapabilities`)
     /// can give a guest, migratable: `virsh hypervisor-cpu-baseline`.
-    pub async fn cpu_baseline(&self, domcaps: &[String]) -> Result<String, String> {
+    pub async fn cpu_baseline(&self, domcaps: &[String]) -> Result<String, VmError> {
         let all = domcaps.concat();
         self.with_file(&["hypervisor-cpu-baseline", "--migratable"], &all)
             .await
@@ -1423,9 +1365,13 @@ impl Virsh {
         };
         Some(LocalVm {
             vcpus: field("CPU(s):").and_then(|v| v.parse().ok()),
-            memory_kib: field("Used memory:")
+            // `2097152 KiB`
+            memory: field("Used memory:")
                 .or_else(|| field("Max memory:"))
-                .and_then(|v| v.split_whitespace().next()?.parse().ok()),
+                .and_then(|v| {
+                    let mut w = v.split_whitespace();
+                    crate::vm_def::libvirt_memory(w.next()?, w.next())
+                }),
             cpu_s: field("CPU time:").and_then(|v| v.trim_end_matches('s').parse().ok()),
             vnc_port,
             domain: d,
@@ -1435,7 +1381,7 @@ impl Virsh {
 
     /// Every domain raidish started on this libvirt (any node's, any
     /// pool's: see `VmRuntime::local_vms`).
-    pub async fn local_vms(&self) -> Result<Vec<LocalVm>, String> {
+    pub async fn local_vms(&self) -> Result<Vec<LocalVm>, VmError> {
         let mut out = Vec::new();
         for d in self.list().await? {
             if let Some(v) = self.local_vm(d).await {
@@ -1453,7 +1399,7 @@ fn parse_list(out: &str) -> Vec<Domain> {
             let mut parts = l.split_whitespace();
             let id = parts.next()?;
             let name = parts.next()?.to_string();
-            let state = parts.collect::<Vec<_>>().join(" ");
+            let state = DomState::parse(&parts.collect::<Vec<_>>().join(" "));
             Some(Domain {
                 name,
                 id: id.parse().ok(),

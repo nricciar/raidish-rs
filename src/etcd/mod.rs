@@ -42,7 +42,8 @@ pub mod store;
 
 /// etcd's protobuf messages and gRPC services (from its `.proto` files,
 /// see `proto/`).
-#[allow(clippy::all, clippy::pedantic)]
+// Generated whole from etcd's protos: not every message is used.
+#[allow(clippy::all, clippy::pedantic, dead_code)]
 pub mod pb {
     pub mod mvccpb {
         tonic::include_proto!("mvccpb");

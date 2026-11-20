@@ -11,25 +11,7 @@ use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
-pub type FileId = u64;
-
-/// Runs when a disk server says our epoch is stale: another writer has the
-/// pool now. `main` makes this exit; it must never be retried.
-static ON_STALE_EPOCH: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
-
-/// This process's pool lease epoch, sent with remote requests outside
-/// metaslabs lent to it (0: no lease). See `crate::fence`.
-pub fn set_lease_epoch(epoch: u64) {
-    crate::fence::client().set_pool_epoch(epoch);
-}
-
-pub fn lease_epoch() -> u64 {
-    crate::fence::client().pool_epoch()
-}
-
-pub fn on_stale_epoch(f: fn()) {
-    let _ = ON_STALE_EPOCH.set(f);
-}
+pub use crate::types::FileId;
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -44,6 +26,22 @@ pub enum DiskError {
     InvalidUri(ParseError),
     /// The disk server refused a write: our lease epoch is out of date.
     StaleEpoch,
+}
+
+impl DiskError {
+    /// About reaching the disk (or our standing with it), not what's on
+    /// it: something a later try may not hit.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            DiskError::UnhealthyDisk
+            | DiskError::Disconnected
+            | DiskError::Timeout
+            | DiskError::StaleEpoch => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            DiskError::TungsteniteError(_) => true,
+            DiskError::IoError(_) | DiskError::InvalidUri(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for DiskError {
@@ -87,10 +85,43 @@ impl From<tokio::task::JoinError> for DiskError {
     }
 }
 
+/// One block's bytes. Runs of blocks are `[Block]`: whole blocks by type
+/// (`as_flattened` for their bytes).
+pub type Block = [u8; BLOCK_SIZE];
+
+/// `n` zeroed blocks.
+pub fn zeroed_blocks(n: usize) -> Vec<Block> {
+    vec![[0u8; BLOCK_SIZE]; n]
+}
+
+/// `bytes` as whole blocks; refused if it isn't a whole number of them.
+pub fn as_blocks(bytes: &[u8]) -> Result<&[Block], DiskError> {
+    match bytes.as_chunks::<BLOCK_SIZE>() {
+        (blocks, []) => Ok(blocks),
+        _ => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} bytes isn't whole blocks", bytes.len()),
+        ))),
+    }
+}
+
+/// `bytes` as whole blocks, to read into; refused if it isn't a whole
+/// number of them.
+pub fn as_blocks_mut(bytes: &mut [u8]) -> Result<&mut [Block], DiskError> {
+    let len = bytes.len();
+    match bytes.as_chunks_mut::<BLOCK_SIZE>() {
+        (blocks, []) => Ok(blocks),
+        _ => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} bytes isn't whole blocks", len),
+        ))),
+    }
+}
+
 #[async_trait]
 pub trait BlockDevice: Send + Sync {
     async fn flush(&self) -> Result<(), DiskError>;
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError>;
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError>;
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
 
     /// Usable capacity in blocks.
@@ -98,21 +129,18 @@ pub trait BlockDevice: Send + Sync {
         Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
     }
 
-    /// Read `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
-        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
-            self.read_block(start + i as u64, chunk).await?;
+    /// Read `buf.len()` consecutive blocks starting at `start`.
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        for (i, b) in buf.iter_mut().enumerate() {
+            self.read_block(start + i as u64, b).await?;
         }
         Ok(())
     }
 
-    /// Write `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
-        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
-            self.write_block(start + i as u64, chunk.try_into().unwrap())
-                .await?;
+    /// Write `buf.len()` consecutive blocks starting at `start`.
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        for (i, b) in buf.iter().enumerate() {
+            self.write_block(start + i as u64, b).await?;
         }
         Ok(())
     }
@@ -147,7 +175,7 @@ impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
     async fn flush(&self) -> Result<(), DiskError> {
         (**self).flush().await
     }
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         (**self).read_block(block, buf).await
     }
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
@@ -156,10 +184,10 @@ impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         (**self).capacity_blocks().await
     }
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         (**self).read_blocks(start, buf).await
     }
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         (**self).write_blocks(start, buf).await
     }
     async fn reconstruct_candidates(&self, block: BlockId) -> Result<Candidates, DiskError> {
@@ -183,17 +211,8 @@ pub struct Candidates {
     pub rebuilt: Vec<Option<Vec<u8>>>,
 }
 
-/// Map a websocket reply status to a result. A stale epoch runs the
-/// `on_stale_epoch` hook (another writer has the pool).
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+/// Map a websocket reply status to a result.
 pub(crate) fn check_status(status: u8) -> Result<(), DiskError> {
-    check_status_in(status, false)
-}
-
-/// `check_status` for a request fenced by a lent metaslab's epoch
-/// (`lent`): a refusal there means this process's writer lost that
-/// metaslab, which the writer handles itself; the hook isn't run.
-pub(crate) fn check_status_in(status: u8, lent: bool) -> Result<(), DiskError> {
     match WsStatus::try_from(status) {
         Ok(WsStatus::Success) => Ok(()),
         Ok(WsStatus::ErrorNotFound) => Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
@@ -204,12 +223,7 @@ pub(crate) fn check_status_in(status: u8, lent: bool) -> Result<(), DiskError> {
             std::io::ErrorKind::PermissionDenied,
             "this certificate or token may not write",
         ))),
-        Ok(WsStatus::StaleEpoch) => {
-            if !lent && let Some(f) = ON_STALE_EPOCH.get() {
-                f();
-            }
-            Err(DiskError::StaleEpoch)
-        }
+        Ok(WsStatus::StaleEpoch) => Err(DiskError::StaleEpoch),
         Err(_) => Err(DiskError::IoError(std::io::Error::other(format!(
             "websocket: unknown status {}",
             status
@@ -342,7 +356,6 @@ impl Disk {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn open(path: &str) -> Result<Self, DiskError> {
         Self::open_with(path, DiskOptions::default()).await
     }
@@ -441,12 +454,12 @@ impl BlockDevice for Disk {
         Ok(())
     }
 
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        self.read_blocks(block, &mut buf[..BLOCK_SIZE]).await
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
+        self.read_blocks(block, std::slice::from_mut(buf)).await
     }
 
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        self.write_blocks(block, buf).await
+    async fn write_block(&self, block: BlockId, buf: &Block) -> Result<(), DiskError> {
+        self.write_blocks(block, std::slice::from_ref(buf)).await
     }
 
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
@@ -468,8 +481,8 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let buf = buf.as_flattened_mut();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
@@ -503,8 +516,8 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        let buf = buf.as_flattened();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {

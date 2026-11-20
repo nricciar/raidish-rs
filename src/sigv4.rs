@@ -80,12 +80,14 @@ pub trait Keys {
     fn secret(&self, id: &str) -> Result<String, AuthError>;
 }
 
-/// A fixed set of keys (`(id, secret)`), as tests and tools use.
+/// A fixed set of keys (`(id, secret)`), for tests.
+#[cfg(test)]
 pub struct StaticKeys {
     pub region: String,
     pub keys: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 impl Keys for StaticKeys {
     fn region(&self) -> String {
         self.region.clone()

@@ -10,14 +10,21 @@
 //! writer, through its intent log (which carries the operations, see
 //! `crate::zil`), elsewhere by a commit.
 
-use crate::btree::{CheckReport, Txn};
-use crate::dataset::{Dataset, DatasetFormat};
+use crate::btree::CheckReport;
+#[cfg(test)]
+use crate::btree::Txn;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::dataset::Dataset;
+use crate::dataset::DatasetFormat;
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::volume::DIRTY_LIMIT_BYTES;
+#[cfg(test)]
 use std::ops::Bound;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 /// Target node size: rounded up to the pool's alignment.
@@ -81,7 +88,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let _tx = self.begin_tx().await;
         let mut root = Dnode::kv(blksz, capacity);
-        root.props = Some(props);
+        if let Some(h) = root.head_mut() {
+            h.props = props;
+        }
         let id = self.create_dataset_locked(name, format, root).await?;
         self.commit_locked().await?;
         Ok(id)
@@ -129,6 +138,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// B+tree dataset `name` of format `format`, opened.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn open_btree(
         &self,
         name: &str,
@@ -147,11 +157,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// `kv` dataset `name`, opened.
+    #[cfg(test)]
     pub(crate) async fn open_kv(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
         self.open_btree(name, DatasetFormat::Kv).await
     }
 
     /// The value of `key` (uncommitted changes included).
+    #[cfg(test)]
     pub async fn kv_get(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
@@ -159,6 +171,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Set `key` to `value`. Returns whether it replaced a value.
+    #[cfg(test)]
     pub async fn kv_put(
         &self,
         name: &str,
@@ -178,6 +191,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Remove `key`. Returns whether it was there.
+    #[cfg(test)]
     pub async fn kv_delete(&self, name: &str, key: &[u8]) -> Result<bool, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let removed = {
@@ -192,6 +206,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Up to `limit` entries with keys within `start` and `end`, in order.
+    #[cfg(test)]
     pub async fn kv_range(
         &self,
         name: &str,
@@ -209,6 +224,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Up to `limit` entries whose keys start with `prefix`, after `after`
     /// (exclusive; None: from the first).
+    #[cfg(test)]
     pub async fn kv_scan_prefix(
         &self,
         name: &str,
@@ -229,6 +245,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// How many keys `name` holds.
+    #[cfg(test)]
     pub async fn kv_len(&self, name: &str) -> Result<u64, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
@@ -238,6 +255,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Commit early if too much is dirty (as volume writes do). Best
     /// effort: whether the caller's own dataset is durable is the flush's
     /// answer, and another dataset failing its sync mustn't fail this one.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn kv_settle(&self) -> Result<(), FileSystemError> {
         if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
             let _ = self
@@ -262,6 +280,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
 /// The smallest key greater than every key starting with `prefix` (None:
 /// there is none, the prefix is all 0xff or empty).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {

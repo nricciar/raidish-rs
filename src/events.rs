@@ -24,6 +24,8 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::types::Epoch;
+use crate::types::{HolderRole, LeaseResource};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
@@ -41,51 +43,7 @@ pub const MAX_PAGE: usize = 1000;
 const META: &[u8] = b"M";
 const SEEN: &[u8] = b"S";
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum Level {
-    Info,
-    Warn,
-    Error,
-}
-
-/// An event as reported, before the log numbers it.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct NewEvent {
-    /// When (ms since the epoch, the reporting node's clock).
-    pub ts_ms: u64,
-    /// The node it happened on (or that noticed it).
-    pub node: String,
-    pub level: Level,
-    /// What sort of event, dotted: `node.down`, `volume.started`...
-    pub kind: String,
-    /// What it's about: `node/<n>`, `volume/<v>`, `vm/<v>`, `disk/<i>`...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    pub message: String,
-    /// Who asked for it (an admin's name), if someone did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<String>,
-}
-
-/// An event in the log.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Event {
-    pub seq: u64,
-    #[serde(flatten)]
-    pub event: NewEvent,
-}
-
-/// A page of the log, oldest first.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
-pub struct EventPage {
-    pub events: Vec<Event>,
-    /// The number the next event will get (what to ask `after` from:
-    /// `next - 1`).
-    pub next: u64,
-    /// The oldest event's number still kept (0: none).
-    pub first: u64,
-}
+pub use crate::api_types::{Event, EventKind, EventPage, Level, NewEvent, Subject};
 
 /// What to read (`GET /api/v1/events`).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, FromForm)]
@@ -103,19 +61,21 @@ struct Meta {
     next_seq: u64,
 }
 
+/// The event number in key `k` (see [`key`]).
+fn seq_of(k: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(k.strip_prefix(b"E")?.try_into().ok()?))
+}
+
 fn key(seq: u64) -> Vec<u8> {
     let mut k = b"E".to_vec();
     k.extend(seq.to_be_bytes());
     k
 }
 
-fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, FileSystemError> {
-    serde_json::to_vec(v).map_err(|e| FileSystemError::InvalidArgument(e.to_string()))
-}
+use crate::service_tree::enc_json as json;
 
 fn parse<T: for<'de> Deserialize<'de>>(b: &[u8]) -> Result<T, FileSystemError> {
-    serde_json::from_slice(b)
-        .map_err(|e| FileSystemError::InvalidArgument(format!("events: {}", e)))
+    crate::service_tree::dec_json(b, "events record")
 }
 
 /// The log, opened on the committer's pool.
@@ -129,23 +89,8 @@ pub struct EventLog<D: BlockDevice> {
 impl<D: BlockDevice> EventLog<D> {
     /// Open the pool's log, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
-        if !fs.datasets().await?.datasets.contains_key(EVENTS_DATASET) {
-            let blksz = fs.default_kv_blksz();
-            match fs
-                .create_btree(
-                    EVENTS_DATASET,
-                    DatasetFormat::Events,
-                    blksz,
-                    crate::kv::NODE_CAPACITY,
-                    Default::default(),
-                )
-                .await
-            {
-                Ok(_) | Err(FileSystemError::AlreadyExists) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        let ds = fs.open_btree(EVENTS_DATASET, DatasetFormat::Events).await?;
+        let ds =
+            crate::service_tree::ensure_btree(&fs, EVENTS_DATASET, DatasetFormat::Events).await?;
         Ok(Arc::new(EventLog {
             fs,
             ds,
@@ -212,8 +157,7 @@ impl<D: BlockDevice> EventLog<D> {
             .range(Bound::Included(b"E"), Bound::Excluded(b"F"), 1)
             .await?
             .first()
-            .map(|(_, v)| parse::<Event>(v).map(|e| e.seq))
-            .transpose()?
+            .and_then(|(k, _)| seq_of(k))
             .unwrap_or(0);
         // Numbers are consecutive (only the oldest go), so the newest
         // `limit` before `n` start at `n - limit`.
@@ -233,8 +177,16 @@ impl<D: BlockDevice> EventLog<D> {
             )
             .await?
             .iter()
-            .map(|(_, v)| parse(v))
-            .collect::<Result<_, _>>()?;
+            // One this version can't read (written by another): skip it
+            // rather than lose the whole page.
+            .filter_map(|(k, v)| match parse(v) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("events: skipping unreadable event {:?}: {}", seq_of(k), e);
+                    None
+                }
+            })
+            .collect();
         Ok(EventPage {
             events,
             next,
@@ -270,7 +222,7 @@ async fn prune<D: BlockDevice>(t: &mut Txn<'_, D>, now: u64) -> Result<(), FileS
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Held {
     pub node: String,
-    pub epoch: u64,
+    pub epoch: Epoch,
 }
 
 /// What the committer last saw of the cluster: just enough to tell what
@@ -278,7 +230,7 @@ pub struct Held {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Observed {
     /// Every node ever seen → its lease epoch and whether it was live.
-    pub nodes: BTreeMap<String, (u64, bool)>,
+    pub nodes: BTreeMap<String, (Epoch, bool)>,
     /// Running datasets → who runs them.
     pub datasets: BTreeMap<String, Held>,
     pub committer: Option<Held>,
@@ -299,42 +251,45 @@ pub fn observe(
         ..Default::default()
     };
     for (r, l) in &state.leases {
-        let live = !l.released && l.expires_ms > now;
-        if let Some(n) = r.strip_prefix("node/") {
-            o.nodes.insert(n.to_string(), (l.epoch, live));
-        } else if let Some(d) = r.strip_prefix("ds/")
-            && live
-        {
-            o.datasets.insert(
-                d.to_string(),
-                Held {
-                    node: crate::frontend::parse_desc(&l.desc).0,
-                    epoch: l.epoch,
-                },
-            );
+        let live = l.is_live(now);
+        match r {
+            LeaseResource::Node(n) => {
+                o.nodes.insert(n.clone(), (l.epoch, live));
+            }
+            // The committer replaying a log isn't running it.
+            LeaseResource::Dataset(d) if live && l.holder.role != HolderRole::Replay => {
+                o.datasets.insert(
+                    d.clone(),
+                    Held {
+                        node: l.holder.node.clone().unwrap_or_default(),
+                        epoch: l.epoch,
+                    },
+                );
+            }
+            _ => {}
         }
     }
     o
 }
 
 /// An event the committer noticed: (level, kind, subject, message).
-pub type Noticed = (Level, &'static str, String, String);
+pub type Noticed = (Level, EventKind, Subject, String);
 
 /// What changed from `old` to `new`, as events. `state` says how leases
-/// ended; `label` names a dataset's kind ("Volume", "Bucket"...).
+/// ended; `format` says what format a dataset is, if known.
 pub fn diff(
     old: Option<&Observed>,
     new: &Observed,
     state: &crate::cluster::state::ClusterState,
-    label: &dyn Fn(&str) -> String,
+    format: &dyn Fn(&str) -> Option<DatasetFormat>,
 ) -> Vec<Noticed> {
     let mut out = Vec::new();
     let me = new.committer.clone().expect("observed by a committer");
     let Some(old) = old else {
         out.push((
             Level::Info,
-            "events.started",
-            "pool".into(),
+            EventKind::EventsStarted,
+            Subject::Pool,
             format!("Activity log started (committer on {})", me.node),
         ));
         return out;
@@ -343,55 +298,55 @@ pub fn diff(
         Some(c) if c == &me => {}
         Some(c) if c.node == me.node => out.push((
             Level::Info,
-            "committer.started",
-            format!("node/{}", me.node),
+            EventKind::CommitterStarted,
+            Subject::node(&me.node),
             format!("Committer restarted on {}", me.node),
         )),
         Some(c) => out.push((
             Level::Warn,
-            "committer.moved",
-            format!("node/{}", me.node),
+            EventKind::CommitterMoved,
+            Subject::node(&me.node),
             format!("{} took over as committer from {}", me.node, c.node),
         )),
         None => out.push((
             Level::Info,
-            "committer.started",
-            format!("node/{}", me.node),
+            EventKind::CommitterStarted,
+            Subject::node(&me.node),
             format!("{} is the committer", me.node),
         )),
     }
     // Nodes.
     for (n, &(epoch, live)) in &new.nodes {
-        let subject = format!("node/{}", n);
+        let subject = Subject::node(n);
         match old.nodes.get(n) {
             None | Some((_, false)) if live => out.push((
                 Level::Info,
-                "node.up",
+                EventKind::NodeUp,
                 subject,
                 format!("Node {} joined the cluster", n),
             )),
             Some(&(e, true)) if live && e != epoch => out.push((
                 Level::Warn,
-                "node.restarted",
+                EventKind::NodeRestarted,
                 subject,
                 format!("Node {} restarted", n),
             )),
             Some((_, true)) if !live => {
                 let released = state
                     .leases
-                    .get(&subject)
+                    .get(&LeaseResource::node(n))
                     .is_some_and(|l| l.released && l.epoch == epoch);
                 if released {
                     out.push((
                         Level::Info,
-                        "node.left",
+                        EventKind::NodeLeft,
                         subject,
                         format!("Node {} left the cluster", n),
                     ));
                 } else {
                     out.push((
                         Level::Error,
-                        "node.down",
+                        EventKind::NodeDown,
                         subject,
                         format!("Node {} stopped responding", n),
                     ));
@@ -409,15 +364,16 @@ pub fn diff(
         .map(|(n, _)| n)
         .collect();
     for (d, was) in &old.datasets {
-        let what = label(d);
-        let subject = format!("{}/{}", what.to_lowercase(), d);
+        let f = format(d);
+        let what = label_of(f);
+        let subject = Subject::dataset(f, d);
         match new.datasets.get(d) {
             Some(now) if now.epoch == was.epoch => {}
             Some(now) => {
                 if !live_nodes.contains(&was.node) && now.node != was.node {
                     out.push((
                         Level::Warn,
-                        "dataset.failover",
+                        EventKind::DatasetFailover,
                         subject,
                         format!(
                             "{} '{}' moved from {} to {} ({} is down)",
@@ -427,13 +383,13 @@ pub fn diff(
                 }
             }
             None => {
-                let lease = state.leases.get(&format!("ds/{}", d));
+                let lease = state.leases.get(&LeaseResource::dataset(d));
                 let clean = lease.is_none_or(|l| l.released || l.epoch != was.epoch);
                 // A live node reports a lease it lost itself.
                 if !clean && !live_nodes.contains(&was.node) {
                     out.push((
                         Level::Warn,
-                        "dataset.lost",
+                        EventKind::DatasetLost,
                         subject,
                         format!("{} '{}' stopped: {} is down", what, d, was.node),
                     ));
@@ -445,8 +401,8 @@ pub fn diff(
         match &new.leader {
             Some(id) => out.push((
                 Level::Info,
-                "raft.leader",
-                "cluster".into(),
+                EventKind::RaftLeader,
+                Subject::Cluster,
                 format!(
                     "Raft leader is now {}",
                     crate::cluster::members::node_name(*id)
@@ -454,8 +410,8 @@ pub fn diff(
             )),
             None => out.push((
                 Level::Warn,
-                "raft.leader",
-                "cluster".into(),
+                EventKind::RaftLeader,
+                Subject::Cluster,
                 "The cluster has no Raft leader".into(),
             )),
         }
@@ -464,6 +420,11 @@ pub fn diff(
 }
 
 /// What a dataset is, for messages ("Volume", "Bucket"...).
+/// A dataset of format `f` (None: not known), for messages.
+pub fn label_of(f: Option<DatasetFormat>) -> &'static str {
+    f.map_or("Dataset", format_label)
+}
+
 pub fn format_label(f: DatasetFormat) -> &'static str {
     match f {
         DatasetFormat::Block => "Volume",
@@ -506,8 +467,8 @@ struct SinkState {
     queue: VecDeque<NewEvent>,
     /// Dropped (the queue was full) since the last send.
     dropped: u64,
-    /// For `once`: key → the message last reported.
-    last: HashMap<String, String>,
+    /// For `once`: the message last reported, by subject.
+    last: HashMap<Subject, String>,
 }
 
 /// Where a node reports events: queued here, sent to the committer by
@@ -532,16 +493,12 @@ impl EventSink {
         }
     }
 
-    pub fn node(&self) -> &str {
-        &self.node
-    }
-
     /// Report an event (now, on this node).
     pub fn emit(
         &self,
         level: Level,
-        kind: &str,
-        subject: impl Into<String>,
+        kind: EventKind,
+        subject: Subject,
         message: impl Into<String>,
         by: Option<String>,
     ) {
@@ -549,8 +506,8 @@ impl EventSink {
             ts_ms: crate::fs::now_ms(),
             node: self.node.clone(),
             level,
-            kind: kind.to_string(),
-            subject: Some(subject.into()),
+            kind,
+            subject,
             message: message.into(),
             by,
         };
@@ -564,45 +521,44 @@ impl EventSink {
         self.wake.notify_one();
     }
 
-    pub fn info(&self, kind: &str, subject: impl Into<String>, message: impl Into<String>) {
+    pub fn info(&self, kind: EventKind, subject: Subject, message: impl Into<String>) {
         self.emit(Level::Info, kind, subject, message, None);
     }
 
-    pub fn warn(&self, kind: &str, subject: impl Into<String>, message: impl Into<String>) {
+    pub fn warn(&self, kind: EventKind, subject: Subject, message: impl Into<String>) {
         self.emit(Level::Warn, kind, subject, message, None);
     }
 
-    pub fn error(&self, kind: &str, subject: impl Into<String>, message: impl Into<String>) {
+    pub fn error(&self, kind: EventKind, subject: Subject, message: impl Into<String>) {
         self.emit(Level::Error, kind, subject, message, None);
     }
 
-    /// Report a condition that's retried (a VM that won't start, every
-    /// tick): once, and again only if its message changes. Returns whether
-    /// it was reported.
+    /// Report a condition of `subject` that's retried (a VM that won't
+    /// start, every tick): once, and again only if its message changes.
+    /// Returns whether it was reported.
     pub fn once(
         &self,
-        key: &str,
         level: Level,
-        kind: &str,
-        subject: impl Into<String>,
+        kind: EventKind,
+        subject: Subject,
         message: impl Into<String>,
     ) -> bool {
         let message = message.into();
         {
             let mut s = self.state.lock().unwrap();
-            if s.last.get(key) == Some(&message) {
+            if s.last.get(&subject) == Some(&message) {
                 return false;
             }
-            s.last.insert(key.to_string(), message.clone());
+            s.last.insert(subject.clone(), message.clone());
         }
         self.emit(level, kind, subject, message, None);
         true
     }
 
-    /// The condition `key` is over (reported again next time). Returns
-    /// whether it was on.
-    pub fn clear(&self, key: &str) -> bool {
-        self.state.lock().unwrap().last.remove(key).is_some()
+    /// The condition of `subject` is over (reported again next time).
+    /// Returns whether it was on.
+    pub fn clear(&self, subject: &Subject) -> bool {
+        self.state.lock().unwrap().last.remove(subject).is_some()
     }
 
     /// Take up to `n` queued events (and a note of any dropped).
@@ -614,8 +570,8 @@ impl EventSink {
                 ts_ms: crate::fs::now_ms(),
                 node: self.node.clone(),
                 level: Level::Warn,
-                kind: "events.dropped".into(),
-                subject: Some(format!("node/{}", self.node)),
+                kind: EventKind::EventsDropped,
+                subject: Subject::node(&self.node),
                 message: format!(
                     "{} events from {} were dropped while no committer was reachable",
                     s.dropped, self.node
@@ -642,6 +598,7 @@ impl EventSink {
     }
 
     /// Queued, not yet sent.
+    #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.state.lock().unwrap().queue.len()
     }

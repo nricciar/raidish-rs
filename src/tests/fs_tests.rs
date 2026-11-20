@@ -92,3 +92,45 @@ async fn test_nested_directory_creation() {
     let data = fs.read_file(file_path).await.unwrap();
     assert_eq!(data, b"Deep content");
 }
+
+#[test]
+fn uberblocks_validate_what_they_claim() {
+    use crate::types::Txg;
+    let good = Uberblock {
+        magic: UBERBLOCK_MAGIC,
+        version: UBERBLOCK_VERSION,
+        txg: Txg::from_raw(7),
+        timestamp: 0,
+        objects: crate::object::TreeRoot {
+            ptr: None,
+            levels: 0,
+        },
+        degraded: Vec::new(),
+        next_object: 10,
+        datasets: FileId::from_raw(2),
+    };
+    assert!(good.validate(Txg::from_raw(7)).is_ok());
+    // Written in another TXG's label than it says.
+    assert!(good.validate(Txg::from_raw(8)).is_err());
+    let bad = [
+        Uberblock {
+            magic: 0,
+            ..good.clone()
+        },
+        Uberblock {
+            version: 0,
+            ..good.clone()
+        },
+        Uberblock {
+            datasets: FileId::from_raw(0),
+            ..good.clone()
+        },
+        Uberblock {
+            next_object: 2,
+            ..good.clone()
+        },
+    ];
+    for b in bad {
+        assert!(b.validate(Txg::from_raw(7)).is_err(), "{:?}", b);
+    }
+}

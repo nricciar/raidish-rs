@@ -30,9 +30,13 @@
 //!   (proxied to the node it runs on), then how to reach this node; 422 if
 //!   it never will be (no VMs here).
 
+use crate::api_error::ApiError;
+pub use crate::api_types::{CheckView, FactsView, MoveTo, VmView};
 use crate::cluster::{Cluster, LeaseOp};
+use crate::committer::PoolAdmin;
 use crate::committer::PutVm;
 use crate::committer::dataset_resource;
+use crate::events::{EventKind, Subject};
 use crate::vm::{LocalVm, VmRuntime, VmSpec};
 use crate::vm_store::VmDef;
 use crate::volumes_api::VolumesState;
@@ -59,19 +63,9 @@ impl VmsState {
         VmsState {
             runtime,
             facts,
-            http: crate::tls::http_builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("http client"),
+            http: crate::tls::http_client(Some(Duration::from_secs(5))).expect("http client"),
         }
     }
-}
-
-type ApiError = (Status, String);
-
-fn bad(m: impl Into<String>) -> ApiError {
-    (Status::BadRequest, m.into())
 }
 
 /// What `GET /api/v1/vm/local` answers.
@@ -87,35 +81,17 @@ pub struct LocalView {
     pub error: Option<String>,
 }
 
-/// A VM, as `GET /api/v1/vms` shows it.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct VmView {
-    #[serde(flatten)]
-    pub spec: VmSpec,
-    /// Should it run (the cluster's intent)?
-    pub want_running: bool,
-    /// The node holding its anchor volume (where it runs, or would).
-    pub node: Option<String>,
-    /// libvirt's state on that node; None: not running there.
-    pub state: Option<String>,
-    /// The node couldn't be asked: `state` is unknown.
-    pub unreachable: Option<String>,
-    /// Started from an older version of its XML.
-    pub restart_pending: bool,
-    pub vcpus: Option<u32>,
-    pub memory_kib: Option<u64>,
-    pub cpu_s: Option<f64>,
-    pub console: bool,
-    /// Why its node couldn't start it.
-    pub start_error: Option<String>,
+/// The node holding VM `spec`'s anchor volume (where it runs, or would).
+fn vm_node(cluster: &Cluster, spec: &VmSpec) -> Option<String> {
+    holder(cluster, spec.anchor()?)
 }
 
 fn holder(cluster: &Cluster, volume: &str) -> Option<String> {
     let now = crate::cluster::now_ms();
     cluster
         .lease_state(&dataset_resource(volume))
-        .filter(|l| !l.released && l.expires_ms > now)
-        .map(|l| crate::frontend::parse_desc(&l.desc).0)
+        .filter(|l| l.is_live(now))
+        .and_then(|l| l.holder.node)
 }
 
 /// A node's base URL; None: this node.
@@ -123,11 +99,11 @@ fn peer_url(cluster: &Cluster, node: &str) -> Result<Option<String>, ApiError> {
     if node == cluster.name {
         return Ok(None);
     }
-    node.strip_prefix("node-")
-        .and_then(|id| id.parse::<u64>().ok())
-        .and_then(|id| cluster.members.peers.get(&id))
-        .map(|u| Some(u.trim_end_matches('/').to_string()))
-        .ok_or_else(|| (Status::BadGateway, format!("no address for {}", node)))
+    cluster
+        .members
+        .peer_url(node)
+        .map(|u| Some(u.to_string()))
+        .ok_or_else(|| ApiError::new(Status::BadGateway, format!("no address for {}", node)))
 }
 
 async fn local_view(
@@ -165,18 +141,22 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
     let rt = st
         .runtime
         .as_ref()
-        .ok_or_else(|| (Status::NotFound, "this node runs no VMs".to_string()))?;
+        .ok_or_else(|| ApiError::new(Status::NotFound, "this node runs no VMs".to_string()))?;
     if action == "poke" {
-        rt.poke.notify_one();
+        rt.poke();
         return Ok(());
     }
+    crate::types::VmName::try_from(name).map_err(|e| ApiError::bad(e.to_string()))?;
     // Only a domain this node started (see `crate::vm::DomMeta::pool`).
     let ours = match (rt.ident(), rt.virsh.meta(name).await) {
         (Some(me), Some(m)) => me.owns(&m),
         _ => false,
     };
     if !ours {
-        return Err((Status::NotFound, format!("no VM '{}' runs here", name)));
+        return Err(ApiError::new(
+            Status::NotFound,
+            format!("no VM '{}' runs here", name),
+        ));
     }
     let r = match action {
         "reboot" => rt.virsh.reboot(name).await,
@@ -184,14 +164,14 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
         // The agent shuts it down (destroying it after the timeout) and
         // starts it again from the current XML.
         "restart" => {
-            rt.restart.lock().unwrap().insert(name.to_string());
+            rt.restart(name);
             Ok(())
         }
         "kill" => rt.virsh.destroy(name).await,
-        a => return Err(bad(format!("unknown action '{}'", a))),
+        a => return Err(ApiError::bad(format!("unknown action '{}'", a))),
     };
-    rt.poke.notify_one();
-    r.map_err(|e| (Status::InternalServerError, e))
+    rt.poke();
+    r.map_err(ApiError::from)
 }
 
 #[post("/api/v1/vm/local/<name>/<action>")]
@@ -220,12 +200,12 @@ async fn on_node(
         .post(format!("{}/api/v1/vm/local/{}/{}", base, name, action))
         .send()
         .await
-        .map_err(|e| (Status::BadGateway, format!("{}: {}", node, e)))?;
+        .map_err(|e| ApiError::new(Status::BadGateway, format!("{}: {}", node, e)))?;
     if resp.status().is_success() {
         return Ok(());
     }
     let code = Status::from_code(resp.status().as_u16()).unwrap_or(Status::BadGateway);
-    Err((code, resp.text().await.unwrap_or_default()))
+    Err(ApiError::new(code, resp.text().await.unwrap_or_default()))
 }
 
 #[get("/api/v1/vms")]
@@ -241,7 +221,7 @@ async fn list(
     // Ask each node with a VM's disks once.
     let mut views: BTreeMap<String, Result<LocalView, String>> = BTreeMap::new();
     for spec in specs.values() {
-        let Some(node) = holder(cluster, &spec.anchor) else {
+        let Some(node) = vm_node(cluster, spec) else {
             continue;
         };
         if views.contains_key(&node) {
@@ -264,18 +244,14 @@ async fn list(
                 }
                 .await
             }
-            Err((_, e)) => Err(e),
+            Err(e) => Err(e.msg),
         };
         views.insert(node, view);
     }
     let out = specs
         .into_values()
         .map(|spec| {
-            let node = if spec.anchor.is_empty() {
-                None
-            } else {
-                holder(cluster, &spec.anchor)
-            };
+            let node = vm_node(cluster, &spec);
             let mut v = VmView {
                 want_running: intent.contains_key(&spec.name),
                 node: node.clone(),
@@ -283,7 +259,7 @@ async fn list(
                 unreachable: None,
                 restart_pending: false,
                 vcpus: None,
-                memory_kib: None,
+                memory: None,
                 cpu_s: None,
                 console: false,
                 start_error: None,
@@ -295,7 +271,7 @@ async fn list(
                         v.state = Some(l.domain.state.clone());
                         v.restart_pending = l.meta.change != v.spec.change;
                         v.vcpus = l.vcpus;
-                        v.memory_kib = l.memory_kib;
+                        v.memory = l.memory;
                         v.cpu_s = l.cpu_s;
                         v.console = l.vnc_port.is_some();
                     }
@@ -320,10 +296,9 @@ async fn list(
 /// with an earlier one is unusable, see `crate::vm::mark_conflicts`).
 async fn specs(volumes: &VolumesState) -> Result<BTreeMap<String, VmSpec>, ApiError> {
     let mut specs: BTreeMap<String, VmSpec> = volumes
-        .client
+        .admin
         .vms()
-        .await
-        .map_err(crate::volumes_api::api_err)?
+        .await?
         .into_iter()
         .map(|(n, d)| (n, d.spec()))
         .collect();
@@ -335,7 +310,7 @@ async fn spec(volumes: &VolumesState, name: &str) -> Result<VmSpec, ApiError> {
     specs(volumes)
         .await?
         .remove(name)
-        .ok_or_else(|| (Status::NotFound, format!("no VM '{}'", name)))
+        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no VM '{}'", name)))
 }
 
 // ---- definitions ------------------------------------------------------------
@@ -348,13 +323,12 @@ async fn definition(
     volumes: &State<VolumesState>,
 ) -> Result<Json<VmDef>, ApiError> {
     volumes
-        .client
+        .admin
         .vms()
-        .await
-        .map_err(crate::volumes_api::api_err)?
+        .await?
         .remove(name)
         .map(Json)
-        .ok_or_else(|| (Status::NotFound, format!("no VM '{}'", name)))
+        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no VM '{}'", name)))
 }
 
 /// PUT /api/v1/vms/<name>[?create=true][&change=N], the domain XML as the
@@ -375,9 +349,9 @@ async fn put_definition(
         .open((crate::vm_store::MAX_XML + 1).bytes())
         .into_string()
         .await
-        .map_err(|e| bad(e.to_string()))?;
+        .map_err(|e| ApiError::bad(e.to_string()))?;
     if !xml.is_complete() {
-        return Err((
+        return Err(ApiError::new(
             Status::PayloadTooLarge,
             format!(
                 "a VM definition is at most {} bytes",
@@ -392,12 +366,12 @@ async fn put_definition(
         change,
     };
     volumes
-        .client
+        .admin
         .on_behalf(&auth.0)
         .put_vm(&req)
         .await
         .map(Json)
-        .map_err(crate::volumes_api::api_err)
+        .map_err(ApiError::from)
 }
 
 /// DELETE /api/v1/vms/<name>[?change=N]: delete its definition (its
@@ -414,11 +388,10 @@ async fn delete_definition(
 ) -> Result<Json<()>, ApiError> {
     let spec = spec(volumes, name).await.ok();
     volumes
-        .client
+        .admin
         .on_behalf(&auth.0)
         .delete_vm(name, change)
-        .await
-        .map_err(crate::volumes_api::api_err)?;
+        .await?;
     // Nothing should run it any more.
     set_intent(cluster, name, false).await?;
     if let Some(spec) = spec {
@@ -436,22 +409,14 @@ async fn set_intent(cluster: &Cluster, name: &str, running: bool) -> Result<(), 
         .lease(&op, false)
         .await
         .map(|_| ())
-        .map_err(|e| (Status::ServiceUnavailable, e))
+        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e))
 }
 
 /// Tell the VM's node to look now (best effort: it looks every tick anyway).
 async fn poke(st: &VmsState, cluster: &Cluster, spec: &VmSpec) {
-    if let Some(node) = holder(cluster, &spec.anchor) {
+    if let Some(node) = vm_node(cluster, spec) {
         let _ = on_node(st, cluster, &node, "-", "poke").await;
     }
-}
-
-#[derive(Deserialize)]
-pub struct MoveTo {
-    pub node: String,
-    /// Refuse unless it can move live.
-    #[serde(default)]
-    pub live: bool,
 }
 
 // ---- can it move there (MIG-4) --------------------------------------------
@@ -462,19 +427,9 @@ fn live_nodes(cluster: &Cluster) -> std::collections::BTreeSet<String> {
     cluster
         .status()
         .state
-        .leases
-        .iter()
-        .filter(|(r, l)| r.starts_with("node/") && !l.released && l.expires_ms > now)
-        .map(|(r, _)| r["node/".len()..].to_string())
+        .live_nodes(now)
+        .map(|(n, _)| n.to_string())
         .collect()
-}
-
-/// Every node's facts, and which nodes are up (`GET /api/v1/nodes/facts`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct FactsView {
-    pub nodes: BTreeMap<String, crate::node_facts::NodeFacts>,
-    /// Nodes up now; the others' facts are as they last were.
-    pub live: Vec<String>,
 }
 
 #[get("/api/v1/nodes/facts")]
@@ -484,11 +439,7 @@ async fn nodes_facts(
     volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
 ) -> Result<Json<FactsView>, ApiError> {
-    let mut nodes = volumes
-        .client
-        .node_facts()
-        .await
-        .map_err(crate::volumes_api::api_err)?;
+    let mut nodes = volumes.admin.node_facts().await?;
     // This node's own, as fresh as it has them.
     if let Some(f) = st.facts.latest() {
         nodes.insert(f.node.clone(), f);
@@ -508,12 +459,12 @@ async fn check_here(
     st: &State<VmsState>,
 ) -> Json<crate::vm_check::Live> {
     let cpu = match (&st.runtime, &ask.cpu) {
-        (Some(rt), Some(cpu)) => Some(rt.virsh.cpu_compare(cpu).await),
+        (Some(rt), Some(cpu)) => Some(rt.virsh.cpu_compare(cpu).await.map_err(String::from)),
         _ => None,
     };
     Json(crate::vm_check::Live {
         cpu,
-        available_mb: Some(crate::node_facts::available_mb()),
+        available: Some(crate::node_facts::available_memory()),
     })
 }
 
@@ -576,16 +527,6 @@ async fn fresh_source(
     }
 }
 
-/// Where a VM could move, and how (`GET /api/v1/vms/<name>/check`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CheckView {
-    pub vm: String,
-    /// Where it runs now (a move from there is checked as live); None: not
-    /// running, so a move is where it starts next.
-    pub running_on: Option<String>,
-    pub verdicts: Vec<crate::vm_check::Verdict>,
-}
-
 async fn check_vm(
     st: &VmsState,
     cluster: &Cluster,
@@ -595,17 +536,13 @@ async fn check_vm(
 ) -> Result<CheckView, ApiError> {
     use crate::vm_check::{Mode, check, cpu_to_compare, needs};
     let spec = spec(volumes, name).await?;
-    if !spec.usable() {
-        return Err(bad(spec.error.unwrap_or_default()));
+    if let Some(e) = spec.error() {
+        return Err(ApiError::bad(e.to_string()));
     }
-    let needs = needs(&spec.xml).map_err(bad)?;
-    let mut facts = volumes
-        .client
-        .node_facts()
-        .await
-        .map_err(crate::volumes_api::api_err)?;
+    let needs = needs(&spec.xml)?;
+    let mut facts = volumes.admin.node_facts().await?;
     let live = live_nodes(cluster);
-    let holder = holder(cluster, &spec.anchor);
+    let holder = vm_node(cluster, &spec);
     let running_on = holder.filter(|_| cluster.status().state.vms.contains_key(name));
     let source = running_on.as_ref().and_then(|n| facts.get(n)).cloned();
     let mut names: std::collections::BTreeSet<String> = facts.keys().cloned().collect();
@@ -643,10 +580,12 @@ async fn check_vm(
             match peer_url(cluster, &node) {
                 Ok(None) => Some(crate::vm_check::Live {
                     cpu: match (&st.runtime, &cpu) {
-                        (Some(rt), Some(c)) => Some(rt.virsh.cpu_compare(c).await),
+                        (Some(rt), Some(c)) => {
+                            Some(rt.virsh.cpu_compare(c).await.map_err(String::from))
+                        }
                         _ => None,
                     },
-                    available_mb: Some(crate::node_facts::available_mb()),
+                    available: Some(crate::node_facts::available_memory()),
                 }),
                 Ok(Some(url)) => crate::agent::migrate_ask_live(&st.http, &url, cpu.clone()).await,
                 Err(_) => None,
@@ -664,7 +603,7 @@ async fn check_vm(
             v.reasons.insert(
                 0,
                 crate::vm_check::Reason {
-                    level: "no".into(),
+                    level: crate::vm_check::ReasonLevel::No,
                     text: format!("{} is down", node),
                 },
             );
@@ -673,7 +612,7 @@ async fn check_vm(
     }
     if let Some(o) = only {
         if verdicts.is_empty() && running_on.as_deref() != Some(o) {
-            return Err((Status::NotFound, format!("no node '{}'", o)));
+            return Err(ApiError::new(Status::NotFound, format!("no node '{}'", o)));
         }
     }
     Ok(CheckView {
@@ -695,16 +634,13 @@ async fn cpu_baseline(
     volumes: &State<VolumesState>,
 ) -> Result<String, ApiError> {
     let rt = st.runtime.as_ref().ok_or_else(|| {
-        (
-            Status::UnprocessableEntity,
+        // Another node may: the CLI tries the next on a 5xx.
+        ApiError::new(
+            Status::ServiceUnavailable,
             "this node runs no VMs (no libvirt to work it out): ask one that does".to_string(),
         )
     })?;
-    let facts = volumes
-        .client
-        .node_facts()
-        .await
-        .map_err(crate::volumes_api::api_err)?;
+    let facts = volumes.admin.node_facts().await?;
     let want: Option<Vec<&str>> = nodes.map(|n| n.split(',').map(str::trim).collect());
     let mut caps = Vec::new();
     let mut used = Vec::new();
@@ -719,13 +655,18 @@ async fn cpu_baseline(
     }
     if let Some(w) = &want {
         if let Some(missing) = w.iter().find(|n| !used.iter().any(|u| u == *n)) {
-            return Err(bad(format!("no libvirt facts from '{}'", missing)));
+            return Err(ApiError::bad(format!(
+                "no libvirt facts from '{}'",
+                missing
+            )));
         }
     }
     if caps.is_empty() {
-        return Err(bad("no node has reported its libvirt yet".to_string()));
+        return Err(ApiError::bad(
+            "no node has reported its libvirt yet".to_string(),
+        ));
     }
-    let cpu = rt.virsh.cpu_baseline(&caps).await.map_err(bad)?;
+    let cpu = rt.virsh.cpu_baseline(&caps).await?;
     Ok(format!(
         "<!-- every one of {} can run this -->\n{}",
         used.join(", "),
@@ -757,51 +698,51 @@ async fn move_vm(
     volumes: &State<VolumesState>,
 ) -> Result<Json<CheckView>, ApiError> {
     let spec = spec(volumes, name).await?;
-    if !spec.usable() {
-        return Err(bad(spec.error.unwrap_or_default()));
-    }
+    let Some(anchor) = spec.anchor() else {
+        return Err(ApiError::bad(spec.error().unwrap_or_default().to_string()));
+    };
     // Where it'd go, and how: refused if it can't run there (or, asked
     // for live, if it can't move live).
     let view = check_vm(st, cluster, volumes, name, Some(&to.node)).await?;
     if let Some(v) = view.verdicts.first() {
         use crate::vm_check::Mode;
         if v.mode == Mode::No {
-            return Err((
+            return Err(ApiError::new(
                 Status::Conflict,
                 format!("VM '{}' can't run on {}: {}", name, to.node, v.why()),
             ));
         }
         if to.live && view.running_on.is_some() && v.mode != Mode::Live {
-            return Err((
+            return Err(ApiError::new(
                 Status::Conflict,
                 format!("VM '{}' can't move to {} live: {}", name, to.node, v.why()),
             ));
         }
     }
     let vols = volumes
-        .client
+        .admin
         .volumes()
         .await
-        .map_err(|e| (Status::ServiceUnavailable, e.to_string()))?;
+        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e.to_string()))?;
     let mut props = vols
         .into_iter()
-        .find(|v| v.name == spec.anchor)
-        .ok_or_else(|| (Status::NotFound, format!("no volume '{}'", spec.anchor)))?
+        .find(|v| v.name == anchor)
+        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no volume '{}'", anchor)))?
         .props;
     if !props.nodes.is_empty() && !props.nodes.contains(&to.node) {
         props.nodes.insert(0, to.node.clone());
     }
     props.move_to = Some(to.node.clone());
     volumes
-        .client
+        .admin
         .on_behalf(&auth.0)
-        .set_props(&spec.anchor, &props)
+        .set_props(anchor, &props)
         .await
-        .map_err(|e| (Status::ServiceUnavailable, e.to_string()))?;
+        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e.to_string()))?;
     events.emit(
         crate::events::Level::Info,
-        "vm.move",
-        format!("vm/{}", name),
+        EventKind::VmMove,
+        Subject::vm(name),
         format!("VM '{}' asked to move to {}", name, to.node),
         Some(auth.0.name.clone()),
     );
@@ -822,8 +763,8 @@ async fn action(
     let spec = spec(volumes, name).await?;
     match action {
         "start" => {
-            if let Some(e) = &spec.error {
-                return Err(bad(e.clone()));
+            if let Some(e) = spec.error() {
+                return Err(ApiError::bad(e.to_string()));
             }
             set_intent(cluster, name, true).await?;
             poke(st, cluster, &spec).await;
@@ -834,28 +775,30 @@ async fn action(
         }
         "kill" => {
             set_intent(cluster, name, false).await?;
-            let node = holder(cluster, &spec.anchor)
-                .ok_or_else(|| (Status::Conflict, format!("'{}' isn't running", name)))?;
+            let node = vm_node(cluster, &spec).ok_or_else(|| {
+                ApiError::new(Status::Conflict, format!("'{}' isn't running", name))
+            })?;
             on_node(st, cluster, &node, name, "kill").await?;
         }
         "reboot" | "reset" | "restart" => {
-            let node = holder(cluster, &spec.anchor)
-                .ok_or_else(|| (Status::Conflict, format!("'{}' isn't running", name)))?;
+            let node = vm_node(cluster, &spec).ok_or_else(|| {
+                ApiError::new(Status::Conflict, format!("'{}' isn't running", name))
+            })?;
             on_node(st, cluster, &node, name, action).await?;
         }
-        a => return Err(bad(format!("unknown action '{}'", a))),
+        a => return Err(ApiError::bad(format!("unknown action '{}'", a))),
     }
-    let what = match action {
-        "start" => "asked to start",
-        "stop" => "asked to shut down",
-        "kill" => "forced off",
-        "reboot" | "restart" => "rebooted",
-        _ => "reset",
+    let (kind, what) = match action {
+        "start" => (EventKind::VmStart, "asked to start"),
+        "stop" => (EventKind::VmStop, "asked to shut down"),
+        "kill" => (EventKind::VmKill, "forced off"),
+        "reboot" | "restart" => (EventKind::VmReboot, "rebooted"),
+        _ => (EventKind::VmReset, "reset"),
     };
     events.emit(
         crate::events::Level::Info,
-        &format!("vm.{}", action),
-        format!("vm/{}", name),
+        kind,
+        Subject::vm(name),
         format!("VM '{}' {}", name, what),
         Some(auth.0.name.clone()),
     );
@@ -874,19 +817,27 @@ async fn console(
     cluster: &State<Arc<Cluster>>,
 ) -> Result<ws::Channel<'static>, ApiError> {
     let spec = spec(volumes, name).await?;
-    let node = holder(cluster, &spec.anchor)
-        .ok_or_else(|| (Status::Conflict, format!("'{}' isn't running", name)))?;
+    let node = vm_node(cluster, &spec)
+        .ok_or_else(|| ApiError::new(Status::Conflict, format!("'{}' isn't running", name)))?;
     match peer_url(cluster, &node)? {
         None => {
-            let rt = st
-                .runtime
-                .as_ref()
-                .ok_or_else(|| (Status::NotFound, "this node runs no VMs".to_string()))?;
-            let port = rt
-                .virsh
-                .vnc_port(name)
-                .await
-                .ok_or_else(|| (Status::Conflict, format!("'{}' has no console", name)))?;
+            let rt = st.runtime.as_ref().ok_or_else(|| {
+                ApiError::new(Status::NotFound, "this node runs no VMs".to_string())
+            })?;
+            // Only a domain this node started (as `local_do`).
+            let ours = match (rt.ident(), rt.virsh.meta(name).await) {
+                (Some(me), Some(m)) => me.owns(&m),
+                _ => false,
+            };
+            if !ours {
+                return Err(ApiError::new(
+                    Status::Conflict,
+                    format!("'{}' isn't running here", name),
+                ));
+            }
+            let port = rt.virsh.vnc_port(name).await.ok_or_else(|| {
+                ApiError::new(Status::Conflict, format!("'{}' has no console", name))
+            })?;
             let host = rt.console.clone();
             Ok(ws.channel(move |stream| Box::pin(bridge_tcp(stream, host, port))))
         }
@@ -997,8 +948,8 @@ async fn incoming(
     volumes: &State<VolumesState>,
     agent: &State<crate::agent::AgentState>,
 ) -> Result<Json<crate::vm::Incoming>, ApiError> {
-    let not_yet = |m: String| (Status::Conflict, m);
-    let never = |m: &str| (Status::UnprocessableEntity, m.to_string());
+    let not_yet = |m: String| ApiError::new(Status::Conflict, m);
+    let never = |m: &str| ApiError::new(Status::UnprocessableEntity, m.to_string());
     let rt = st
         .runtime
         .as_ref()
@@ -1007,8 +958,8 @@ async fn incoming(
         return Err(not_yet("the pool isn't open here yet".into()));
     }
     let spec = spec(volumes, name).await?;
-    if !spec.usable() {
-        return Err(bad(spec.error.unwrap_or_default()));
+    if let Some(e) = spec.error() {
+        return Err(ApiError::bad(e.to_string()));
     }
     let proxied: Vec<String> = agent
         .read()
@@ -1019,7 +970,7 @@ async fn incoming(
         .map(|v| v.name.clone())
         .collect();
     let missing: Vec<&String> = spec
-        .volumes
+        .volumes()
         .iter()
         .filter(|v| !proxied.contains(v))
         .collect();

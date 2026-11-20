@@ -119,7 +119,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // Print orphaned block warning if any exist
         if let Ok(orphaned) = self.find_orphaned_blocks().await {
             if !orphaned.is_empty() {
-                let total_orphaned: u64 = orphaned.iter().map(|(_, len)| len).sum();
+                let total_orphaned: u64 = orphaned.iter().map(|e| e.len).sum();
                 println!(
                     "⚠️  WARNING: {} orphaned blocks detected in {} extents",
                     total_orphaned,
@@ -127,8 +127,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 );
                 if orphaned.len() <= 10 {
                     println!("   Orphaned extents:");
-                    for (start, len) in &orphaned {
-                        println!("     - Block {} (length {})", start, len);
+                    for e in &orphaned {
+                        println!("     - Block {} (length {})", e.start, e.len);
                     }
                 }
             }

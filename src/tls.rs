@@ -176,12 +176,28 @@ pub fn scheme() -> &'static str {
 }
 
 /// A reqwest client builder that speaks the process's TLS.
-pub fn http_builder() -> reqwest::ClientBuilder {
+fn http_builder() -> reqwest::ClientBuilder {
     let b = reqwest::Client::builder();
     match client() {
         Some(c) => b.use_preconfigured_tls((*c).clone()),
         None => b,
     }
+}
+
+/// How long any API client waits to connect to a node.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// An HTTP client for talking to `listen` nodes (this process's TLS
+/// identity, if it has one): `CONNECT_TIMEOUT` to connect, and `timeout`
+/// for the whole of a request (None: as long as it takes, for a stream).
+pub fn http_client(timeout: Option<std::time::Duration>) -> Result<reqwest::Client, String> {
+    let b = http_builder().connect_timeout(CONNECT_TIMEOUT);
+    match timeout {
+        Some(t) => b.timeout(t),
+        None => b,
+    }
+    .build()
+    .map_err(|e| format!("HTTP client: {}", e))
 }
 
 /// The websocket connector for `connect_async_tls_with_config`.

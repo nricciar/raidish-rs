@@ -8,7 +8,7 @@ use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
 pub enum Msg {
-    Checked(Result<Whoami, Option<String>>),
+    Checked(Result<Whoami, session::NotIn>),
     Submit,
     SignOut,
 }
@@ -46,14 +46,19 @@ impl Component for Root {
     fn update(&mut self, ctx: &Context<Self>, msg: Msg) -> bool {
         match msg {
             Msg::Checked(Ok(who)) => self.state = State::In(who),
-            Msg::Checked(Err(why)) => {
+            Msg::Checked(Err(session::NotIn::Rejected(why))) => {
                 let had_token = session::token().is_some();
                 if had_token {
                     // Expired, revoked or from another cluster: forget it.
                     session::set_token(None);
                 }
                 // A first visit just asks; a rejected token says why.
-                self.state = State::Login(why.filter(|_| had_token));
+                self.state = State::Login(Some(why).filter(|_| had_token));
+            }
+            // Keep the token: it's the node that's away, not the token
+            // that's bad. Signing in again (or reloading) asks again.
+            Msg::Checked(Err(session::NotIn::Unreachable(why))) => {
+                self.state = State::Login(Some(why));
             }
             Msg::Submit => {
                 let Some(input) = self.input.cast::<HtmlTextAreaElement>() else {
@@ -85,9 +90,9 @@ impl Component for Root {
             },
             State::In(who) => html! {
                 <App
-                    user={(!who.open()).then(|| format!("{} ({})", who.name, who.role))}
+                    user={(who.via != raidish::api_types::Via::Open).then(|| format!("{} ({})", who.name, who.role))}
                     on_sign_out={ctx.link().callback(|_| Msg::SignOut)}
-                    can_write={who.role != "readonly"}
+                    can_write={who.can_write()}
                 />
             },
             State::Login(error) => {

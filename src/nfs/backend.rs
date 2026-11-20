@@ -19,78 +19,105 @@
 
 use crate::committer::object_resource;
 use crate::disk::{BlockDevice, FileId};
-use crate::files_api::{ObjectGuard, ObjectLeases};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Dnode, ObjType, SetAttrs};
 use crate::object::{ObjTree, Sizing};
+use crate::object_lease::{ObjectGuard, ObjectLeases};
 use crate::open_file::OpenFile;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// NFS status codes (NFSv3's numbering; v4 shares most of them).
-pub mod status {
-    pub const OK: u32 = 0;
-    pub const PERM: u32 = 1;
-    pub const NOENT: u32 = 2;
-    pub const IO: u32 = 5;
-    pub const NXIO: u32 = 6;
-    pub const EXIST: u32 = 17;
-    pub const NOTDIR: u32 = 20;
-    pub const ISDIR: u32 = 21;
-    pub const INVAL: u32 = 22;
-    pub const FBIG: u32 = 27;
-    pub const NOSPC: u32 = 28;
-    pub const NAMETOOLONG: u32 = 63;
-    pub const NOTEMPTY: u32 = 66;
-    pub const STALE: u32 = 70;
-    pub const BADHANDLE: u32 = 10001;
-    pub const NOT_SYNC: u32 = 10002;
-    pub const BAD_COOKIE: u32 = 10003;
-    pub const NOTSUPP: u32 = 10004;
-    pub const TOOSMALL: u32 = 10005;
-    pub const SERVERFAULT: u32 = 10006;
-    pub const JUKEBOX: u32 = 10008;
-}
+/// An NFS status (v3 `nfsstat3`, v4 `nfsstat4`: one code space), as sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct NfsStat(u32);
 
-pub type NfsResult<T> = Result<T, u32>;
+impl NfsStat {
+    pub const fn code(self) -> u32 {
+        self.0
+    }
 
-/// What a failed pool call means to an NFS client.
-pub fn nfs_status(e: &FileSystemError) -> u32 {
-    use FileSystemError as E;
-    match e {
-        E::FileNotFound | E::DirectoryNotFound => status::NOENT,
-        E::NotADirectory => status::NOTDIR,
-        E::NotAFile => status::ISDIR,
-        E::AlreadyExists => status::EXIST,
-        E::UnableToAllocateBlocks(_) => status::NOSPC,
-        // Someone else holds the object, or no committer right now: later.
-        E::Conflict(_) | E::Unavailable(_) | E::NotFormatted => status::JUKEBOX,
-        E::InvalidArgument(m) => {
-            // Refusals from the committer arrive as text.
-            if m.contains("isn't empty") {
-                status::NOTEMPTY
-            } else if m.contains("bad name") {
-                status::INVAL
-            } else if m.contains("Already exists") {
-                status::EXIST
-            } else if m.contains("not found") {
-                status::NOENT
-            } else if m.contains("Not a directory") {
-                status::NOTDIR
-            } else if m.contains("Not a file") {
-                status::ISDIR
-            } else if m.contains("lease") || m.contains("open for writing") {
-                status::JUKEBOX
-            } else {
-                status::INVAL
-            }
-        }
-        _ => status::IO,
+    /// A status as a peer sent it.
+    pub const fn from_code(code: u32) -> Self {
+        NfsStat(code)
+    }
+
+    #[cfg(test)]
+    pub fn is_ok(self) -> bool {
+        self.0 == 0
     }
 }
 
-fn err(e: FileSystemError) -> u32 {
+/// Tests read statuses off the wire as numbers.
+#[cfg(test)]
+impl PartialEq<NfsStat> for u32 {
+    fn eq(&self, s: &NfsStat) -> bool {
+        *self == s.0
+    }
+}
+
+impl std::fmt::Display for NfsStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NFS status {}", self.0)
+    }
+}
+
+impl crate::nfs::xdr::Writer {
+    /// Write status `s`.
+    pub fn stat(&mut self, s: NfsStat) -> &mut Self {
+        self.u32(s.code())
+    }
+}
+
+/// NFS status codes.
+pub mod status {
+    use super::NfsStat;
+    pub const OK: NfsStat = NfsStat::from_code(0);
+    pub const PERM: NfsStat = NfsStat::from_code(1);
+    pub const NOENT: NfsStat = NfsStat::from_code(2);
+    pub const IO: NfsStat = NfsStat::from_code(5);
+    pub const NXIO: NfsStat = NfsStat::from_code(6);
+    pub const EXIST: NfsStat = NfsStat::from_code(17);
+    pub const NOTDIR: NfsStat = NfsStat::from_code(20);
+    pub const ISDIR: NfsStat = NfsStat::from_code(21);
+    pub const INVAL: NfsStat = NfsStat::from_code(22);
+    pub const FBIG: NfsStat = NfsStat::from_code(27);
+    pub const NOSPC: NfsStat = NfsStat::from_code(28);
+    pub const NAMETOOLONG: NfsStat = NfsStat::from_code(63);
+    pub const NOTEMPTY: NfsStat = NfsStat::from_code(66);
+    pub const STALE: NfsStat = NfsStat::from_code(70);
+    pub const BADHANDLE: NfsStat = NfsStat::from_code(10001);
+    pub const NOT_SYNC: NfsStat = NfsStat::from_code(10002);
+    pub const BAD_COOKIE: NfsStat = NfsStat::from_code(10003);
+    pub const NOTSUPP: NfsStat = NfsStat::from_code(10004);
+    pub const TOOSMALL: NfsStat = NfsStat::from_code(10005);
+    pub const SERVERFAULT: NfsStat = NfsStat::from_code(10006);
+    pub const JUKEBOX: NfsStat = NfsStat::from_code(10008);
+}
+
+pub type NfsResult<T> = Result<T, NfsStat>;
+
+/// What a failed pool call means to an NFS client.
+pub fn nfs_status(e: &FileSystemError) -> NfsStat {
+    use crate::types::ErrorKind as K;
+    match e.kind() {
+        K::NotFound => status::NOENT,
+        K::NotDir => status::NOTDIR,
+        K::NotFile => status::ISDIR,
+        K::Exists => status::EXIST,
+        K::NotEmpty => status::NOTEMPTY,
+        K::NoSpace => status::NOSPC,
+        K::Invalid => status::INVAL,
+        K::Forbidden => status::PERM,
+        // Someone else holds the object, or no committer right now: later.
+        K::Conflict | K::Unavailable => status::JUKEBOX,
+        K::Internal => status::IO,
+    }
+}
+
+fn err(e: FileSystemError) -> NfsStat {
     nfs_status(&e)
 }
 
@@ -168,7 +195,7 @@ pub enum Forwarded {
     },
     Done,
     /// An NFS status.
-    Err(u32),
+    Err(NfsStat),
 }
 
 /// The other nodes' NFS servers.
@@ -178,20 +205,6 @@ pub trait Peers: Send + Sync {
     fn holder(&self, id: FileId) -> Option<String>;
     /// Have `node` do `req`.
     async fn forward(&self, node: &str, req: &Forward) -> Result<Forwarded, String>;
-}
-
-/// The description of the lease a node's NFS server writes `id` under.
-pub fn lease_desc(node: &str, id: FileId) -> String {
-    format!("nfs {} object {}", node, id)
-}
-
-/// The node an NFS write lease's description names (see `lease_desc`).
-pub fn lease_node(desc: &str) -> Option<&str> {
-    let mut words = desc.split(' ');
-    match (words.next(), words.next(), words.next()) {
-        (Some("nfs"), Some(node), Some("object")) => Some(node),
-        _ => None,
-    }
 }
 
 /// A directory entry, as `readdir` lists it.
@@ -323,6 +336,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
 
     /// How long a file goes without a write before it is committed and
     /// closed (and another node may write it).
+    #[cfg(test)]
     pub fn with_close_after(mut self, d: Duration) -> Self {
         self.close_after = d;
         self
@@ -334,6 +348,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
     }
 
     /// This process's write verifier.
+    #[cfg(test)]
     pub fn verifier(&self) -> [u8; 8] {
         self.verifier
     }
@@ -365,7 +380,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
         let fs = self.fs().await?;
         let mut h = b"RDH1".to_vec();
         h.extend_from_slice(&self.pool_guid(&fs).await.to_be_bytes());
-        h.extend_from_slice(&id.to_be_bytes());
+        h.extend_from_slice(&id.get().to_be_bytes());
         Ok(h)
     }
 
@@ -380,7 +395,9 @@ impl<D: BlockDevice + 'static> Backend<D> {
         if guid != self.pool_guid(&fs).await {
             return Err(status::STALE);
         }
-        Ok(u64::from_be_bytes(fh[12..20].try_into().unwrap()))
+        Ok(FileId::from_raw(u64::from_be_bytes(
+            fh[12..20].try_into().unwrap(),
+        )))
     }
 
     // ---- reading ----
@@ -395,7 +412,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
         match found {
             // Only files and directories are NFS objects (not volumes,
             // snapshots or the dataset directory).
-            Some(d) if matches!(d.kind, ObjType::File | ObjType::Directory) => Ok(d),
+            Some(d) if matches!(d.kind(), ObjType::File | ObjType::Directory) => Ok(d),
             _ => Err(status::STALE),
         }
     }
@@ -431,7 +448,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
         };
         Attr {
             id,
-            kind: d.kind,
+            kind: d.kind(),
             mode: d.attrs.mode,
             nlink: if d.is_directory() { 2 } else { d.attrs.nlink },
             uid: d.attrs.uid,
@@ -469,8 +486,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
         }
         let id = match name {
             "." => dir,
-            ".." if d.parent == 0 => fs.root_dir(),
-            ".." => d.parent,
+            ".." => d.parent.unwrap_or_else(|| fs.root_dir()),
             _ => match self.entry(&fs, dir, name).await? {
                 Some((id, _)) => id,
                 None => return Err(status::NOENT),
@@ -583,9 +599,12 @@ impl<D: BlockDevice + 'static> Backend<D> {
         }
         let guard = match &self.leases {
             Some(l) => Some(
-                l.take(&object_resource(id), &lease_desc(&self.node, id))
-                    .await
-                    .map_err(|_| status::JUKEBOX)?,
+                l.take(
+                    object_resource(id),
+                    crate::types::Holder::new(crate::types::HolderRole::Nfs, Some(&self.node)),
+                )
+                .await
+                .map_err(|_| status::JUKEBOX)?,
             ),
             None => None,
         };
@@ -788,7 +807,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
         }
         if let Some((_, existing)) = fs.lookup_in(dir, name).await.map_err(err)? {
             let retransmit = exclusive.is_some_and(|v| existing.attrs.mtime_ns == v);
-            if guarded || (exclusive.is_some() && !retransmit) || existing.kind != kind {
+            if guarded || (exclusive.is_some() && !retransmit) || existing.kind() != kind {
                 return Err(status::EXIST);
             }
         }
@@ -915,6 +934,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
 
     /// Commit and close every file this node writes, letting their leases
     /// go (on shutdown, or to hand them over now).
+    #[cfg(test)]
     pub async fn close_all(&self) {
         let Some(fs) = (self.source)() else { return };
         let all: Vec<Held> = self.held.lock().await.drain().map(|(_, h)| h).collect();
@@ -929,6 +949,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
     }
 
     /// Files this node is writing now.
+    #[cfg(test)]
     pub async fn writing(&self) -> Vec<FileId> {
         self.held.lock().await.keys().copied().collect()
     }

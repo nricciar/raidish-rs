@@ -10,30 +10,48 @@
 // openraft's error types are large by design.
 #![allow(clippy::result_large_err)]
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod lease;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod members;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod network;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod routes;
 pub mod state;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
+#[cfg(not(target_arch = "wasm32"))]
 use openraft::error::{ClientWriteError, RaftError};
+#[cfg(not(target_arch = "wasm32"))]
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
-use state::{ClusterState, Request, Response};
+use state::ClusterState;
+pub use state::LeaseOp;
+#[cfg(not(target_arch = "wasm32"))]
+use state::{Request, Response};
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Cursor;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use store::Store;
 
+#[cfg(not(target_arch = "wasm32"))]
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = Request,
         R = Response,
 );
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ClusterConfig {
     /// Where this node keeps its Raft state (default `~/.raidish/<name>`).
@@ -41,187 +59,31 @@ pub struct ClusterConfig {
 }
 
 /// Header carrying the sender's layout fingerprint on Raft RPCs.
+#[cfg(not(target_arch = "wasm32"))]
 pub const FINGERPRINT_HEADER: &str = "X-Raidish-Layout";
 /// Header carrying the id the sender believes the receiver has. A node
 /// whose config disagrees about who is who gets refused.
+#[cfg(not(target_arch = "wasm32"))]
 pub const TO_HEADER: &str = "X-Raidish-To";
+/// Header carrying the Raft protocol version the sender speaks.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PROTOCOL_HEADER: &str = "X-Raidish-Raft";
+/// The version of the Raft messages and the entries in them (`LeaseOp`,
+/// the state machine's records). Bump it with any change to them: nodes
+/// of different versions refuse each other's Raft traffic, and a node
+/// won't start on Raft data of another version.
+#[cfg(not(target_arch = "wasm32"))]
+pub const RAFT_PROTOCOL: u32 = 1;
 
 /// How long a lease request waits for a leader (one that answers) before
 /// giving up: a few election timeouts, and under the clients' request
 /// timeout (see `lease::LeaseClient`).
+#[cfg(not(target_arch = "wasm32"))]
 pub const FORWARD_WAIT: Duration = Duration::from_secs(4);
 
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
+pub use crate::types::now_ms;
 
-/// A lease request as sent by clients (the leader adds the time).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum LeaseOp {
-    Acquire {
-        resource: String,
-        owner: String,
-        desc: String,
-        ttl_ms: u64,
-    },
-    Renew {
-        resource: String,
-        owner: String,
-        epoch: u64,
-        ttl_ms: u64,
-    },
-    Release {
-        resource: String,
-        owner: String,
-        epoch: u64,
-    },
-    Transfer {
-        resource: String,
-        from_owner: String,
-        from_epoch: u64,
-        to_owner: String,
-        to_desc: String,
-        ttl_ms: u64,
-    },
-    Lend {
-        idx: u32,
-        writer: String,
-        writer_epoch: u64,
-        pool_owner: String,
-        pool_epoch: u64,
-    },
-    Return {
-        idx: u32,
-        pool_owner: String,
-        pool_epoch: u64,
-    },
-    NfsClient {
-        client: String,
-        present: bool,
-        nfs_owner: String,
-        nfs_epoch: u64,
-    },
-    SetVm {
-        name: String,
-        running: bool,
-    },
-    SetServiceKey {
-        key: String,
-    },
-    SetAttached {
-        volume: String,
-        nodes: Vec<String>,
-    },
-    Attach {
-        volume: String,
-        node: String,
-        on: bool,
-    },
-}
-
-impl LeaseOp {
-    pub(crate) fn stamp(&self, now_ms: u64) -> Request {
-        match self.clone() {
-            LeaseOp::Acquire {
-                resource,
-                owner,
-                desc,
-                ttl_ms,
-            } => Request::Acquire {
-                resource,
-                owner,
-                desc,
-                ttl_ms,
-                now_ms,
-            },
-            LeaseOp::Renew {
-                resource,
-                owner,
-                epoch,
-                ttl_ms,
-            } => Request::Renew {
-                resource,
-                owner,
-                epoch,
-                ttl_ms,
-                now_ms,
-            },
-            LeaseOp::Release {
-                resource,
-                owner,
-                epoch,
-            } => Request::Release {
-                resource,
-                owner,
-                epoch,
-            },
-            LeaseOp::Transfer {
-                resource,
-                from_owner,
-                from_epoch,
-                to_owner,
-                to_desc,
-                ttl_ms,
-            } => Request::Transfer {
-                resource,
-                from_owner,
-                from_epoch,
-                to_owner,
-                to_desc,
-                ttl_ms,
-                now_ms,
-            },
-            LeaseOp::Lend {
-                idx,
-                writer,
-                writer_epoch,
-                pool_owner,
-                pool_epoch,
-            } => Request::Lend {
-                idx,
-                writer,
-                writer_epoch,
-                pool_owner,
-                pool_epoch,
-                now_ms,
-            },
-            LeaseOp::Return {
-                idx,
-                pool_owner,
-                pool_epoch,
-            } => Request::Return {
-                idx,
-                pool_owner,
-                pool_epoch,
-                now_ms,
-            },
-            LeaseOp::NfsClient {
-                client,
-                present,
-                nfs_owner,
-                nfs_epoch,
-            } => Request::NfsClient {
-                client,
-                present,
-                nfs_owner,
-                nfs_epoch,
-                now_ms,
-            },
-            LeaseOp::SetVm { name, running } => Request::SetVm {
-                name,
-                running,
-                now_ms,
-            },
-            LeaseOp::SetServiceKey { key } => Request::SetServiceKey { key },
-            LeaseOp::SetAttached { volume, nodes } => Request::SetAttached { volume, nodes },
-            LeaseOp::Attach { volume, node, on } => Request::Attach { volume, node, on },
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MemberView {
     pub id: u64,
     /// None for the node that answered.
@@ -229,7 +91,8 @@ pub struct MemberView {
     pub disks: Vec<usize>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// `GET /api/v1/cluster/status` (what `raidish cluster status` prints).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     /// The node that answered (name and id).
     pub node: String,
@@ -242,6 +105,14 @@ pub struct Status {
     pub now_ms: u64,
 }
 
+impl Status {
+    /// The member serving pool disk `disk`.
+    pub fn owner_of(&self, disk: usize) -> Option<&MemberView> {
+        self.members.iter().find(|m| m.disks.contains(&disk))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Cluster {
     pub name: String,
     pub raft: Raft<TypeConfig>,
@@ -250,6 +121,7 @@ pub struct Cluster {
     http: reqwest::Client,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Cluster {
     /// Start this node's Raft member. `fence` learns every grant as it is
     /// applied (the disk server fences with it).
@@ -271,10 +143,7 @@ impl Cluster {
         let config = Arc::new(config.validate().map_err(|e| e.to_string())?);
         let store = Store::open(&data_dir, fence)?;
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
-        let http = crate::tls::http_builder()
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = crate::tls::http_client(None)?;
         let network = network::Network {
             http: http.clone(),
             peers: Arc::new(members.peers.clone()),
@@ -376,7 +245,7 @@ impl Cluster {
     pub async fn lease(&self, op: &LeaseOp, forwarded: bool) -> Result<Response, String> {
         let deadline = tokio::time::Instant::now() + FORWARD_WAIT;
         loop {
-            let (leader, err) = match self.raft.client_write(op.stamp(now_ms())).await {
+            let (leader, err) = match self.raft.client_write(op.clone().stamp(now_ms())).await {
                 Ok(resp) => return Ok(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) if !forwarded => {
                     match f.leader_id.and_then(|id| self.members.peers.get(&id)) {
@@ -468,7 +337,7 @@ impl Cluster {
     }
 
     /// Lease `resource` as this node's applied state has it.
-    pub fn lease_state(&self, resource: &str) -> Option<state::Lease> {
+    pub fn lease_state(&self, resource: &crate::types::LeaseResource) -> Option<state::Lease> {
         self.store.lease(resource)
     }
 
@@ -501,6 +370,7 @@ impl Cluster {
 }
 
 /// `~/.raidish/<name>`, or `./.raidish/<name>` without a home directory.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn default_data_dir(name: &str) -> PathBuf {
     let base = std::env::var("HOME").map_or(PathBuf::from("."), PathBuf::from);
     base.join(".raidish").join(name)

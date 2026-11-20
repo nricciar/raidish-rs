@@ -1,6 +1,7 @@
 //! Drives the NBD server over a real socket with a minimal client.
 
 use super::*;
+use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
 use std::time::Duration;
@@ -258,25 +259,6 @@ async fn remove_export_flushes_and_closes_its_connections() {
     server.add_export("alpha").await.unwrap();
     let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
     assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
-}
-
-#[tokio::test]
-async fn one_sync_loop_per_file_system() {
-    let pool = TestPool::new().await;
-    let fs = Arc::new(pool.format().await);
-    let count = |fs: &Fs| {
-        let ptr = Arc::as_ptr(fs) as *const ();
-        SYNC_LOOPS
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|w| w.as_ptr() as *const () == ptr)
-            .count()
-    };
-    ensure_sync_loop(&fs, "nbd");
-    ensure_sync_loop(&fs, "nvme");
-    ensure_sync_loop(&fs, "nbd");
-    assert_eq!(count(&fs), 1);
 }
 
 #[tokio::test]

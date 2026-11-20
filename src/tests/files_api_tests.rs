@@ -4,7 +4,10 @@ use super::*;
 use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority};
+use crate::object_lease::ObjectGuard;
 use crate::test_util::TestPool;
+use crate::types::{Epoch, Holding, LeaseRef};
+use async_trait::async_trait;
 use rocket::figment::util::map;
 use rocket::local::asynchronous::Client;
 
@@ -16,11 +19,12 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn lease(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
+async fn lease(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &str) -> Epoch {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Acquire {
-        resource: resource.into(),
+        resource: resource.clone(),
         owner: owner.into(),
-        desc: format!("test {}", owner),
+        holder: crate::types::Holder::default().with_detail(format!("test {}", owner)),
         ttl_ms: 600_000,
     };
     match auth.propose(op).await.unwrap() {
@@ -34,7 +38,7 @@ struct TestLeases(Arc<LocalAuthority>);
 
 struct TestGuard {
     auth: Arc<LocalAuthority>,
-    resource: String,
+    resource: crate::types::LeaseResource,
     lease: ObjLease,
 }
 
@@ -46,8 +50,7 @@ impl ObjectGuard for TestGuard {
     async fn release(&self) {
         let op = LeaseOp::Release {
             resource: self.resource.clone(),
-            owner: self.lease.owner.clone(),
-            epoch: self.lease.epoch,
+            holder: Holding::new(self.lease.owner.clone(), self.lease.epoch),
         };
         self.auth.propose(op).await.unwrap();
     }
@@ -55,18 +58,22 @@ impl ObjectGuard for TestGuard {
 
 #[async_trait]
 impl ObjectLeases for TestLeases {
-    async fn take(&self, resource: &str, desc: &str) -> Result<Box<dyn ObjectGuard>, String> {
+    async fn take(
+        &self,
+        resource: crate::types::LeaseResource,
+        desc: crate::types::Holder,
+    ) -> Result<Box<dyn ObjectGuard>, String> {
         let owner = format!("upload-{}", desc);
         let op = LeaseOp::Acquire {
-            resource: resource.into(),
+            resource: resource.clone(),
             owner: owner.clone(),
-            desc: desc.into(),
+            holder: desc,
             ttl_ms: 600_000,
         };
         match self.0.propose(op).await? {
             Response::Granted { epoch, .. } => Ok(Box::new(TestGuard {
                 auth: self.0.clone(),
-                resource: resource.into(),
+                resource: resource.clone(),
                 lease: ObjLease { owner, epoch },
             })),
             other => Err(format!("{} is held: {:?}", resource, other)),
@@ -84,7 +91,7 @@ async fn setup() -> Setup {
     let pool = TestPool::new().await;
     drop(pool.format().await);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = lease(&auth, POOL, "c").await;
+    let epoch = lease(&auth, &POOL, "c").await;
     let fs = Arc::new(pool.load().await);
     let committer =
         Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
@@ -102,8 +109,7 @@ async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<Fil
         let epoch = lease(&s.auth, &resource, id).await;
         let sink = Arc::new(DirectSink {
             committer: s.committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         });
         Some(Arc::new(
             FileSystem::load_writer(s.pool.dev().await, sink)
@@ -169,7 +175,7 @@ async fn any_node_reads_and_writes_files() {
     let root = ls(&b, "/api/v1/dir").await;
     let names: Vec<(&str, &str, u64)> = root
         .iter()
-        .map(|e| (e.name.as_str(), e.kind.as_str(), e.size))
+        .map(|e| (e.name.as_str(), e.kind.name(), e.size))
         .collect();
     assert_eq!(
         names,
@@ -397,7 +403,7 @@ async fn partial_writes_rename_and_attributes() {
         .into_json()
         .await
         .unwrap();
-    assert_eq!((st.id, st.kind.as_str(), st.size), (id, "file", 3000));
+    assert_eq!((st.id, st.kind.name(), st.size), (id, "file", 3000));
     assert_eq!((st.mode, st.uid, st.nlink), (0o640, 33, 1));
     assert_eq!(ls(&b, "/api/v1/dir/e").await[0].mode, 0o640);
 

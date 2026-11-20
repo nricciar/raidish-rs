@@ -10,6 +10,7 @@
 
 use super::err;
 use crate::disk::FileId;
+use crate::nfs::backend::NfsStat;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -69,7 +70,7 @@ pub struct Range {
 
 impl Range {
     /// `offset` and `length` as LOCK has them (`u64::MAX` length: all).
-    pub fn of(offset: u64, length: u64) -> Result<Range, u32> {
+    pub fn of(offset: u64, length: u64) -> Result<Range, NfsStat> {
         if length == 0 {
             return Err(err::INVAL);
         }
@@ -185,7 +186,7 @@ impl Inner {
     }
 
     /// May `client` reclaim (`reclaim`), or make new state? Err: why not.
-    fn grace_check(&self, client: u64, reclaim: bool) -> Result<(), u32> {
+    fn grace_check(&self, client: u64, reclaim: bool) -> Result<(), NfsStat> {
         let may = self
             .clients
             .get(&client)
@@ -287,11 +288,6 @@ impl StateTable {
         t
     }
 
-    /// Whether new opens and locks wait for reclaims now.
-    pub fn in_grace(&self) -> bool {
-        self.inner.lock().unwrap().in_grace()
-    }
-
     /// Once the grace period is over (everyone reclaimed, or time ran
     /// out): the clients that never came back, whose records can go. None
     /// while it lasts (or once reported).
@@ -323,7 +319,7 @@ impl StateTable {
         owner: &[u8],
         verifier: [u8; 8],
         update: bool,
-    ) -> Result<Exchanged, u32> {
+    ) -> Result<Exchanged, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         let existing = inner
             .clients
@@ -397,7 +393,7 @@ impl StateTable {
         seq: u32,
         slots: u32,
         encode: impl FnOnce([u8; 16]) -> Vec<u8>,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), u32> {
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         if (clientid >> 32) as u32 != self.instance {
             return Err(err::STALE_CLIENTID);
@@ -448,7 +444,7 @@ impl StateTable {
         Ok((reply, newly.then_some(owner)))
     }
 
-    pub fn destroy_session(&self, sid: &[u8; 16]) -> Result<(), u32> {
+    pub fn destroy_session(&self, sid: &[u8; 16]) -> Result<(), NfsStat> {
         match self.inner.lock().unwrap().sessions.remove(sid) {
             Some(_) => Ok(()),
             None => Err(err::BADSESSION),
@@ -456,7 +452,7 @@ impl StateTable {
     }
 
     /// DESTROY_CLIENTID. Returns the client's owner string (to forget).
-    pub fn destroy_clientid(&self, clientid: u64) -> Result<Vec<u8>, u32> {
+    pub fn destroy_clientid(&self, clientid: u64) -> Result<Vec<u8>, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         let Some(c) = inner.clients.get(&clientid) else {
             return Err(err::STALE_CLIENTID);
@@ -485,7 +481,7 @@ impl StateTable {
 
     /// SEQUENCE: check slot `slot`'s `seqid` (RFC 8881 §2.10.6.1), renew
     /// the client's lease.
-    pub fn sequence(&self, sid: &[u8; 16], slot: u32, seqid: u32) -> Result<Sequenced, u32> {
+    pub fn sequence(&self, sid: &[u8; 16], slot: u32, seqid: u32) -> Result<Sequenced, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         let Some(s) = inner.sessions.get_mut(sid) else {
             return Err(err::BADSESSION);
@@ -532,7 +528,7 @@ impl StateTable {
     }
 
     /// RECLAIM_COMPLETE (once per client).
-    pub fn reclaim_complete(&self, client: u64) -> Result<(), u32> {
+    pub fn reclaim_complete(&self, client: u64) -> Result<(), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         let c = inner.clients.get_mut(&client).ok_or(err::STALE_CLIENTID)?;
         if c.reclaim_complete {
@@ -576,7 +572,7 @@ impl StateTable {
         client: u64,
         sid: &Stateid,
         file: Option<FileId>,
-    ) -> Result<(), u32> {
+    ) -> Result<(), NfsStat> {
         if sid.other[..4] != self.instance.to_be_bytes() {
             return Err(err::STALE_STATEID);
         }
@@ -603,7 +599,7 @@ impl StateTable {
         sid: &Stateid,
         file: FileId,
         write: bool,
-    ) -> Result<(), u32> {
+    ) -> Result<(), NfsStat> {
         let inner = self.inner.lock().unwrap();
         if sid.is_special() {
             // Anonymous I/O: refused if an open denies it.
@@ -619,7 +615,7 @@ impl StateTable {
     }
 
     /// TEST_STATEID for one stateid.
-    pub fn test(&self, client: u64, sid: &Stateid) -> u32 {
+    pub fn test(&self, client: u64, sid: &Stateid) -> NfsStat {
         let inner = self.inner.lock().unwrap();
         match self.check(&inner, client, sid, None) {
             Ok(()) => err::OK,
@@ -628,7 +624,7 @@ impl StateTable {
     }
 
     /// FREE_STATEID: a lock stateid holding nothing.
-    pub fn free(&self, client: u64, sid: &Stateid) -> Result<(), u32> {
+    pub fn free(&self, client: u64, sid: &Stateid) -> Result<(), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, sid, None)?;
         match &inner.states[&sid.other].kind {
@@ -652,7 +648,7 @@ impl StateTable {
         access: u32,
         deny: u32,
         reclaim: bool,
-    ) -> Result<Stateid, u32> {
+    ) -> Result<Stateid, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.clients.get(&client).is_some_and(|c| c.confirmed) {
             return Err(err::STALE_CLIENTID);
@@ -716,7 +712,7 @@ impl StateTable {
         file: FileId,
         access: u32,
         deny: u32,
-    ) -> Result<Stateid, u32> {
+    ) -> Result<Stateid, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, sid, Some(file))?;
         let s = inner.states.get_mut(&sid.other).unwrap();
@@ -739,7 +735,7 @@ impl StateTable {
     }
 
     /// CLOSE (refused while the owner still holds locks on the file).
-    pub fn close(&self, client: u64, sid: &Stateid, file: FileId) -> Result<(), u32> {
+    pub fn close(&self, client: u64, sid: &Stateid, file: FileId) -> Result<(), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, sid, Some(file))?;
         if !matches!(inner.states[&sid.other].kind, Kind::Open { .. }) {
@@ -787,7 +783,7 @@ impl StateTable {
         by: &Stateid,
         file: FileId,
         rw: bool,
-    ) -> Result<Stateid, u32> {
+    ) -> Result<Stateid, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, by, Some(file))?;
         let existing = inner.on_file(file).find_map(|(o, s)| match s.kind {
@@ -824,7 +820,7 @@ impl StateTable {
 
     /// LAYOUTRETURN of a file's layout (layouts are whole-file: any return
     /// drops it).
-    pub fn layout_return(&self, client: u64, sid: &Stateid, file: FileId) -> Result<(), u32> {
+    pub fn layout_return(&self, client: u64, sid: &Stateid, file: FileId) -> Result<(), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, sid, Some(file))?;
         if !matches!(inner.states[&sid.other].kind, Kind::Layout { .. }) {
@@ -849,19 +845,12 @@ impl StateTable {
     }
 
     /// Whether `client` has a layout of `file`.
+    #[cfg(test)]
     pub fn has_layout(&self, client: u64, file: FileId) -> bool {
         let inner = self.inner.lock().unwrap();
         inner
             .on_file(file)
             .any(|(_, s)| s.client == client && matches!(s.kind, Kind::Layout { .. }))
-    }
-
-    /// Whether `file` is open (by anyone, here).
-    pub fn is_open(&self, file: FileId) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .on_file(file)
-            .any(|(_, s)| matches!(s.kind, Kind::Open { .. }))
     }
 
     // ---- locks ----
@@ -907,7 +896,7 @@ impl StateTable {
         r: Range,
         write: bool,
         reclaim: bool,
-    ) -> Result<Result<Stateid, Denied>, u32> {
+    ) -> Result<Result<Stateid, Denied>, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         inner.grace_check(client, reclaim)?;
         let (other, owner) = match by {
@@ -985,7 +974,7 @@ impl StateTable {
         sid: &Stateid,
         file: FileId,
         r: Range,
-    ) -> Result<Stateid, u32> {
+    ) -> Result<Stateid, NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         self.check(&inner, client, sid, Some(file))?;
         let s = inner.states.get_mut(&sid.other).unwrap();
@@ -1059,6 +1048,7 @@ fn set_range(held: &mut Vec<(Range, bool)>, r: Range, kind: Option<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::fid;
 
     fn r(a: u64, b: u64) -> Range {
         Range { start: a, end: b }
@@ -1096,19 +1086,26 @@ mod tests {
         let t = StateTable::new();
         let (a, b) = (client(&t, b"a"), client(&t, b"b"));
         let oa = t
-            .open(a, b"oa", 7, SHARE_READ | SHARE_WRITE, SHARE_WRITE, false)
+            .open(
+                a,
+                b"oa",
+                fid(7),
+                SHARE_READ | SHARE_WRITE,
+                SHARE_WRITE,
+                false,
+            )
             .unwrap();
         // b may read alongside, not write (a denies writes).
         assert_eq!(
-            t.open(b, b"ob", 7, SHARE_WRITE, 0, false),
+            t.open(b, b"ob", fid(7), SHARE_WRITE, 0, false),
             Err(err::SHARE_DENIED)
         );
-        let ob = t.open(b, b"ob", 7, SHARE_READ, 0, false).unwrap();
+        let ob = t.open(b, b"ob", fid(7), SHARE_READ, 0, false).unwrap();
         // Byte-range locks.
         let la = t
             .lock(
                 a,
-                7,
+                fid(7),
                 Locker::New {
                     open: oa,
                     owner: b"la",
@@ -1122,7 +1119,7 @@ mod tests {
         let denied = t
             .lock(
                 b,
-                7,
+                fid(7),
                 Locker::New {
                     open: ob,
                     owner: b"lb",
@@ -1137,24 +1134,27 @@ mod tests {
             (denied.range, denied.write, denied.client),
             (r(0, 100), true, a)
         );
-        assert!(t.test_lock(b, b"lb", 7, r(100, 200), true).is_none());
-        assert_eq!(t.close(a, &oa, 7), Err(err::LOCKS_HELD));
-        let la = t.unlock(a, &la, 7, r(0, 100)).unwrap();
+        assert!(t.test_lock(b, b"lb", fid(7), r(100, 200), true).is_none());
+        assert_eq!(t.close(a, &oa, fid(7)), Err(err::LOCKS_HELD));
+        let la = t.unlock(a, &la, fid(7), r(0, 100)).unwrap();
         assert_eq!(la.seqid, 2);
-        assert!(t.test_lock(b, b"lb", 7, r(0, 10), true).is_none());
+        assert!(t.test_lock(b, b"lb", fid(7), r(0, 10), true).is_none());
         // An old seqid is refused, the current one (or 0) works.
-        assert_eq!(t.check_io(a, &Stateid { seqid: 0, ..oa }, 7, true), Ok(()));
-        t.close(a, &oa, 7).unwrap();
-        assert_eq!(t.check_io(a, &oa, 7, false), Err(err::BAD_STATEID));
+        assert_eq!(
+            t.check_io(a, &Stateid { seqid: 0, ..oa }, fid(7), true),
+            Ok(())
+        );
+        t.close(a, &oa, fid(7)).unwrap();
+        assert_eq!(t.check_io(a, &oa, fid(7), false), Err(err::BAD_STATEID));
         // Anonymous writes respect deny modes.
         let _ = t
-            .open(b, b"ob2", 8, SHARE_READ, SHARE_WRITE, false)
+            .open(b, b"ob2", fid(8), SHARE_READ, SHARE_WRITE, false)
             .unwrap();
         assert_eq!(
-            t.check_io(a, &Stateid::ANONYMOUS, 8, true),
+            t.check_io(a, &Stateid::ANONYMOUS, fid(8), true),
             Err(err::LOCKED)
         );
-        assert_eq!(t.check_io(a, &Stateid::ANONYMOUS, 8, false), Ok(()));
+        assert_eq!(t.check_io(a, &Stateid::ANONYMOUS, fid(8), false), Ok(()));
     }
 
     #[test]

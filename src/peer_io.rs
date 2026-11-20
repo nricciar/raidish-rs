@@ -6,7 +6,7 @@
 //! (`docs/design/mig-1-volume-handoff.md`).
 //!
 //! The wire: mutual TLS with the cluster's CA, node certificates only. The
-//! proxy sends one line, `RAIDISH-VOL <volume> <epoch>`, naming the lease
+//! proxy sends one line, `RAIDISH-VOL/1 <volume> <epoch>`, naming the lease
 //! epoch it believes the writer holds; the writer answers `OK <size>` if
 //! it does (and serves the volume), else `ERR <why>` and hangs up. Then it's
 //! the NBD transmission phase, exactly as an NBD client speaks it (see
@@ -16,6 +16,9 @@
 //! writer moved or refused) are sent again, to wherever the writer is by
 //! then: block writes are idempotent, so one that may have landed already
 //! is safe to repeat.
+//!
+//! The preambles carry this protocol's version (`/1`); a node answers one
+//! of another version with `ERR`, naming its own.
 
 use crate::fs::FileSystemError;
 use crate::nbd::{
@@ -23,6 +26,7 @@ use crate::nbd::{
     NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC,
 };
 use crate::pki::Role;
+use crate::types::Epoch;
 use crate::volume_io::{SwitchableIo, VolumeIo};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -37,10 +41,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// The peer I/O port, unless configured otherwise.
 pub const DEFAULT_PORT: u16 = 10810;
 
-const PREAMBLE: &str = "RAIDISH-VOL";
+/// A proxy's preamble, with this protocol's version. Bump the version
+/// (here and in `HANDOFF`) with any change to what follows it.
+const PREAMBLE: &str = "RAIDISH-VOL/1";
 /// What a writer handing a volume over starts with:
-/// `RAIDISH-HANDOFF <volume> <epoch> <transport>`.
-pub const HANDOFF: &str = "RAIDISH-HANDOFF";
+/// `RAIDISH-HANDOFF/1 <volume> <epoch> <transport>`.
+pub const HANDOFF: &str = "RAIDISH-HANDOFF/1";
 /// The longest preamble or answer line accepted.
 const MAX_LINE: usize = 4096;
 /// How long to wait for a connection, its TLS handshake and its answer.
@@ -65,7 +71,7 @@ pub type PeerOut = tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStrea
 pub trait PeerVolumes: Send + Sync + 'static {
     /// `volume`'s export, if this node writes it under its `ds/` lease at
     /// `epoch`; otherwise why not.
-    fn export(&self, volume: &str, epoch: u64) -> Result<PeerExport, String>;
+    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String>;
 
     /// The writer of `volume` (at lease `epoch`) wants to hand it to this
     /// node, exported over `transport`: the rest of the conversation is
@@ -73,7 +79,7 @@ pub trait PeerVolumes: Send + Sync + 'static {
     async fn handoff(
         &self,
         _volume: &str,
-        _epoch: u64,
+        _epoch: Epoch,
         _transport: &str,
         _rd: PeerLines,
         mut wr: PeerOut,
@@ -85,20 +91,16 @@ pub trait PeerVolumes: Send + Sync + 'static {
 
 /// Serve peer I/O on `listener`: `tls` must require a client certificate
 /// (`TlsConfig::server_config(true, ..)`), and only nodes are let in.
-pub async fn serve(
-    listener: TcpListener,
-    tls: TlsAcceptor,
-    volumes: Arc<dyn PeerVolumes>,
-) -> std::io::Result<()> {
-    loop {
-        let (sock, _) = listener.accept().await?;
+pub async fn serve(listener: TcpListener, tls: TlsAcceptor, volumes: Arc<dyn PeerVolumes>) {
+    crate::net::accept_loop(listener, "peer-io", move |sock, peer| {
         let (tls, volumes) = (tls.clone(), volumes.clone());
-        tokio::spawn(async move {
+        async move {
             if let Err(e) = serve_conn(sock, tls, volumes).await {
-                eprintln!("peer-io: {}", e);
+                eprintln!("peer-io: {}: {}", peer, e);
             }
-        });
-    }
+        }
+    })
+    .await
 }
 
 async fn serve_conn(
@@ -106,10 +108,7 @@ async fn serve_conn(
     tls: TlsAcceptor,
     volumes: Arc<dyn PeerVolumes>,
 ) -> std::io::Result<()> {
-    let _ = sock.set_nodelay(true);
-    let tls = tokio::time::timeout(CONNECT_TIMEOUT, tls.accept(sock))
-        .await
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    let tls = crate::net::tls_accept(&tls, sock).await?;
     if crate::frontend::peer_role(&tls) != Some(Role::Node) {
         return Ok(()); // only nodes proxy volumes
     }
@@ -118,6 +117,19 @@ async fn serve_conn(
     let line = tokio::time::timeout(CONNECT_TIMEOUT, read_line(&mut rd))
         .await
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    let first = line.split(' ').next().unwrap_or("");
+    if first != PREAMBLE
+        && first != HANDOFF
+        && (first.starts_with("RAIDISH-VOL") || first.starts_with("RAIDISH-HANDOFF"))
+    {
+        let why = format!(
+            "ERR {} isn't spoken here: this node speaks {} and {}\n",
+            first, PREAMBLE, HANDOFF
+        );
+        wr.write_all(why.as_bytes()).await?;
+        wr.flush().await?;
+        return Ok(());
+    }
     let mut words = line.split(' ');
     if let (Some(HANDOFF), Some(volume), Some(epoch), Some(transport), None) = (
         words.next(),
@@ -126,7 +138,7 @@ async fn serve_conn(
         words.next(),
         words.next(),
     ) {
-        let Ok(epoch) = epoch.parse::<u64>() else {
+        let Ok(epoch) = epoch.parse::<Epoch>() else {
             wr.write_all(b"ERR bad epoch\n").await?;
             wr.flush().await?;
             return Ok(());
@@ -142,7 +154,7 @@ async fn serve_conn(
         wr.flush().await?;
         return Ok(());
     };
-    let Ok(epoch) = epoch.parse::<u64>() else {
+    let Ok(epoch) = epoch.parse::<Epoch>() else {
         wr.write_all(b"ERR bad epoch\n").await?;
         return Ok(());
     };
@@ -204,11 +216,11 @@ pub async fn dial(
 /// Where a volume's writer is now: its peer I/O address and port, and the
 /// lease epoch it writes under. Read from the live lease every time.
 pub trait Locate: Send + Sync + 'static {
-    fn writer(&self) -> Option<(String, u16, u64)>;
+    fn writer(&self) -> Option<(String, u16, Epoch)>;
 }
 
-impl<F: Fn() -> Option<(String, u16, u64)> + Send + Sync + 'static> Locate for F {
-    fn writer(&self) -> Option<(String, u16, u64)> {
+impl<F: Fn() -> Option<(String, u16, Epoch)> + Send + Sync + 'static> Locate for F {
+    fn writer(&self) -> Option<(String, u16, Epoch)> {
         self()
     }
 }
@@ -311,7 +323,7 @@ impl PeerIo {
         Ok(c)
     }
 
-    async fn connect(&self, addr: &str, port: u16, epoch: u64) -> Result<Arc<Conn>, String> {
+    async fn connect(&self, addr: &str, port: u16, epoch: Epoch) -> Result<Arc<Conn>, String> {
         let tls = dial(&self.connector, addr, port).await?;
         let (rd, mut wr) = tokio::io::split(tls);
         wr.write_all(format!("{} {} {}\n", PREAMBLE, self.volume, epoch).as_bytes())
@@ -455,7 +467,7 @@ impl Drop for PeerIo {
 /// What a writer's NBD error means here.
 fn errno_error(errno: u32) -> FileSystemError {
     match errno {
-        ENOSPC => FileSystemError::UnableToAllocateBlocks(0),
+        ENOSPC => FileSystemError::NoSpace("on the writer".into()),
         EIO => FileSystemError::Unavailable("the writer failed the request (EIO)".into()),
         e => FileSystemError::InvalidArgument(format!("the writer refused the request ({})", e)),
     }

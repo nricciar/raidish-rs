@@ -65,6 +65,43 @@ pub struct Store {
     fence: Arc<crate::fence::ServerFence>,
 }
 
+/// The file naming the Raft protocol a data directory was written in.
+const VERSION_FILE: &str = "version";
+
+/// Refuse Raft data of another protocol version (see
+/// `super::RAFT_PROTOCOL`); stamp a new directory with ours.
+fn check_version(dir: &Path) -> Result<(), String> {
+    let path = dir.join(VERSION_FILE);
+    let ours = super::RAFT_PROTOCOL;
+    match std::fs::read_to_string(&path) {
+        Ok(v) if v.trim().parse() == Ok(ours) => Ok(()),
+        Ok(v) => Err(format!(
+            "{}: Raft data of protocol {}, this raidish speaks {}",
+            dir.display(),
+            v.trim(),
+            ours
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let used = std::fs::read_dir(dir)
+                .map_err(|e| format!("{}: {}", dir.display(), e))?
+                .next()
+                .is_some();
+            if used {
+                return Err(format!(
+                    "{}: Raft data of an older raidish (no {} file): this one speaks \
+                     protocol {}",
+                    dir.display(),
+                    VERSION_FILE,
+                    ours
+                ));
+            }
+            std::fs::write(&path, format!("{}\n", ours))
+                .map_err(|e| format!("{}: {}", path.display(), e))
+        }
+        Err(e) => Err(format!("{}: {}", path.display(), e)),
+    }
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SErr> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -113,6 +150,7 @@ impl Store {
     /// Open (or create) the store in `dir`.
     pub fn open(dir: &Path, fence: Arc<crate::fence::ServerFence>) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        check_version(dir)?;
         let err = |e: SErr| format!("{}: {}", dir.display(), e);
         let vote = read_json(&dir.join("vote.json")).map_err(err)?;
         let committed = read_json(&dir.join("committed.json"))
@@ -159,7 +197,7 @@ impl Store {
     }
 
     /// One lease of the applied state (cheaper than `state()`).
-    pub fn lease(&self, resource: &str) -> Option<super::state::Lease> {
+    pub fn lease(&self, resource: &crate::types::LeaseResource) -> Option<super::state::Lease> {
         self.view.read().unwrap().leases.get(resource).cloned()
     }
 
@@ -177,10 +215,7 @@ impl Store {
 fn observe(fence: &crate::fence::ServerFence, state: &ClusterState) {
     fence.observe(
         state.pool_epoch(),
-        state
-            .metaslabs
-            .iter()
-            .map(|(&i, g)| (i, g.writer.is_some(), g.epoch)),
+        state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
     );
 }
 

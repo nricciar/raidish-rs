@@ -3,7 +3,7 @@
 //! and its live numbers side by side; then its hardware and its XML.
 //! Re-read every few seconds, like the list.
 
-use crate::api::{self, Vm, Volume};
+use crate::api::{self, VmView, VolumeView};
 use crate::app::Route;
 use crate::cluster::Status;
 use crate::dialog::{Dialog, Field, Spec, Values};
@@ -11,6 +11,8 @@ use crate::fmt;
 use crate::session::{now_ms, tab_hidden};
 use crate::vms::{Console, ConsolePreview, REFRESH_MS, confirm, state, state_tag};
 use gloo_timers::callback::Interval;
+use raidish::api_types::Mode;
+use raidish::types::NodeId;
 use std::collections::VecDeque;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
@@ -42,8 +44,8 @@ pub enum Tab {
 
 pub enum Msg {
     Load,
-    Loaded(Result<Vec<Vm>, String>),
-    Volumes(Vec<Volume>),
+    Loaded(Result<Vec<VmView>, String>),
+    Volumes(Vec<VolumeView>),
     /// A power action: asks first unless it's harmless.
     Power(&'static str),
     Ask(Spec, Action),
@@ -63,12 +65,12 @@ pub enum Msg {
 }
 
 pub struct VmPage {
-    vm: Option<Vm>,
+    vm: Option<VmView>,
     /// Loaded, and it isn't there.
     missing: bool,
     error: Option<String>,
     loading: bool,
-    volumes: Vec<Volume>,
+    volumes: Vec<VolumeView>,
     notice: Option<String>,
     dialog: Option<(Spec, Action)>,
     busy: bool,
@@ -149,7 +151,7 @@ impl Component for VmPage {
                 match r {
                     Ok(vms) => {
                         self.error = None;
-                        self.vm = vms.into_iter().find(|v| v.name == name);
+                        self.vm = vms.into_iter().find(|v| v.spec.name == name);
                         self.missing = self.vm.is_none();
                         // Where it can move: again once it's somewhere else
                         // (or started, or stopped).
@@ -176,9 +178,9 @@ impl Component for VmPage {
                         }
                         // (Re)read the XML when it changed.
                         if let Some(vm) = vm
-                            && self.xml.as_ref().is_none_or(|(c, _)| *c != vm.change)
+                            && self.xml.as_ref().is_none_or(|(c, _)| *c != vm.spec.change)
                         {
-                            let name = vm.name.clone();
+                            let name = vm.spec.name.clone();
                             ctx.link().send_future(async move {
                                 Msg::Xml(api::vm_definition(&name).await)
                             });
@@ -374,9 +376,9 @@ impl Component for VmPage {
 }
 
 /// Why it isn't doing what it should, if anything.
-fn problems(vm: &Vm) -> Html {
+fn problems(vm: &VmView) -> Html {
     let mut out = Vec::new();
-    if let Some(e) = &vm.error {
+    if let Some(e) = vm.spec.disks.error() {
         out.push(format!("Its definition can't be used: {}", e));
     }
     if let Some(e) = &vm.start_error {
@@ -444,7 +446,12 @@ impl VmPage {
             .props()
             .cluster
             .as_ref()
-            .map(|c| c.members.iter().map(|m| format!("node-{}", m.id)).collect())
+            .map(|c| {
+                c.members
+                    .iter()
+                    .map(|m| NodeId::from_raw(m.id).name())
+                    .collect()
+            })
             .unwrap_or_default();
         nodes.sort_by_key(|n| (n.len(), n.clone()));
         nodes
@@ -454,7 +461,7 @@ impl VmPage {
     fn own_disks(&self) -> Vec<String> {
         self.vm
             .iter()
-            .flat_map(|v| v.hw.disks.iter())
+            .flat_map(|v| v.spec.hw.disks.iter())
             .filter(|d| d.device != "cdrom")
             .filter_map(|d| d.volume.clone())
             .collect()
@@ -463,8 +470,8 @@ impl VmPage {
     fn volume_size(&self, v: &str) -> Option<u64> {
         self.volumes
             .iter()
-            .find(|x| x.name == v)
-            .map(|x| x.size_bytes)
+            .find(|x| x.info.name == v)
+            .map(|x| x.info.size_bytes)
     }
 
     /// CPU use over the samples, as % of its vCPUs.
@@ -493,24 +500,24 @@ impl VmPage {
             .find(|v| v.node == node)
     }
 
-    fn move_dialog(&self, ctx: &Context<Self>, vm: &Vm) -> Option<Callback<MouseEvent>> {
+    fn move_dialog(&self, ctx: &Context<Self>, vm: &VmView) -> Option<Callback<MouseEvent>> {
         let here = vm.node.clone().unwrap_or_default();
         // Not the nodes it can't run on at all.
         let others: Vec<String> = self
             .nodes(ctx)
             .into_iter()
             .filter(|n| *n != here)
-            .filter(|n| self.verdict(n).is_none_or(|v| v.mode != "no"))
+            .filter(|n| self.verdict(n).is_none_or(|v| v.mode != Mode::No))
             .collect();
-        if others.is_empty() || vm.error.is_some() {
+        if others.is_empty() || vm.spec.disks.error().is_some() {
             return None;
         }
         let running = vm.running();
         let labels: Vec<String> = others
             .iter()
-            .map(|n| match self.verdict(n).map(|v| v.mode.as_str()) {
-                Some("live") if running => format!("{} · live", n),
-                Some("cold") if running => format!("{} · cold (shut down, started there)", n),
+            .map(|n| match self.verdict(n).map(|v| v.mode) {
+                Some(Mode::Live) if running => format!("{} · live", n),
+                Some(Mode::Cold) if running => format!("{} · cold (shut down, started there)", n),
                 _ => n.clone(),
             })
             .collect();
@@ -522,18 +529,18 @@ impl VmPage {
         // Live first.
         let first = others
             .iter()
-            .find(|n| self.verdict(n).is_some_and(|v| v.mode == "live"))
+            .find(|n| self.verdict(n).is_some_and(|v| v.mode == Mode::Live))
             .unwrap_or(&others[0])
             .clone();
         let notes: Vec<(String, String)> = self
             .check
             .iter()
             .flat_map(|c| c.verdicts.iter())
-            .filter(|v| running || v.mode == "no")
-            .filter(|v| v.mode != "live")
+            .filter(|v| running || v.mode == Mode::No)
+            .filter(|v| v.mode != Mode::Live)
             .map(|v| (v.node.clone(), v.why()))
             .collect();
-        let spec = Spec::new(&format!("Move {}?", vm.name), "Move")
+        let spec = Spec::new(&format!("Move {}?", vm.spec.name), "Move")
             .message(html! { <>
                 <p>{ if running {
                     "Live where it says so: it keeps running while it moves. Cold: it's shut down here first, then started there."
@@ -555,7 +562,7 @@ impl VmPage {
         )
     }
 
-    fn header(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn header(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let (class, _, why) = state(vm);
         let mut facts = Vec::new();
@@ -569,10 +576,10 @@ impl VmPage {
         if let Some(c) = vm.vcpus() {
             facts.push(format!("{} vCPU", c));
         }
-        if let Some(k) = vm.memory_kib() {
-            facts.push(fmt::bytes(k * 1024));
+        if let Some(m) = vm.memory() {
+            facts.push(fmt::bytes(m.get()));
         }
-        if let Some(m) = &vm.hw.machine {
+        if let Some(m) = &vm.spec.hw.machine {
             facts.push(m.clone());
         }
         html! {
@@ -581,7 +588,7 @@ impl VmPage {
                     <span class={classes!("dot", "big", class)}></span>
                     <div>
                         <div class="vm-title">
-                            <h1>{ &vm.name }</h1>
+                            <h1>{ &vm.spec.name }</h1>
                             { state_tag(vm) }
                             if vm.restart_pending {
                                 <span class="tag warn" title="its definition changed since it started">{ "RESTART PENDING" }</span>
@@ -604,11 +611,11 @@ impl VmPage {
         }
     }
 
-    fn controls(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn controls(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let p = |a: &'static str| link.callback(move |_| Msg::Power(a));
         let running = vm.running();
-        let usable = vm.error.is_none();
+        let usable = vm.spec.disks.error().is_none();
         // One power button: what it does depends on where it is.
         let power = if !usable {
             Html::default()
@@ -624,7 +631,7 @@ impl VmPage {
         let deletable = !vm.want_running && !running && vm.unreachable.is_none();
         let disks = self.own_disks();
         let delete = {
-            let spec = Spec::new(&format!("Delete {}?", vm.name), "Delete")
+            let spec = Spec::new(&format!("Delete {}?", vm.spec.name), "Delete")
                 .message(html! { <p>{ "Deletes its definition. This can't be undone." }</p> })
                 .field(
                     Field::check("disks", "Also delete its disk volumes", false).hint(&if disks
@@ -676,7 +683,7 @@ impl VmPage {
         }
     }
 
-    fn screen(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn screen(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let off = if vm.console && self.console {
             Some("Showing in the console window")
@@ -694,28 +701,35 @@ impl VmPage {
                 if let Some(text) = off {
                     <div class="preview off">
                         <span class="off-text">{ text }</span>
-                        if text == "Powered off" && ctx.props().can_write && vm.error.is_none() {
+                        if text == "Powered off" && ctx.props().can_write && vm.spec.disks.error().is_none() {
                             <button class="btn primary" onclick={link.callback(|_| Msg::Power("start"))}>{ "▶  Start" }</button>
                         }
                     </div>
                 } else {
-                    <ConsolePreview name={vm.name.clone()} on_open={link.callback(|_| Msg::Console(true))} />
+                    <ConsolePreview name={vm.spec.name.clone()} on_open={link.callback(|_| Msg::Console(true))} />
                 }
             </section>
         }
     }
 
-    fn side(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn side(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let vcpus = vm.vcpus().unwrap_or(1);
         let pct = self.cpu_pct(vcpus);
         let disk_bytes: u64 = vm
+            .spec
             .hw
             .disks
             .iter()
             .filter(|d| d.device != "cdrom")
             .filter_map(|d| d.volume.as_deref().and_then(|v| self.volume_size(v)))
             .sum();
-        let n_disks = vm.hw.disks.iter().filter(|d| d.device != "cdrom").count();
+        let n_disks = vm
+            .spec
+            .hw
+            .disks
+            .iter()
+            .filter(|d| d.device != "cdrom")
+            .count();
         let mv = self.move_dialog(ctx, vm).filter(|_| ctx.props().can_write);
         html! {
             <aside class="vm-side">
@@ -735,7 +749,7 @@ impl VmPage {
                 <div class="facts two">
                     <div class="fact">
                         <div class="fact-label">{ "Memory" }</div>
-                        <div class="fact-value">{ vm.memory_kib().map_or("—".into(), |k| fmt::bytes(k * 1024)) }</div>
+                        <div class="fact-value">{ vm.memory().map_or("—".into(), |m| fmt::bytes(m.get())) }</div>
                         <div class="fact-sub">{ if vm.running() { "assigned" } else { "configured" } }</div>
                     </div>
                     <div class="fact">
@@ -748,7 +762,7 @@ impl VmPage {
                     <div class="fact-label">{ "Placement" }</div>
                     <div class="kv small">
                         <span>{ "Node" }</span><span>{ vm.node.clone().unwrap_or_else(|| "none (its disks aren't served)".into()) }</span>
-                        <span>{ "Follows" }</span><span>{ if vm.anchor.is_empty() { "—".into() } else { format!("volume {}", vm.anchor) } }</span>
+                        <span>{ "Follows" }</span><span>{ vm.spec.disks.anchor().map_or("—".into(), |a| format!("volume {}", a)) }</span>
                         <span>{ "Keep running" }</span><span>{ if vm.want_running { "yes, restarted if it stops" } else { "no" } }</span>
                     </div>
                     if let Some(mv) = mv {
@@ -761,7 +775,7 @@ impl VmPage {
     }
 
     /// Each other node: can it move there, live or cold, and why not.
-    fn moves(&self, vm: &Vm) -> Html {
+    fn moves(&self, vm: &VmView) -> Html {
         let Some(c) = &self.check else {
             return html! {};
         };
@@ -774,13 +788,13 @@ impl VmPage {
                 <div class="fact-label">{ if running { "Moving it" } else { "Starting it on" } }</div>
                 <ul class="moves">
                     { for c.verdicts.iter().map(|v| {
-                        let (cls, text) = match (v.mode.as_str(), running) {
-                            ("no", _) => ("bad", "NO"),
-                            ("cold", true) => ("warn", "COLD"),
-                            ("live", true) => ("ok", "LIVE"),
+                        let (cls, text) = match (v.mode, running) {
+                            (Mode::No, _) => ("bad", "NO"),
+                            (Mode::Cold, true) => ("warn", "COLD"),
+                            (Mode::Live, true) => ("ok", "LIVE"),
                             _ => ("ok", "OK"),
                         };
-                        let why = if running || v.mode == "no" { v.why() } else { String::new() };
+                        let why = if running || v.mode == Mode::No { v.why() } else { String::new() };
                         let all = v.reasons.iter().map(|r| format!("{}: {}", r.level, r.text)).collect::<Vec<_>>().join("\n");
                         html! {
                             <li title={all}>
@@ -802,8 +816,8 @@ impl VmPage {
         }
     }
 
-    fn hardware(&self, vm: &Vm) -> Html {
-        let hw = &vm.hw;
+    fn hardware(&self, vm: &VmView) -> Html {
+        let hw = &vm.spec.hw;
         let row = |ico: &str, label: String, value: Html, meta: String| {
             html! {
                 <li class="hw-row">
@@ -824,7 +838,7 @@ impl VmPage {
             row(
                 "memory",
                 "Memory".into(),
-                html! { { vm.memory_kib().map_or("—".into(), |k| fmt::bytes(k * 1024)) } },
+                html! { { vm.memory().map_or("—".into(), |m| fmt::bytes(m.get())) } },
                 String::new(),
             ),
             row(
@@ -899,7 +913,7 @@ impl VmPage {
         html! { <ul class="hw">{ for rows }</ul> }
     }
 
-    fn definition(&self, ctx: &Context<Self>, vm: &Vm) -> Html {
+    fn definition(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
         let oninput = link.callback(|e: InputEvent| {

@@ -27,16 +27,16 @@
 pub mod http;
 
 use crate::btree::Txn;
-use crate::dataset::{Dataset, DatasetFormat};
+use crate::dataset::DatasetFormat;
 use crate::disk::BlockDevice;
-use crate::frontend::Settler;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
+use crate::types::ErrorKind;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const MAX_BATCH: usize = 10;
@@ -55,21 +55,40 @@ pub enum SqsError {
     ReceiptHandleIsInvalid(String),
     MessageNotInflight,
     Unavailable,
-    Fs(String),
+    /// The pool failed it (`kind` says how).
+    Fs {
+        kind: ErrorKind,
+        msg: String,
+    },
 }
 
 impl From<FileSystemError> for SqsError {
     fn from(e: FileSystemError) -> Self {
-        match e {
-            FileSystemError::Unavailable(_) => SqsError::Unavailable,
-            e => SqsError::Fs(e.to_string()),
+        SqsError::Fs {
+            kind: e.kind(),
+            msg: e.message(),
         }
+    }
+}
+
+impl ServiceError for SqsError {
+    fn stopped() -> Self {
+        SqsError::Unavailable
+    }
+}
+
+impl<D: BlockDevice + 'static> Served for Queue<D> {
+    fn is_stopped(&self) -> bool {
+        self.tree.is_stopped()
     }
 }
 
 impl From<bincode::Error> for SqsError {
     fn from(e: bincode::Error) -> Self {
-        SqsError::Fs(e.to_string())
+        SqsError::Fs {
+            kind: ErrorKind::Internal,
+            msg: e.to_string(),
+        }
     }
 }
 
@@ -467,32 +486,51 @@ fn v_parts(k: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
-pub fn encode_receipt(seq: u64, nonce: u64) -> String {
-    use base64::Engine;
-    let mut b = Vec::with_capacity(16);
-    b.extend(seq.to_be_bytes());
-    b.extend(nonce.to_be_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+/// A queue's messages by state (see `Queue::counts`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub visible: u64,
+    pub inflight: u64,
+    pub delayed: u64,
 }
 
-pub fn decode_receipt(r: &str) -> Result<(u64, u64)> {
-    use base64::Engine;
-    let bad = || {
-        SqsError::ReceiptHandleIsInvalid(format!(
-            "The input receipt handle \"{}\" is not a valid receipt handle.",
-            r
-        ))
-    };
-    let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(r)
-        .map_err(|_| bad())?;
-    if b.len() != 16 {
-        return Err(bad());
+/// A receipt handle: which message (`seq`), as which receipt of it
+/// (`nonce`, new each time it's received, so an old handle can't delete or
+/// hide it once someone else has received it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub seq: u64,
+    pub nonce: u64,
+}
+
+impl Receipt {
+    pub fn encode(self) -> String {
+        use base64::Engine;
+        let mut b = Vec::with_capacity(16);
+        b.extend(self.seq.to_be_bytes());
+        b.extend(self.nonce.to_be_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
     }
-    Ok((
-        u64::from_be_bytes(b[..8].try_into().unwrap()),
-        u64::from_be_bytes(b[8..].try_into().unwrap()),
-    ))
+
+    pub fn decode(r: &str) -> Result<Self> {
+        use base64::Engine;
+        let bad = || {
+            SqsError::ReceiptHandleIsInvalid(format!(
+                "The input receipt handle \"{}\" is not a valid receipt handle.",
+                r
+            ))
+        };
+        let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(r)
+            .map_err(|_| bad())?;
+        if b.len() != 16 {
+            return Err(bad());
+        }
+        Ok(Receipt {
+            seq: u64::from_be_bytes(b[..8].try_into().unwrap()),
+            nonce: u64::from_be_bytes(b[8..].try_into().unwrap()),
+        })
+    }
 }
 
 /// A new message id, as a (version 4) UUID.
@@ -513,16 +551,11 @@ fn nonce(seq: u64) -> u64 {
     crate::fs::new_guid(seq).max(1)
 }
 
-fn now_ms() -> u64 {
-    crate::cluster::now_ms()
-}
+use crate::types::now_ms;
 
 /// A queue, served from this node.
 pub struct Queue<D: BlockDevice> {
-    pub fs: Arc<FileSystem<D>>,
-    pub name: String,
-    stopped: AtomicBool,
-    settler: Settler,
+    pub tree: ServiceTree<D>,
     /// Signalled when messages may have become receivable.
     arrived: tokio::sync::Notify,
 }
@@ -533,12 +566,8 @@ impl<D: BlockDevice + 'static> Queue<D> {
         fs: Arc<FileSystem<D>>,
         name: &str,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
-        fs.open_btree(name, DatasetFormat::Queue).await?;
         let q = Arc::new(Queue {
-            fs,
-            name: name.to_string(),
-            stopped: AtomicBool::new(false),
-            settler: Settler::default(),
+            tree: ServiceTree::open(fs, name, DatasetFormat::Queue).await?,
             arrived: tokio::sync::Notify::new(),
         });
         // A new queue: its meta.
@@ -559,38 +588,23 @@ impl<D: BlockDevice + 'static> Queue<D> {
         })
         .await
         .map_err(|e| FileSystemError::Unavailable(format!("{:?}", e)))?;
-        let weak = Arc::downgrade(&q);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let Some(q) = weak.upgrade() else { return };
-                if q.is_stopped() {
-                    return;
-                }
-                if let Err(e) = q.sweep().await
-                    && e != SqsError::Unavailable
-                {
-                    eprintln!("sqs '{}': deleting old messages: {:?}", q.name, e);
-                }
+        spawn_while_alive(&q, Duration::from_secs(10), None, |q| async move {
+            if let Err(e) = q.sweep().await
+                && e != SqsError::Unavailable
+            {
+                eprintln!("sqs '{}': deleting old messages: {:?}", q.tree.name, e);
             }
         });
         Ok(q)
     }
 
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+        self.tree.stop();
         self.arrived.notify_waiters();
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
-    }
-
-    async fn ds(&self) -> Result<Arc<Dataset>> {
-        if self.is_stopped() {
-            return Err(SqsError::Unavailable);
-        }
-        Ok(self.fs.open_btree(&self.name, DatasetFormat::Queue).await?)
+        self.tree.is_stopped()
     }
 
     /// Run a logged write, and make it durable.
@@ -602,19 +616,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
     {
-        let ds = self.ds().await?;
-        let out = {
-            let _w = ds.ops.write().await;
-            let mut t = Txn::begin(&self.fs, &ds.obj).await?;
-            let out = f(&mut t).await?;
-            if !t.is_empty() {
-                t.apply_logged()?;
-                self.settler.applied();
-            }
-            out
-        };
-        self.settler.settle(&self.fs, &self.name).await?;
-        Ok(out)
+        self.tree.write(f).await
     }
 
     /// Run a read (of durable state only).
@@ -626,11 +628,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
     {
-        let ds = self.ds().await?;
-        let _r = ds.ops.read().await;
-        self.settler.settle(&self.fs, &self.name).await?;
-        let t = Txn::begin(&self.fs, &ds.obj).await?;
-        f(&t).await
+        self.tree.read(f).await
     }
 
     pub async fn meta(&self) -> Result<Meta> {
@@ -825,7 +823,11 @@ impl<D: BlockDevice + 'static> Queue<D> {
                             t.put(&q_key(seq), &bincode::serialize(&msg)?).await?;
                             t.put(&v_key(msg.visible_at_ms, seq), &[1]).await?;
                             got.push(Received {
-                                receipt: encode_receipt(seq, msg.nonce),
+                                receipt: Receipt {
+                                    seq,
+                                    nonce: msg.nonce,
+                                }
+                                .encode(),
                                 msg,
                             });
                             if got.len() >= max {
@@ -880,7 +882,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                 let mut out = Vec::new();
                 let mut changed = false;
                 for r in receipts {
-                    let (seq, nonce) = match decode_receipt(&r) {
+                    let Receipt { seq, nonce } = match Receipt::decode(&r) {
                         Ok(x) => x,
                         Err(e) => {
                             out.push(Err(e));
@@ -909,7 +911,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
 
     /// Delete one message by seq (moved to a dead-letter queue), unless it
     /// was received again since.
-    pub async fn remove(&self, seq: u64, nonce: u64) -> Result<()> {
+    pub async fn remove(&self, Receipt { seq, nonce }: Receipt) -> Result<()> {
         self.write(move |t| {
             Box::pin(async move {
                 if let Some(raw) = t.get(&q_key(seq)).await? {
@@ -943,7 +945,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                             )));
                             continue;
                         }
-                        let (seq, nonce) = match decode_receipt(&r) {
+                        let Receipt { seq, nonce } = match Receipt::decode(&r) {
                             Ok(x) => x,
                             Err(e) => {
                                 out.push(Err(e));
@@ -1019,8 +1021,8 @@ impl<D: BlockDevice + 'static> Queue<D> {
         }
     }
 
-    /// (visible, in flight, delayed) messages, roughly.
-    pub async fn counts(&self) -> Result<(u64, u64, u64)> {
+    /// How many messages are in each state, roughly.
+    pub async fn counts(&self) -> Result<Counts> {
         self.read(|t| {
             Box::pin(async move {
                 let now = now_ms();
@@ -1043,7 +1045,11 @@ impl<D: BlockDevice + 'static> Queue<D> {
                         }
                     }
                 }
-                Ok((visible, inflight, delayed))
+                Ok(Counts {
+                    visible,
+                    inflight,
+                    delayed,
+                })
             })
         })
         .await

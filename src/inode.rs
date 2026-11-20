@@ -20,6 +20,8 @@
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, TreeRoot};
+use crate::types::Txg;
+use crate::types::{Holding, LeaseRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -30,9 +32,13 @@ pub const DNODES_PER_LEAF: u64 = 32;
 /// pool's alignment).
 const TABLE_LEAF_BLOCKS: u64 = 8;
 
+/// What an object is. In JSON it's named as `name` gives it (on disk,
+/// bincode stores the variant's index).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ObjType {
     File,
+    #[serde(rename = "dir")]
     Directory,
     /// Copy-on-write virtual block device (see `crate::volume`).
     Volume,
@@ -43,6 +49,7 @@ pub enum ObjType {
     Datasets,
     /// A `kv` dataset's B+tree (see `crate::btree`): its records are the
     /// tree's nodes.
+    #[serde(rename = "kv")]
     KvTree,
 }
 
@@ -78,20 +85,7 @@ impl FileIndex {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Extent {
-    pub start: u64,
-    pub len: u64,
-}
-
-impl Extent {
-    pub fn start(&self) -> u64 {
-        self.start
-    }
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-}
+pub use crate::types::Extent;
 
 /// An object's attributes.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -146,28 +140,60 @@ pub(crate) fn now_ns() -> u64 {
 /// An object as the object table stores it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Dnode {
-    pub kind: ObjType,
+    /// What it is, and what only that kind of object has.
+    pub body: Body,
     /// Bytes per data record.
     pub blksz: u32,
     /// Logical size in bytes.
     pub size: u64,
     pub tree: TreeRoot,
     pub attrs: Attrs,
-    /// A tree dataset root's placement settings.
-    pub props: Option<DatasetProps>,
-    /// A tree dataset root's intent log, if a writer runs it (see `crate::zil`):
-    /// writes acknowledged since the tree was committed.
-    pub log: Option<DatasetLog>,
     /// The directory it is linked from (a posix root's is itself: a
-    /// directory's `..`; a tree dataset's root: the dataset directory).
-    pub parent: FileId,
+    /// directory's `..`; a tree dataset's root: the dataset directory; a
+    /// snapshot's: its volume). None: linked from nowhere (yet).
+    pub parent: Option<FileId>,
     /// Bumped by every change to the object (contents, entries,
     /// attributes): NFS clients validate their caches on it. Unlike a
     /// time, it never goes backwards, whichever node's clock is involved.
     pub change: u64,
-    /// A volume's snapshots and origin, or a snapshot's place among them
-    /// (see `crate::snapshot`). None: a volume with neither.
-    pub lineage: Option<Lineage>,
+}
+
+/// What an object is (see [`ObjType`]), with what only its kind has.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum Body {
+    File,
+    Directory,
+    Datasets,
+    Volume(Head),
+    KvTree(Head),
+    /// A snapshot of the volume that is its `parent`.
+    Snapshot(Snap),
+}
+
+/// A tree dataset's root object (a volume, a kv tree): what it holds
+/// besides its tree.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct Head {
+    /// Its placement settings.
+    pub props: DatasetProps,
+    /// Its intent log, if a writer runs it (see `crate::zil`): writes
+    /// acknowledged since the tree was committed.
+    pub log: Option<DatasetLog>,
+    /// The snapshot it was cloned from (see `crate::snapshot`): blocks
+    /// born at or before it are the origin's.
+    pub origin: Option<SnapRef>,
+    /// Its snapshots, oldest first.
+    pub snapshots: Vec<SnapRef>,
+}
+
+/// A snapshot's place among its volume's (see `crate::snapshot`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Snap {
+    pub txg: Txg,
+    /// See `SnapRef::guid`.
+    pub guid: u64,
+    /// Volumes cloned from it (it can't be destroyed while they exist).
+    pub clones: Vec<FileId>,
 }
 
 /// A snapshot, as its volume (or a clone made from it) refers to it.
@@ -178,37 +204,38 @@ pub struct SnapRef {
     pub id: FileId,
     /// The TXG it was taken in: every block it references was born at or
     /// before it, and every block born after it is someone else's.
-    pub txg: u64,
+    pub txg: Txg,
     /// Names these contents in any pool: a received snapshot keeps the
     /// sender's (see `crate::send`).
     pub guid: u64,
 }
 
-/// How copy-on-write volumes share blocks (see `crate::snapshot`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum Lineage {
-    /// A volume (`kind` Volume).
-    Head {
-        /// The snapshot it was cloned from: blocks born at or before it
-        /// are the origin's.
-        origin: Option<SnapRef>,
-        /// Its snapshots, oldest first.
-        snapshots: Vec<SnapRef>,
-    },
-    /// A snapshot (`kind` Snapshot) of the volume `parent`.
-    Snapshot {
-        txg: u64,
-        /// See `SnapRef::guid`.
-        guid: u64,
-        /// Volumes cloned from it (it can't be destroyed while they exist).
-        clones: Vec<FileId>,
-    },
+impl Body {
+    pub fn kind(&self) -> ObjType {
+        match self {
+            Body::File => ObjType::File,
+            Body::Directory => ObjType::Directory,
+            Body::Datasets => ObjType::Datasets,
+            Body::Volume(_) => ObjType::Volume,
+            Body::KvTree(_) => ObjType::KvTree,
+            Body::Snapshot(_) => ObjType::Snapshot,
+        }
+    }
+
+    /// A tree dataset root of `kind` (Volume or KvTree) holding `head`.
+    pub fn tree_root(kind: ObjType, head: Head) -> Self {
+        match kind {
+            ObjType::Volume => Body::Volume(head),
+            ObjType::KvTree => Body::KvTree(head),
+            k => panic!("a {} is no tree dataset root", k.name()),
+        }
+    }
 }
 
 impl Dnode {
-    fn new(kind: ObjType, blksz: u32, mode: u16) -> Self {
+    fn new(body: Body, blksz: u32, mode: u16) -> Self {
         Dnode {
-            kind,
+            body,
             blksz,
             size: 0,
             tree: TreeRoot {
@@ -216,51 +243,90 @@ impl Dnode {
                 levels: 0,
             },
             attrs: Attrs::new(mode),
-            props: None,
-            log: None,
-            parent: 0,
+            parent: None,
             change: 0,
-            lineage: None,
         }
     }
 
     pub fn directory(blksz: u32) -> Self {
-        Self::new(ObjType::Directory, blksz, 0o755)
+        Self::new(Body::Directory, blksz, 0o755)
     }
 
     /// The dataset directory (see `crate::dataset`).
     pub fn datasets(blksz: u32) -> Self {
-        Self::new(ObjType::Datasets, blksz, 0o700)
+        Self::new(Body::Datasets, blksz, 0o700)
     }
 
     pub fn file(blksz: u32) -> Self {
-        Self::new(ObjType::File, blksz, 0o644)
+        Self::new(Body::File, blksz, 0o644)
     }
 
     pub fn volume(volblocksize: u32, size: u64, levels: u8) -> Self {
-        let mut d = Self::new(ObjType::Volume, volblocksize, 0o600);
+        let mut d = Self::new(Body::Volume(Head::default()), volblocksize, 0o600);
         d.size = size;
         d.tree.levels = levels;
-        d.props = Some(DatasetProps::default());
         d
     }
 
     /// A `kv` dataset's tree: `capacity` node records of `blksz` bytes,
     /// none allocated (an empty B+tree).
     pub fn kv(blksz: u32, capacity: u64) -> Self {
-        let mut d = Self::new(ObjType::KvTree, blksz, 0o600);
+        let mut d = Self::new(Body::KvTree(Head::default()), blksz, 0o600);
         d.size = capacity * blksz as u64;
         d.tree.levels = crate::object::levels_for(capacity);
-        d.props = Some(DatasetProps::default());
         d
     }
 
+    pub fn kind(&self) -> ObjType {
+        self.body.kind()
+    }
+
     pub fn is_file(&self) -> bool {
-        self.kind == ObjType::File
+        matches!(self.body, Body::File)
     }
 
     pub fn is_directory(&self) -> bool {
-        self.kind == ObjType::Directory
+        matches!(self.body, Body::Directory)
+    }
+
+    /// A tree dataset root's settings, log and lineage.
+    pub fn head(&self) -> Option<&Head> {
+        match &self.body {
+            Body::Volume(h) | Body::KvTree(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn head_mut(&mut self) -> Option<&mut Head> {
+        match &mut self.body {
+            Body::Volume(h) | Body::KvTree(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// A tree dataset root's settings (None: not one).
+    pub fn props(&self) -> Option<&DatasetProps> {
+        self.head().map(|h| &h.props)
+    }
+
+    /// A tree dataset root's intent log, if it has one.
+    pub fn log(&self) -> Option<&DatasetLog> {
+        self.head().and_then(|h| h.log.as_ref())
+    }
+
+    /// A snapshot's place among its volume's.
+    pub fn snap(&self) -> Option<&Snap> {
+        match &self.body {
+            Body::Snapshot(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn snap_mut(&mut self) -> Option<&mut Snap> {
+        match &mut self.body {
+            Body::Snapshot(s) => Some(s),
+            _ => None,
+        }
     }
 }
 
@@ -276,12 +342,10 @@ pub struct DatasetLog {
     /// Records of `regions[0]` before this one are already in the tree.
     pub from_seq: u64,
     /// The writer lease (`writer/...`) whose lent space holds it.
-    pub writer: String,
-    pub writer_epoch: u64,
+    pub writer: LeaseRef,
     /// The `ds/<name>` lease it was written under: once that's gone, no
     /// more records can be acknowledged, and it may be replayed.
-    pub ds_owner: String,
-    pub ds_epoch: u64,
+    pub ds: Holding,
 }
 
 /// A run of blocks holding intent log records.
@@ -452,8 +516,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Object `id`'s dnode, if it exists (uncommitted changes included).
     pub async fn try_read_dnode(&self, id: FileId) -> Result<Option<Dnode>, FileSystemError> {
-        let mut leaf = self.table_leaf(id / DNODES_PER_LEAF).await?;
-        Ok(leaf.swap_remove((id % DNODES_PER_LEAF) as usize))
+        let mut leaf = self.table_leaf(id.get() / DNODES_PER_LEAF).await?;
+        Ok(leaf.swap_remove((id.get() % DNODES_PER_LEAF) as usize))
     }
 
     pub async fn read_dnode(&self, id: FileId) -> Result<Dnode, FileSystemError> {
@@ -474,9 +538,9 @@ impl<D: BlockDevice> FileSystem<D> {
             self.writer.is_none(),
             "writers don't change the object table"
         );
-        let leaf = id / DNODES_PER_LEAF;
+        let leaf = id.get() / DNODES_PER_LEAF;
         let mut slots = self.table_leaf(leaf).await?;
-        let slot = &mut slots[(id % DNODES_PER_LEAF) as usize];
+        let slot = &mut slots[(id.get() % DNODES_PER_LEAF) as usize];
         let mut dnode = dnode;
         if let Some(d) = &mut dnode {
             // Every rewrite is a change (callers only rewrite to change it).
@@ -508,7 +572,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut out = self.tree_extents(&dnode.tree).await?;
         out.extend(
             dnode
-                .log
+                .log()
                 .iter()
                 .flat_map(|l| l.regions.iter().map(LogRegion::extent)),
         );
@@ -683,8 +747,8 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         check_name(&l.name)?;
         let id = self.alloc_object();
-        dnode.parent = l.parent_id;
-        let kind = dnode.kind;
+        dnode.parent = Some(l.parent_id);
+        let kind = dnode.kind();
         self.write_dnode(id, Some(dnode)).await?;
         l.index.files.insert(l.name.clone(), DirEntry { id, kind });
         self.write_dir(l.parent_id, &mut l.parent, &l.index).await?;
@@ -698,10 +762,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let dnode = self.read_dnode(entry.id).await?;
         if dnode.is_directory() && dnode.size > 0 && !self.read_dir(&dnode).await?.files.is_empty()
         {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "directory '{}' isn't empty",
-                l.name
-            )));
+            return Err(FileSystemError::NotEmpty(format!("directory '{}'", l.name)));
         }
         self.free_dnode(entry.id, &dnode).await?;
         l.index.files.remove(&l.name);
@@ -747,7 +808,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 if at == self.root_dir() {
                     break;
                 }
-                at = self.read_dnode(at).await?.parent;
+                match self.read_dnode(at).await?.parent {
+                    Some(p) => at = p,
+                    None => break,
+                }
             }
         }
         let replaced = match dst.entry {
@@ -759,8 +823,8 @@ impl<D: BlockDevice> FileSystem<D> {
                     (ObjType::File, ObjType::File) => {}
                     (ObjType::Directory, ObjType::Directory) => {
                         if !self.read_dir(&target).await?.files.is_empty() {
-                            return Err(FileSystemError::InvalidArgument(format!(
-                                "directory '{}' isn't empty",
+                            return Err(FileSystemError::NotEmpty(format!(
+                                "directory '{}'",
                                 dst.name
                             )));
                         }
@@ -789,7 +853,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 .await?;
         }
         let mut d = self.read_dnode(moved.id).await?;
-        d.parent = dst.parent_id;
+        d.parent = Some(dst.parent_id);
         d.attrs.ctime_ns = now_ns();
         self.write_dnode(moved.id, Some(d)).await?;
         Ok((moved.id, replaced))
@@ -811,7 +875,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let l = self.lookup_at(dir, name).await?;
         if let Some(e) = l.entry {
             let d = self.read_dnode(e.id).await?;
-            if d.kind != kind {
+            if d.kind() != kind {
                 return Err(FileSystemError::AlreadyExists);
             }
             return match exclusive {

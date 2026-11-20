@@ -6,6 +6,7 @@ use crate::frontend::testing::Fixture;
 use crate::frontend::{Owner, Route};
 use crate::pki::Role;
 use crate::test_util::TestPool;
+use crate::types::ep;
 use std::collections::BTreeMap;
 
 struct Sqs {
@@ -41,7 +42,7 @@ async fn server(pool: &TestPool) -> Sqs {
     }
     fe.set_routes(routes, BTreeMap::new());
     for q in ["q", "dlq"] {
-        fe.serve_local(q, DatasetFormat::Queue, fs.clone(), 1)
+        fe.serve_local(q, DatasetFormat::Queue, fs.clone(), ep(1))
             .await
             .unwrap();
     }

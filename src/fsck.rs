@@ -21,10 +21,12 @@ use crate::blkptr::BlockPtr;
 use crate::dataset::{DEFAULT_FS, DatasetFormat};
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Lineage, ObjType, decode_leaf};
+use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Head, ObjType, Snap, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
 use crate::object::{INDIRECT_FANOUT, TreeRoot};
+use crate::types::Txg;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 /// What a record holds: a node of some tree, at a level (0 = data).
@@ -158,10 +160,10 @@ pub(crate) fn expand(node: &Node, data: &[u8]) -> Result<Expanded, String> {
     let mut found = Vec::new();
     for (slot, d) in slots.into_iter().enumerate() {
         let Some(d) = d else { continue };
-        let id = node.index * DNODES_PER_LEAF + slot as u64;
+        let id = FileId::from_raw(node.index * DNODES_PER_LEAF + slot as u64);
         children.extend(tree_node(
             &d.tree,
-            ObjKind::of(d.kind, d.tree.levels),
+            ObjKind::of(d.kind(), d.tree.levels),
             format!("object {}", id),
         ));
         found.push((id, d));
@@ -181,7 +183,7 @@ fn join(path: &str, name: &str) -> String {
 
 /// Insert a range, merging with neighbours. Returns the part of it that
 /// overlapped what was already there (empty when disjoint).
-fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64, u64)> {
+fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<Extent> {
     let end = start + len;
     let mut overlap = Vec::new();
     let mut new_start = start;
@@ -190,7 +192,7 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64,
         && ps + pl >= start
     {
         if ps + pl > start {
-            overlap.push((start, (ps + pl).min(end) - start));
+            overlap.push(Extent::new(start, (ps + pl).min(end) - start));
         }
         new_start = ps;
         new_end = new_end.max(ps + pl);
@@ -201,7 +203,7 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64,
             break;
         }
         if ns < end {
-            overlap.push((ns, (ns + nl).min(end) - ns));
+            overlap.push(Extent::new(ns, (ns + nl).min(end) - ns));
         }
         new_end = new_end.max(ns + nl);
         map.remove(&ns);
@@ -246,18 +248,18 @@ fn complement(map: &BTreeMap<u64, u64>, start: u64, end: u64) -> BTreeMap<u64, u
 }
 
 /// Ranges in both `a` and `b`.
-fn intersect(a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>) -> Vec<(u64, u64)> {
+fn intersect(a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>) -> Vec<Extent> {
     let mut out = Vec::new();
     for (&s, &l) in a {
         for (&bs, &bl) in &clip(b, s, s + l) {
-            out.push((bs, bl));
+            out.push(Extent::new(bs, bl));
         }
     }
     out
 }
 
-fn total(ranges: &[(u64, u64)]) -> u64 {
-    ranges.iter().map(|(_, l)| l).sum()
+fn total(ranges: &[Extent]) -> u64 {
+    ranges.iter().map(|e| e.len).sum()
 }
 
 /// Collects every extent the tree references.
@@ -265,7 +267,7 @@ fn total(ranges: &[(u64, u64)]) -> u64 {
 pub struct LiveSet {
     pub live: BTreeMap<u64, u64>,
     /// Blocks referenced more than once.
-    pub cross_links: Vec<(u64, u64)>,
+    pub cross_links: Vec<Extent>,
 }
 
 impl Visitor for LiveSet {
@@ -281,18 +283,18 @@ impl Visitor for LiveSet {
 
 #[derive(Debug, Default, Clone)]
 pub struct FsckReport {
-    pub txg: u64,
+    pub txg: Txg,
     pub repair: bool,
     pub records: u64,
     pub live_blocks: u64,
     /// Allocated but referenced by nothing.
-    pub leaks: Vec<(u64, u64)>,
+    pub leaks: Vec<Extent>,
     /// Referenced, but free (or pending free) in the space maps.
-    pub referenced_free: Vec<(u64, u64)>,
+    pub referenced_free: Vec<Extent>,
     /// Blocks referenced by more than one pointer.
-    pub cross_links: Vec<(u64, u64)>,
+    pub cross_links: Vec<Extent>,
     /// References outside the data area.
-    pub out_of_range: Vec<(u64, u64)>,
+    pub out_of_range: Vec<Extent>,
     pub errors: Vec<String>,
     pub incomplete: bool,
     pub leaks_repaired: bool,
@@ -316,11 +318,15 @@ impl std::fmt::Display for FsckReport {
             "fsck at TXG {}: {} records, {} blocks in use",
             self.txg, self.records, self.live_blocks
         )?;
-        let show = |f: &mut std::fmt::Formatter<'_>, what: &str, r: &[(u64, u64)], fixed: &str| {
+        let show = |f: &mut std::fmt::Formatter<'_>, what: &str, r: &[Extent], fixed: &str| {
             if r.is_empty() {
                 return Ok(());
             }
-            let sample: Vec<String> = r.iter().take(8).map(|(s, l)| format!("{s}+{l}")).collect();
+            let sample: Vec<String> = r
+                .iter()
+                .take(8)
+                .map(|e| format!("{}+{}", e.start, e.len))
+                .collect();
             writeln!(
                 f,
                 "  {}: {} blocks in {} extents{} [{}{}]",
@@ -388,34 +394,38 @@ impl std::fmt::Display for RebuildReport {
 
 /// One salvaged file or volume.
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Salvaged {
     pub path: String,
     pub bytes: u64,
-    /// (offset, length) ranges that could not be read and were zero-filled.
-    pub lost: Vec<(u64, u64)>,
+    /// Byte ranges that could not be read and were zero-filled.
+    pub lost: Vec<std::ops::Range<u64>>,
 }
 
 #[derive(Debug, Default, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SalvageReport {
     pub items: Vec<Salvaged>,
     /// Directories / inodes that could not be read (their contents are lost).
     pub errors: Vec<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SalvageReport {
     pub fn is_complete(&self) -> bool {
         self.errors.is_empty() && self.items.iter().all(|i| i.lost.is_empty())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for SalvageReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in &self.items {
             if i.lost.is_empty() {
                 writeln!(f, "  ok      {} ({} bytes)", i.path, i.bytes)?;
             } else {
-                let lost: u64 = i.lost.iter().map(|(_, l)| l).sum();
-                let at: Vec<String> = i.lost.iter().take(4).map(|(o, _)| o.to_string()).collect();
+                let lost: u64 = i.lost.iter().map(|r| r.end - r.start).sum();
+                let at: Vec<String> = i.lost.iter().take(4).map(|r| r.start.to_string()).collect();
                 writeln!(
                     f,
                     "  DAMAGED {} ({} bytes, {} lost at offsets {}{})",
@@ -449,19 +459,19 @@ fn check_lineage(
     dnodes: &BTreeMap<FileId, Dnode>,
     errors: &mut Vec<String>,
 ) -> Vec<(FileId, String)> {
-    let Some(Lineage::Head { origin, snapshots }) = &d.lineage else {
-        if d.lineage.is_some() {
-            errors.push(format!("volume {}: lineage of a snapshot", id));
-        }
+    let Some(Head {
+        origin, snapshots, ..
+    }) = d.head()
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut last = 0;
+    let mut last = Txg::ZERO;
     if let Some(o) = origin {
         last = o.txg;
         match dnodes.get(&o.id) {
-            Some(s) if s.kind == ObjType::Snapshot => match &s.lineage {
-                Some(Lineage::Snapshot { txg, clones, .. }) if *txg == o.txg => {
+            Some(s) => match s.snap() {
+                Some(Snap { txg, clones, .. }) if *txg == o.txg => {
                     if !clones.contains(&id) {
                         errors.push(format!(
                             "volume {}: its origin {} doesn't list it as a clone",
@@ -476,8 +486,8 @@ fn check_lineage(
     }
     for r in snapshots {
         let ok = match dnodes.get(&r.id) {
-            Some(s) if s.kind == ObjType::Snapshot && s.parent == id => {
-                matches!(&s.lineage, Some(Lineage::Snapshot { txg, guid, .. }) if *txg == r.txg && *guid == r.guid)
+            Some(s) if s.parent == Some(id) => {
+                matches!(s.snap(), Some(Snap { txg, guid, .. }) if *txg == r.txg && *guid == r.guid)
             }
             _ => false,
         };
@@ -492,14 +502,11 @@ fn check_lineage(
             errors.push(format!("{}: snapshots out of TXG order", r.name));
         }
         last = r.txg;
-        if let Some(Lineage::Snapshot { clones, .. }) = &dnodes[&r.id].lineage {
+        if let Some(Snap { clones, .. }) = dnodes[&r.id].snap() {
             for c in clones {
-                let theirs = dnodes.get(c).and_then(|cd| match &cd.lineage {
-                    Some(Lineage::Head {
-                        origin: Some(o), ..
-                    }) => Some(o.id),
-                    _ => None,
-                });
+                let theirs = dnodes
+                    .get(c)
+                    .and_then(|cd| cd.head()?.origin.as_ref().map(|o| o.id));
                 if theirs != Some(r.id) {
                     errors.push(format!("{}: clone {} doesn't name it as origin", r.name, c));
                 }
@@ -512,12 +519,14 @@ fn check_lineage(
 }
 
 #[derive(Default)]
+#[cfg(not(target_arch = "wasm32"))]
 struct Collect {
     dirs: Vec<String>,
     /// Files and volumes.
     objects: Vec<(String, Dnode)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Visitor for Collect {
     fn dir(&mut self, path: &str) {
         self.dirs.push(path.to_string());
@@ -545,7 +554,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stack: Vec<Node> = table_node(table).into_iter().collect();
         // Snapshots, clones and their volumes share subtrees: each record
         // once (a reused lba always has a newer birth).
-        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        let mut seen: HashSet<(u64, Txg)> = HashSet::new();
         while let Some(node) = stack.pop() {
             if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
                 continue;
@@ -575,7 +584,7 @@ impl<D: BlockDevice> FileSystem<D> {
             match expand(&node, &data) {
                 Ok((children, found)) => {
                     for (id, d) in found {
-                        for r in d.log.iter().flat_map(|l| &l.regions) {
+                        for r in d.log().iter().flat_map(|l| &l.regions) {
                             v.log_region(r.start, r.len);
                         }
                         dnodes.insert(id, d);
@@ -613,7 +622,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // Every dataset's namespace starts in the dataset directory.
         let ds_id = self.datasets_object();
         match dnodes.get(&ds_id) {
-            Some(ds) if ds.kind == ObjType::Datasets => {
+            Some(ds) if ds.kind() == ObjType::Datasets => {
                 reached.insert(ds_id);
                 match self.read_datasets(ds).await {
                     Ok(index) => {
@@ -636,11 +645,11 @@ impl<D: BlockDevice> FileSystem<D> {
                                     ));
                                     complete = false;
                                 }
-                                Some(r) if r.kind != want => report.errors.push(format!(
+                                Some(r) if r.kind() != want => report.errors.push(format!(
                                     "dataset '{}': root object {} is a {}, not a {}",
                                     name,
                                     e.root,
-                                    r.kind.name(),
+                                    r.kind().name(),
                                     want.name()
                                 )),
                                 Some(_) if reached.contains(&e.root) => {
@@ -666,7 +675,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 report.errors.push(format!(
                     "dataset directory (object {}) is a {}",
                     ds_id,
-                    ds.kind.name()
+                    ds.kind().name()
                 ));
                 complete = false;
             }
@@ -680,19 +689,19 @@ impl<D: BlockDevice> FileSystem<D> {
         while let Some((id, path)) = stack.pop() {
             reached.insert(id);
             let d = &dnodes[&id];
-            match d.kind {
+            match d.kind() {
                 ObjType::File => v.file(&path, id, d),
                 ObjType::Volume | ObjType::KvTree => {
                     v.volume(&path, id, d);
                     let snaps = check_lineage(id, d, dnodes, &mut report.errors);
-                    if d.kind == ObjType::KvTree {
+                    if d.kind() == ObjType::KvTree {
                         self.check_kv(&path, d, report).await;
                     }
                     for (sid, name) in snaps {
                         reached.insert(sid);
                         let spath = format!("{}@{}", path, name);
                         v.volume(&spath, sid, &dnodes[&sid]);
-                        if d.kind == ObjType::KvTree {
+                        if d.kind() == ObjType::KvTree {
                             self.check_kv(&spath, &dnodes[&sid], report).await;
                         }
                     }
@@ -716,20 +725,20 @@ impl<D: BlockDevice> FileSystem<D> {
                                 "{}: entry for object {}, which doesn't exist",
                                 child, e.id
                             )),
-                            Some(cd) if !matches!(cd.kind, ObjType::File | ObjType::Directory) => {
+                            Some(cd) if !matches!(cd.kind(), ObjType::File | ObjType::Directory) => {
                                 report.errors.push(format!(
                                     "{}: entry for object {}, a {} (only the dataset directory links those)",
                                     child,
                                     e.id,
-                                    cd.kind.name()
+                                    cd.kind().name()
                                 ))
                             }
-                            Some(cd) if cd.kind != e.kind => report.errors.push(format!(
+                            Some(cd) if cd.kind() != e.kind => report.errors.push(format!(
                                 "{}: entry says {}, object {} is a {}",
                                 child,
                                 e.kind.name(),
                                 e.id,
-                                cd.kind.name()
+                                cd.kind().name()
                             )),
                             Some(_) if reached.contains(&e.id) => report.errors.push(format!(
                                 "{}: object {} is linked more than once",
@@ -777,11 +786,11 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Roots of the valid ring uberblocks older than the committed one.
     async fn older_roots(&self) -> Vec<TreeRoot> {
-        let txg = self.uberblock().await.map_or(0, |u| u.txg);
+        let txg = self.uberblock().await.map_or(Txg::ZERO, |u| u.txg);
         self.uberblock_ring()
             .await
             .into_iter()
-            .filter(|u| u.txg < txg && u.txg + TXG_DEFER_SIZE >= txg)
+            .filter(|u| u.txg < txg && u.txg.after(TXG_DEFER_SIZE) >= txg)
             .map(|u| u.objects)
             .collect()
     }
@@ -791,7 +800,7 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn diff_spacemaps(
         &self,
         live: &BTreeMap<u64, u64>,
-    ) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    ) -> (Vec<Extent>, Vec<Extent>, Vec<Extent>) {
         let (mut leaks, mut referenced_free) = (Vec::new(), Vec::new());
         for ms in self.metaslabs.iter() {
             let ms = ms.read().await;
@@ -801,14 +810,19 @@ impl<D: BlockDevice> FileSystem<D> {
             let live_here = clip(live, start, end);
             // Allocated minus live.
             for (&s, &l) in &allocated {
-                leaks.extend(complement(&live_here, s, s + l));
+                leaks.extend(
+                    complement(&live_here, s, s + l)
+                        .into_iter()
+                        .map(|(s, l)| Extent::new(s, l)),
+                );
             }
             referenced_free.extend(intersect(&live_here, &released));
         }
         let data_start = self.layout.data_start;
         let data_end = data_start + self.layout.metaslab_count * self.layout.metaslab_size_blocks;
-        let mut out_of_range: Vec<(u64, u64)> = clip(live, 0, data_start).into_iter().collect();
-        out_of_range.extend(clip(live, data_end, u64::MAX));
+        let extents = |m: BTreeMap<u64, u64>| m.into_iter().map(|(s, l)| Extent::new(s, l));
+        let mut out_of_range: Vec<Extent> = extents(clip(live, 0, data_start)).collect();
+        out_of_range.extend(extents(clip(live, data_end, u64::MAX)));
         (leaks, referenced_free, out_of_range)
     }
 
@@ -824,7 +838,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let (live, walk) = self.live_set().await;
         let (leaks, referenced_free, out_of_range) = self.diff_spacemaps(&live.live).await;
         let mut report = FsckReport {
-            txg: self.uberblock().await.map_or(0, |u| u.txg),
+            txg: self.uberblock().await.map_or(Txg::ZERO, |u| u.txg),
             repair,
             records: walk.records,
             live_blocks: live.live.values().sum(),
@@ -842,16 +856,19 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let mut changed = false;
         if !report.referenced_free.is_empty() {
-            for &(s, l) in &report.referenced_free {
+            for &Extent { start: s, len: l } in &report.referenced_free {
                 if let Some(idx) = self.layout.metaslab_for_block(s) {
-                    self.metaslabs[idx].write().await.mark_allocated(s, l);
+                    self.metaslabs[idx.index()]
+                        .write()
+                        .await
+                        .mark_allocated(s, l);
                 }
             }
             report.referenced_free_repaired = true;
             changed = true;
         }
         if !report.leaks.is_empty() && !report.incomplete {
-            for &(s, l) in &report.leaks {
+            for &Extent { start: s, len: l } in &report.leaks {
                 self.free(s, l).await?;
             }
             report.leaks_repaired = true;
@@ -898,7 +915,11 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let protected = self.protected_set(older).await;
-        let release_txg = self.uberblock().await.map_or(0, |u| u.txg) + TXG_DEFER_SIZE;
+        let release_txg = self
+            .uberblock()
+            .await
+            .map_or(Txg::ZERO, |u| u.txg)
+            .after(TXG_DEFER_SIZE);
         let mut report = RebuildReport {
             live_blocks: live.live.values().sum(),
             errors: walk.errors,
@@ -945,7 +966,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Find all blocks that are allocated but not referenced by any live data
-    pub async fn find_orphaned_blocks(&self) -> Result<Vec<(u64, u64)>, FileSystemError> {
+    pub async fn find_orphaned_blocks(&self) -> Result<Vec<Extent>, FileSystemError> {
         let (live, walk) = self.live_set().await;
         if walk.incomplete {
             return Err(FileSystemError::ChecksumMismatch);
@@ -1001,7 +1022,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let data = match self.read_record(&ptr).await {
                     Ok(d) => d,
                     Err(_) => {
-                        item.lost.push((offset, lost));
+                        item.lost.push(offset..offset + lost);
                         continue;
                     }
                 };
@@ -1019,10 +1040,10 @@ impl<D: BlockDevice> FileSystem<D> {
                             }
                         }
                     }
-                    Err(_) => item.lost.push((offset, lost)),
+                    Err(_) => item.lost.push(offset..offset + lost),
                 }
             }
-            item.lost.sort_unstable();
+            item.lost.sort_unstable_by_key(|r| r.start);
             report.items.push(item);
         }
         Ok(report)

@@ -2,6 +2,7 @@ use super::*;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{LoadOptions, Rewind};
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
+use crate::types::Txg;
 use crate::vdev::Pool;
 use std::path::Path;
 use std::sync::Arc;
@@ -102,7 +103,7 @@ async fn leaks_are_found_and_freed() {
 
     let report = fs.fsck(false).await.unwrap();
     assert!(!report.is_clean());
-    assert_eq!(report.leaks, vec![(leaked.start, leaked.len)]);
+    assert_eq!(report.leaks, vec![leaked]);
     assert_eq!(fs.find_orphaned_blocks().await.unwrap().len(), 1);
 
     let report = fs.fsck(true).await.unwrap();
@@ -128,10 +129,7 @@ async fn referenced_free_blocks_are_reallocated() {
     fs.commit_txg().await.unwrap();
 
     let report = fs.fsck(false).await.unwrap();
-    assert_eq!(
-        report.referenced_free,
-        vec![(victim.lba, victim.asize as u64)]
-    );
+    assert_eq!(report.referenced_free, vec![victim.extent()]);
     let report = fs.fsck(true).await.unwrap();
     assert!(
         report.referenced_free_repaired && report.is_clean(),
@@ -236,7 +234,7 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
             pool.dev().await,
             LoadOptions {
                 read_only: true,
-                rewind: Rewind::Txg(newest + 100),
+                rewind: Rewind::Txg(newest.after(100)),
             },
         )
         .await
@@ -258,7 +256,7 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     assert!(fs.uberblock().await.unwrap().txg > newest);
     assert!(fs.fsck(false).await.unwrap().is_clean());
     // The discarded TXGs are gone from the ring, so nothing can go back to them.
-    let ring: Vec<u64> = fs.uberblock_ring().await.iter().map(|u| u.txg).collect();
+    let ring: Vec<Txg> = fs.uberblock_ring().await.iter().map(|u| u.txg).collect();
     assert!(
         ring.iter().all(|&t| t <= good_txg || t > newest),
         "discarded TXGs still importable: {:?}",
@@ -314,7 +312,7 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     for p in &a_blocks {
         let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
         assert!(
-            !fs.metaslabs[ms]
+            !fs.metaslabs[ms.index()]
                 .read()
                 .await
                 .released_map()
@@ -350,7 +348,7 @@ async fn damaged_directory_hides_no_space() {
     for p in &a_blocks {
         let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
         assert!(
-            !fs.metaslabs[ms]
+            !fs.metaslabs[ms.index()]
                 .read()
                 .await
                 .released_map()
@@ -429,7 +427,10 @@ async fn salvage_copies_what_is_readable() {
     let damaged: Vec<_> = report.items.iter().filter(|i| !i.lost.is_empty()).collect();
     assert_eq!(damaged.len(), 1);
     assert_eq!(damaged[0].path, "/big");
-    assert_eq!(damaged[0].lost, vec![(off as u64, lost.lsize as u64)]);
+    assert_eq!(
+        damaged[0].lost,
+        vec![off as u64..off as u64 + lost.lsize as u64]
+    );
 }
 
 /// Counts `read_blocks` calls reaching the device.
@@ -443,11 +444,19 @@ impl<D: BlockDevice> BlockDevice for CountingDev<D> {
     async fn flush(&self) -> Result<(), crate::disk::DiskError> {
         self.inner.flush().await
     }
-    async fn read_block(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+    async fn read_block(
+        &self,
+        b: u64,
+        buf: &mut crate::disk::Block,
+    ) -> Result<(), crate::disk::DiskError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_block(b, buf).await
     }
-    async fn read_blocks(&self, b: u64, buf: &mut [u8]) -> Result<(), crate::disk::DiskError> {
+    async fn read_blocks(
+        &self,
+        b: u64,
+        buf: &mut [crate::disk::Block],
+    ) -> Result<(), crate::disk::DiskError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_blocks(b, buf).await
     }
@@ -458,7 +467,11 @@ impl<D: BlockDevice> BlockDevice for CountingDev<D> {
     ) -> Result<(), crate::disk::DiskError> {
         self.inner.write_block(b, buf).await
     }
-    async fn write_blocks(&self, b: u64, buf: &[u8]) -> Result<(), crate::disk::DiskError> {
+    async fn write_blocks(
+        &self,
+        b: u64,
+        buf: &[crate::disk::Block],
+    ) -> Result<(), crate::disk::DiskError> {
         self.inner.write_blocks(b, buf).await
     }
     async fn reconstruct_candidates(
@@ -585,10 +598,13 @@ fn interval_helpers() {
     assert!(insert_range(&mut m, 10, 5).is_empty());
     assert!(insert_range(&mut m, 15, 5).is_empty()); // adjacent: merged
     assert_eq!(m, BTreeMap::from([(10, 10)]));
-    assert_eq!(insert_range(&mut m, 18, 4), vec![(18, 2)]);
+    assert_eq!(insert_range(&mut m, 18, 4), vec![Extent::new(18, 2)]);
     assert_eq!(m, BTreeMap::from([(10, 12)]));
     assert_eq!(clip(&m, 12, 15), BTreeMap::from([(12, 3)]));
     assert_eq!(complement(&m, 0, 30), BTreeMap::from([(0, 10), (22, 8)]));
     let other = BTreeMap::from([(5, 7), (20, 5)]);
-    assert_eq!(intersect(&m, &other), vec![(10, 2), (20, 2)]);
+    assert_eq!(
+        intersect(&m, &other),
+        vec![Extent::new(10, 2), Extent::new(20, 2)]
+    );
 }

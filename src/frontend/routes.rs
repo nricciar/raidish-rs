@@ -57,7 +57,7 @@ pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res
     }
     let now = chrono::Utc::now().timestamp();
     let asked = match &req.expires {
-        Some(e) => Some(now + crate::cli_pki::parse_duration(e).map_err(bad)?),
+        Some(e) => Some(now + crate::pki::parse_duration(e).map_err(bad)?),
         None => None,
     };
     let exp = match (asked, caller.exp) {

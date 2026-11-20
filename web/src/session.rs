@@ -24,7 +24,7 @@ pub struct Snapshot {
 
 pub struct LayoutData {
     pub layout: Layout,
-    pub txg: u64,
+    pub txg: raidish::types::Txg,
 }
 
 /// `Rc` compared by identity, for component props: cheap, and a new
@@ -85,39 +85,31 @@ pub fn get(url: &str) -> gloo_net::http::RequestBuilder {
 }
 
 /// Who this node says we are.
-#[derive(serde::Deserialize, Clone, PartialEq, Debug)]
-pub struct Whoami {
-    pub name: String,
-    pub role: String,
-    /// "open" when the node has no TLS (no logins at all).
-    pub via: serde_json::Value,
+pub use raidish::api_types::Principal as Whoami;
+
+/// Why [`whoami`] got no answer.
+pub enum NotIn {
+    /// The node turned the token down (or there was none): it's no good.
+    Rejected(String),
+    /// No answer to go by (the node down, restarting, erroring): the
+    /// token may be fine.
+    Unreachable(String),
 }
 
-impl Whoami {
-    pub fn open(&self) -> bool {
-        self.via == serde_json::Value::String("open".into())
-    }
-}
-
-/// Ok(who) if we're let in, Err(Some(reason)) if not, Err(None) if the node
-/// couldn't be asked.
-pub async fn whoami() -> Result<Whoami, Option<String>> {
+pub async fn whoami() -> Result<Whoami, NotIn> {
     let resp = get("/api/v1/auth/whoami")
         .send()
         .await
-        .map_err(|e| Some(format!("can't reach the node: {}", e)))?;
-    if resp.status() == 401 {
-        return Err(Some(resp.text().await.unwrap_or_default()));
+        .map_err(|e| NotIn::Unreachable(format!("can't reach the node: {}", e)))?;
+    if matches!(resp.status(), 401 | 403) {
+        return Err(NotIn::Rejected(resp.text().await.unwrap_or_default()));
     }
     if !resp.ok() {
-        // An older node without the endpoint: no auth.
-        return Ok(Whoami {
-            name: "anonymous".into(),
-            role: "admin".into(),
-            via: serde_json::Value::String("open".into()),
-        });
+        return Err(NotIn::Unreachable(format!("HTTP {}", resp.status())));
     }
-    resp.json().await.map_err(|e| Some(e.to_string()))
+    resp.json()
+        .await
+        .map_err(|e| NotIn::Unreachable(e.to_string()))
 }
 
 pub fn origin() -> String {
@@ -190,7 +182,7 @@ impl Session {
 
     pub fn io_stats(&self) -> Vec<IoStats> {
         self.disks
-            .disks
+            .caddies()
             .iter()
             .map(|c| c.io_stats().unwrap_or_default())
             .collect()

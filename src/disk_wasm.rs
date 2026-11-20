@@ -170,7 +170,15 @@ impl RemoteDisk {
             return Err(DiskError::Disconnected);
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let msg = encode_request(op, self.disk_id, block, count, id, lease_epoch(), data);
+        let msg = encode_request(
+            op,
+            self.disk_id,
+            block,
+            count,
+            id,
+            crate::types::Epoch::NONE,
+            data,
+        );
         let (tx, rx) = oneshot::channel();
         let started = now_ms();
         if queue.unbounded_send(Job { id, msg, reply: tx }).is_err() {
@@ -220,7 +228,8 @@ enum SocketEvent {
 
 /// Open the socket, wait for it to connect, and install its request queue.
 async fn connect(disk: &Arc<RemoteDisk>) -> Result<(), String> {
-    let ws = WebSocket::new(&with_token(&disk.url)).map_err(|e| format!("{:?}", e))?;
+    let ws = WebSocket::new(&with_token(&crate::websocket::versioned(&disk.url)))
+        .map_err(|e| format!("{:?}", e))?;
     ws.set_binary_type(BinaryType::Arraybuffer);
     let (opened_tx, opened_rx) = oneshot::channel::<Result<(), String>>();
     let (jobs_tx, jobs_rx) = mpsc::unbounded::<Job>();

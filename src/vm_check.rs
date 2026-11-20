@@ -4,44 +4,11 @@
 //! about the VM's CPU and its free memory (`Live`).
 
 use crate::node_facts::NodeFacts;
+use crate::types::Bytes;
 use crate::vm::{El, parse_root};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// It can't run there.
-    No,
-    /// Shut down here, started there.
-    Cold,
-    /// Migrated live.
-    Live,
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Mode::No => "no",
-            Mode::Cold => "cold",
-            Mode::Live => "live",
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Reason {
-    /// What it rules out: `no` (it can't run there), `cold` (not live), or
-    /// `warn` (nothing, but worth knowing).
-    pub level: String,
-    pub text: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Verdict {
-    pub node: String,
-    pub mode: Mode,
-    pub reasons: Vec<Reason>,
-}
+pub use crate::api_types::{Mode, Reason, ReasonLevel, Verdict};
 
 impl Verdict {
     fn new(node: &str) -> Verdict {
@@ -54,36 +21,22 @@ impl Verdict {
     fn no(&mut self, t: impl Into<String>) {
         self.mode = Mode::No;
         self.reasons.push(Reason {
-            level: "no".into(),
+            level: ReasonLevel::No,
             text: t.into(),
         });
     }
     fn cold(&mut self, t: impl Into<String>) {
         self.mode = self.mode.min(Mode::Cold);
         self.reasons.push(Reason {
-            level: "cold".into(),
+            level: ReasonLevel::Cold,
             text: t.into(),
         });
     }
     fn warn(&mut self, t: impl Into<String>) {
         self.reasons.push(Reason {
-            level: "warn".into(),
+            level: ReasonLevel::Warn,
             text: t.into(),
         });
-    }
-    /// The reasons that set its mode, joined.
-    pub fn why(&self) -> String {
-        let want = match self.mode {
-            Mode::No => "no",
-            Mode::Cold => "cold",
-            Mode::Live => "warn",
-        };
-        self.reasons
-            .iter()
-            .filter(|r| r.level == want)
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join("; ")
     }
 }
 
@@ -94,7 +47,7 @@ pub struct Needs {
     pub virt_type: String,
     pub arch: Option<String>,
     pub machine: Option<String>,
-    pub memory_mb: u64,
+    pub memory: Bytes,
     /// `host-passthrough`, `host-model`, `custom`, `maximum`; None: no
     /// `<cpu>` (qemu's default model, fine anywhere).
     pub cpu_mode: Option<String>,
@@ -106,27 +59,14 @@ pub struct Needs {
     pub bridges: Vec<String>,
 }
 
-fn memory_mb(el: &El) -> u64 {
-    let n: u64 = el.text().parse().unwrap_or(0);
-    let kib = match el.attr("unit").unwrap_or("KiB") {
-        "b" | "bytes" => n / 1024,
-        "KB" => n * 1000 / 1024,
-        "k" | "KiB" => n,
-        "MB" => n * 1_000_000 / 1024,
-        "M" | "MiB" => n * 1024,
-        "GB" => n * 1_000_000_000 / 1024,
-        "G" | "GiB" => n << 20,
-        "T" | "TiB" => n << 30,
-        _ => n,
-    };
-    kib / 1024
-}
-
 /// Read what `xml` (a domain) needs.
-pub fn needs(xml: &str) -> Result<Needs, String> {
+pub fn needs(xml: &str) -> Result<Needs, crate::vm::VmError> {
     let root = parse_root(xml)?;
     if root.name != "domain" {
-        return Err(format!("expected a <domain>, got <{}>", root.name));
+        return Err(crate::vm::VmError::Invalid(format!(
+            "expected a <domain>, got <{}>",
+            root.name
+        )));
     }
     let mut n = Needs {
         virt_type: root.attr("type").unwrap_or("kvm").to_string(),
@@ -137,7 +77,7 @@ pub fn needs(xml: &str) -> Result<Needs, String> {
         n.machine = t.attr("machine").map(str::to_string);
     }
     if let Some(m) = root.child("memory") {
-        n.memory_mb = memory_mb(m);
+        n.memory = crate::vm_def::libvirt_memory(&m.text(), m.attr("unit")).unwrap_or_default();
     }
     if let Some(c) = root.child("cpu") {
         n.cpu_mode = Some(c.attr("mode").unwrap_or("custom").to_string());
@@ -216,7 +156,7 @@ pub struct Live {
     /// `cpu-compare` of the VM's CPU there: Err with libvirt's reason.
     pub cpu: Option<Result<String, String>>,
     /// Its free memory, MiB.
-    pub available_mb: Option<u64>,
+    pub available: Option<Bytes>,
 }
 
 /// The verdict for moving a VM that needs `n` from `source` (None: it
@@ -270,14 +210,18 @@ pub fn check(
             v.no(format!("{} has no bridge '{}'", to, br));
         }
     }
-    match live.and_then(|l| l.available_mb) {
-        Some(free) if n.memory_mb > free => v.warn(format!(
+    match live.and_then(|l| l.available) {
+        Some(free) if n.memory > free => v.warn(format!(
             "{} has {} MiB available, the VM wants {} MiB",
-            to, free, n.memory_mb
+            to,
+            free.mib(),
+            n.memory.mib()
         )),
-        None if n.memory_mb > t.host.memory_mb && t.host.memory_mb > 0 => v.warn(format!(
+        None if n.memory > t.host.memory && t.host.memory > Bytes::default() => v.warn(format!(
             "{} has {} MiB of memory, the VM wants {} MiB",
-            to, t.host.memory_mb, n.memory_mb
+            to,
+            t.host.memory.mib(),
+            n.memory.mib()
         )),
         _ => {}
     }

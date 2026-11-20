@@ -209,7 +209,7 @@ async fn fsck_finds_a_damaged_tree() {
     let ds = fs.open_kv("kv").await.unwrap();
     let leaf = {
         let t = crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap();
-        let mut id = t.header.root;
+        let mut id = t.header.root.unwrap().get();
         loop {
             match t.node(id).await.unwrap() {
                 crate::btree::Node::Branch { children, .. } => id = children[0],

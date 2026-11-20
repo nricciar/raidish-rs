@@ -31,11 +31,12 @@
 //!   `fs_locations` lists every node's address, for clients to find them.
 
 pub mod attrs;
+mod ops;
 pub mod state;
 
 use crate::disk::{BlockDevice, FileId};
 use crate::inode::{ObjType, SetAttrs};
-use crate::nfs::backend::{Backend, status as s3};
+use crate::nfs::backend::{Backend, NfsStat, status as s3};
 use crate::nfs::rpc::{Call, Cred, Reply};
 use crate::nfs::xdr::{Reader, Writer, XdrError, XdrResult};
 use state::{Exchanged, Locker, Range, Sequenced, StateTable, Stateid};
@@ -86,7 +87,7 @@ pub enum V4Forwarded {
     Reply(Vec<u8>),
     /// The SEQUENCE went through (the client, the session's slot count),
     /// or its status.
-    Sequenced(Result<(u64, u32), u32>),
+    Sequenced(Result<(u64, u32), NfsStat>),
     /// Not the owner (any more): try again.
     NotOwner,
 }
@@ -125,59 +126,53 @@ pub struct Device {
 
 /// NFSv4 status codes.
 pub mod err {
-    pub const OK: u32 = 0;
-    pub const NOENT: u32 = 2;
-    pub const IO: u32 = 5;
-    pub const NXIO: u32 = 6;
-    pub const EXIST: u32 = 17;
-    pub const NOTDIR: u32 = 20;
-    pub const ISDIR: u32 = 21;
-    pub const INVAL: u32 = 22;
-    pub const NOSPC: u32 = 28;
-    pub const NAMETOOLONG: u32 = 63;
-    pub const NOTEMPTY: u32 = 66;
-    pub const STALE: u32 = 70;
-    pub const BADHANDLE: u32 = 10001;
-    pub const BAD_COOKIE: u32 = 10003;
-    pub const GRACE: u32 = 10013;
-    pub const RECLAIM_BAD: u32 = 10034;
-    pub const NOTSUPP: u32 = 10004;
-    pub const TOOSMALL: u32 = 10005;
-    pub const SERVERFAULT: u32 = 10006;
-    pub const BADTYPE: u32 = 10007;
-    pub const DELAY: u32 = 10008;
-    pub const SAME: u32 = 10009;
-    pub const DENIED: u32 = 10010;
-    pub const LOCKED: u32 = 10012;
-    pub const SHARE_DENIED: u32 = 10015;
-    pub const NOFILEHANDLE: u32 = 10020;
-    pub const MINOR_VERS_MISMATCH: u32 = 10021;
-    pub const STALE_CLIENTID: u32 = 10022;
-    pub const STALE_STATEID: u32 = 10023;
-    pub const OLD_STATEID: u32 = 10024;
-    pub const BAD_STATEID: u32 = 10025;
-    pub const NOT_SAME: u32 = 10027;
-    pub const RESTOREFH: u32 = 10030;
-    pub const ATTRNOTSUPP: u32 = 10032;
-    pub const NO_GRACE: u32 = 10033;
-    pub const BADXDR: u32 = 10036;
-    pub const LOCKS_HELD: u32 = 10037;
-    pub const BADOWNER: u32 = 10039;
-    pub const BADNAME: u32 = 10041;
-    pub const OP_ILLEGAL: u32 = 10044;
-    pub const BADIOMODE: u32 = 10049;
-    pub const BADSESSION: u32 = 10052;
-    pub const LAYOUTUNAVAILABLE: u32 = 10059;
-    pub const UNKNOWN_LAYOUTTYPE: u32 = 10062;
-    pub const BADSLOT: u32 = 10053;
-    pub const COMPLETE_ALREADY: u32 = 10054;
-    pub const SEQ_MISORDERED: u32 = 10063;
-    pub const SEQUENCE_POS: u32 = 10064;
-    pub const RETRY_UNCACHED_REP: u32 = 10068;
-    pub const TOO_MANY_OPS: u32 = 10070;
-    pub const OP_NOT_IN_SESSION: u32 = 10071;
-    pub const CLIENTID_BUSY: u32 = 10074;
-    pub const NOT_ONLY_OP: u32 = 10081;
+    use crate::nfs::backend::NfsStat;
+    pub const OK: NfsStat = NfsStat::from_code(0);
+    pub const NOENT: NfsStat = NfsStat::from_code(2);
+    #[cfg(test)]
+    pub const NXIO: NfsStat = NfsStat::from_code(6);
+    pub const ISDIR: NfsStat = NfsStat::from_code(21);
+    pub const INVAL: NfsStat = NfsStat::from_code(22);
+    pub const NAMETOOLONG: NfsStat = NfsStat::from_code(63);
+    pub const BAD_COOKIE: NfsStat = NfsStat::from_code(10003);
+    pub const GRACE: NfsStat = NfsStat::from_code(10013);
+    pub const RECLAIM_BAD: NfsStat = NfsStat::from_code(10034);
+    pub const NOTSUPP: NfsStat = NfsStat::from_code(10004);
+    pub const TOOSMALL: NfsStat = NfsStat::from_code(10005);
+    pub const BADTYPE: NfsStat = NfsStat::from_code(10007);
+    pub const DELAY: NfsStat = NfsStat::from_code(10008);
+    pub const SAME: NfsStat = NfsStat::from_code(10009);
+    pub const DENIED: NfsStat = NfsStat::from_code(10010);
+    pub const LOCKED: NfsStat = NfsStat::from_code(10012);
+    pub const SHARE_DENIED: NfsStat = NfsStat::from_code(10015);
+    pub const NOFILEHANDLE: NfsStat = NfsStat::from_code(10020);
+    pub const MINOR_VERS_MISMATCH: NfsStat = NfsStat::from_code(10021);
+    pub const STALE_CLIENTID: NfsStat = NfsStat::from_code(10022);
+    pub const STALE_STATEID: NfsStat = NfsStat::from_code(10023);
+    pub const OLD_STATEID: NfsStat = NfsStat::from_code(10024);
+    pub const BAD_STATEID: NfsStat = NfsStat::from_code(10025);
+    pub const NOT_SAME: NfsStat = NfsStat::from_code(10027);
+    pub const RESTOREFH: NfsStat = NfsStat::from_code(10030);
+    pub const ATTRNOTSUPP: NfsStat = NfsStat::from_code(10032);
+    pub const NO_GRACE: NfsStat = NfsStat::from_code(10033);
+    pub const BADXDR: NfsStat = NfsStat::from_code(10036);
+    pub const LOCKS_HELD: NfsStat = NfsStat::from_code(10037);
+    pub const BADOWNER: NfsStat = NfsStat::from_code(10039);
+    pub const BADNAME: NfsStat = NfsStat::from_code(10041);
+    pub const OP_ILLEGAL: NfsStat = NfsStat::from_code(10044);
+    pub const BADIOMODE: NfsStat = NfsStat::from_code(10049);
+    pub const BADSESSION: NfsStat = NfsStat::from_code(10052);
+    pub const LAYOUTUNAVAILABLE: NfsStat = NfsStat::from_code(10059);
+    pub const UNKNOWN_LAYOUTTYPE: NfsStat = NfsStat::from_code(10062);
+    pub const BADSLOT: NfsStat = NfsStat::from_code(10053);
+    pub const COMPLETE_ALREADY: NfsStat = NfsStat::from_code(10054);
+    pub const SEQ_MISORDERED: NfsStat = NfsStat::from_code(10063);
+    pub const SEQUENCE_POS: NfsStat = NfsStat::from_code(10064);
+    pub const RETRY_UNCACHED_REP: NfsStat = NfsStat::from_code(10068);
+    pub const TOO_MANY_OPS: NfsStat = NfsStat::from_code(10070);
+    pub const OP_NOT_IN_SESSION: NfsStat = NfsStat::from_code(10071);
+    pub const CLIENTID_BUSY: NfsStat = NfsStat::from_code(10074);
+    pub const NOT_ONLY_OP: NfsStat = NfsStat::from_code(10081);
 }
 
 /// Operation numbers.
@@ -235,7 +230,7 @@ pub mod op {
 
 /// What the backend's (NFSv3-numbered) status is in NFSv4 terms. The
 /// shared codes have the same numbers; `JUKEBOX` is `DELAY`.
-fn v4(st: u32) -> u32 {
+fn v4(st: NfsStat) -> NfsStat {
     match st {
         s3::NOT_SYNC => err::INVAL,
         s3::JUKEBOX => err::DELAY,
@@ -260,14 +255,14 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn fh(&self) -> Result<FileId, u32> {
+    fn fh(&self) -> Result<FileId, NfsStat> {
         self.cfh.ok_or(err::NOFILEHANDLE)
     }
-    fn client(&self) -> Result<u64, u32> {
+    fn client(&self) -> Result<u64, NfsStat> {
         self.client.ok_or(err::OP_NOT_IN_SESSION)
     }
     /// A stateid argument, with "the current stateid" resolved.
-    fn stateid(&self, s: Stateid) -> Result<Stateid, u32> {
+    fn stateid(&self, s: Stateid) -> Result<Stateid, NfsStat> {
         if s == Stateid::CURRENT {
             return self.cur.ok_or(err::BAD_STATEID);
         }
@@ -276,7 +271,7 @@ impl Ctx {
 }
 
 /// An operation's outcome: its status, then (if OK) its results in `w`.
-type OpResult = Result<u32, XdrError>;
+type OpResult = Result<NfsStat, XdrError>;
 
 fn read_stateid(r: &mut Reader<'_>) -> XdrResult<Stateid> {
     let seqid = r.u32()?;
@@ -289,7 +284,7 @@ fn write_stateid(w: &mut Writer, s: &Stateid) {
 }
 
 /// `component4`: a name in a directory.
-fn name_ok(n: &str) -> Result<(), u32> {
+fn name_ok(n: &str) -> Result<(), NfsStat> {
     if n.is_empty() {
         return Err(err::INVAL);
     }
@@ -589,9 +584,9 @@ impl<D: BlockDevice + 'static> Server<D> {
         let tag = r.opaque(1024)?.to_vec();
         let minor = r.u32()?;
         let count = r.u32()?;
-        let head = |st: u32, n: u32| {
+        let head = |st: NfsStat, n: u32| {
             let mut w = Writer::new();
-            w.u32(st).opaque(&tag).u32(n);
+            w.stat(st).opaque(&tag).u32(n);
             w
         };
         if minor != 1 && minor != 2 {
@@ -611,7 +606,7 @@ impl<D: BlockDevice + 'static> Server<D> {
             // Past SEQUENCE, a request that doesn't decode is answered
             // (BADXDR), never dropped: its slot must be finished.
             let Ok(opnum) = r.u32() else {
-                results.u32(op::ILLEGAL).u32(err::BADXDR);
+                results.u32(op::ILLEGAL).stat(err::BADXDR);
                 done += 1;
                 last = err::BADXDR;
                 break;
@@ -656,7 +651,7 @@ impl<D: BlockDevice + 'static> Server<D> {
             } else {
                 opnum
             };
-            results.u32(reported).u32(status);
+            results.u32(reported).stat(status);
             if status == err::OK {
                 results.buf.extend_from_slice(&w.buf);
             } else if !w.is_empty() {
@@ -678,43 +673,6 @@ impl<D: BlockDevice + 'static> Server<D> {
             self.st().finish(&sid, slotid, kept);
         }
         Ok(out)
-    }
-
-    async fn sequence(
-        &self,
-        ctx: &mut Ctx,
-        r: &mut Reader<'_>,
-        w: &mut Writer,
-        count: u32,
-        pre: Option<(u64, u32)>,
-    ) -> XdrResult<Seq> {
-        let sid: [u8; 16] = r.fixed(16)?.try_into().unwrap();
-        let seqid = r.u32()?;
-        let slotid = r.u32()?;
-        let _highest = r.u32()?;
-        let cache = r.bool()?;
-        if count > state::MAX_OPS {
-            return Ok(Seq::Run(err::TOO_MANY_OPS, None));
-        }
-        if let Some((client, slots)) = pre {
-            ctx.client = Some(client);
-            ctx.trusted = true;
-            w.fixed(&sid).u32(seqid).u32(slotid);
-            w.u32(slots - 1).u32(slots - 1).u32(0);
-            return Ok(Seq::Run(err::OK, None));
-        }
-        let st = self.st();
-        match st.sequence(&sid, slotid, seqid) {
-            Err(st) => Ok(Seq::Run(st, None)),
-            Ok(Sequenced::Replay(bytes)) => Ok(Seq::Replay(bytes)),
-            Ok(Sequenced::New { client }) => {
-                ctx.client = Some(client);
-                let slots = st.slots(&sid).unwrap_or(1);
-                w.fixed(&sid).u32(seqid).u32(slotid);
-                w.u32(slots - 1).u32(slots - 1).u32(0);
-                Ok(Seq::Run(err::OK, Some((sid, slotid, cache))))
-            }
-        }
     }
 
     /// Run one operation (its arguments are next in `r`).
@@ -854,7 +812,7 @@ impl<D: BlockDevice + 'static> Server<D> {
                 };
                 w.u32(n);
                 for s in &ids {
-                    w.u32(self.st().test(client, s));
+                    w.stat(self.st().test(client, s));
                 }
                 Ok(err::OK)
             }
@@ -899,1041 +857,24 @@ impl<D: BlockDevice + 'static> Server<D> {
         }
     }
 
-    /// The nodes as pNFS data servers (none: no pNFS).
-    fn devices(&self) -> Vec<Device> {
-        self.cluster.as_ref().map_or(Vec::new(), |c| c.devices())
-    }
-
-    fn pnfs(&self) -> bool {
-        !self.devices().is_empty()
-    }
-
-    /// LAYOUTGET: a flexfiles layout of the current file.
-    async fn layoutget(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let _signal = r.bool()?;
-        let kind = r.u32()?;
-        let iomode = r.u32()?;
-        r.u64()?; // offset
-        r.u64()?; // length
-        r.u64()?; // minlength
-        let by = read_stateid(r)?;
-        let _maxcount = r.u32()?;
-        let go = async {
-            let file = ctx.fh()?;
-            let devices = self.devices();
-            if devices.is_empty() {
-                return Err(err::LAYOUTUNAVAILABLE);
-            }
-            if kind != LAYOUT4_FLEX_FILES {
-                return Err(err::UNKNOWN_LAYOUTTYPE);
-            }
-            let rw = match iomode {
-                1 => false,
-                2 => true,
-                _ => return Err(err::BADIOMODE),
-            };
-            let a = self.backend.getattr(file).await.map_err(v4)?;
-            if a.kind != ObjType::File {
-                return Err(err::INVAL);
-            }
-            let by = ctx.stateid(by)?;
-            let sid = self.st().layout_get(ctx.client()?, &by, file, rw)?;
-            // Reads: every node. Writes: the node writing it, else this one.
-            let mirrors: Vec<&Device> = if rw {
-                let writer = self
-                    .backend
-                    .writer_of(file)
-                    .await
-                    .unwrap_or_else(|| self.node.clone());
-                let pick = devices
-                    .iter()
-                    .find(|d| d.node == writer)
-                    .or(devices.first());
-                pick.into_iter().collect()
-            } else {
-                devices.iter().collect()
-            };
-            let fh = self.backend.handle(file).await.map_err(v4)?;
-            let mut body = Writer::new();
-            body.u64(0); // stripe unit: no striping
-            body.u32(mirrors.len() as u32);
-            for d in &mirrors {
-                body.u32(1); // one data server per mirror
-                body.fixed(&device_id(d.id)).u32(1);
-                write_stateid(&mut body, &Stateid::ANONYMOUS);
-                body.u32(1).opaque(&fh);
-                body.string(&a.uid.to_string()).string(&a.gid.to_string());
-            }
-            // FF_FLAGS_NO_LAYOUTCOMMIT: sizes and times are the pool's.
-            body.u32(1).u32(0);
-            Ok((sid, if rw { 2 } else { 1 }, body))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((sid, mode, body)) => {
-                ctx.cur = Some(sid);
-                w.bool(true); // returned at close
-                write_stateid(w, &sid);
-                w.u32(1).u64(0).u64(u64::MAX).u32(mode);
-                w.u32(LAYOUT4_FLEX_FILES).opaque(&body.buf);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn layoutreturn(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let _reclaim = r.bool()?;
-        let _kind = r.u32()?;
-        let _iomode = r.u32()?;
-        let returntype = r.u32()?;
-        let file_return = if returntype == 1 {
-            r.u64()?;
-            r.u64()?;
-            let sid = read_stateid(r)?;
-            r.opaque(1 << 16)?; // flexfiles I/O errors and stats: not kept
-            Some(sid)
-        } else {
-            None
-        };
-        let client = match ctx.client() {
-            Ok(c) => c,
-            Err(e) => return Ok(e),
-        };
-        match file_return {
-            Some(sid) => {
-                let file = match ctx.fh() {
-                    Ok(f) => f,
-                    Err(e) => return Ok(e),
-                };
-                let sid = match ctx.stateid(sid) {
-                    Ok(s) => s,
-                    Err(e) => return Ok(e),
-                };
-                // Already gone (returned at close) is fine.
-                let _ = self.st().layout_return(client, &sid, file);
-            }
-            None => self.st().layout_return_all(client),
-        }
-        w.bool(false); // no layout left
-        Ok(err::OK)
-    }
-
-    async fn layoutcommit(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        r.u64()?;
-        r.u64()?;
-        r.bool()?;
-        read_stateid(r)?;
-        if r.bool()? {
-            r.u64()?;
-        }
-        if r.bool()? {
-            r.u64()?;
-            r.u32()?;
-        }
-        r.u32()?;
-        r.opaque(1 << 16)?;
-        if let Err(e) = ctx.fh() {
-            return Ok(e);
-        }
-        // Nothing to update: the pool keeps sizes and times itself.
-        w.bool(false);
-        Ok(err::OK)
-    }
-
-    async fn getdeviceinfo(&self, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let id: [u8; 16] = r.fixed(16)?.try_into().unwrap();
-        let kind = r.u32()?;
-        let maxcount = r.u32()?;
-        attrs::read_bitmap(r)?;
-        if kind != LAYOUT4_FLEX_FILES {
-            return Ok(err::UNKNOWN_LAYOUTTYPE);
-        }
-        let devices = self.devices();
-        let Some(d) = node_of_device(&id).and_then(|n| devices.iter().find(|d| d.id == n)) else {
-            return Ok(err::NOENT);
-        };
-        let (netid, addr) = uaddr(&d.addr, d.port);
-        let mut body = Writer::new();
-        body.u32(1).string(netid).string(&addr);
-        // NFSv3, loosely coupled, 1 MiB I/O.
-        body.u32(1)
-            .u32(3)
-            .u32(0)
-            .u32(attrs::MAX_IO as u32)
-            .u32(attrs::MAX_IO as u32)
-            .bool(false);
-        if maxcount != 0 && body.len() + 16 > maxcount as usize {
-            w.u32(body.len() as u32 + 16);
-            return Ok(err::TOOSMALL);
-        }
-        w.u32(LAYOUT4_FLEX_FILES).opaque(&body.buf);
-        w.u32(0); // no notifications
-        Ok(err::OK)
-    }
-
-    async fn layouterror(&self, r: &mut Reader<'_>) -> OpResult {
-        r.u64()?;
-        r.u64()?;
-        read_stateid(r)?;
-        let n = r.u32()?;
-        if n > 64 {
-            return Err(XdrError("too many errors"));
-        }
-        for _ in 0..n {
-            let d: [u8; 16] = r.fixed(16)?.try_into().unwrap();
-            let status = r.u32()?;
-            let opnum = r.u32()?;
-            eprintln!(
-                "nfs: a client reports error {} (op {}) from data server node-{}",
-                status,
-                opnum,
-                node_of_device(&d).map_or("?".to_string(), |n| n.to_string())
-            );
-        }
-        Ok(err::OK)
-    }
-
     /// Check an I/O stateid (unless the owner checked the request).
-    fn check_io(&self, ctx: &Ctx, sid: &Stateid, id: FileId, write: bool) -> Result<(), u32> {
+    fn check_io(&self, ctx: &Ctx, sid: &Stateid, id: FileId, write: bool) -> Result<(), NfsStat> {
         if ctx.trusted {
             return Ok(());
         }
         self.st().check_io(ctx.client()?, sid, id, write)
     }
-
-    // ---- client IDs and sessions ----
-
-    async fn exchange_id(&self, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let verifier: [u8; 8] = r.fixed(8)?.try_into().unwrap();
-        let owner = r.opaque(1024)?.to_vec();
-        let flags = r.u32()?;
-        let how = r.u32()?;
-        match how {
-            0 => {}
-            1 => {
-                attrs::read_bitmap(r)?;
-                attrs::read_bitmap(r)?;
-            }
-            _ => return Ok(err::NOTSUPP),
-        }
-        let impls = r.u32()?;
-        if impls > 1 {
-            return Err(XdrError("impl id"));
-        }
-        for _ in 0..impls {
-            r.string(1024)?;
-            r.string(1024)?;
-            r.u64()?;
-            r.u32()?;
-        }
-        if how != 0 {
-            // Machine credential protection needs Kerberos.
-            return Ok(err::NOTSUPP);
-        }
-        let update = flags & 0x4000_0000 != 0;
-        let Exchanged {
-            clientid,
-            sequenceid,
-            confirmed,
-        } = match self.st().exchange_id(&owner, verifier, update) {
-            Ok(x) => x,
-            Err(e) => return Ok(e),
-        };
-        let identity = self.identity().await;
-        w.u64(clientid).u32(sequenceid);
-        // USE_PNFS_MDS when layouts are handed out (else USE_NON_PNFS),
-        // and CONFIRMED_R for a confirmed record.
-        let role = if self.pnfs() {
-            0x0002_0000
-        } else {
-            0x0001_0000
-        };
-        w.u32(role | if confirmed { 0x8000_0000 } else { 0 });
-        w.u32(0); // SP4_NONE
-        w.u64(0).opaque(&identity); // server_owner
-        w.opaque(&identity); // server_scope
-        w.u32(1).string("raidish").string("raidish").u64(0).u32(0);
-        Ok(err::OK)
-    }
-
-    async fn create_session(&self, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let clientid = r.u64()?;
-        let seq = r.u32()?;
-        let _flags = r.u32()?;
-        let fore = read_channel(r)?;
-        let back = read_channel(r)?;
-        let _cb_program = r.u32()?;
-        skip_cb_sec(r)?;
-        let granted = Channel {
-            max_request: fore.max_request.min(state::MAX_REQUEST),
-            max_response: fore.max_response.min(state::MAX_REQUEST),
-            max_cached: fore.max_cached.min(state::MAX_CACHED_REPLY),
-            max_ops: fore.max_ops.min(state::MAX_OPS),
-            max_requests: fore.max_requests.clamp(1, state::MAX_SLOTS),
-        };
-        let slots = granted.max_requests;
-        let made = self.st().create_session(clientid, seq, slots, |sid| {
-            let mut b = Writer::new();
-            // No flags: not persistent, and no back channel on it.
-            b.fixed(&sid).u32(seq).u32(0);
-            write_channel(&mut b, &granted);
-            write_channel(&mut b, &back);
-            b.into_bytes()
-        });
-        Ok(match made {
-            Ok((body, newly)) => {
-                if let Some(owner) = newly {
-                    // Before the client relies on it: it may reclaim after
-                    // a failover.
-                    self.record(&owner, true).await;
-                }
-                w.buf.extend_from_slice(&body);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    // ---- reading ----
-
-    async fn attrs(&self, w: &mut Writer, id: FileId, want: &[u32], minor: u32) -> Result<(), u32> {
-        let a = self.backend.getattr(id).await.map_err(v4)?;
-        let fh = self.backend.handle(id).await.map_err(v4)?;
-        let space = if attrs::wants_space(want) {
-            Some(self.backend.fsstat().await.map_err(v4)?)
-        } else {
-            None
-        };
-        let locations = match &self.cluster {
-            Some(c) if attrs::has(want, attrs::FS_LOCATIONS) => c.locations(),
-            _ => Vec::new(),
-        };
-        attrs::encode(
-            w,
-            want,
-            &a,
-            &attrs::Extra {
-                fh: &fh,
-                space,
-                locations: &locations,
-                minor,
-                pnfs: self.pnfs(),
-            },
-        );
-        Ok(())
-    }
-
-    async fn getattr(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let want = attrs::read_bitmap(r)?;
-        let id = match ctx.fh() {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        Ok(self
-            .attrs(w, id, &want, ctx.minor)
-            .await
-            .err()
-            .unwrap_or(err::OK))
-    }
-
-    async fn getfh(&self, ctx: &mut Ctx, w: &mut Writer) -> OpResult {
-        let id = match ctx.fh() {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        Ok(match self.backend.handle(id).await {
-            Ok(h) => {
-                w.opaque(&h);
-                err::OK
-            }
-            Err(st) => v4(st),
-        })
-    }
-
-    async fn lookup(&self, ctx: &mut Ctx, r: &mut Reader<'_>) -> OpResult {
-        let name = r.string(1024)?;
-        let dir = match ctx.fh() {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
-        if let Err(e) = name_ok(&name) {
-            return Ok(e);
-        }
-        Ok(match self.backend.lookup(dir, &name).await {
-            Ok(a) => {
-                ctx.cfh = Some(a.id);
-                err::OK
-            }
-            Err(st) => v4(st),
-        })
-    }
-
-    async fn lookupp(&self, ctx: &mut Ctx) -> OpResult {
-        let dir = match ctx.fh() {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
-        match self.backend.root().await {
-            Ok(root) if dir == root => return Ok(err::NOENT),
-            Ok(_) => {}
-            Err(st) => return Ok(v4(st)),
-        }
-        Ok(match self.backend.lookup(dir, "..").await {
-            Ok(a) => {
-                ctx.cfh = Some(a.id);
-                err::OK
-            }
-            Err(st) => v4(st),
-        })
-    }
-
-    async fn verify(&self, ctx: &mut Ctx, r: &mut Reader<'_>, want_same: bool) -> OpResult {
-        let bm = attrs::read_bitmap(r)?;
-        let theirs = r.opaque(1 << 16)?.to_vec();
-        let id = match ctx.fh() {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        if bm.iter().enumerate().any(|(i, word)| {
-            (0..32).any(|b| {
-                word & (1 << b) != 0 && !attrs::supported(ctx.minor).contains(&(i as u32 * 32 + b))
-            })
-        }) {
-            return Ok(err::ATTRNOTSUPP);
-        }
-        let mut ours = Writer::new();
-        if let Err(e) = self.attrs(&mut ours, id, &bm, ctx.minor).await {
-            return Ok(e);
-        }
-        let mut rr = Reader::new(&ours.buf);
-        attrs::read_bitmap(&mut rr)?;
-        let same = rr.opaque(1 << 16)? == theirs.as_slice();
-        Ok(match (want_same, same) {
-            (true, true) | (false, false) => err::OK,
-            (true, false) => err::NOT_SAME,
-            (false, true) => err::SAME,
-        })
-    }
-
-    async fn access(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let want = r.u32()?;
-        let id = match ctx.fh() {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        Ok(match self.backend.getattr(id).await {
-            Ok(a) => {
-                let ok = crate::nfs::v3::access_bits(&a, ctx.cred.as_ref(), want);
-                w.u32(want & 0x3f).u32(ok);
-                err::OK
-            }
-            Err(st) => v4(st),
-        })
-    }
-
-    async fn read(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let sid = read_stateid(r)?;
-        let offset = r.u64()?;
-        let count = r.u32()?;
-        let go = async {
-            let id = ctx.fh()?;
-            let a = self.backend.getattr(id).await.map_err(v4)?;
-            if a.kind == ObjType::Directory {
-                return Err(err::ISDIR);
-            }
-            let sid = ctx.stateid(sid)?;
-            if sid != Stateid::BYPASS {
-                self.check_io(ctx, &sid, id, false)?;
-            }
-            self.backend
-                .read(id, offset, count.min(attrs::MAX_IO as u32))
-                .await
-                .map_err(v4)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((data, eof)) => {
-                w.bool(eof).opaque(&data);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn readdir(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let cookie = r.u64()?;
-        let verf = r.u64()?;
-        let _dircount = r.u32()? as usize;
-        let maxcount = r.u32()? as usize;
-        let want = attrs::read_bitmap(r)?;
-        let dir = match ctx.fh() {
-            Ok(d) => d,
-            Err(e) => return Ok(e),
-        };
-        let (dattr, entries) = match self.backend.readdir(dir).await {
-            Ok(x) => x,
-            Err(st) => return Ok(v4(st)),
-        };
-        // Cookies 1 and 2 are reserved: entry i is cookie i + 3.
-        if cookie == 1 || cookie == 2 {
-            return Ok(err::BAD_COOKIE);
-        }
-        if cookie != 0 && verf != dattr.change {
-            return Ok(err::NOT_SAME);
-        }
-        let skip = cookie.saturating_sub(2) as usize;
-        let mut body = Writer::new();
-        body.u64(dattr.change);
-        // status, verifier, the list's end and eof, roughly.
-        let mut used = 4 + 8 + 8;
-        let mut eof = true;
-        let mut sent = 0;
-        for (i, e) in entries.iter().enumerate().skip(skip) {
-            let mut ent = Writer::new();
-            ent.bool(true).u64(i as u64 + 3).string(&e.name);
-            if self.attrs(&mut ent, e.id, &want, ctx.minor).await.is_err() {
-                // Gone meanwhile.
-                continue;
-            }
-            if used + ent.len() > maxcount {
-                eof = false;
-                break;
-            }
-            used += ent.len();
-            sent += 1;
-            body.buf.extend_from_slice(&ent.buf);
-        }
-        if sent == 0 && !eof {
-            return Ok(err::TOOSMALL);
-        }
-        body.bool(false).bool(eof);
-        w.buf.extend_from_slice(&body.buf);
-        Ok(err::OK)
-    }
-
-    // ---- writing ----
-
-    async fn write(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let sid = read_stateid(r)?;
-        let offset = r.u64()?;
-        let stable = r.u32()?;
-        let data = r.opaque(attrs::MAX_IO as usize)?;
-        let go = async {
-            let id = ctx.fh()?;
-            let sid = ctx.stateid(sid)?;
-            self.check_io(ctx, &sid, id, true)?;
-            self.backend
-                .write(id, offset, data, stable != 0)
-                .await
-                .map_err(v4)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((_, verifier)) => {
-                // FILE_SYNC4 for anything but UNSTABLE4.
-                w.u32(data.len() as u32)
-                    .u32(if stable != 0 { 2 } else { 0 })
-                    .fixed(&verifier);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    /// SEEK: the next data or hole (NFSv4.2).
-    async fn seek(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let sid = read_stateid(r)?;
-        let offset = r.u64()?;
-        let what = r.u32()?;
-        let go = async {
-            let id = ctx.fh()?;
-            if what > 1 {
-                return Err(err::INVAL);
-            }
-            let sid = ctx.stateid(sid)?;
-            if sid != Stateid::BYPASS {
-                self.check_io(ctx, &sid, id, false)?;
-            }
-            self.backend.seek(id, offset, what == 0).await.map_err(v4)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((at, eof)) => {
-                w.bool(eof).u64(at);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    /// DEALLOCATE: punch a hole (NFSv4.2).
-    async fn deallocate(&self, ctx: &mut Ctx, r: &mut Reader<'_>) -> OpResult {
-        let sid = read_stateid(r)?;
-        let offset = r.u64()?;
-        let len = r.u64()?;
-        let go = async {
-            let id = ctx.fh()?;
-            let sid = ctx.stateid(sid)?;
-            self.check_io(ctx, &sid, id, true)?;
-            self.backend.deallocate(id, offset, len).await.map_err(v4)
-        };
-        Ok(go.await.err().unwrap_or(err::OK))
-    }
-
-    async fn commit(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        r.u64()?;
-        r.u32()?;
-        let id = match ctx.fh() {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        Ok(match self.backend.commit(id).await {
-            Ok(v) => {
-                w.fixed(&v);
-                err::OK
-            }
-            Err(st) => v4(st),
-        })
-    }
-
-    async fn setattr(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let sid = read_stateid(r)?;
-        let decoded = attrs::decode(r, crate::inode::now_ns());
-        let go = async {
-            let id = ctx.fh()?;
-            let s = decoded?;
-            if let Some(size) = s.size {
-                let a = self.backend.getattr(id).await.map_err(v4)?;
-                if a.kind == ObjType::Directory {
-                    return Err(err::ISDIR);
-                }
-                let sid = ctx.stateid(sid)?;
-                if sid != Stateid::BYPASS {
-                    self.check_io(ctx, &sid, id, true)?;
-                }
-                self.backend
-                    .setattr(id, &SetAttrs::default(), Some(size))
-                    .await
-                    .map_err(v4)?;
-            }
-            if s.set != SetAttrs::default() {
-                self.backend.setattr(id, &s.set, None).await.map_err(v4)?;
-            }
-            Ok(s.bitmap)
-        };
-        // attrsset comes with failures too (empty then).
-        let (st, bm) = match go.await {
-            Ok(bm) => (err::OK, bm),
-            Err(e) => (e, Vec::new()),
-        };
-        attrs::write_bitmap(w, &bm);
-        Ok(st)
-    }
-
-    /// The owner of new objects: the caller, unless the attributes say.
-    fn owned(&self, mut set: SetAttrs, ctx: &Ctx) -> SetAttrs {
-        if let Some(c) = &ctx.cred {
-            set.uid.get_or_insert(c.uid);
-            set.gid.get_or_insert(c.gid);
-        }
-        set
-    }
-
-    async fn dir_change(&self, dir: FileId) -> u64 {
-        self.backend.getattr(dir).await.map_or(0, |a| a.change)
-    }
-
-    async fn create(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let kind = r.u32()?;
-        match kind {
-            5 => {
-                r.string(4096)?;
-            }
-            3 | 4 => {
-                r.u32()?;
-                r.u32()?;
-            }
-            _ => {}
-        }
-        let name = r.string(1024)?;
-        let decoded = attrs::decode(r, crate::inode::now_ns());
-        let go = async {
-            let dir = ctx.fh()?;
-            name_ok(&name)?;
-            match kind {
-                2 => {}
-                5 => return Err(err::NOTSUPP),
-                _ => return Err(err::BADTYPE),
-            }
-            let s = decoded?;
-            let mut set = self.owned(s.set, ctx);
-            set.mode.get_or_insert(0o755);
-            let before = self.dir_change(dir).await;
-            let a = self
-                .backend
-                .create(dir, &name, ObjType::Directory, &set, None, true)
-                .await
-                .map_err(v4)?;
-            Ok((a.id, before, self.dir_change(dir).await, s.bitmap))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((id, before, after, bm)) => {
-                ctx.cfh = Some(id);
-                change_info(w, before, after);
-                attrs::write_bitmap(w, &bm);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn remove(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let name = r.string(1024)?;
-        let go = async {
-            let dir = ctx.fh()?;
-            name_ok(&name)?;
-            let target = self.backend.lookup(dir, &name).await.map_err(v4)?;
-            let before = self.dir_change(dir).await;
-            self.backend
-                .remove(dir, &name, target.kind == ObjType::Directory)
-                .await
-                .map_err(v4)?;
-            self.st().forget_file(target.id);
-            Ok((before, self.dir_change(dir).await))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((before, after)) => {
-                change_info(w, before, after);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn rename(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let from = r.string(1024)?;
-        let to = r.string(1024)?;
-        let go = async {
-            let src = ctx.sfh.ok_or(err::NOFILEHANDLE)?;
-            let dst = ctx.fh()?;
-            name_ok(&from)?;
-            name_ok(&to)?;
-            let (sb, db) = (self.dir_change(src).await, self.dir_change(dst).await);
-            let replaced = self.backend.lookup(dst, &to).await.ok().map(|a| a.id);
-            self.backend
-                .rename(src, &from, dst, &to)
-                .await
-                .map_err(v4)?;
-            if let Some(id) = replaced {
-                self.st().forget_file(id);
-            }
-            Ok((
-                sb,
-                self.dir_change(src).await,
-                db,
-                self.dir_change(dst).await,
-            ))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((sb, sa, db, da)) => {
-                change_info(w, sb, sa);
-                change_info(w, db, da);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    // ---- opens ----
-
-    async fn open(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let _seqid = r.u32()?;
-        let access = r.u32()?;
-        let deny = r.u32()?;
-        let owner_client = r.u64()?;
-        let owner = r.opaque(1024)?.to_vec();
-        let now = crate::inode::now_ns();
-        // How: (create, guarded, exclusive verifier, attributes).
-        let opentype = r.u32()?;
-        let mut how: Option<(bool, Option<u64>, Result<attrs::Settable, u32>)> = None;
-        if opentype == 1 {
-            how = Some(match r.u32()? {
-                m @ (0 | 1) => (m == 1, None, attrs::decode(r, now)),
-                2 => {
-                    let v = r.u64()?;
-                    (false, Some(v), Ok(empty_settable()))
-                }
-                3 => {
-                    let v = r.u64()?;
-                    (false, Some(v), attrs::decode(r, now))
-                }
-                _ => return Err(XdrError("createmode")),
-            });
-        }
-        let claim = r.u32()?;
-        let name = match claim {
-            0 => Some(r.string(1024)?),
-            1 => {
-                r.u32()?;
-                None
-            }
-            2 => {
-                read_stateid(r)?;
-                Some(r.string(1024)?)
-            }
-            3 => Some(r.string(1024)?),
-            5 => {
-                read_stateid(r)?;
-                None
-            }
-            4 | 6 => None,
-            _ => return Err(XdrError("claim")),
-        };
-        let go = async {
-            let client = ctx.client()?;
-            if owner_client != client {
-                return Err(err::STALE_CLIENTID);
-            }
-            let (acc, den) = (access & 3, deny & 3);
-            if acc == 0 {
-                return Err(err::INVAL);
-            }
-            let here = ctx.fh()?;
-            let (file, cinfo, bitmap) = match claim {
-                // CLAIM_NULL: by name in the current directory.
-                0 => {
-                    let name = name.unwrap();
-                    name_ok(&name)?;
-                    let before = self.dir_change(here).await;
-                    let (id, bm) = match how {
-                        None => {
-                            let a = self.backend.lookup(here, &name).await.map_err(v4)?;
-                            (a.id, Vec::new())
-                        }
-                        Some((guarded, exclusive, attrs)) => {
-                            let s = attrs?;
-                            let mut set = self.owned(s.set.clone(), ctx);
-                            set.mode.get_or_insert(0o644);
-                            let a = self
-                                .backend
-                                .create(here, &name, ObjType::File, &set, exclusive, guarded)
-                                .await
-                                .map_err(v4)?;
-                            // UNCHECKED on an existing file with a size: truncate.
-                            if let Some(size) = s.size
-                                && a.size != size
-                            {
-                                self.backend
-                                    .setattr(a.id, &SetAttrs::default(), Some(size))
-                                    .await
-                                    .map_err(v4)?;
-                            }
-                            (a.id, s.bitmap)
-                        }
-                    };
-                    (id, Some((before, self.dir_change(here).await)), bm)
-                }
-                // CLAIM_FH: the current filehandle itself.
-                4 => {
-                    if how.is_some() {
-                        return Err(err::INVAL);
-                    }
-                    (here, None, Vec::new())
-                }
-                // CLAIM_PREVIOUS: a reclaim of the current filehandle.
-                1 => {
-                    if how.is_some() {
-                        return Err(err::INVAL);
-                    }
-                    (here, None, Vec::new())
-                }
-                // There are no delegations to claim.
-                _ => return Err(err::NOTSUPP),
-            };
-            let a = self.backend.getattr(file).await.map_err(v4)?;
-            if a.kind == ObjType::Directory {
-                return Err(err::ISDIR);
-            }
-            let sid = self.st().open(client, &owner, file, acc, den, claim == 1)?;
-            Ok((file, sid, cinfo, bitmap))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok((file, sid, cinfo, bitmap)) => {
-                ctx.cfh = Some(file);
-                ctx.cur = Some(sid);
-                write_stateid(w, &sid);
-                let (b, a) = cinfo.unwrap_or((0, 0));
-                change_info(w, b, a);
-                w.u32(0x4); // OPEN4_RESULT_LOCKTYPE_POSIX
-                attrs::write_bitmap(w, &bitmap);
-                w.u32(0); // OPEN_DELEGATE_NONE
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn open_downgrade(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let sid = read_stateid(r)?;
-        let _seqid = r.u32()?;
-        let access = r.u32()? & 3;
-        let deny = r.u32()? & 3;
-        let go = async {
-            let id = ctx.fh()?;
-            let sid = ctx.stateid(sid)?;
-            self.st().downgrade(ctx.client()?, &sid, id, access, deny)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok(s) => {
-                ctx.cur = Some(s);
-                write_stateid(w, &s);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn close(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let _seqid = r.u32()?;
-        let sid = read_stateid(r)?;
-        let go = async {
-            let id = ctx.fh()?;
-            let sid = ctx.stateid(sid)?;
-            self.st().close(ctx.client()?, &sid, id)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok(()) => {
-                write_stateid(w, &Stateid::INVALID);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
-
-    // ---- locks ----
-
-    fn denied(w: &mut Writer, d: &state::Denied) {
-        w.u64(d.range.start)
-            .u64(d.range.length())
-            .u32(if d.write { 2 } else { 1 })
-            .u64(d.client)
-            .opaque(&d.owner);
-    }
-
-    async fn lock(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let locktype = r.u32()?;
-        let reclaim = r.bool()?;
-        let offset = r.u64()?;
-        let length = r.u64()?;
-        let new_owner = r.bool()?;
-        let (open, existing, owner) = if new_owner {
-            r.u32()?;
-            let open = read_stateid(r)?;
-            r.u32()?;
-            r.u64()?;
-            let owner = r.opaque(1024)?.to_vec();
-            (Some(open), None, owner)
-        } else {
-            let s = read_stateid(r)?;
-            r.u32()?;
-            (None, Some(s), Vec::new())
-        };
-        let go = async {
-            if !(1..=4).contains(&locktype) {
-                return Err(err::INVAL);
-            }
-            let id = ctx.fh()?;
-            let range = Range::of(offset, length)?;
-            let by = match (open, existing) {
-                (Some(o), _) => Locker::New {
-                    open: ctx.stateid(o)?,
-                    owner: &owner,
-                },
-                (_, Some(s)) => Locker::Existing(ctx.stateid(s)?),
-                _ => unreachable!(),
-            };
-            self.st()
-                .lock(ctx.client()?, id, by, range, locktype % 2 == 0, reclaim)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok(Ok(sid)) => {
-                ctx.cur = Some(sid);
-                write_stateid(w, &sid);
-                err::OK
-            }
-            Ok(Err(d)) => {
-                Self::denied(w, &d);
-                err::DENIED
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn lockt(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let locktype = r.u32()?;
-        let offset = r.u64()?;
-        let length = r.u64()?;
-        let _clientid = r.u64()?;
-        let owner = r.opaque(1024)?.to_vec();
-        let go = async {
-            let id = ctx.fh()?;
-            let range = Range::of(offset, length)?;
-            Ok(self
-                .st()
-                .test_lock(ctx.client()?, &owner, id, range, locktype % 2 == 0))
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok(None) => err::OK,
-            Ok(Some(d)) => {
-                Self::denied(w, &d);
-                err::DENIED
-            }
-            Err(e) => e,
-        })
-    }
-
-    async fn locku(&self, ctx: &mut Ctx, r: &mut Reader<'_>, w: &mut Writer) -> OpResult {
-        let _locktype = r.u32()?;
-        let _seqid = r.u32()?;
-        let sid = read_stateid(r)?;
-        let offset = r.u64()?;
-        let length = r.u64()?;
-        let go = async {
-            let id = ctx.fh()?;
-            let range = Range::of(offset, length)?;
-            let sid = ctx.stateid(sid)?;
-            self.st().unlock(ctx.client()?, &sid, id, range)
-        };
-        let res = go.await;
-        Ok(match res {
-            Ok(s) => {
-                ctx.cur = Some(s);
-                write_stateid(w, &s);
-                err::OK
-            }
-            Err(e) => e,
-        })
-    }
 }
 
 /// A reply failing the COMPOUND in `args` with `st` at its first op.
-fn fail_reply(args: &[u8], st: u32) -> Reply {
+fn fail_reply(args: &[u8], st: NfsStat) -> Reply {
     let mut r = Reader::new(args);
     let (Ok(tag), Ok(_minor), Ok(_count), Ok(first)) = (r.opaque(1024), r.u32(), r.u32(), r.u32())
     else {
         return Reply::GarbageArgs;
     };
     let mut w = Writer::new();
-    w.u32(st).opaque(tag).u32(1).u32(first).u32(st);
+    w.stat(st).opaque(tag).u32(1).u32(first).stat(st);
     Reply::Success(w)
 }
 
@@ -2022,7 +963,7 @@ fn empty_settable() -> attrs::Settable {
 /// What SEQUENCE decided.
 enum Seq {
     /// Go on (with SEQUENCE's status); the slot to finish, if any.
-    Run(u32, Option<([u8; 16], u32, bool)>),
+    Run(NfsStat, Option<([u8; 16], u32, bool)>),
     /// Send this cached reply again, as is.
     Replay(Vec<u8>),
 }

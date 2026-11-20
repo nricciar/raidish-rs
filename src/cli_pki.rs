@@ -351,65 +351,45 @@ pub async fn s3_key(command: &TokenCommands, config: &crate::config::Config) {
         "role": role.map(|r| r.to_string()),
         "expires": expires,
     });
-    let http = crate::tls::http_builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
+    let http = crate::tls::http_client(Some(std::time::Duration::from_secs(15)))
         .unwrap_or_else(|e| fail(e));
-    let mut last = String::new();
-    for ep in &endpoints {
-        let r = match http
+    use crate::net::{Answer, try_each};
+    let r = try_each(endpoints.iter().map(String::as_str), |ep| {
+        let sent = http
             .post(format!("{}/api/v1/services/keys", ep))
             .json(&req)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last = format!("{}: {}", ep, e);
-                continue;
+            .send();
+        async move {
+            match sent.await {
+                Ok(r) if r.status().is_success() => Answer::Got(r),
+                Ok(r) => {
+                    let status = r.status();
+                    Answer::Refused(format!(
+                        "{}: {}",
+                        status,
+                        r.text().await.unwrap_or_default()
+                    ))
+                }
+                Err(e) => Answer::Unreachable(e.to_string()),
             }
-        };
-        if !r.status().is_success() {
-            let status = r.status();
-            fail(format!(
-                "{}: {}",
-                status,
-                r.text().await.unwrap_or_default()
-            ));
         }
-        let k: crate::frontend::routes::KeyResponse = r.json().await.unwrap_or_else(|e| fail(e));
-        eprintln!(
-            "access key for {} ({}), expires {}; revoked with id {}",
-            if token.is_some() {
-                "the token"
-            } else {
-                "this certificate"
-            },
-            k.role,
-            k.expires.map(when).unwrap_or("never".into()),
-            k.id
-        );
-        println!("AWS_ACCESS_KEY_ID={}", k.access_key_id);
-        println!("AWS_SECRET_ACCESS_KEY={}", k.secret_access_key);
-        return;
-    }
-    fail(last)
-}
-
-/// `90d`, `12h`, `30m`, `45s` or plain seconds.
-pub fn parse_duration(s: &str) -> Result<i64, String> {
-    let (num, mult) = match s.chars().last() {
-        Some('d') => (&s[..s.len() - 1], 86400),
-        Some('h') => (&s[..s.len() - 1], 3600),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('s') => (&s[..s.len() - 1], 1),
-        _ => (s, 1),
-    };
-    num.parse::<i64>()
-        .ok()
-        .filter(|n| *n > 0)
-        .map(|n| n * mult)
-        .ok_or_else(|| format!("bad duration '{}' (try 90d, 12h, 30m)", s))
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    let k: crate::frontend::routes::KeyResponse = r.json().await.unwrap_or_else(|e| fail(e));
+    eprintln!(
+        "access key for {} ({}), expires {}; revoked with id {}",
+        if token.is_some() {
+            "the token"
+        } else {
+            "this certificate"
+        },
+        k.role,
+        k.expires.map(when).unwrap_or("never".into()),
+        k.id
+    );
+    println!("AWS_ACCESS_KEY_ID={}", k.access_key_id);
+    println!("AWS_SECRET_ACCESS_KEY={}", k.secret_access_key);
 }
 
 fn when(s: i64) -> String {
@@ -437,7 +417,7 @@ pub fn run_token(command: &TokenCommands, config: &crate::config::Config) {
             };
             let ttl = expires
                 .as_deref()
-                .map(|e| parse_duration(e).unwrap_or_else(|e| fail(e)));
+                .map(|e| crate::pki::parse_duration(e).unwrap_or_else(|e| fail(e)));
             let (token, claims) =
                 crate::auth::create_token(name, *role, ttl, &chain[0], key.secret_pkcs8_der())
                     .unwrap_or_else(|e| fail(e));

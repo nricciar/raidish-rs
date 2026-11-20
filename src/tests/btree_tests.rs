@@ -128,7 +128,7 @@ async fn a_deep_tree_shrinks_back_to_nothing() {
         let ds = fs.open_kv("t").await.unwrap();
         crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
     };
-    assert_eq!((h.root, h.height, h.entries), (0, 0, 0));
+    assert_eq!((h.root, h.height, h.entries), (None, 0, 0));
     // Every node's record was freed (only the header is left).
     let id = fs.dataset_id("t").await.unwrap();
     let d = fs.read_dnode(id).await.unwrap();
@@ -232,4 +232,20 @@ async fn limits_are_enforced() {
         .unwrap();
     assert!(fs.kv_get("vol", b"k").await.is_err());
     assert!(fs.block_read("t", 0, &mut [0u8; 8]).await.is_err());
+}
+
+#[test]
+fn decode_takes_all_of_a_record_or_nothing() {
+    use super::{decode, encode};
+    let mut buf = encode(&(7u64, 9u32)).unwrap();
+    assert_eq!(decode::<(u64, u32)>(&buf, "t").unwrap(), (7, 9));
+    // Longer than the record says it is: trailing bytes are refused.
+    let longer = (buf.len() - 4 + 2) as u32;
+    buf[..4].copy_from_slice(&longer.to_le_bytes());
+    buf.extend([0, 0]);
+    assert!(decode::<(u64, u32)>(&buf, "t").is_err());
+    // A length past the buffer.
+    let mut short = encode(&1u64).unwrap();
+    short[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(decode::<u64>(&short, "t").is_err());
 }

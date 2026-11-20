@@ -6,6 +6,8 @@ use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset_resource};
 use crate::test_util::TestPool;
+use crate::types::Txg;
+use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx};
 use crate::vdev::Pool;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,11 +19,12 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn lease(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
+async fn lease(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &str) -> Epoch {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Acquire {
-        resource: resource.into(),
+        resource: resource.clone(),
         owner: owner.into(),
-        desc: format!("test {}", owner),
+        holder: crate::types::Holder::default().with_detail(format!("test {}", owner)),
         ttl_ms: 600_000,
     };
     match auth.propose(op).await.unwrap() {
@@ -30,11 +33,16 @@ async fn lease(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
     }
 }
 
-async fn release(auth: &LocalAuthority, resource: &str, owner: &str, epoch: u64) {
+async fn release(
+    auth: &LocalAuthority,
+    resource: impl std::fmt::Display,
+    owner: &str,
+    epoch: Epoch,
+) {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Release {
-        resource: resource.into(),
-        owner: owner.into(),
-        epoch,
+        resource: resource.clone(),
+        holder: Holding::new(owner, epoch),
     };
     assert_eq!(auth.propose(op).await.unwrap(), Response::Released);
 }
@@ -53,7 +61,7 @@ async fn setup() -> Setup {
         .unwrap();
     drop(fs);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = lease(&auth, POOL, "c").await;
+    let epoch = lease(&auth, &POOL, "c").await;
     let fs = Arc::new(pool.load().await);
     let committer =
         Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
@@ -67,9 +75,9 @@ async fn setup() -> Setup {
 struct Writer {
     fs: FileSystem<Pool>,
     id: String,
-    epoch: u64,
+    epoch: Epoch,
     ds_owner: String,
-    ds_epoch: u64,
+    ds_epoch: Epoch,
 }
 
 impl Writer {
@@ -99,15 +107,14 @@ async fn writer(s: &Setup, id: &str, fresh: Option<crate::writer::LeaseCheck>) -
     let epoch = lease(&s.auth, &resource, id).await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: resource,
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
     let ds_owner = format!("o{}", id);
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), &ds_owner).await;
-    fs.attach_dataset_leased("a", &ds_owner, ds_epoch, None, fresh)
+    fs.attach_dataset_leased("a", Holding::new(ds_owner.clone(), ds_epoch), None, fresh)
         .await
         .unwrap();
     Writer {
@@ -120,7 +127,7 @@ async fn writer(s: &Setup, id: &str, fresh: Option<crate::writer::LeaseCheck>) -
 }
 
 async fn txg(s: &Setup) -> u64 {
-    s.committer.fs.uberblock().await.unwrap().txg
+    (s.committer.fs().uberblock().await.unwrap().txg).get()
 }
 
 async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
@@ -188,7 +195,7 @@ async fn a_flush_is_acknowledged_from_the_log_and_replayed_after_a_crash() {
     drop(fresh);
     // ...until the committer notices and replays the log.
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(read(&fresh, 0, want.len()).await, want);
     drop(fresh);
@@ -228,7 +235,7 @@ async fn the_next_holder_claims_the_volume_and_sees_the_log() {
         .unwrap();
     w2.fs.flush().await.unwrap();
     w2.fs.detach_dataset("a").await.unwrap();
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     want[..1000].copy_from_slice(&pattern(1000, 3));
     want[4000..5000].copy_from_slice(&pattern(1000, 4));
     w2.fs.return_metaslabs().await;
@@ -261,7 +268,7 @@ async fn a_commit_rotates_the_log_and_the_space_adds_up() {
 
     w.fs.detach_dataset("a").await.unwrap();
     assert!(cursor(&w.fs).await.is_none());
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     w.fs.return_metaslabs().await;
     assert_clean(&s).await;
 }
@@ -340,12 +347,12 @@ async fn a_lapsed_lease_is_taken_over_before_its_log_is_replayed() {
     // Only just expired: its holder may still renew it. Leave it be.
     expire_volume_lease(&s, 1000);
     s.committer.reclaim().await;
-    assert_eq!(s.committer.fs.dataset_logs().await.unwrap().len(), 1);
+    assert_eq!(s.committer.fs().dataset_logs().await.unwrap().len(), 1);
 
     // Lapsed for good (the writer is partitioned away, not dead).
     expire_volume_lease(&s, 60_000);
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(read(&fresh, 0, want.len()).await, want);
     drop(fresh);
@@ -354,8 +361,7 @@ async fn a_lapsed_lease_is_taken_over_before_its_log_is_replayed() {
     // acknowledging flushes into a log nobody will replay.
     let renew = LeaseOp::Renew {
         resource: dataset_resource("a"),
-        owner: w.ds_owner.clone(),
-        epoch: w.ds_epoch,
+        holder: Holding::new(w.ds_owner.clone(), w.ds_epoch),
         ttl_ms: 10_000,
     };
     assert_eq!(s.auth.propose(renew).await.unwrap(), Response::Lost);
@@ -411,14 +417,15 @@ async fn a_flush_some_disk_missed_commits_and_reports_the_miss() {
     let epoch = lease(&s.auth, &resource, "1").await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: resource,
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev_without(&[1, 3]).await, sink)
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(10_000, 1)).await.unwrap();
     fs.flush().await.unwrap(); // commits: log registered
     let data = pattern(300_000, 2);
@@ -445,7 +452,7 @@ async fn a_flush_some_disk_missed_commits_and_reports_the_miss() {
     release(&s.auth, &dataset_resource("a"), "o1", ds_epoch).await;
     release(&s.auth, "writer/1", "1", epoch).await;
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
 
     // A writer that reaches every disk acknowledges from the log again.
     let w = writer(&s, "2", None).await;
@@ -469,7 +476,7 @@ struct Gate {
 
 #[async_trait::async_trait]
 impl crate::writer::CommitSink for Gate {
-    fn writer(&self) -> (String, u64) {
+    fn writer(&self) -> LeaseRef {
         self.inner.writer()
     }
     async fn lease_metaslab(
@@ -478,7 +485,7 @@ impl crate::writer::CommitSink for Gate {
     ) -> Result<crate::writer::LentMetaslab, crate::writer::CommitError> {
         self.inner.lease_metaslab(want).await
     }
-    async fn return_metaslab(&self, idx: u32) -> Result<(), crate::writer::CommitError> {
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), crate::writer::CommitError> {
         self.inner.return_metaslab(idx).await
     }
     async fn commit(
@@ -501,10 +508,9 @@ impl crate::writer::CommitSink for Gate {
     async fn claim_dataset(
         &self,
         volume: &str,
-        ds_owner: &str,
-        ds_epoch: u64,
+        ds: &Holding,
     ) -> Result<(), crate::writer::CommitError> {
-        self.inner.claim_dataset(volume, ds_owner, ds_epoch).await
+        self.inner.claim_dataset(volume, ds).await
     }
 }
 
@@ -517,8 +523,7 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
     let sink = Arc::new(Gate {
         inner: DirectSink {
             committer: s.committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         },
         open: open_rx,
         waiting: Default::default(),
@@ -529,7 +534,9 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
     fs.flush().await.unwrap(); // commits: log registered
 
@@ -560,7 +567,7 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
     open_tx.send_replace(true);
     folding.await.unwrap().unwrap();
     assert_eq!(
-        s.committer.fs.dataset_logs().await.unwrap()[0]
+        s.committer.fs().dataset_logs().await.unwrap()[0]
             .1
             .regions
             .len(),
@@ -596,17 +603,17 @@ async fn a_faulted_pool_keeps_the_log_for_later() {
 
     // More disks need a resilver than raidz2 can cover: unreadable records
     // would look like the end of the log, so nothing is replayed (or dropped).
-    let disks = s.committer.fs.disk_count();
+    let disks = s.committer.fs().disk_count();
     for d in 0..3 {
-        s.committer.fs.mark_degraded(d, 1);
+        s.committer.fs().mark_degraded(d, Txg::from_raw(1));
     }
     s.committer.reclaim().await;
-    assert_eq!(s.committer.fs.dataset_logs().await.unwrap().len(), 1);
+    assert_eq!(s.committer.fs().dataset_logs().await.unwrap().len(), 1);
 
     // Resilvered: now it's replayed.
-    *s.committer.fs.degraded.lock().unwrap() = vec![None; disks];
+    *s.committer.fs().degraded.lock().unwrap() = vec![None; disks];
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(read(&fresh, 0, data.len()).await, data);
 }
@@ -619,8 +626,7 @@ async fn a_writer_heals_what_a_disk_missed_in_its_lent_space() {
     let sink = || {
         Arc::new(DirectSink {
             committer: s.committer.clone(),
-            writer: resource.clone(),
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         })
     };
     // Written and committed while disk 1 was unreachable: its shards there
@@ -629,10 +635,12 @@ async fn a_writer_heals_what_a_disk_missed_in_its_lent_space() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    a.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    a.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     a.block_write("a", 0, &pattern(400_000, 1)).await.unwrap();
     a.sync().await.unwrap();
-    assert!(s.committer.fs.degraded_disks()[1].is_some());
+    assert!(s.committer.fs().degraded_disks()[1].is_some());
     let lent = a.writer.as_ref().unwrap().lent.lock().unwrap().clone();
     assert!(!lent.is_empty());
 
@@ -646,7 +654,7 @@ async fn a_writer_heals_what_a_disk_missed_in_its_lent_space() {
     assert!(report.is_clean(), "{}", report);
 
     // Nothing left for the committer to find.
-    let scrub = s.committer.fs.scrub(false).await.unwrap();
+    let scrub = s.committer.fs().scrub(false).await.unwrap();
     assert_eq!(scrub.mismatched(), 0, "{}", scrub);
 }
 
@@ -657,13 +665,12 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
     let epoch = lease(&s.auth, "writer/1", "1").await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: "writer/1".into(),
-        epoch,
+        writer: LeaseRef::new(crate::types::res("writer/1"), epoch),
     });
     let (dev, switch) = FaultyDev::new(s.pool.dev().await);
     let fs = FileSystem::load_writer(dev, sink).await.unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset_leased("a", "o1", ds_epoch, None, None)
+    fs.attach_dataset_leased("a", Holding::new("o1", ds_epoch), None, None)
         .await
         .unwrap();
     let cursor = |fs: &FileSystem<FaultyDev<Pool>>| {
@@ -770,7 +777,7 @@ async fn small_writes_log_only_the_bytes_that_changed() {
 
     w.die(&s).await;
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(read(&fresh, 0, size).await, want);
     drop(fresh);
@@ -786,8 +793,7 @@ async fn a_patch_written_during_a_stuck_commit_applies_over_what_it_synced() {
     let sink = Arc::new(Gate {
         inner: DirectSink {
             committer: s.committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         },
         open: open_rx,
         waiting: Default::default(),
@@ -798,7 +804,9 @@ async fn a_patch_written_during_a_stuck_commit_applies_over_what_it_synced() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     let mut want = pattern(100_000, 1);
     fs.block_write("a", 0, &want).await.unwrap();
     fs.flush().await.unwrap(); // commits: log registered
@@ -871,8 +879,7 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
     let epoch = lease(&s.auth, &resource, "1").await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: resource,
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     });
     let fs = Arc::new(
         FileSystem::load_writer(s.pool.dev().await, sink)
@@ -880,12 +887,14 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
     fs.flush().await.unwrap(); // commits: log registered
     // The loop's first tick runs at once; the next would be SYNC_INTERVAL
     // away, far longer than this test waits.
-    crate::nbd::ensure_sync_loop(&fs, "test");
+    crate::volume_io::ensure_sync_loop(&fs, "test");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let first = cursor(&fs).await.unwrap().region;
 
@@ -940,7 +949,7 @@ async fn setup_kv() -> Setup {
         .unwrap();
     drop(fs);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = lease(&auth, POOL, "c").await;
+    let epoch = lease(&auth, &POOL, "c").await;
     let fs = Arc::new(pool.load().await);
     let committer =
         Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
@@ -983,14 +992,15 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
     let wepoch = lease(&s.auth, "writer/1", id).await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: "writer/1".into(),
-        epoch: wepoch,
+        writer: LeaseRef::new(crate::types::res("writer/1"), wepoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-    fs.attach_dataset("k", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
 
     // A committed base (deep enough to split on later puts), and a log.
     let mut model = BTreeMap::new();
@@ -1054,7 +1064,7 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
     drop(fresh);
     // ...until the committer replays them through the tree.
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(kv_all(&fresh).await, model_vec(&model));
     assert_eq!(fresh.kv_len("k").await.unwrap(), model.len() as u64);
@@ -1071,8 +1081,7 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
     let sink = Arc::new(Gate {
         inner: DirectSink {
             committer: s.committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         },
         open: open_rx,
         waiting: Default::default(),
@@ -1083,7 +1092,9 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-    fs.attach_dataset("k", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     let mut model = BTreeMap::new();
     for i in 0..400u32 {
         let k = format!("a/{:04}", i).into_bytes();
@@ -1189,14 +1200,15 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
     let epoch = lease(&s.auth, &resource, "1").await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: resource,
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev_without(&[2]).await, sink)
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", "o1", ds_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(10_000, 1)).await.unwrap();
     fs.flush().await.unwrap(); // commits (and reports disk 2)
     let w = fs.writer.clone().unwrap();
@@ -1212,14 +1224,14 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
         .await
         .unwrap();
     assert!(fs.unaccounted_misses()[2]);
-    *s.committer.fs.degraded.lock().unwrap() = vec![None; s.committer.fs.disk_count()];
+    *s.committer.fs().degraded.lock().unwrap() = vec![None; s.committer.fs().disk_count()];
     fs.writer_report_misses(&w, &vol).await.unwrap();
     assert!(txg(&s).await > before, "committed");
     assert!(!fs.unaccounted_misses()[2]);
-    assert!(s.committer.fs.degraded_disks()[2].is_some());
+    assert!(s.committer.fs().degraded_disks()[2].is_some());
     // The log is as it was: flushes carry on into it.
     assert_eq!(cursor(&fs).await.unwrap(), c);
-    assert_eq!(s.committer.fs.dataset_logs().await.unwrap().len(), 1);
+    assert_eq!(s.committer.fs().dataset_logs().await.unwrap().len(), 1);
     let fresh = s.pool.load().await;
     assert!(fresh.degraded_disks()[2].is_some());
 }
@@ -1234,14 +1246,15 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
         let wepoch = lease(&s.auth, "writer/1", "1").await;
         let sink = Arc::new(DirectSink {
             committer: s.committer.clone(),
-            writer: "writer/1".into(),
-            epoch: wepoch,
+            writer: LeaseRef::new(crate::types::res("writer/1"), wepoch),
         });
         let fs = FileSystem::load_writer(s.pool.dev().await, sink)
             .await
             .unwrap();
         let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-        fs.attach_dataset("k", "o1", ds_epoch).await.unwrap();
+        fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+            .await
+            .unwrap();
         for i in 0..400u32 {
             let k = format!("base/{:05}", i).into_bytes();
             let v = pattern(40 + (i as usize % 90), i as u8);
@@ -1266,17 +1279,18 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
     let wepoch = lease(&s.auth, "writer/2", "2").await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: "writer/2".into(),
-        epoch: wepoch,
+        writer: LeaseRef::new(crate::types::res("writer/2"), wepoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
     s.committer.reclaim().await;
-    assert!(s.committer.fs.dataset_logs().await.unwrap().is_empty());
+    assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
 
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o2").await;
-    fs.attach_dataset("k", "o2", ds_epoch).await.unwrap();
+    fs.attach_dataset("k", Holding::new("o2", ds_epoch))
+        .await
+        .unwrap();
     assert_eq!(kv_all(&fs).await, model_vec(&model));
     for i in 0..50u32 {
         let k = format!("next/{:05}", i).into_bytes();

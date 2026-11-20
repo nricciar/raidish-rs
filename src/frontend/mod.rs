@@ -14,7 +14,7 @@
 //!   and node may write, readonly only reads). A connection to a node that
 //!   doesn't run the dataset is forwarded to the one that does: over TLS
 //!   between the nodes (this node's certificate), starting with a
-//!   `RAIDISH-FWD <dataset> <role>` line (the client's role, believed only
+//!   `RAIDISH-FWD/1 <dataset> <role>` line (the client's role, believed only
 //!   from a node) so it's never forwarded again.
 //! * S3 and SQS: every node listens on one HTTPS port for each (requests
 //!   are signed with access keys made from tokens, see [`keys`]). A
@@ -31,17 +31,16 @@ pub mod http;
 pub mod keys;
 pub mod routes;
 
-use crate::committer::CommitClient;
+use crate::committer::PoolAdmin;
 use crate::dataset::DatasetFormat;
-use crate::disk::BlockDevice;
 use crate::etcd::server::{Caller, EtcdConn};
 use crate::etcd::store::EtcdStore;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::pki::Role;
+use crate::types::Epoch;
 use crate::vdev::Pool;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -93,10 +92,19 @@ pub fn peer_role<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Role> {
     crate::pki::inspect_der(der).ok()?.role
 }
 
-/// What a forwarded etcd connection starts with.
-pub const FORWARD_PREAMBLE: &[u8] = b"RAIDISH-FWD ";
+/// What a forwarded etcd connection starts with, with this forwarding's
+/// version. Bump it with any change to the line.
+pub const FORWARD_PREAMBLE: &[u8] = b"RAIDISH-FWD/1 ";
 /// The header marking a proxied S3 / SQS request.
 pub const FORWARDED_HEADER: &str = "x-raidish-forwarded";
+
+/// A configured port: unset is `default`, 0 is off (None).
+fn on(port: Option<u16>, default: u16) -> Option<u16> {
+    match port.unwrap_or(default) {
+        0 => None,
+        p => Some(p),
+    }
+}
 
 /// The `services` section of the config.
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -120,11 +128,13 @@ impl ServicesConfig {
     pub fn bind(&self) -> String {
         self.bind.clone().unwrap_or_else(|| "0.0.0.0".into())
     }
-    pub fn s3_port(&self) -> u16 {
-        self.s3_port.unwrap_or(9000)
+    /// The S3 port; None: no S3 here.
+    pub fn s3_port(&self) -> Option<u16> {
+        on(self.s3_port, 9000)
     }
-    pub fn sqs_port(&self) -> u16 {
-        self.sqs_port.unwrap_or(9324)
+    /// The SQS port; None: no SQS here.
+    pub fn sqs_port(&self) -> Option<u16> {
+        on(self.sqs_port, 9324)
     }
     pub fn region(&self) -> String {
         self.region.clone().unwrap_or_else(|| "us-east-1".into())
@@ -160,6 +170,19 @@ pub struct Route {
     pub owner: Option<Owner>,
 }
 
+/// Where a dataset a request names is served, as this node sees it.
+pub enum Located<T> {
+    /// Here: what `Frontend::locate`'s `pick` took from it.
+    Here(T),
+    /// At another node: pass the request on.
+    There(Owner),
+    /// It exists, but isn't served anywhere this request can go right now
+    /// (starting up, moving, or already passed on once).
+    Unavailable,
+    /// No such dataset (of that format).
+    Missing,
+}
+
 /// A dataset served here.
 pub enum Local {
     Etcd {
@@ -169,6 +192,30 @@ pub enum Local {
     },
     S3(Arc<crate::s3::Bucket<Pool>>),
     Queue(Arc<crate::sqs::Queue<Pool>>),
+}
+
+impl Local {
+    pub fn bucket(&self) -> Option<Arc<crate::s3::Bucket<Pool>>> {
+        match self {
+            Local::S3(b) => Some(b.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn queue(&self) -> Option<Arc<crate::sqs::Queue<Pool>>> {
+        match self {
+            Local::Queue(q) => Some(q.clone()),
+            _ => None,
+        }
+    }
+
+    /// An etcd dataset's connection queue.
+    pub fn etcd_conns(&self) -> Option<mpsc::Sender<std::io::Result<EtcdConn>>> {
+        match self {
+            Local::Etcd { conns, .. } => Some(conns.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl Local {
@@ -190,17 +237,17 @@ struct Routing {
 
 /// This node's front ends.
 pub struct Frontend {
-    pub node: String,
-    pub config: ServicesConfig,
-    pub tls: ServiceTls,
+    node: String,
+    config: ServicesConfig,
+    tls: ServiceTls,
     /// Checks S3/SQS requests' access keys (see [`keys`]).
-    pub auth: keys::ServiceAuth,
-    pub committer: CommitClient,
+    auth: keys::ServiceAuth,
+    committer: crate::committer::Admin,
     routing: RwLock<Routing>,
     local: RwLock<BTreeMap<String, Arc<Local>>>,
     etcd_ports: Mutex<BTreeMap<u16, tokio::task::JoinHandle<()>>>,
     /// Signalled when the routes change (a waiting CreateBucket...).
-    pub changed: tokio::sync::Notify,
+    changed: tokio::sync::Notify,
 }
 
 /// An etcd member id for a node.
@@ -213,12 +260,31 @@ pub fn member_id(node: &str) -> u64 {
 }
 
 impl Frontend {
+    /// The services and their ports.
+    pub fn config(&self) -> &ServicesConfig {
+        &self.config
+    }
+
+    pub fn tls(&self) -> &ServiceTls {
+        &self.tls
+    }
+
+    /// Checks S3/SQS requests' access keys.
+    pub fn auth(&self) -> &keys::ServiceAuth {
+        &self.auth
+    }
+
+    /// The pool's metadata operations (buckets and queues are datasets).
+    pub fn committer(&self) -> &crate::committer::Admin {
+        &self.committer
+    }
+
     pub fn new(
         node: String,
         config: ServicesConfig,
         auth: keys::ServiceAuth,
         tls: ServiceTls,
-        committer: CommitClient,
+        committer: crate::committer::Admin,
     ) -> Arc<Self> {
         Arc::new(Frontend {
             node,
@@ -241,13 +307,13 @@ impl Frontend {
     /// Start the S3 and SQS listeners.
     pub async fn start(self: &Arc<Self>) -> std::io::Result<()> {
         let bind = self.config.bind();
-        if self.config.s3_port() != 0 {
-            let l = TcpListener::bind((bind.as_str(), self.config.s3_port())).await?;
+        if let Some(port) = self.config.s3_port() {
+            let l = TcpListener::bind((bind.as_str(), port)).await?;
             println!("s3: serving on {}", l.local_addr()?);
             tokio::spawn(crate::s3::http::serve(self.clone(), l));
         }
-        if self.config.sqs_port() != 0 {
-            let l = TcpListener::bind((bind.as_str(), self.config.sqs_port())).await?;
+        if let Some(port) = self.config.sqs_port() {
+            let l = TcpListener::bind((bind.as_str(), port)).await?;
             println!("sqs: serving on {}", l.local_addr()?);
             tokio::spawn(crate::sqs::http::serve(self.clone(), l));
         }
@@ -293,6 +359,29 @@ impl Frontend {
         self.local.read().unwrap().get(name).cloned()
     }
 
+    /// Where `name` (a `format` dataset) is served: here (`pick` takes
+    /// what the request needs from it), at another node, nowhere right
+    /// now, or not at all. `forwarded`: a node already passed this request
+    /// on, so it isn't passed on again (it would only bounce).
+    pub fn locate<T>(
+        &self,
+        name: &str,
+        format: DatasetFormat,
+        forwarded: bool,
+        pick: impl FnOnce(&Local) -> Option<T>,
+    ) -> Located<T> {
+        if let Some(t) = self.local(name).as_deref().and_then(pick) {
+            return Located::Here(t);
+        }
+        let Some(route) = self.route(name).filter(|r| r.format == format) else {
+            return Located::Missing;
+        };
+        match route.owner {
+            Some(o) if o.node != self.node && !forwarded => Located::There(o),
+            _ => Located::Unavailable,
+        }
+    }
+
     /// Listen on every etcd dataset's port (and no others).
     fn listen_etcd(self: &Arc<Self>, ports: &[u16]) {
         let mut l = self.etcd_ports.lock().unwrap();
@@ -312,26 +401,13 @@ impl Frontend {
                 port,
                 tokio::spawn(async move {
                     let bind = fe.config.bind();
-                    // Retried: the port may be busy for a moment (an
-                    // earlier listener closing).
-                    let listener = loop {
-                        match TcpListener::bind((bind.as_str(), port)).await {
-                            Ok(l) => break l,
-                            Err(e) => {
-                                eprintln!("etcd: listening on {}:{}: {}", bind, port, e);
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                            }
-                        }
-                    };
+                    let listener = crate::net::bind_retrying(&bind, port, "etcd").await;
                     println!("etcd: listening on {}:{}", bind, port);
-                    loop {
-                        let Ok((sock, _)) = listener.accept().await else {
-                            continue;
-                        };
-                        let _ = sock.set_nodelay(true);
+                    crate::net::accept_loop(listener, "etcd", move |sock, _| {
                         let fe = fe.clone();
-                        tokio::spawn(async move { fe.etcd_conn(port, sock).await });
-                    }
+                        async move { fe.etcd_conn(port, sock).await }
+                    })
+                    .await
                 }),
             );
         }
@@ -339,9 +415,7 @@ impl Frontend {
 
     /// A connection to an etcd port: served here, or forwarded.
     async fn etcd_conn(&self, port: u16, sock: TcpStream) {
-        let Ok(Ok(tls)) =
-            tokio::time::timeout(Duration::from_secs(10), self.tls.etcd.accept(sock)).await
-        else {
+        let Ok(tls) = crate::net::tls_accept(&self.tls.etcd, sock).await else {
             return;
         };
         let Some(peer) = peer_role(&tls) else {
@@ -357,28 +431,31 @@ impl Frontend {
             Some(r) => r,
             None => peer,
         };
-        let Some((name, route)) = self
+        // The etcd dataset on this port.
+        let Some(name) = self
             .routing
             .read()
             .unwrap()
             .routes
             .iter()
             .find(|(_, r)| r.format == DatasetFormat::Etcd && r.port == Some(port))
-            .map(|(n, r)| (n.clone(), r.clone()))
+            .map(|(n, _)| n.clone())
         else {
             return;
         };
-        if let Some(l) = self.local(&name)
-            && let Local::Etcd { conns, .. } = &*l
-        {
-            let _ = conns.send(Ok(EtcdConn::new(io, Caller { role }))).await;
-            return;
-        }
-        if forwarded.is_some() {
-            return; // not (or no longer) here: the client reconnects
-        }
-        let Some(owner) = route.owner.filter(|o| o.node != self.node) else {
-            return; // nowhere yet
+        let owner = match self.locate(
+            &name,
+            DatasetFormat::Etcd,
+            forwarded.is_some(),
+            Local::etcd_conns,
+        ) {
+            Located::Here(conns) => {
+                let _ = conns.send(Ok(EtcdConn::new(io, Caller { role }))).await;
+                return;
+            }
+            Located::There(owner) => owner,
+            // Not (or no longer) here, or nowhere yet: the client reconnects.
+            Located::Unavailable | Located::Missing => return,
         };
         let Ok(mut up) = self.tls.connect(&owner.addr, port).await else {
             return;
@@ -403,11 +480,11 @@ impl Frontend {
         name: &str,
         format: DatasetFormat,
         fs: Arc<FileSystem<Pool>>,
-        epoch: u64,
+        epoch: Epoch,
     ) -> Result<(), FileSystemError> {
         let local = match format {
             DatasetFormat::Etcd => {
-                let store = EtcdStore::open(fs, name, member_id(&self.node), epoch)
+                let store = EtcdStore::open(fs, name, member_id(&self.node), epoch.get())
                     .await
                     .map_err(|e| FileSystemError::Unavailable(e.to_string()))?;
                 let port = self.route(name).and_then(|r| r.port).unwrap_or(0);
@@ -593,6 +670,20 @@ async fn read_preamble<S: AsyncRead + Unpin>(
         .await
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
     if buf != FORWARD_PREAMBLE {
+        // Another version's forwarding line: refused, not handed to the
+        // service as a client's bytes.
+        if buf.starts_with(b"RAIDISH-FWD") {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "services: refusing a forwarded connection that starts {:?}: this node \
+                     speaks {:?} (every node must run the same raidish)",
+                    String::from_utf8_lossy(&buf),
+                    String::from_utf8_lossy(FORWARD_PREAMBLE)
+                )
+            });
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
         return Ok((
             Prefixed {
                 pre: buf,
@@ -631,48 +722,6 @@ async fn read_preamble<S: AsyncRead + Unpin>(
         },
         Some(role),
     ))
-}
-
-/// Where a store's writes are (applied, durable), so answers and reads
-/// only ever reflect durable writes (as `crate::etcd::store` does).
-#[derive(Default)]
-pub struct Settler {
-    applied: AtomicU64,
-    durable: AtomicU64,
-}
-
-impl Settler {
-    /// A write was applied (called with the dataset's operations
-    /// write-locked).
-    pub fn applied(&self) {
-        self.applied.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Make every applied write to dataset `name` durable.
-    pub async fn settle<D: BlockDevice>(
-        &self,
-        fs: &FileSystem<D>,
-        name: &str,
-    ) -> Result<(), FileSystemError> {
-        let target = self.applied.load(Ordering::SeqCst);
-        if self.durable.load(Ordering::SeqCst) >= target {
-            return Ok(());
-        }
-        fs.kv_settle().await?;
-        fs.flush_for(name).await?;
-        self.durable.fetch_max(target, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-/// The node and advertised address in an agent's lease description
-/// (`agent <node>` or `agent <node> @<address>`).
-pub fn parse_desc(desc: &str) -> (String, Option<String>) {
-    let rest = desc.strip_prefix("agent ").unwrap_or(desc);
-    let mut it = rest.split_whitespace();
-    let node = it.next().unwrap_or("").to_string();
-    let addr = it.find_map(|w| w.strip_prefix('@')).map(str::to_string);
-    (node, addr)
 }
 
 /// A CA, a node certificate, a service key and a frontend using them.
@@ -727,7 +776,10 @@ pub mod testing {
                 config,
                 auth,
                 ServiceTls::new(&self.tls).unwrap(),
-                CommitClient::new(vec![]),
+                crate::committer::Admin::new(
+                    Default::default(),
+                    crate::committer::CommitClient::new(vec![]),
+                ),
             )
         }
 

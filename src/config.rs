@@ -85,8 +85,17 @@ pub struct PoolSpec {
 impl PoolSpec {
     /// Open the disks and build the pool.
     pub async fn open(&self, opts: DiskOptions) -> Pool {
+        self.open_fenced(opts, Default::default()).await
+    }
+
+    /// `open`, its requests carrying `fence`'s epochs from the first.
+    pub async fn open_fenced(
+        &self,
+        opts: DiskOptions,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Pool {
         let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
-        let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
+        let disks = Arc::new(DiskSet::new_fenced(&paths, opts, fence).await);
         self.on(disks)
     }
 

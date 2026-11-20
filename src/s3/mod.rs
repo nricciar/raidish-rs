@@ -27,10 +27,10 @@ pub mod checksum;
 pub mod http;
 
 use crate::btree::Txn;
-use crate::dataset::{Dataset, DatasetFormat};
+use crate::dataset::DatasetFormat;
 use crate::disk::BlockDevice;
-use crate::frontend::Settler;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +72,18 @@ pub enum S3Error {
 impl From<FileSystemError> for S3Error {
     fn from(e: FileSystemError) -> Self {
         S3Error::Fs(e)
+    }
+}
+
+impl ServiceError for S3Error {
+    fn stopped() -> Self {
+        S3Error::Unavailable
+    }
+}
+
+impl<D: BlockDevice + 'static> Served for Bucket<D> {
+    fn is_stopped(&self) -> bool {
+        self.tree.is_stopped()
     }
 }
 
@@ -132,17 +144,10 @@ struct Meta {
     next_upload: u64,
 }
 
-fn enc<T: Serialize>(v: &T) -> Vec<u8> {
-    bincode::serialize(v).expect("encoding")
-}
+use crate::service_tree::enc_bin as enc;
 
 fn dec<T: for<'a> Deserialize<'a>>(b: &[u8], what: &str) -> Result<T> {
-    bincode::deserialize(b).map_err(|e| {
-        S3Error::Fs(FileSystemError::InvalidArgument(format!(
-            "corrupt s3 {}: {}",
-            what, e
-        )))
-    })
+    Ok(crate::service_tree::dec_bin(b, &format!("s3 {}", what))?)
 }
 
 fn key_of(tag: u8, rest: &[u8]) -> Vec<u8> {
@@ -205,13 +210,10 @@ pub struct Listing {
 
 /// A bucket, served from this node.
 pub struct Bucket<D: BlockDevice> {
-    pub fs: Arc<FileSystem<D>>,
-    pub name: String,
-    stopped: AtomicBool,
-    settler: Settler,
+    pub tree: ServiceTree<D>,
     /// Bodies being read: not to be deleted yet.
     readers: Mutex<HashMap<u64, usize>>,
-    gc: tokio::sync::Notify,
+    gc: Arc<tokio::sync::Notify>,
     /// Refusing writes (being deleted).
     closing: AtomicBool,
 }
@@ -243,14 +245,10 @@ impl<D: BlockDevice + 'static> Bucket<D> {
         fs: Arc<FileSystem<D>>,
         name: &str,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
-        fs.open_btree(name, DatasetFormat::S3).await?;
         let b = Arc::new(Bucket {
-            fs,
-            name: name.to_string(),
-            stopped: AtomicBool::new(false),
-            settler: Settler::default(),
+            tree: ServiceTree::open(fs, name, DatasetFormat::S3).await?,
             readers: Mutex::new(HashMap::new()),
-            gc: tokio::sync::Notify::new(),
+            gc: Default::default(),
             closing: AtomicBool::new(false),
         });
         // Half-written bodies: nothing points at them.
@@ -268,48 +266,23 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             S3Error::Fs(e) => e,
             e => FileSystemError::InvalidArgument(format!("{:?}", e)),
         })?;
-        let weak = Arc::downgrade(&b);
-        tokio::spawn(async move {
-            loop {
-                let Some(b) = weak.upgrade() else { return };
-                if b.stopped.load(Ordering::SeqCst) {
-                    return;
-                }
-                if let Err(e) = b.collect().await {
-                    eprintln!("s3 '{}': deleting old bodies: {:?}", b.name, e);
-                }
-                let wait = async {
-                    let _ = tokio::time::timeout(Duration::from_secs(10), b.gc.notified()).await;
-                };
-                wait.await;
+        let gc = Some(b.gc.clone());
+        spawn_while_alive(&b, Duration::from_secs(10), gc, |b| async move {
+            if let Err(e) = b.collect().await {
+                eprintln!("s3 '{}': deleting old bodies: {:?}", b.tree.name, e);
             }
         });
         Ok(b)
     }
 
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        self.gc.notify_waiters();
+        self.tree.stop();
+        // A permit, not a wake-up: its loop may be mid-pass, not waiting.
+        self.gc.notify_one();
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
-    }
-
-    /// Refuse writes from now on (a DeleteBucket in progress).
-    pub fn close(&self) {
-        self.closing.store(true, Ordering::SeqCst);
-    }
-
-    pub fn reopen(&self) {
-        self.closing.store(false, Ordering::SeqCst);
-    }
-
-    async fn ds(&self) -> Result<Arc<Dataset>> {
-        if self.is_stopped() {
-            return Err(S3Error::Unavailable);
-        }
-        Ok(self.fs.open_btree(&self.name, DatasetFormat::S3).await?)
+        self.tree.is_stopped()
     }
 
     /// Run a logged write, and make it durable.
@@ -321,19 +294,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
     {
-        let ds = self.ds().await?;
-        let out = {
-            let _w = ds.ops.write().await;
-            let mut t = Txn::begin(&self.fs, &ds.obj).await?;
-            let out = f(&mut t).await?;
-            if !t.is_empty() {
-                t.apply_logged()?;
-                self.settler.applied();
-            }
-            out
-        };
-        self.settler.settle(&self.fs, &self.name).await?;
-        Ok(out)
+        self.tree.write(f).await
     }
 
     /// Run a read (of durable state only).
@@ -345,11 +306,16 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
     {
-        let ds = self.ds().await?;
-        let _r = ds.ops.read().await;
-        self.settler.settle(&self.fs, &self.name).await?;
-        let t = Txn::begin(&self.fs, &ds.obj).await?;
-        f(&t).await
+        self.tree.read(f).await
+    }
+
+    /// Refuse writes from now on (a DeleteBucket in progress).
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub fn reopen(&self) {
+        self.closing.store(false, Ordering::SeqCst);
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -416,10 +382,10 @@ impl<D: BlockDevice + 'static> Bucket<D> {
                 return Ok(());
             }
             let readers: Vec<u64> = self.readers.lock().unwrap().keys().copied().collect();
-            let ds = self.ds().await?;
+            let ds = self.tree.ds::<S3Error>().await?;
             let more = {
                 let _w = ds.ops.write().await;
-                let mut t = Txn::begin(&self.fs, &ds.obj).await?;
+                let mut t = Txn::begin(&self.tree.fs, &ds.obj).await?;
                 let dead = scan(&t, Bound::Included(b"D"), b"E", 64).await?;
                 let mut deleted = 0;
                 let mut done_any = false;
@@ -453,7 +419,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
                 t.apply(None)?;
                 done_any && deleted > 0
             };
-            self.fs.kv_settle().await?;
+            self.tree.fs.kv_settle().await?;
             if !more {
                 return Ok(());
             }
@@ -637,7 +603,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
         }
         self.check_writable()?;
         let key = key.to_string();
-        let name = self.name.clone();
+        let name = self.tree.name.clone();
         self.write(|t| {
             Box::pin(async move {
                 let mut m: Meta = match t.get(b"M").await? {
@@ -897,20 +863,20 @@ impl<D: BlockDevice + 'static> BodyWriter<D> {
 
     async fn put_chunk(&mut self) -> Result<()> {
         let chunk = std::mem::take(&mut self.buf);
-        let ds = self.bucket.ds().await?;
+        let ds = self.bucket.tree.ds::<S3Error>().await?;
         {
             let _w = ds.ops.write().await;
-            let mut t = Txn::begin(&self.bucket.fs, &ds.obj).await?;
+            let mut t = Txn::begin(&self.bucket.tree.fs, &ds.obj).await?;
             t.put(&b_key(self.body, self.chunk), &chunk).await?;
             if self.logged {
                 t.apply_logged()?;
-                self.bucket.settler.applied();
+                self.bucket.tree.settler.applied();
             } else {
                 t.apply(None)?;
             }
         }
         self.chunk += 1;
-        self.bucket.fs.kv_settle().await?;
+        self.bucket.tree.fs.kv_settle().await?;
         Ok(())
     }
 
@@ -923,7 +889,7 @@ impl<D: BlockDevice + 'static> BodyWriter<D> {
         if !self.logged && self.chunk > 0 {
             // The chunks went straight to the tree: commit them before
             // anything that's logged points at them.
-            self.bucket.fs.sync().await?;
+            self.bucket.tree.fs.sync().await?;
         }
         let md5: [u8; 16] = std::mem::take(&mut self.md5).finalize().into();
         Ok((
@@ -949,7 +915,10 @@ impl<D: BlockDevice + 'static> BodyWriter<D> {
             })
             .await;
         if let Err(e) = r {
-            eprintln!("s3 '{}': dropping body {}: {:?}", self.bucket.name, body, e);
+            eprintln!(
+                "s3 '{}': dropping body {}: {:?}",
+                self.bucket.tree.name, body, e
+            );
         }
         self.bucket.gc.notify_one();
     }

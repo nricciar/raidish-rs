@@ -13,8 +13,24 @@
 //! `epoch` is the sender's pool lease epoch (0 without one). The server
 //! remembers the newest epoch it has seen (from requests or from the
 //! cluster) and refuses writes and flushes with an older one: `StaleEpoch`.
+//!
+//! A client names the version it speaks when it connects (`/ws?v=N`,
+//! [`BLOCK_PROTOCOL`]); a node refuses any other before the upgrade, so
+//! nodes of different versions never misread each other's frames.
 
-use crate::disk::{BLOCK_SIZE, DiskError};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::disk::BLOCK_SIZE;
+use crate::disk::DiskError;
+use crate::types::Epoch;
+
+/// This framing's version. Bump it with any change to the messages.
+pub const BLOCK_PROTOCOL: u32 = 1;
+
+/// A disk's websocket `url`, asking for [`BLOCK_PROTOCOL`].
+pub fn versioned(url: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{}{}v={}", url, sep, BLOCK_PROTOCOL)
+}
 
 pub const WS_REQUEST_HEADER_LEN: usize = 31;
 pub const WS_RESPONSE_HEADER_LEN: usize = 9;
@@ -87,7 +103,7 @@ pub fn encode_request(
     block: u64,
     count: u32,
     id: u64,
-    epoch: u64,
+    epoch: Epoch,
     data: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(WS_REQUEST_HEADER_LEN + data.map_or(0, |d| d.len()));
@@ -103,6 +119,7 @@ pub fn encode_request(
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn encode_response(status: WsStatus, id: u64, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(WS_RESPONSE_HEADER_LEN + data.len());
     out.push(status as u8);
@@ -119,10 +136,12 @@ pub fn decode_response(msg: &[u8]) -> Option<(u8, u64)> {
     Some((msg[0], u64::from_le_bytes(msg[1..9].try_into().unwrap())))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct WsRequest<'a> {
     data: &'a [u8],
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<'a> WsRequest<'a> {
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         (data.len() >= WS_REQUEST_HEADER_LEN).then_some(Self { data })
@@ -148,8 +167,8 @@ impl<'a> WsRequest<'a> {
         u64::from_le_bytes(self.data[15..23].try_into().unwrap())
     }
 
-    pub fn epoch(&self) -> u64 {
-        u64::from_le_bytes(self.data[23..31].try_into().unwrap())
+    pub fn epoch(&self) -> Epoch {
+        Epoch::from_le_bytes(self.data[23..31].try_into().unwrap())
     }
 
     /// Write payload, if it is exactly `count` blocks.

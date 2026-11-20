@@ -10,6 +10,7 @@ use super::rpc::{Call, Cred, Reply};
 use super::xdr::{Reader, Writer, XdrResult};
 use crate::disk::{BlockDevice, FileId};
 use crate::inode::{ObjType, SetAttrs};
+use crate::nfs::backend::NfsStat;
 use std::sync::Arc;
 
 pub const PMAP_PROG: u32 = 100000;
@@ -58,7 +59,7 @@ fn fattr(w: &mut Writer, a: &Attr) {
         .u32(0)
         .u32(0)
         .u64(a.fsid)
-        .u64(a.id);
+        .u64(a.id.get());
     time(w, a.mtime_ns); // atime (not kept)
     time(w, a.mtime_ns);
     time(w, a.ctime_ns);
@@ -83,9 +84,9 @@ fn wcc(w: &mut Writer, after: Option<&Attr>) {
 }
 
 /// A reply starting with `status`.
-fn reply(st: u32) -> Writer {
+fn reply(st: NfsStat) -> Writer {
     let mut w = Writer::new();
-    w.u32(st);
+    w.stat(st);
     w
 }
 
@@ -168,7 +169,7 @@ impl<D: BlockDevice + 'static> Server<D> {
 
     /// A file handle: the object it names, or why not. Arguments that
     /// don't decode are an `Err` of their own (`GARBAGE_ARGS`).
-    async fn fh(&self, r: &mut Reader<'_>) -> XdrResult<Result<FileId, u32>> {
+    async fn fh(&self, r: &mut Reader<'_>) -> XdrResult<Result<FileId, NfsStat>> {
         let fh = r.opaque(FH_MAX)?;
         Ok(self.backend.object(fh).await)
     }
@@ -253,7 +254,7 @@ impl<D: BlockDevice + 'static> Server<D> {
     }
 
     /// `diropargs3`: a directory and a name.
-    async fn dirop(&self, r: &mut Reader<'_>) -> XdrResult<(Result<FileId, u32>, String)> {
+    async fn dirop(&self, r: &mut Reader<'_>) -> XdrResult<(Result<FileId, NfsStat>, String)> {
         let dir = self.fh(r).await?;
         let name = r.string(NAME_MAX + 1)?;
         let dir = match dir {
@@ -320,7 +321,7 @@ impl<D: BlockDevice + 'static> Server<D> {
     }
 
     /// An answer of `st` with the object's attributes (`READLINK`).
-    async fn attr_only(&self, r: &mut Reader<'_>, st: u32) -> XdrResult<Writer> {
+    async fn attr_only(&self, r: &mut Reader<'_>, st: NfsStat) -> XdrResult<Writer> {
         let a = match self.fh(r).await? {
             Ok(id) => self.post_op_of(id).await,
             Err(_) => None,
@@ -331,7 +332,7 @@ impl<D: BlockDevice + 'static> Server<D> {
     }
 
     /// An answer of `st` with the directory's `wcc_data` (`SYMLINK`, `MKNOD`).
-    async fn dir_only(&self, r: &mut Reader<'_>, st: u32) -> XdrResult<Writer> {
+    async fn dir_only(&self, r: &mut Reader<'_>, st: NfsStat) -> XdrResult<Writer> {
         let a = match self.fh(r).await? {
             Ok(id) => self.post_op_of(id).await,
             Err(_) => None,
@@ -614,7 +615,7 @@ impl<D: BlockDevice + 'static> Server<D> {
         let mut eof = true;
         for (i, (name, id)) in all.iter().enumerate().skip(cookie as usize) {
             let mut e = Writer::new();
-            e.bool(true).u64(*id).string(name).u64(i as u64 + 1);
+            e.bool(true).u64(id.get()).string(name).u64(i as u64 + 1);
             let name_bytes = e.len();
             if plus {
                 let a = self.backend.getattr(*id).await.ok();
@@ -749,18 +750,18 @@ impl<D: BlockDevice + 'static> Server<D> {
                 match self.backend.export(&path).await {
                     Ok(id) => match self.backend.handle(id).await {
                         Ok(h) => {
-                            let mut w = reply(0);
+                            let mut w = reply(status::OK);
                             w.opaque(&h);
                             // AUTH_SYS, AUTH_NONE
                             w.u32(2).u32(1).u32(0);
                             w
                         }
-                        Err(_) => reply(10006),
+                        Err(_) => reply(status::SERVERFAULT),
                     },
-                    // MNT3ERR_NOENT, MNT3ERR_NOTDIR, or a server fault.
-                    Err(status::NOENT) => reply(2),
-                    Err(status::NOTDIR) => reply(20),
-                    Err(_) => reply(10006),
+                    // MNT3ERR_NOENT, MNT3ERR_NOTDIR (the same numbers), or
+                    // a server fault.
+                    Err(st @ (status::NOENT | status::NOTDIR)) => reply(st),
+                    Err(_) => reply(status::SERVERFAULT),
                 }
             }
             2 => {

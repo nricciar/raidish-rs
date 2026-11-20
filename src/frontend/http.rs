@@ -11,7 +11,6 @@ use hyper::body::{Body as _, Incoming};
 use hyper::{Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::time::Duration;
 use tokio::net::TcpListener;
 
 pub type Body = BoxBody<Bytes, std::io::Error>;
@@ -31,18 +30,11 @@ where
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Response<Body>> + Send + 'static,
 {
-    loop {
-        let Ok((sock, _)) = l.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let _ = sock.set_nodelay(true);
+    crate::net::accept_loop(l, "https", move |sock, _| {
         let handle = handle.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
-            let Ok(Ok(sock)) =
-                tokio::time::timeout(Duration::from_secs(10), tls.accept(sock)).await
-            else {
+        async move {
+            let Ok(sock) = crate::net::tls_accept(&tls, sock).await else {
                 return;
             };
             let svc = hyper::service::service_fn(move |req| {
@@ -53,8 +45,9 @@ where
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .serve_connection(hyper_util::rt::TokioIo::new(sock), svc)
                     .await;
-        });
-    }
+        }
+    })
+    .await
 }
 
 /// Whether another node already proxied this request here.
@@ -395,10 +388,6 @@ impl PayloadReader {
         }
         Ok(())
     }
-
-    pub fn bytes_read(&self) -> u64 {
-        self.read
-    }
 }
 
 /// A plain response.
@@ -406,4 +395,39 @@ pub fn status(code: StatusCode, body: Body) -> Response<Body> {
     let mut r = Response::new(body);
     *r.status_mut() = code;
     r
+}
+
+/// What a `Range` header asks of a `size`-byte file or object.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ByteRange {
+    /// No (usable) range: the whole thing.
+    All,
+    Part(std::ops::Range<u64>),
+    /// Nothing of it is in it (`416`).
+    Unsatisfiable,
+}
+
+/// Parse `bytes=a-b`, `bytes=a-` or `bytes=-n`. Anything else (another
+/// unit, several ranges, garbage) is ignored, as RFC 9110 allows.
+pub(crate) fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
+    let Some(spec) = header.and_then(|h| h.trim().strip_prefix("bytes=")) else {
+        return ByteRange::All;
+    };
+    if spec.contains(',') {
+        return ByteRange::All;
+    }
+    let Some((a, b)) = spec.trim().split_once('-') else {
+        return ByteRange::All;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    let range = match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(first), Ok(last)) if first <= last => first..last.saturating_add(1).min(size),
+        (Ok(first), Err(_)) if b.is_empty() => first..size,
+        (Err(_), Ok(n)) if a.is_empty() => size.saturating_sub(n)..size,
+        _ => return ByteRange::All,
+    };
+    if range.start >= size || range.is_empty() {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Part(range)
 }

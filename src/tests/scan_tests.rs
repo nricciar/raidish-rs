@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::{TOTAL_BLOCKS, TestDiskServer, TestPool, wait_until};
+use crate::types::Txg;
 use crate::vdev::Pool;
 use std::path::Path;
 
@@ -65,7 +66,7 @@ async fn resilver_restores_redundancy_after_an_outage() {
 
         // Data disk 1 drops out while the pool keeps changing.
         server.stop();
-        let disk1 = &fs.dev.pool().unwrap().disks;
+        let disk1 = &fs.dev.pool().unwrap().disks();
         assert!(wait_until(3, || !disk1.is_online(1)).await);
         write_files(&fs, "a", 2, 2).await; // overwrite some
         write_files(&fs, "b", 2, 3).await; // and add more
@@ -124,7 +125,7 @@ async fn resilver_skips_what_did_not_change() {
     let full = fs.scrub(true).await.unwrap();
 
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks;
+    let stripe = &fs.dev.pool().unwrap().disks();
     assert!(wait_until(3, || !stripe.is_online(4)).await);
     write_files(&fs, "new", 1, 1).await;
     server.restart().await;
@@ -219,8 +220,8 @@ async fn replaced_disk_is_fenced_then_rebuilt() {
 
     {
         let fs = pool.load().await;
-        let stripe = &fs.dev.pool().unwrap().disks;
-        assert_eq!(fs.degraded_disks()[2], Some(0));
+        let stripe = &fs.dev.pool().unwrap().disks();
+        assert_eq!(fs.degraded_disks()[2], Some(Txg::ZERO));
         assert!(stripe.is_fenced(2));
         check_files(&fs, "f", 1, 3).await; // served around the blank disk
 
@@ -291,7 +292,7 @@ async fn health_monitor_resilvers_a_returning_disk() {
     let monitor = spawn_health_monitor(fs.clone(), Duration::from_millis(100), None);
 
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks;
+    let stripe = &fs.dev.pool().unwrap().disks();
     assert!(wait_until(3, || !stripe.is_online(3)).await);
     write_files(&fs, "m", 1, 2).await;
     assert!(fs.degraded_disks()[3].is_some());
@@ -319,7 +320,7 @@ async fn resilver_only_touches_the_disk_that_was_away() {
     write_files(&fs, "x", 1, 1).await;
     fs.sync().await.unwrap();
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks;
+    let stripe = &fs.dev.pool().unwrap().disks();
     assert!(wait_until(3, || !stripe.is_online(4)).await);
     write_files(&fs, "y", 1, 1).await;
     fs.sync().await.unwrap();

@@ -1,15 +1,16 @@
 //! The NFS server over a real socket, with a small NFSv3 client.
 
-use super::backend::{Backend, Forward, Forwarded, Peers, lease_node, status};
+use super::backend::{Backend, Forward, Forwarded, NfsStat, Peers, status};
 use super::rpc::Client;
 use super::v3::{MOUNT_PROG, NFS_PROG, PMAP_PROG};
 use super::xdr::{Reader, Writer};
 use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority};
-use crate::files_api::{ObjectGuard, ObjectLeases};
 use crate::fs::FileSystem;
+use crate::object_lease::{ObjectGuard, ObjectLeases};
 use crate::test_util::TestPool;
+use crate::types::{Epoch, Holding, LeaseRef};
 use crate::vdev::Pool;
 use crate::writer::ObjLease;
 use async_trait::async_trait;
@@ -153,25 +154,25 @@ impl Nfs {
         (0, r.opaque(64).unwrap().to_vec())
     }
 
-    async fn getattr(&mut self, fh: &[u8]) -> Result<Fattr, u32> {
+    async fn getattr(&mut self, fh: &[u8]) -> Result<Fattr, NfsStat> {
         let mut w = Writer::new();
         w.opaque(fh);
         let b = self.nfs(1, w).await;
         let mut r = Reader::new(&b);
         match r.u32().unwrap() {
             0 => Ok(fattr(&mut r)),
-            s => Err(s),
+            s => Err(NfsStat::from_code(s)),
         }
     }
 
-    async fn lookup(&mut self, dir: &[u8], name: &str) -> Result<Vec<u8>, u32> {
+    async fn lookup(&mut self, dir: &[u8], name: &str) -> Result<Vec<u8>, NfsStat> {
         let mut w = Writer::new();
         w.opaque(dir).string(name);
         let b = self.nfs(3, w).await;
         let mut r = Reader::new(&b);
         match r.u32().unwrap() {
             0 => Ok(r.opaque(64).unwrap().to_vec()),
-            s => Err(s),
+            s => Err(NfsStat::from_code(s)),
         }
     }
 
@@ -182,7 +183,7 @@ impl Nfs {
         name: &str,
         mkdir: bool,
         how: u32,
-    ) -> Result<Vec<u8>, u32> {
+    ) -> Result<Vec<u8>, NfsStat> {
         let mut w = Writer::new();
         w.opaque(dir).string(name);
         if !mkdir {
@@ -196,7 +197,7 @@ impl Nfs {
                 assert!(r.bool().unwrap(), "a handle");
                 Ok(r.opaque(64).unwrap().to_vec())
             }
-            s => Err(s),
+            s => Err(NfsStat::from_code(s)),
         }
     }
 
@@ -205,7 +206,7 @@ impl Nfs {
         dir: &[u8],
         name: &str,
         verf: u64,
-    ) -> Result<Vec<u8>, u32> {
+    ) -> Result<Vec<u8>, NfsStat> {
         let mut w = Writer::new();
         w.opaque(dir).string(name).u32(2).u64(verf);
         let b = self.nfs(8, w).await;
@@ -215,7 +216,7 @@ impl Nfs {
                 assert!(r.bool().unwrap());
                 Ok(r.opaque(64).unwrap().to_vec())
             }
-            s => Err(s),
+            s => Err(NfsStat::from_code(s)),
         }
     }
 
@@ -246,7 +247,12 @@ impl Nfs {
         (st, count, committed, verf)
     }
 
-    async fn read(&mut self, fh: &[u8], offset: u64, count: u32) -> Result<(Vec<u8>, bool), u32> {
+    async fn read(
+        &mut self,
+        fh: &[u8],
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), NfsStat> {
         let mut w = Writer::new();
         w.opaque(fh).u64(offset).u32(count);
         let b = self.nfs(6, w).await;
@@ -254,7 +260,7 @@ impl Nfs {
         let st = r.u32().unwrap();
         post_op(&mut r);
         if st != 0 {
-            return Err(st);
+            return Err(NfsStat::from_code(st));
         }
         let n = r.u32().unwrap();
         let eof = r.bool().unwrap();
@@ -263,7 +269,7 @@ impl Nfs {
         Ok((data, eof))
     }
 
-    async fn commit(&mut self, fh: &[u8]) -> Result<[u8; 8], u32> {
+    async fn commit(&mut self, fh: &[u8]) -> Result<[u8; 8], NfsStat> {
         let mut w = Writer::new();
         w.opaque(fh).u64(0).u32(0);
         let b = self.nfs(21, w).await;
@@ -271,33 +277,33 @@ impl Nfs {
         let st = r.u32().unwrap();
         wcc(&mut r);
         if st != 0 {
-            return Err(st);
+            return Err(NfsStat::from_code(st));
         }
         Ok(r.fixed(8).unwrap().try_into().unwrap())
     }
 
-    async fn setattr(&mut self, fh: &[u8], mode: Option<u32>, size: Option<u64>) -> u32 {
+    async fn setattr(&mut self, fh: &[u8], mode: Option<u32>, size: Option<u64>) -> NfsStat {
         let mut w = Writer::new();
         w.opaque(fh);
         sattr(&mut w, mode, size);
         w.bool(false); // no guard
         let b = self.nfs(2, w).await;
-        Reader::new(&b).u32().unwrap()
+        NfsStat::from_code(Reader::new(&b).u32().unwrap())
     }
 
     /// REMOVE or RMDIR.
-    async fn remove(&mut self, dir: &[u8], name: &str, rmdir: bool) -> u32 {
+    async fn remove(&mut self, dir: &[u8], name: &str, rmdir: bool) -> NfsStat {
         let mut w = Writer::new();
         w.opaque(dir).string(name);
         let b = self.nfs(if rmdir { 13 } else { 12 }, w).await;
-        Reader::new(&b).u32().unwrap()
+        NfsStat::from_code(Reader::new(&b).u32().unwrap())
     }
 
-    async fn rename(&mut self, fd: &[u8], from: &str, td: &[u8], to: &str) -> u32 {
+    async fn rename(&mut self, fd: &[u8], from: &str, td: &[u8], to: &str) -> NfsStat {
         let mut w = Writer::new();
         w.opaque(fd).string(from).opaque(td).string(to);
         let b = self.nfs(14, w).await;
-        Reader::new(&b).u32().unwrap()
+        NfsStat::from_code(Reader::new(&b).u32().unwrap())
     }
 
     async fn access(&mut self, fh: &[u8], want: u32) -> u32 {
@@ -318,7 +324,7 @@ impl Nfs {
         verf: u64,
         count: u32,
         plus: bool,
-    ) -> Result<(Vec<(String, u64)>, bool, u64), u32> {
+    ) -> Result<(Vec<(String, u64)>, bool, u64), NfsStat> {
         let mut w = Writer::new();
         w.opaque(dir).u64(cookie).u64(verf);
         if plus {
@@ -331,7 +337,7 @@ impl Nfs {
         let st = r.u32().unwrap();
         post_op(&mut r);
         if st != 0 {
-            return Err(st);
+            return Err(NfsStat::from_code(st));
         }
         let verf = r.u64().unwrap();
         let mut out = Vec::new();
@@ -607,7 +613,7 @@ struct TestLeases(Arc<LocalAuthority>);
 
 struct TestGuard {
     auth: Arc<LocalAuthority>,
-    resource: String,
+    resource: crate::types::LeaseResource,
     lease: ObjLease,
 }
 
@@ -619,8 +625,7 @@ impl ObjectGuard for TestGuard {
     async fn release(&self) {
         let op = LeaseOp::Release {
             resource: self.resource.clone(),
-            owner: self.lease.owner.clone(),
-            epoch: self.lease.epoch,
+            holder: Holding::new(self.lease.owner.clone(), self.lease.epoch),
         };
         self.auth.propose(op).await.unwrap();
     }
@@ -628,18 +633,22 @@ impl ObjectGuard for TestGuard {
 
 #[async_trait]
 impl ObjectLeases for TestLeases {
-    async fn take(&self, resource: &str, desc: &str) -> Result<Box<dyn ObjectGuard>, String> {
+    async fn take(
+        &self,
+        resource: crate::types::LeaseResource,
+        desc: crate::types::Holder,
+    ) -> Result<Box<dyn ObjectGuard>, String> {
         let owner = format!("nfs-{}", desc);
         let op = LeaseOp::Acquire {
-            resource: resource.into(),
+            resource: resource.clone(),
             owner: owner.clone(),
-            desc: desc.into(),
+            holder: desc,
             ttl_ms: 600_000,
         };
         match self.0.propose(op).await? {
             Response::Granted { epoch, .. } => Ok(Box::new(TestGuard {
                 auth: self.0.clone(),
-                resource: resource.into(),
+                resource: resource.clone(),
                 lease: ObjLease { owner, epoch },
             })),
             other => Err(format!("{} is held: {:?}", resource, other)),
@@ -647,11 +656,12 @@ impl ObjectLeases for TestLeases {
     }
 }
 
-async fn grant(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
+async fn grant(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &str) -> Epoch {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Acquire {
-        resource: resource.into(),
+        resource: resource.clone(),
         owner: owner.into(),
-        desc: owner.into(),
+        holder: crate::types::Holder::default().with_detail(owner),
         ttl_ms: 600_000,
     };
     match auth.propose(op).await.unwrap() {
@@ -668,7 +678,7 @@ async fn two_nodes_share_handles_and_hand_files_over() {
     let pool = TestPool::new().await;
     drop(pool.format().await);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = grant(&auth, POOL, "c").await;
+    let epoch = grant(&auth, &POOL, "c").await;
     let committer = Arc::new(
         Committer::new(
             Arc::new(pool.load().await),
@@ -685,8 +695,7 @@ async fn two_nodes_share_handles_and_hand_files_over() {
         let epoch = grant(&auth, &resource, id).await;
         let sink = Arc::new(DirectSink {
             committer: committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         });
         let fs = Arc::new(
             FileSystem::load_writer(pool.dev().await, sink)
@@ -754,7 +763,9 @@ impl Peers for TestPeers {
         if l.released || l.expires_ms <= crate::cluster::now_ms() {
             return None;
         }
-        lease_node(&l.desc).map(String::from)
+        l.holder
+            .node_as(crate::types::HolderRole::Nfs)
+            .map(String::from)
     }
 
     async fn forward(&self, node: &str, req: &Forward) -> Result<Forwarded, String> {
@@ -777,7 +788,7 @@ async fn requests_for_a_file_another_node_writes_are_forwarded() {
     let pool = TestPool::new().await;
     drop(pool.format().await);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = grant(&auth, POOL, "c").await;
+    let epoch = grant(&auth, &POOL, "c").await;
     let committer = Arc::new(
         Committer::new(
             Arc::new(pool.load().await),
@@ -799,8 +810,7 @@ async fn requests_for_a_file_another_node_writes_are_forwarded() {
         let epoch = grant(&auth, &resource, id).await;
         let sink = Arc::new(DirectSink {
             committer: committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         });
         let fs = Arc::new(
             FileSystem::load_writer(pool.dev().await, sink)

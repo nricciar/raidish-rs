@@ -10,102 +10,109 @@
 //! Everything here is deterministic: the leader stamps `now_ms` into each
 //! request before proposing it, so every replica computes the same result.
 
+use crate::types::{Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, MetaslabIdx};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The resource a pool writer (the committer) leases.
-pub const POOL: &str = "pool";
+pub const POOL: LeaseResource = LeaseResource::Pool;
 
 /// The resource the NFSv4 state owner leases (see `crate::nfs::v4`).
-pub const NFS4: &str = "nfs4";
+pub const NFS4: LeaseResource = LeaseResource::Nfs4;
 
 pub use crate::fence::Domain;
 
 /// Who may write a metaslab's data, and since which epoch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct MetaslabGrant {
-    /// The writer lease resource (`writer/<node>`) it's lent to; None:
-    /// back with the committer.
-    pub writer: Option<String>,
-    /// That writer lease's epoch.
-    pub writer_epoch: u64,
-    /// Epoch of the lend (or of the return): the fencing token of the
-    /// metaslab while lent.
-    pub epoch: u64,
+pub enum MetaslabGrant {
+    /// Lent to writer lease `writer` (`writer/<node>` at its epoch);
+    /// `epoch` (the lend's) fences the metaslab's data.
+    Lent { writer: LeaseRef, epoch: Epoch },
+    /// Back with the committer since `epoch`.
+    Returned { epoch: Epoch },
 }
 
-/// A command proposed through Raft.
+impl MetaslabGrant {
+    /// The epoch of the lend or return.
+    pub fn epoch(&self) -> Epoch {
+        match self {
+            MetaslabGrant::Lent { epoch, .. } | MetaslabGrant::Returned { epoch } => *epoch,
+        }
+    }
+
+    /// The writer lease it's lent to.
+    pub fn writer(&self) -> Option<&LeaseRef> {
+        match self {
+            MetaslabGrant::Lent { writer, .. } => Some(writer),
+            MetaslabGrant::Returned { .. } => None,
+        }
+    }
+
+    /// What a disk server needs of it.
+    pub fn fence(&self) -> crate::fence::Grant {
+        match self {
+            MetaslabGrant::Lent { epoch, .. } => crate::fence::Grant::Lent(*epoch),
+            MetaslabGrant::Returned { epoch } => crate::fence::Grant::Returned(*epoch),
+        }
+    }
+}
+
+/// A change to the cluster state. Callers propose these (see
+/// `crate::cluster::Cluster::propose`); the leader stamps them into a
+/// [`Request`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum Request {
+pub enum LeaseOp {
     Acquire {
-        resource: String,
+        resource: LeaseResource,
         owner: String,
-        desc: String,
+        holder: Holder,
         ttl_ms: u64,
-        now_ms: u64,
     },
+    /// Extend `holder`'s `resource` lease (even past expiry, as long as
+    /// nobody took it in between).
     Renew {
-        resource: String,
-        owner: String,
-        epoch: u64,
+        resource: LeaseResource,
+        holder: Holding,
         ttl_ms: u64,
-        now_ms: u64,
     },
     Release {
-        resource: String,
-        owner: String,
-        epoch: u64,
+        resource: LeaseResource,
+        holder: Holding,
     },
-    /// Hand a lease straight to another owner: applied only if `from_owner`
-    /// holds the live `resource` lease at `from_epoch`. `to_owner` gets it at
-    /// a new epoch in the same step, so it's never free in between (a plain
-    /// release and acquire would let any other node take it), and the new
-    /// epoch fences whatever the old holder still tries to write.
+    /// Hand a lease straight to another owner: applied only if `from`
+    /// holds the live `resource` lease. `to_owner` gets it at a new epoch
+    /// in the same step, so it's never free in between (a plain release
+    /// and acquire would let any other node take it), and the new epoch
+    /// fences whatever the old holder still tries to write.
     Transfer {
-        resource: String,
-        from_owner: String,
-        from_epoch: u64,
+        resource: LeaseResource,
+        from: Holding,
         to_owner: String,
-        to_desc: String,
+        to_holder: Holder,
         ttl_ms: u64,
-        now_ms: u64,
     },
-    /// The NFSv4 state owner (the `nfs4` lease holder at `nfs_epoch`)
-    /// records that NFSv4 client `client` (its owner string, hex) has
-    /// state that may be reclaimed after a failover, or (`present: false`)
-    /// that it hasn't any more.
+    /// The NFSv4 state owner (`nfs`, the `nfs4` lease holder) records that
+    /// NFSv4 client `client` (its owner string, hex) has state that may be
+    /// reclaimed after a failover, or (`present: false`) that it hasn't any
+    /// more.
     NfsClient {
         client: String,
         present: bool,
-        nfs_owner: String,
-        nfs_epoch: u64,
-        now_ms: u64,
+        nfs: Holding,
     },
-    /// The committer (current `pool` holder) lends metaslab `idx` to the
-    /// holder of `writer` at `writer_epoch`.
+    /// The committer (`pool`, the current `pool` holder) lends metaslab
+    /// `idx` to writer lease `writer`.
     Lend {
-        idx: u32,
-        writer: String,
-        writer_epoch: u64,
-        pool_owner: String,
-        pool_epoch: u64,
-        now_ms: u64,
+        idx: MetaslabIdx,
+        writer: LeaseRef,
+        pool: Holding,
     },
     /// The committer takes metaslab `idx` back.
-    Return {
-        idx: u32,
-        pool_owner: String,
-        pool_epoch: u64,
-        now_ms: u64,
-    },
+    Return { idx: MetaslabIdx, pool: Holding },
     /// Whether VM `name` should be running (see `crate::vm`). Only the
     /// intent: what actually runs is whatever libvirt says on the node that
     /// holds the VM's disk.
-    SetVm {
-        name: String,
-        running: bool,
-        now_ms: u64,
-    },
+    SetVm { name: String, running: bool },
     /// The key S3/SQS access keys are derived with (see
     /// `crate::frontend::keys`): set once, by whichever node asks first.
     SetServiceKey { key: String },
@@ -123,18 +130,34 @@ pub enum Request {
     },
 }
 
+impl LeaseOp {
+    /// Stamp with the leader's clock, ready to propose.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn stamp(self, now_ms: u64) -> Request {
+        Request { op: self, now_ms }
+    }
+}
+
+/// A command proposed through Raft: an op and the leader's clock when it
+/// was proposed, so every replica computes the same result.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Request {
+    pub op: LeaseOp,
+    pub now_ms: u64,
+}
+
 /// What applying a [`Request`] produced.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Response {
     /// The caller holds the lease at `epoch` until `expires_ms`.
     Granted {
-        epoch: u64,
+        epoch: Epoch,
         expires_ms: u64,
     },
     /// Someone else holds it.
     Held {
         owner: String,
-        desc: String,
+        holder: Holder,
         expires_ms: u64,
     },
     /// The caller's lease is gone (taken over, or released).
@@ -142,7 +165,7 @@ pub enum Response {
     Released,
     /// A metaslab lend/return went through; `epoch` fences its data now.
     Fenced {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// A lend/return was refused (not the committer, writer not live, ...).
     Refused(String),
@@ -156,28 +179,29 @@ pub enum Response {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub owner: String,
-    pub desc: String,
-    pub epoch: u64,
+    pub holder: Holder,
+    pub epoch: Epoch,
     pub expires_ms: u64,
     pub released: bool,
 }
 
 impl Lease {
-    fn live(&self, now_ms: u64) -> bool {
+    /// Held (not released, not expired) at `now_ms`.
+    pub fn is_live(&self, now_ms: u64) -> bool {
         !self.released && self.expires_ms > now_ms
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClusterState {
-    /// The newest epoch handed out (0: none yet).
-    pub epoch: u64,
+    /// The newest epoch handed out (none yet: `Epoch::NONE`).
+    pub epoch: Epoch,
     /// Every resource ever leased. Released or expired leases stay, so the
     /// resource's last epoch is never forgotten.
-    pub leases: BTreeMap<String, Lease>,
+    pub leases: BTreeMap<LeaseResource, Lease>,
     /// Metaslabs ever lent, by index. Never forgotten, like leases.
     #[serde(default)]
-    pub metaslabs: BTreeMap<u32, MetaslabGrant>,
+    pub metaslabs: BTreeMap<MetaslabIdx, MetaslabGrant>,
     /// NFSv4 clients that may reclaim state after a state owner failover:
     /// owner string (hex) → when recorded.
     #[serde(default)]
@@ -198,107 +222,128 @@ pub struct ClusterState {
 
 impl ClusterState {
     /// Epoch of the newest `pool` grant: block writes older than this are stale.
-    pub fn pool_epoch(&self) -> u64 {
-        self.leases.get(POOL).map_or(0, |l| l.epoch)
+    pub fn pool_epoch(&self) -> Epoch {
+        self.leases.get(&POOL).map_or(Epoch::NONE, |l| l.epoch)
     }
 
     /// The epoch that fences writes to `domain`: the pool lease for the pool
     /// and metaslabs the committer keeps, the lend for lent metaslabs.
-    pub fn fence_epoch(&self, domain: Domain) -> u64 {
+    pub fn fence_epoch(&self, domain: Domain) -> Epoch {
         match domain {
             Domain::Pool => self.pool_epoch(),
             Domain::Metaslab(i) => match self.metaslabs.get(&i) {
-                Some(g) if g.writer.is_some() => g.epoch,
-                Some(g) => g.epoch.max(self.pool_epoch()),
+                Some(MetaslabGrant::Lent { epoch, .. }) => *epoch,
+                Some(MetaslabGrant::Returned { epoch }) => (*epoch).max(self.pool_epoch()),
                 None => self.pool_epoch(),
             },
         }
     }
 
-    /// Is `idx` lent to a writer?
-    pub fn lent_to(&self, idx: u32) -> Option<&MetaslabGrant> {
-        self.metaslabs.get(&idx).filter(|g| g.writer.is_some())
+    /// The writer lease `idx` is lent to (and its epoch), if any.
+    pub fn lent_to(&self, idx: MetaslabIdx) -> Option<&LeaseRef> {
+        self.metaslabs.get(&idx).and_then(MetaslabGrant::writer)
     }
 
-    /// Does `owner` hold the live `resource` lease at `epoch`?
-    pub fn holds(&self, resource: &str, owner: Option<&str>, epoch: u64, now_ms: u64) -> bool {
-        self.leases.get(resource).is_some_and(|l| {
-            l.epoch == epoch && l.live(now_ms) && owner.is_none_or(|o| o == l.owner)
+    /// The live lease on `resource`, if any.
+    pub fn live_lease(&self, resource: &LeaseResource, now_ms: u64) -> Option<&Lease> {
+        self.leases.get(resource).filter(|l| l.is_live(now_ms))
+    }
+
+    /// The node whose lease `resource` is (live), if a node's.
+    pub fn holder_node(&self, resource: &LeaseResource, now_ms: u64) -> Option<&str> {
+        self.live_lease(resource, now_ms)?.holder.node.as_deref()
+    }
+
+    /// The node running dataset `name` (its agent holding its live `ds/`
+    /// lease). Not the committer replaying a gone writer's log: that holds
+    /// the lease, but runs nothing (see [`Self::dataset_held`]).
+    pub fn dataset_node(&self, name: &str, now_ms: u64) -> Option<&str> {
+        let l = self.live_lease(&LeaseResource::dataset(name), now_ms)?;
+        match l.holder.role {
+            HolderRole::Agent => l.holder.node.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether anyone (an agent, or the committer replaying) holds dataset
+    /// `name`'s live `ds/` lease: who'd run it must wait for them.
+    pub fn dataset_held(&self, name: &str, now_ms: u64) -> bool {
+        self.live_lease(&LeaseResource::dataset(name), now_ms)
+            .is_some()
+    }
+
+    /// The nodes whose agents are running (hold their live `node/` lease),
+    /// with their leases.
+    pub fn live_nodes(&self, now_ms: u64) -> impl Iterator<Item = (&str, &Lease)> {
+        self.leases.iter().filter_map(move |(r, l)| match r {
+            LeaseResource::Node(n) if l.is_live(now_ms) => Some((n.as_str(), l)),
+            _ => None,
         })
     }
 
+    /// Does `holder` hold the live `resource` lease?
+    pub fn holds(&self, resource: &LeaseResource, holder: &Holding, now_ms: u64) -> bool {
+        self.live_lease(resource, now_ms)
+            .is_some_and(|l| l.epoch == holder.epoch && l.owner == holder.owner)
+    }
+
+    /// Is `lease` (whoever holds it) live?
+    pub fn is_live(&self, lease: &LeaseRef, now_ms: u64) -> bool {
+        self.live_lease(&lease.resource, now_ms)
+            .is_some_and(|l| l.epoch == lease.epoch)
+    }
+
     pub fn apply(&mut self, req: &Request) -> Response {
-        match req {
-            Request::Lend {
-                idx,
-                writer,
-                writer_epoch,
-                pool_owner,
-                pool_epoch,
-                now_ms,
-            } => {
-                if !self.holds(POOL, Some(pool_owner), *pool_epoch, *now_ms) {
+        let now_ms = req.now_ms;
+        match &req.op {
+            LeaseOp::Lend { idx, writer, pool } => {
+                if !self.holds(&POOL, pool, now_ms) {
                     return Response::Refused("not the committer".into());
                 }
-                if !self.holds(writer, None, *writer_epoch, *now_ms) {
+                if !self.is_live(writer, now_ms) {
+                    return Response::Refused(format!("{} is not live", writer));
+                }
+                if let Some(w) = self.lent_to(*idx) {
                     return Response::Refused(format!(
-                        "{} is not live at {}",
-                        writer, writer_epoch
+                        "metaslab {} is lent to {}",
+                        idx, w.resource
                     ));
                 }
-                if let Some(g) = self.lent_to(*idx) {
-                    return Response::Refused(format!(
-                        "metaslab {} is lent to {:?}",
-                        idx, g.writer
-                    ));
-                }
-                self.epoch += 1;
+                self.epoch = self.epoch.next();
                 self.metaslabs.insert(
                     *idx,
-                    MetaslabGrant {
-                        writer: Some(writer.clone()),
-                        writer_epoch: *writer_epoch,
+                    MetaslabGrant::Lent {
+                        writer: writer.clone(),
                         epoch: self.epoch,
                     },
                 );
                 Response::Fenced { epoch: self.epoch }
             }
-            Request::Return {
-                idx,
-                pool_owner,
-                pool_epoch,
-                now_ms,
-            } => {
-                if !self.holds(POOL, Some(pool_owner), *pool_epoch, *now_ms) {
+            LeaseOp::Return { idx, pool } => {
+                if !self.holds(&POOL, pool, now_ms) {
                     return Response::Refused("not the committer".into());
                 }
-                self.epoch += 1;
-                self.metaslabs.insert(
-                    *idx,
-                    MetaslabGrant {
-                        writer: None,
-                        writer_epoch: 0,
-                        epoch: self.epoch,
-                    },
-                );
+                self.epoch = self.epoch.next();
+                self.metaslabs
+                    .insert(*idx, MetaslabGrant::Returned { epoch: self.epoch });
+
                 Response::Fenced { epoch: self.epoch }
             }
-            Request::Acquire {
+            LeaseOp::Acquire {
                 resource,
                 owner,
-                desc,
+                holder,
                 ttl_ms,
-                now_ms,
             } => {
                 let expires_ms = now_ms + ttl_ms;
                 match self.leases.get_mut(resource) {
-                    Some(l) if l.live(*now_ms) && l.owner != *owner => Response::Held {
+                    Some(l) if l.is_live(now_ms) && l.owner != *owner => Response::Held {
                         owner: l.owner.clone(),
-                        desc: l.desc.clone(),
+                        holder: l.holder.clone(),
                         expires_ms: l.expires_ms,
                     },
                     // Asking again for a lease we hold: same epoch, extended.
-                    Some(l) if l.live(*now_ms) => {
+                    Some(l) if l.is_live(now_ms) => {
                         l.expires_ms = l.expires_ms.max(expires_ms);
                         Response::Granted {
                             epoch: l.epoch,
@@ -306,12 +351,12 @@ impl ClusterState {
                         }
                     }
                     _ => {
-                        self.epoch += 1;
+                        self.epoch = self.epoch.next();
                         self.leases.insert(
                             resource.clone(),
                             Lease {
                                 owner: owner.clone(),
-                                desc: desc.clone(),
+                                holder: holder.clone(),
                                 epoch: self.epoch,
                                 expires_ms,
                                 released: false,
@@ -324,17 +369,15 @@ impl ClusterState {
                     }
                 }
             }
-            Request::Renew {
+            LeaseOp::Renew {
                 resource,
-                owner,
-                epoch,
+                holder,
                 ttl_ms,
-                now_ms,
             } => match self.leases.get_mut(resource) {
                 // Renewing after expiry is fine as long as nobody took the
                 // lease in between: the epoch is unchanged, so nobody else
                 // can have written.
-                Some(l) if l.owner == *owner && l.epoch == *epoch && !l.released => {
+                Some(l) if l.owner == holder.owner && l.epoch == holder.epoch && !l.released => {
                     l.expires_ms = l.expires_ms.max(now_ms + ttl_ms);
                     Response::Granted {
                         epoch: l.epoch,
@@ -343,37 +386,31 @@ impl ClusterState {
                 }
                 _ => Response::Lost,
             },
-            Request::Release {
-                resource,
-                owner,
-                epoch,
-            } => match self.leases.get_mut(resource) {
-                Some(l) if l.owner == *owner && l.epoch == *epoch => {
+            LeaseOp::Release { resource, holder } => match self.leases.get_mut(resource) {
+                Some(l) if l.owner == holder.owner && l.epoch == holder.epoch => {
                     l.released = true;
                     Response::Released
                 }
                 _ => Response::Lost,
             },
-            Request::Transfer {
+            LeaseOp::Transfer {
                 resource,
-                from_owner,
-                from_epoch,
+                from,
                 to_owner,
-                to_desc,
+                to_holder,
                 ttl_ms,
-                now_ms,
             } => {
-                if to_owner.is_empty() || to_owner == from_owner {
+                if to_owner.is_empty() || *to_owner == from.owner {
                     return Response::Refused("no new owner to transfer to".into());
                 }
-                if self.holds(resource, Some(from_owner), *from_epoch, *now_ms) {
-                    self.epoch += 1;
+                if self.holds(resource, from, now_ms) {
+                    self.epoch = self.epoch.next();
                     let expires_ms = now_ms + ttl_ms;
                     self.leases.insert(
                         resource.clone(),
                         Lease {
                             owner: to_owner.clone(),
-                            desc: to_desc.clone(),
+                            holder: to_holder.clone(),
                             epoch: self.epoch,
                             expires_ms,
                             released: false,
@@ -387,7 +424,9 @@ impl ClusterState {
                 match self.leases.get(resource) {
                     // The same transfer again (clients send every request to
                     // every node, see `LeaseClient::call`): it went through.
-                    Some(l) if l.owner == *to_owner && l.epoch > *from_epoch && l.live(*now_ms) => {
+                    Some(l)
+                        if l.owner == *to_owner && l.epoch > from.epoch && l.is_live(now_ms) =>
+                    {
                         Response::Granted {
                             epoch: l.epoch,
                             expires_ms: l.expires_ms,
@@ -396,36 +435,30 @@ impl ClusterState {
                     _ => Response::Lost,
                 }
             }
-            Request::NfsClient {
+            LeaseOp::NfsClient {
                 client,
                 present,
-                nfs_owner,
-                nfs_epoch,
-                now_ms,
+                nfs,
             } => {
-                if !self.holds(NFS4, Some(nfs_owner), *nfs_epoch, *now_ms) {
+                if !self.holds(&NFS4, nfs, now_ms) {
                     return Response::Refused("not the NFSv4 state owner".into());
                 }
                 if *present {
-                    self.nfs_clients.insert(client.clone(), *now_ms);
+                    self.nfs_clients.insert(client.clone(), now_ms);
                 } else {
                     self.nfs_clients.remove(client);
                 }
                 Response::Recorded
             }
-            Request::SetVm {
-                name,
-                running,
-                now_ms,
-            } => {
+            LeaseOp::SetVm { name, running } => {
                 if *running {
-                    self.vms.insert(name.clone(), *now_ms);
+                    self.vms.insert(name.clone(), now_ms);
                 } else {
                     self.vms.remove(name);
                 }
                 Response::Recorded
             }
-            Request::SetAttached { volume, nodes } => {
+            LeaseOp::SetAttached { volume, nodes } => {
                 if nodes.is_empty() {
                     self.attached.remove(volume);
                 } else {
@@ -439,7 +472,7 @@ impl ClusterState {
                 }
                 Response::Recorded
             }
-            Request::Attach { volume, node, on } => {
+            LeaseOp::Attach { volume, node, on } => {
                 let nodes = self.attached.entry(volume.clone()).or_default();
                 match on {
                     true if !nodes.contains(node) => nodes.push(node.clone()),
@@ -451,7 +484,7 @@ impl ClusterState {
                 }
                 Response::Recorded
             }
-            Request::SetServiceKey { key } => {
+            LeaseOp::SetServiceKey { key } => {
                 if self.service_key.is_none() {
                     self.service_key = Some(key.clone());
                 }

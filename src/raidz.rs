@@ -1,4 +1,4 @@
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, zeroed_blocks};
 use crate::disks::DiskSet;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
 use async_trait::async_trait;
@@ -106,7 +106,11 @@ impl BlockDevice for RaidZ {
                         let mut buf = [0u8; BLOCK_SIZE];
                         // A missing disk shouldn't block the write: rebuild
                         // the shard from the rest of the stripe instead.
-                        if self.read_shard(i, stripe_id, &mut buf).await.is_err() {
+                        if self
+                            .read_shard(i, stripe_id, std::slice::from_mut(&mut buf))
+                            .await
+                            .is_err()
+                        {
                             self.reconstruct_from_stripe(stripe_id, i, &mut buf)
                                 .await
                                 .map_err(io_err)?;
@@ -166,7 +170,7 @@ impl BlockDevice for RaidZ {
         Ok(())
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         let stripe = lba / self.data as u64;
         let data_index = (lba % self.data as u64) as usize;
 
@@ -178,7 +182,7 @@ impl BlockDevice for RaidZ {
         }
 
         match self
-            .read_shard(data_index, stripe, &mut buf[..BLOCK_SIZE])
+            .read_shard(data_index, stripe, std::slice::from_mut(buf))
             .await
         {
             Ok(()) => Ok(()),
@@ -248,8 +252,8 @@ impl BlockDevice for RaidZ {
 
     /// Contiguous reads become one read per data disk. Stripes with
     /// unflushed writes (or a failed disk) fall back to per-block reads.
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        let n = (buf.len() / BLOCK_SIZE) as u64;
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let n = buf.len() as u64;
         if n == 0 {
             return Ok(());
         }
@@ -260,20 +264,19 @@ impl BlockDevice for RaidZ {
         if n > 1 && !buffered {
             let count = (s_last - s_first + 1) as usize;
             let runs = (0..self.data).map(|i| async move {
-                let mut run = vec![0u8; count * BLOCK_SIZE];
+                let mut run = zeroed_blocks(count);
                 self.read_shard(i, s_first, &mut run).await.map(|_| run)
             });
             if let Ok(runs) = futures::future::try_join_all(runs).await {
-                for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+                for (i, out) in buf.iter_mut().enumerate() {
                     let lba = start + i as u64;
-                    let at = (lba / d - s_first) as usize * BLOCK_SIZE;
-                    out.copy_from_slice(&runs[(lba % d) as usize][at..at + BLOCK_SIZE]);
+                    *out = runs[(lba % d) as usize][(lba / d - s_first) as usize];
                 }
                 return Ok(());
             }
         }
 
-        for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+        for (i, out) in buf.iter_mut().enumerate() {
             self.read_block(start + i as u64, out).await?;
         }
         Ok(())
@@ -282,31 +285,31 @@ impl BlockDevice for RaidZ {
     /// Whole stripes are encoded and written straight to the disks (one
     /// write per disk, no read-modify-write); partial stripes at either end
     /// go through the stripe buffer.
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         let d = self.data as u64;
         let mut lba = start;
         let mut rest = buf;
 
-        while !lba.is_multiple_of(d) && !rest.is_empty() {
-            let (block, tail) = rest.split_at(BLOCK_SIZE);
-            self.write_block(lba, block.try_into().unwrap()).await?;
+        while !lba.is_multiple_of(d)
+            && let Some((block, tail)) = rest.split_first()
+        {
+            self.write_block(lba, block).await?;
             rest = tail;
             lba += 1;
         }
 
-        let full_blocks = (rest.len() / BLOCK_SIZE) as u64 / d * d;
+        let full_blocks = rest.len() as u64 / d * d;
         if full_blocks > 0 {
-            let (full, tail) = rest.split_at(full_blocks as usize * BLOCK_SIZE);
-            self.write_full_stripes(lba / d, full)
+            let (full, tail) = rest.split_at(full_blocks as usize);
+            self.write_full_stripes(lba / d, full.as_flattened())
                 .await
                 .map_err(io_err)?;
             lba += full_blocks;
             rest = tail;
         }
 
-        while !rest.is_empty() {
-            let (block, tail) = rest.split_at(BLOCK_SIZE);
-            self.write_block(lba, block.try_into().unwrap()).await?;
+        while let Some((block, tail)) = rest.split_first() {
+            self.write_block(lba, block).await?;
             rest = tail;
             lba += 1;
         }
@@ -319,7 +322,7 @@ impl BlockDevice for RaidZ {
         let target = (lba % self.data as u64) as usize;
         let reads = (0..n).filter(|&i| i != target).map(|i| async move {
             let mut buf = [0u8; BLOCK_SIZE];
-            self.read_shard(i, stripe_id, &mut buf)
+            self.read_shard(i, stripe_id, std::slice::from_mut(&mut buf))
                 .await
                 .map(|_| (i, buf))
         });
@@ -387,7 +390,11 @@ impl BlockDevice for RaidZ {
         }
         // Parity already encodes this data, so only the data shard needs rewriting.
         self.disks
-            .write_shards(self.members[data_index], stripe_id, buf)
+            .write_shards(
+                self.members[data_index],
+                stripe_id,
+                std::slice::from_ref(buf),
+            )
             .await
     }
 }
@@ -405,23 +412,13 @@ impl RaidZ {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_local_disk(&self, index: usize) -> bool {
         self.disks.is_local(self.members[index])
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn with_pool_size(mut self, pool_size: usize) -> Self {
-        let pool = Arc::new(ArrayQueue::new(pool_size));
-        for _ in 0..pool_size {
-            let _ = pool.push(vec![0u8; BLOCK_SIZE * self.data].into_boxed_slice());
-        }
-        self.stripe_pool = pool;
-        self
-    }
-
     /// Read shard position `i` of stripes starting at `stripe`.
-    async fn read_shard(&self, i: usize, stripe: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_shard(&self, i: usize, stripe: u64, buf: &mut [Block]) -> Result<(), DiskError> {
         self.disks.read_shards(self.members[i], stripe, buf).await
     }
 
@@ -441,7 +438,7 @@ impl RaidZ {
         for i in (0..n).filter(|&i| i != data_index) {
             futures.push(async move {
                 let mut temp_buf = [0u8; BLOCK_SIZE];
-                self.read_shard(i, stripe_id, &mut temp_buf)
+                self.read_shard(i, stripe_id, std::slice::from_mut(&mut temp_buf))
                     .await
                     .map(|_| (i, temp_buf))
             });
@@ -545,7 +542,7 @@ impl RaidZ {
     }
 
     /// Encode whole stripes of `data` into one buffer per shard position.
-    fn encode_stripes(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, RaidZError> {
+    fn encode_stripes(&self, data: &[u8]) -> Result<Vec<Vec<Block>>, RaidZError> {
         encode_stripes(self.data, self.parity, data)
     }
 
@@ -563,7 +560,7 @@ impl RaidZ {
         let n = data.len() / (self.data * BLOCK_SIZE);
         let expected = self.encode_stripes(data)?;
         let reads = self.members.iter().map(|&d| async move {
-            let mut run = vec![0u8; n * BLOCK_SIZE];
+            let mut run = zeroed_blocks(n);
             self.disks
                 .read_shards_raw(d, first_stripe, &mut run)
                 .await
@@ -587,15 +584,14 @@ impl RaidZ {
                 if busy {
                     continue;
                 }
-                let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
-                if run[at.clone()] == expected[i][at.clone()] {
+                if run[j] == expected[i][j] {
                     continue;
                 }
                 check.mismatched[d] += 1;
                 if repair {
                     match self
                         .disks
-                        .write_shards(d, first_stripe + j as u64, &expected[i][at])
+                        .write_shards(d, first_stripe + j as u64, &expected[i][j..j + 1])
                         .await
                     {
                         Ok(()) => check.repaired[d] += 1,
@@ -627,7 +623,7 @@ impl RaidZ {
         let reads = self.members.iter().map(|&d| async move {
             let mut b = [0u8; BLOCK_SIZE];
             self.disks
-                .read_shards_raw(d, stripe, &mut b)
+                .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
                 .await
                 .ok()
                 .map(|_| b)
@@ -685,8 +681,13 @@ impl RaidZ {
     async fn label_stripe_is_blank(&self, stripe: u64) -> bool {
         let mut readable = 0;
         for &d in &self.members {
-            let mut b = vec![0u8; BLOCK_SIZE];
-            if self.disks.read_shards_raw(d, stripe, &mut b).await.is_ok() {
+            let mut b = [0u8; BLOCK_SIZE];
+            if self
+                .disks
+                .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
+                .await
+                .is_ok()
+            {
                 readable += 1;
                 if b.iter().any(|&x| x != 0) {
                     return false;
@@ -744,24 +745,24 @@ impl Vdev for RaidZ {
 }
 
 /// Encode whole stripes of `data` into one buffer per shard position.
-fn encode_stripes(data: usize, parity: usize, bytes: &[u8]) -> Result<Vec<Vec<u8>>, RaidZError> {
+/// Each disk's shards of whole stripes `bytes` (data disks, then parity).
+fn encode_stripes(data: usize, parity: usize, bytes: &[u8]) -> Result<Vec<Vec<Block>>, RaidZError> {
     let stripe_bytes = data * BLOCK_SIZE;
     debug_assert!(bytes.len().is_multiple_of(stripe_bytes));
     let stripes = bytes.len() / stripe_bytes;
-    let mut disk_bufs: Vec<Vec<u8>> = vec![vec![0u8; stripes * BLOCK_SIZE]; data + parity];
+    let mut disk_bufs: Vec<Vec<Block>> = vec![zeroed_blocks(stripes); data + parity];
     let mut encoder = ReedSolomonEncoder::new(data, parity, BLOCK_SIZE)?;
     for (j, stripe) in bytes.chunks(stripe_bytes).enumerate() {
-        let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
         if j > 0 {
             encoder.reset(data, parity, BLOCK_SIZE)?;
         }
         for (i, shard) in stripe.chunks(BLOCK_SIZE).enumerate() {
-            disk_bufs[i][at.clone()].copy_from_slice(shard);
+            disk_bufs[i][j].copy_from_slice(shard);
             encoder.add_original_shard(shard)?;
         }
         let encoded = encoder.encode()?;
         for (p, recovery) in encoded.recovery_iter().enumerate() {
-            disk_bufs[data + p][at.clone()].copy_from_slice(recovery);
+            disk_bufs[data + p][j].copy_from_slice(recovery);
         }
     }
     Ok(disk_bufs)
@@ -798,7 +799,7 @@ fn label_candidates(
         data_only[..data].fill(true);
         if let Some(d) = data_of(&data_only) {
             let enc = encode_stripes(data, parity, &d)?;
-            if (data..n).all(|i| enc[i][..] == shards[i][..]) {
+            if (data..n).all(|i| enc[i].as_flattened() == &shards[i][..]) {
                 return Ok(None);
             }
         }
@@ -814,7 +815,7 @@ fn label_candidates(
         let Some(d) = data_of(&use_) else { continue };
         let enc = encode_stripes(data, parity, &d)?;
         let agree = (0..n)
-            .filter(|&i| present[i] && enc[i][..] == shards[i][..])
+            .filter(|&i| present[i] && enc[i].as_flattened() == &shards[i][..])
             .count();
         out.push((d, agree));
     }

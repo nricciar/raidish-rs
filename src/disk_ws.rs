@@ -2,6 +2,7 @@
 //! own `RemoteDisk` in `disk_wasm.rs` with the same interface.
 
 use super::*;
+use crate::fence::Stamp;
 use crate::websocket::{WsOp, decode_response, encode_request};
 use dashmap::DashMap;
 use futures_util::stream::SplitSink;
@@ -82,12 +83,24 @@ impl Drop for WsConn {
 
 impl WsConn {
     async fn connect(url: &str, opts: DiskOptions) -> Result<Arc<Self>, DiskError> {
+        let versioned = crate::websocket::versioned(url);
         let (ws, _) = tokio::time::timeout(
             opts.connect_timeout,
-            connect_async_tls_with_config(url, None, false, crate::tls::ws_connector()),
+            connect_async_tls_with_config(&versioned, None, false, crate::tls::ws_connector()),
         )
         .await
-        .map_err(|_| DiskError::Timeout)??;
+        .map_err(|_| DiskError::Timeout)?
+        .map_err(|e| match e {
+            // Refused before the upgrade: say why (a version mismatch, a
+            // missing certificate...).
+            tungstenite::Error::Http(r) => DiskError::IoError(std::io::Error::other(format!(
+                "{}: {} {}",
+                url,
+                r.status(),
+                String::from_utf8_lossy(r.body().as_deref().unwrap_or_default())
+            ))),
+            e => e.into(),
+        })?;
         let (sink, mut stream) = ws.split();
         let state = Arc::new(ConnState {
             pending: DashMap::new(),
@@ -182,13 +195,13 @@ impl WsConn {
         data: Option<&[u8]>,
     ) -> Result<Bytes, DiskError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (epoch, lent) = match op {
-            WsOp::Flush | WsOp::Info => (lease_epoch(), false),
-            _ => match fence {
-                Some((i, f)) => f.epoch_for(Some(*i), block, count),
-                None => (lease_epoch(), false),
-            },
+        let stamp = match (op, fence) {
+            (_, None) => Stamp::Pool(crate::types::Epoch::NONE),
+            (WsOp::Flush | WsOp::Info, Some((_, f))) => Stamp::Pool(f.pool_epoch()),
+            (_, Some((i, f))) => f.epoch_for(Some(*i), block, count),
         };
+        let epoch = stamp.epoch();
+
         let (tx, rx) = oneshot::channel();
         self.state.pending.insert(id, tx);
         if self.is_closed() {
@@ -225,8 +238,13 @@ impl WsConn {
                     return Err(DiskError::Timeout);
                 }
             };
-        check_status_in(status, lent)?;
-        Ok(payload)
+        let r = check_status(status);
+        // Our pool epoch refused: another committer or writer has the pool
+        // now (a lent metaslab's refusal is the writer's own business).
+        if let (Err(DiskError::StaleEpoch), Stamp::Pool(_), Some((_, f))) = (&r, stamp, fence) {
+            f.stale();
+        }
+        r.map(|_| payload)
     }
 }
 

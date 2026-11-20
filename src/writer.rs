@@ -24,6 +24,10 @@ use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::object::TreeRoot;
+use crate::types::ErrorKind;
+use crate::types::MetaslabIdx;
+use crate::types::Txg;
+use crate::types::{Epoch, Holding, LeaseRef, LeaseResource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,13 +36,13 @@ use std::sync::Arc;
 /// A metaslab lent to a writer, with the space it may allocate.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LentMetaslab {
-    pub idx: u32,
+    pub idx: MetaslabIdx,
     /// The lend's fencing epoch: the writer's requests there carry it.
-    pub epoch: u64,
-    /// Free extents (start, len) when lent.
-    pub free: Vec<(u64, u64)>,
+    pub epoch: Epoch,
+    /// Free extents when lent.
+    pub free: Vec<Extent>,
     /// The committer's open TXG (the writer stamps new blocks with it).
-    pub open_txg: u64,
+    pub open_txg: Txg,
 }
 
 /// A writer's commit, sent, whose answer hasn't been acted on yet: what's
@@ -69,40 +73,38 @@ impl Drop for LogNowhereOnDrop<'_> {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DatasetCommit {
     pub dataset: String,
-    /// The writer lease (`writer/...`) and its epoch.
-    pub writer: String,
-    pub writer_epoch: u64,
-    /// The `ds/<name>` lease owner and epoch.
-    pub ds_owner: String,
-    pub ds_epoch: u64,
+    /// The writer lease (`writer/...`).
+    pub writer: LeaseRef,
+    /// The `ds/<name>` lease it's committed under.
+    pub ds: Holding,
     /// The root the tree was built on, and the new one.
     pub base_root: Option<BlockPtr>,
     pub new_root: Option<BlockPtr>,
     /// Extents (start, len) the new tree allocated / replaced.
-    pub allocs: Vec<(u64, u64)>,
-    pub frees: Vec<(u64, u64)>,
+    pub allocs: Vec<Extent>,
+    pub frees: Vec<Extent>,
     /// The birth TXG of each of `frees` (a snapshot keeps blocks born at
     /// or before it; missing: all kept).
     #[serde(default)]
-    pub free_births: Vec<u64>,
+    pub free_births: Vec<Txg>,
     /// Pool disks the writer missed writes on since its last commit.
     pub missed: Vec<usize>,
     /// The TXG the new blocks were stamped with.
-    pub birth_txg: u64,
+    pub birth_txg: Txg,
     /// The volume's intent log from now on (see `crate::zil`): a fresh
     /// region (its extent is among `allocs`), or None. The one it replaces
     /// is freed.
     pub log: Option<crate::inode::DatasetLog>,
     /// The lowest TXG any new block was stamped with (None: no new blocks).
     #[serde(default)]
-    pub min_birth: Option<u64>,
+    pub min_birth: Option<Txg>,
 }
 
 /// The committer's answer to a commit.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Committed {
     /// The TXG that made it durable.
-    pub txg: u64,
+    pub txg: Txg,
 }
 
 /// A namespace change (file or directory), from a writer to the committer.
@@ -121,13 +123,13 @@ pub enum FsOp {
         blksz: u32,
         tree: TreeRoot,
         /// Every extent (start, len) the tree's records and indirects take.
-        allocs: Vec<(u64, u64)>,
+        allocs: Vec<Extent>,
         /// The file and its contents as the writer saw them (None: absent).
         /// If they have changed since, the op is refused (compare-and-swap).
         base: Option<(crate::disk::FileId, TreeRoot)>,
         /// The lowest TXG any new block was stamped with.
         #[serde(default)]
-        min_birth: Option<u64>,
+        min_birth: Option<Txg>,
     },
     Mkdir {
         path: String,
@@ -181,19 +183,18 @@ pub enum FsOp {
         tree: TreeRoot,
         size: u64,
         /// Extents (start, len) the new tree allocated / replaced.
-        allocs: Vec<(u64, u64)>,
-        frees: Vec<(u64, u64)>,
+        allocs: Vec<Extent>,
+        frees: Vec<Extent>,
         /// The lowest TXG any new block was stamped with.
         #[serde(default)]
-        min_birth: Option<u64>,
+        min_birth: Option<Txg>,
     },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FsCommit {
-    /// The writer lease (`writer/...`) and its epoch.
-    pub writer: String,
-    pub writer_epoch: u64,
+    /// The writer lease (`writer/...`).
+    pub writer: LeaseRef,
     pub op: FsOp,
     /// The `obj/<id>` lease this change is made under, if any. Without one,
     /// a change to an object someone else holds that lease on is refused.
@@ -201,21 +202,17 @@ pub struct FsCommit {
     /// Pool disks the writer missed writes on since its last commit.
     pub missed: Vec<usize>,
     /// The TXG the writer's new blocks were stamped with.
-    pub birth_txg: u64,
+    pub birth_txg: Txg,
 }
 
 /// An `obj/<id>` lease (see `crate::committer::object_resource`): held
 /// while a file is open for writing, so no one else changes it meanwhile.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ObjLease {
-    pub owner: String,
-    pub epoch: u64,
-}
+pub type ObjLease = Holding;
 
 /// The committer's answer to an [`FsCommit`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FsCommitted {
-    pub txg: u64,
+    pub txg: Txg,
     /// The file id at the path (0 for a delete).
     pub file_id: crate::disk::FileId,
 }
@@ -225,65 +222,106 @@ pub enum CommitError {
     /// Not now (no committer, quorum lost, lease not visible yet): the same
     /// request may be sent again.
     Retry(String),
-    /// Refused for good (lost the lease, root moved on, bad extents).
-    Refused(String),
+    /// Refused for good (lost the lease, root moved on, bad extents, or
+    /// what was asked failed): `kind` says how.
+    Refused { kind: ErrorKind, msg: String },
     /// Refused because the new blocks were stamped with a TXG below the
     /// birth floor (see `FileSystem::raise_birth_floor`): rebuild, stamped
     /// with this open TXG, and send again.
-    Restamp(u64),
+    Restamp(Txg),
 }
 
 impl std::fmt::Display for CommitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CommitError::Retry(m) => write!(f, "committer unavailable: {}", m),
-            CommitError::Refused(m) => write!(f, "commit refused: {}", m),
+            CommitError::Refused { msg, .. } => write!(f, "refused: {}", msg),
             CommitError::Restamp(t) => write!(f, "births below the floor; restamp at TXG {}", t),
         }
     }
 }
 
+impl CommitError {
+    /// Refused as `kind`, saying `msg`.
+    pub fn refused(kind: ErrorKind, msg: impl Into<String>) -> Self {
+        CommitError::Refused {
+            kind,
+            msg: msg.into(),
+        }
+    }
+
+    /// Doing it failed with `e` (in `what`, if not empty): refused, unless
+    /// that's something a later try may not hit (the pool's disks out of
+    /// reach: retry; below the birth floor: restamp), as with `From`.
+    pub fn failed(what: impl std::fmt::Display, e: &FileSystemError) -> Self {
+        let what = what.to_string();
+        let msg = if what.is_empty() {
+            e.message()
+        } else {
+            format!("{}: {}", what, e.message())
+        };
+        match e {
+            FileSystemError::Restamp(t) => CommitError::Restamp(*t),
+            e if e.kind() == ErrorKind::Unavailable => CommitError::Retry(msg),
+            e => CommitError::refused(e.kind(), msg),
+        }
+    }
+
+    /// What sort of failure it is.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            CommitError::Retry(_) | CommitError::Restamp(_) => ErrorKind::Unavailable,
+            CommitError::Refused { kind, .. } => *kind,
+        }
+    }
+}
+
+impl From<FileSystemError> for CommitError {
+    /// Refused as it failed (a pool that can't be asked right now: retry).
+    fn from(e: FileSystemError) -> Self {
+        match e {
+            FileSystemError::Restamp(t) => CommitError::Restamp(t),
+            e => CommitError::failed("", &e),
+        }
+    }
+}
+
 impl From<CommitError> for FileSystemError {
+    /// The error as the committer's side had it.
     fn from(e: CommitError) -> Self {
         match e {
-            CommitError::Retry(_) => FileSystemError::Unavailable(e.to_string()),
-            CommitError::Refused(_) => FileSystemError::InvalidArgument(e.to_string()),
+            CommitError::Retry(m) => FileSystemError::Unavailable(format!("committer: {}", m)),
+            CommitError::Refused { kind, msg } => FileSystemError::from_kind(kind, msg),
             CommitError::Restamp(t) => FileSystemError::Restamp(t),
         }
     }
 }
 
-/// How a writer reaches the committer. The writer identity (lease and
-/// epoch) belongs to the sink, which fills `writer`/`writer_epoch` in.
+/// How a writer reaches the committer. The writer identity (its lease)
+/// belongs to the sink, which fills `writer` in.
 #[async_trait]
 pub trait CommitSink: Send + Sync {
     /// The writer lease resource and epoch this sink commits as.
-    fn writer(&self) -> (String, u64);
+    fn writer(&self) -> LeaseRef;
     /// Lend this writer a metaslab with at least some free space
     /// (preferably `want_blocks`).
     async fn lease_metaslab(&self, want_blocks: u64) -> Result<LentMetaslab, CommitError>;
-    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError>;
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError>;
     /// Commit; resends `Retry` answers itself until there is a definite one.
     async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError>;
     /// Commit a namespace change. Like `commit`, a resend of an applied op
     /// is acknowledged.
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError>;
-    /// Get volume `volume` ready to run under its `ds/<name>` lease
-    /// (`ds_owner`, `ds_epoch`): if a previous holder left an intent log,
-    /// the committer replays it first.
-    async fn claim_dataset(
-        &self,
-        volume: &str,
-        ds_owner: &str,
-        ds_epoch: u64,
-    ) -> Result<(), CommitError>;
+    /// Get volume `volume` ready to run under its `ds/<name>` lease `ds`:
+    /// if a previous holder left an intent log, the committer replays it
+    /// first.
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError>;
 }
 
 /// A volume a writer runs.
 pub(crate) struct Attached {
-    /// The `ds/<name>` lease owner and epoch.
-    pub owner: String,
-    pub epoch: u64,
+    /// The `ds/<name>` lease.
+    pub ds: Holding,
     /// Turns true once that lease is lost: a commit still waiting for the
     /// committer then gives up (see `attach_dataset_until`).
     pub lost: Option<tokio::sync::watch::Receiver<bool>>,
@@ -303,18 +341,18 @@ pub(crate) struct WriterState {
     /// Dataset name → its lease.
     pub datasets: std::sync::Mutex<HashMap<String, Attached>>,
     /// Metaslabs lent to this writer.
-    pub lent: std::sync::Mutex<Vec<u32>>,
+    pub lent: std::sync::Mutex<Vec<MetaslabIdx>>,
     /// Lent metaslabs holding records of a file still being written (not
     /// committed yet), with how many writes pin each: they can't be given
     /// back until then, or the committer could lend that space again.
-    pub pinned: std::sync::Mutex<HashMap<u32, usize>>,
+    pub pinned: std::sync::Mutex<HashMap<MetaslabIdx, usize>>,
 }
 
 impl WriterState {
-    pub(crate) fn pin(&self, idx: u32) {
+    pub(crate) fn pin(&self, idx: MetaslabIdx) {
         *self.pinned.lock().unwrap().entry(idx).or_default() += 1;
     }
-    pub(crate) fn unpin(&self, idx: u32) {
+    pub(crate) fn unpin(&self, idx: MetaslabIdx) {
         let mut p = self.pinned.lock().unwrap();
         if let Some(n) = p.get_mut(&idx) {
             *n -= 1;
@@ -323,7 +361,7 @@ impl WriterState {
             }
         }
     }
-    fn is_pinned(&self, idx: u32) -> bool {
+    fn is_pinned(&self, idx: MetaslabIdx) -> bool {
         self.pinned.lock().unwrap().contains_key(&idx)
     }
 
@@ -378,13 +416,8 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Start running volume `name` under its `ds/<name>` lease.
-    pub async fn attach_dataset(
-        &self,
-        name: &str,
-        owner: &str,
-        epoch: u64,
-    ) -> Result<(), FileSystemError> {
-        self.attach_dataset_until(name, owner, epoch, None).await
+    pub async fn attach_dataset(&self, name: &str, ds: Holding) -> Result<(), FileSystemError> {
+        self.attach_dataset_until(name, ds, None).await
     }
 
     /// `attach_dataset`, where `lost` turns true once the lease is lost. A
@@ -394,12 +427,10 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn attach_dataset_until(
         &self,
         name: &str,
-        owner: &str,
-        epoch: u64,
+        ds: Holding,
         lost: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), FileSystemError> {
-        self.attach_dataset_leased(name, owner, epoch, lost, None)
-            .await
+        self.attach_dataset_leased(name, ds, lost, None).await
     }
 
     /// `attach_dataset_until`, where `fresh` says whether the lease is still
@@ -407,8 +438,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn attach_dataset_leased(
         &self,
         name: &str,
-        owner: &str,
-        epoch: u64,
+        ds: Holding,
         lost: Option<tokio::sync::watch::Receiver<bool>>,
         fresh: Option<LeaseCheck>,
     ) -> Result<(), FileSystemError> {
@@ -419,7 +449,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 "not a volume writer".into(),
             ))?;
         // Whatever the last holder logged and acknowledged comes first.
-        w.sink.claim_dataset(name, owner, epoch).await?;
+        w.sink.claim_dataset(name, &ds).await?;
         // Reload the index: the volume may have been created, moved here or
         // replayed since this writer opened the pool.
         self.reload_root_index().await?;
@@ -428,8 +458,7 @@ impl<D: BlockDevice> FileSystem<D> {
         w.datasets.lock().unwrap().insert(
             name.to_string(),
             Attached {
-                owner: owner.to_string(),
-                epoch,
+                ds,
                 lost,
                 fresh,
                 detaching: false,
@@ -485,13 +514,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if vol.log.lock().unwrap().is_none() {
             return Ok(());
         }
-        let Some((ds_owner, ds_epoch)) = w
-            .datasets
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|a| (a.owner.clone(), a.epoch))
-        else {
+        let Some(ds) = w.datasets.lock().unwrap().get(name).map(|a| a.ds.clone()) else {
             return Ok(());
         };
         // No flush may log into it meanwhile.
@@ -505,14 +528,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 name
             )));
         }
-        let (writer, writer_epoch) = w.sink.writer();
+        let writer = w.sink.writer();
         let root = vol.obj.root_ptr();
         let commit = DatasetCommit {
             dataset: name.to_string(),
             writer,
-            writer_epoch,
-            ds_owner,
-            ds_epoch,
+            ds,
             base_root: root.clone(),
             new_root: root,
             allocs: Vec::new(),
@@ -524,7 +545,7 @@ impl<D: BlockDevice> FileSystem<D> {
             min_birth: None,
         };
         let c = w.sink.commit(commit).await?;
-        self.note_open_txg(c.txg + 1).await;
+        self.note_open_txg(c.txg.next()).await;
         self.set_dataset_log(w, &vol, None);
         self.set_cursor(&vol, None);
         Ok(())
@@ -553,23 +574,21 @@ impl<D: BlockDevice> FileSystem<D> {
         if missed.is_empty() {
             return Ok(());
         }
-        let (ds_owner, ds_epoch) = w
+        let ds = w
             .datasets
             .lock()
             .unwrap()
             .get(&vol.name)
-            .map(|a| (a.owner.clone(), a.epoch))
+            .map(|a| a.ds.clone())
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
-        let (writer, writer_epoch) = w.sink.writer();
+        let writer = w.sink.writer();
         let root = vol.obj.root_ptr();
         let commit = DatasetCommit {
             dataset: vol.name.clone(),
             writer,
-            writer_epoch,
-            ds_owner,
-            ds_epoch,
+            ds,
             base_root: root.clone(),
             new_root: root,
             allocs: Vec::new(),
@@ -582,7 +601,7 @@ impl<D: BlockDevice> FileSystem<D> {
             min_birth: None,
         };
         let c = w.sink.commit(commit).await?;
-        self.note_open_txg(c.txg + 1).await;
+        self.note_open_txg(c.txg.next()).await;
         // Reported (only now: had it failed, the next try reports them).
         let mut seen = self.miss_seen.lock().unwrap();
         for d in missed {
@@ -609,9 +628,10 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn return_metaslabs(&self) {
         let Some(w) = &self.writer else { return };
         let _tx = self.begin_tx().await;
-        let lent: Vec<u32> = {
+        let lent: Vec<MetaslabIdx> = {
             let mut l = w.lent.lock().unwrap();
-            let (pinned, free): (Vec<u32>, Vec<u32>) = l.iter().partition(|&&i| w.is_pinned(i));
+            let (pinned, free): (Vec<MetaslabIdx>, Vec<MetaslabIdx>) =
+                l.iter().partition(|&&i| w.is_pinned(i));
             *l = pinned;
             free
         };
@@ -629,7 +649,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let ring = self.read_uberblock_ring().await;
         let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
         self.objects.follow_root(newest.objects.clone());
-        self.note_open_txg(newest.txg + 1).await;
+        self.note_open_txg(newest.txg.next()).await;
         Ok(())
     }
 
@@ -647,23 +667,23 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(());
         }
         self.objects.follow_root(newest.objects.clone());
-        self.note_open_txg(newest.txg + 1).await;
+        self.note_open_txg(newest.txg.next()).await;
         Ok(())
     }
 
     /// Note the committer's open TXG: new blocks are stamped with it.
-    pub(crate) async fn note_open_txg(&self, open_txg: u64) {
+    pub(crate) async fn note_open_txg(&self, open_txg: Txg) {
         if let Some(u) = self.uberblock.lock().await.as_mut() {
-            u.txg = u.txg.max(open_txg.saturating_sub(1));
+            u.txg = u.txg.max(open_txg.prev());
         }
     }
 
-    async fn drop_lent(&self, idx: u32) {
-        if let Some(ms) = self.metaslabs.get(idx as usize) {
+    async fn drop_lent(&self, idx: MetaslabIdx) {
+        if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.free_extents.clear();
         }
         if let Some(pool) = self.dev.pool() {
-            pool.disks.fence.clear_metaslab(idx);
+            pool.disks().fence().clear_metaslab(idx);
         }
     }
 
@@ -683,10 +703,13 @@ impl<D: BlockDevice> FileSystem<D> {
                 .lease_metaslab(need - have)
                 .await
                 .map_err(|e| match e {
-                    CommitError::Refused(_) => FileSystemError::UnableToAllocateBlocks(need),
+                    CommitError::Refused {
+                        kind: ErrorKind::NoSpace,
+                        ..
+                    } => FileSystemError::NoSpace(format!("{} blocks", need)),
                     e => e.into(),
                 })?;
-            let Some(ms) = self.metaslabs.get(lent.idx as usize) else {
+            let Some(ms) = self.metaslabs.get(lent.idx.index()) else {
                 return Err(FileSystemError::InvalidArgument(format!(
                     "committer lent unknown metaslab {}",
                     lent.idx
@@ -694,10 +717,12 @@ impl<D: BlockDevice> FileSystem<D> {
             };
             {
                 let mut ms = ms.write().await;
-                ms.free_extents = lent.free.iter().copied().collect();
+                ms.free_extents = lent.free.iter().map(|e| (e.start, e.len)).collect();
             }
             if let Some(pool) = self.dev.pool() {
-                pool.disks.fence.set_metaslab_epoch(lent.idx, lent.epoch);
+                pool.disks()
+                    .fence()
+                    .set_metaslab_epoch(lent.idx, lent.epoch);
             }
             self.note_open_txg(lent.open_txg).await;
             w.lent.lock().unwrap().push(lent.idx);
@@ -707,12 +732,12 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Return lent metaslabs that are nearly full (between syncs only).
     pub(crate) async fn return_full(&self, w: &WriterState) {
         let threshold = RETURN_BELOW_RECORDS * self.max_record_blocks();
-        let lent: Vec<u32> = w.lent.lock().unwrap().clone();
+        let lent: Vec<MetaslabIdx> = w.lent.lock().unwrap().clone();
         for idx in lent {
             if w.is_pinned(idx) {
                 continue;
             }
-            let free = self.metaslabs[idx as usize].read().await.free_blocks();
+            let free = self.metaslabs[idx.index()].read().await.free_blocks();
             if free < threshold {
                 self.drop_lent(idx).await;
                 w.lent.lock().unwrap().retain(|&i| i != idx);
@@ -743,7 +768,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn writer_commit(
         &self,
         w: &WriterState,
-    ) -> (Result<u64, FileSystemError>, Vec<String>) {
+    ) -> (Result<Txg, FileSystemError>, Vec<String>) {
         // A sync stamped below the birth floor is rebuilt (with the TXG
         // the committer sent back) and sent again.
         let mut attempts = 0;
@@ -766,7 +791,7 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         self.return_full(w).await;
         let r = match result {
-            Ok(()) => self.open_txg().await.map(|t| t.saturating_sub(1)),
+            Ok(()) => self.open_txg().await.map(Txg::prev),
             Err(e) => Err(e),
         };
         (r, clean)
@@ -781,12 +806,12 @@ impl<D: BlockDevice> FileSystem<D> {
         records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
     ) -> Result<(), FileSystemError> {
-        let (ds_owner, ds_epoch, detaching) = w
+        let (ds, detaching) = w
             .datasets
             .lock()
             .unwrap()
             .get(&vol.name)
-            .map(|a| (a.owner.clone(), a.epoch, a.detaching))
+            .map(|a| (a.ds.clone(), a.detaching))
             .ok_or_else(|| {
                 FileSystemError::InvalidArgument(format!("volume '{}' isn't attached", vol.name))
             })?;
@@ -803,7 +828,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // the cut this sync took its records at, then a new region flushes
         // go to once it's committed. Without one (no contiguous space, or
         // detaching), flushes keep to the current region.
-        let (writer, writer_epoch) = w.sink.writer();
+        let writer = w.sink.writer();
         let from = vol.fold_from.lock().unwrap().take();
         let new_region = match detaching {
             true => None,
@@ -821,9 +846,7 @@ impl<D: BlockDevice> FileSystem<D> {
             regions,
             from_seq,
             writer: writer.clone(),
-            writer_epoch,
-            ds_owner: ds_owner.clone(),
-            ds_epoch,
+            ds: ds.clone(),
         });
         let release_log = async |r: &Option<crate::inode::LogRegion>| {
             if let Some(r) = r {
@@ -855,18 +878,13 @@ impl<D: BlockDevice> FileSystem<D> {
             release_log(&new_region).await;
             return Err(e.into());
         }
-        let ext = |p: &BlockPtr| {
-            let Extent { start, len } = p.extent();
-            (start, len)
-        };
-        let mut allocs: Vec<(u64, u64)> = allocated.iter().map(ext).collect();
+        let ext = |p: &BlockPtr| p.extent();
+        let mut allocs: Vec<Extent> = allocated.iter().map(ext).collect();
         allocs.extend(new_region.iter().map(crate::zil::region_alloc));
         let commit = DatasetCommit {
             dataset: vol.name.clone(),
             writer,
-            writer_epoch,
-            ds_owner,
-            ds_epoch,
+            ds,
             base_root,
             new_root: new_root.ptr.clone(),
             allocs,
@@ -947,10 +965,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 if new_region.is_some() {
                     self.set_cursor(vol, new_region);
                 }
-                self.note_open_txg(c.txg + 1).await;
+                self.note_open_txg(c.txg.next()).await;
                 Ok(())
             }
-            Err(CommitError::Refused(m)) => {
+            Err(CommitError::Refused { kind, msg: m }) => {
                 // Definitely not applied: the space is ours to reuse (and the
                 // old region is still the registered one).
                 *vol.in_doubt.lock().unwrap() = None;
@@ -958,10 +976,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 if let Some(r) = &new_region {
                     self.unallocate(r.start, r.len).await;
                 }
-                Err(FileSystemError::InvalidArgument(format!(
-                    "commit refused: {}",
-                    m
-                )))
+                Err(FileSystemError::from_kind(
+                    kind,
+                    format!("commit refused: {}", m),
+                ))
             }
             Err(CommitError::Restamp(open)) => {
                 // Not applied either: rebuild (the records stay dirty)
@@ -1022,18 +1040,17 @@ impl<D: BlockDevice> FileSystem<D> {
         op: FsOp,
         lease: Option<ObjLease>,
     ) -> Result<FsCommitted, CommitError> {
-        let (writer, writer_epoch) = w.sink.writer();
+        let writer = w.sink.writer();
         let commit = FsCommit {
             writer,
-            writer_epoch,
             op,
             lease,
             missed: self.take_new_misses(),
-            birth_txg: self.open_txg().await.unwrap_or(0),
+            birth_txg: self.open_txg().await.unwrap_or(Txg::ZERO),
         };
         let r = w.sink.commit_fs(commit).await;
         if let Ok(c) = &r {
-            self.note_open_txg(c.txg + 1).await;
+            self.note_open_txg(c.txg.next()).await;
             if let Err(e) = self.reload_root_index().await {
                 eprintln!("writer: reloading the root index: {}", e);
             }
@@ -1134,7 +1151,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Check the TXGs a writer stamped its new blocks with: none from the
     /// future (past the open TXG), and none below the birth floor (else
     /// `Restamp`: rebuild with the open TXG).
-    async fn check_births(&self, min_birth: Option<u64>, stamped: u64) -> Result<(), CommitError> {
+    async fn check_births(&self, min_birth: Option<Txg>, stamped: Txg) -> Result<(), CommitError> {
         let Some(min) = min_birth else {
             return Ok(());
         };
@@ -1143,11 +1160,14 @@ impl<D: BlockDevice> FileSystem<D> {
             .await
             .map_err(|e| CommitError::Retry(e.to_string()))?;
         if min > open || stamped > open {
-            return Err(CommitError::Refused(format!(
-                "blocks stamped with TXG {} past the open TXG {}",
-                stamped.max(min),
-                open
-            )));
+            return Err(CommitError::refused(
+                ErrorKind::Invalid,
+                format!(
+                    "blocks stamped with TXG {} past the open TXG {}",
+                    stamped.max(min),
+                    open
+                ),
+            ));
         }
         if min < self.birth_floor() {
             return Err(CommitError::Restamp(open));
@@ -1159,26 +1179,27 @@ impl<D: BlockDevice> FileSystem<D> {
     /// then mark them allocated.
     async fn claim_writer_allocs(
         &self,
-        allocs: &[(u64, u64)],
-        writer: &str,
-        lent_to_writer: &impl Fn(u32) -> bool,
+        allocs: &[Extent],
+        writer: &LeaseResource,
+        lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
     ) -> Result<(), CommitError> {
-        let refuse = |m: String| CommitError::Refused(m);
-        for &(start, len) in allocs {
+        let refuse = |m: String| CommitError::refused(ErrorKind::Invalid, m);
+        for &Extent { start, len } in allocs {
+            let last = (len > 0).then(|| start.checked_add(len - 1)).flatten();
             let idx = self
                 .layout
                 .metaslab_for_block(start)
-                .filter(|&i| self.layout.metaslab_for_block(start + len - 1) == Some(i))
+                .filter(|&i| last.and_then(|l| self.layout.metaslab_for_block(l)) == Some(i))
                 .ok_or_else(|| {
                     refuse(format!("allocation {}+{} outside a metaslab", start, len))
                 })?;
-            if !lent_to_writer(idx as u32) {
+            if !lent_to_writer(idx) {
                 return Err(refuse(format!(
                     "allocation {}+{} in metaslab {}, not lent to {}",
                     start, len, idx, writer
                 )));
             }
-            let ms = self.metaslabs[idx].read().await;
+            let ms = self.metaslabs[idx.index()].read().await;
             if !ms.lent || !ms.is_free(start, len) {
                 return Err(refuse(format!(
                     "allocation {}+{} isn't free space",
@@ -1186,9 +1207,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 )));
             }
         }
-        for &(start, len) in allocs {
+        for &Extent { start, len } in allocs {
             let idx = self.layout.metaslab_for_block(start).unwrap();
-            self.metaslabs[idx].write().await.mark_allocated(start, len);
+            self.metaslabs[idx.index()]
+                .write()
+                .await
+                .mark_allocated(start, len);
         }
         Ok(())
     }
@@ -1202,7 +1226,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn apply_fs_commit(
         &self,
         c: &FsCommit,
-        lent_to_writer: impl Fn(u32) -> bool,
+        lent_to_writer: impl Fn(MetaslabIdx) -> bool,
         object_ok: impl Fn(crate::disk::FileId) -> Result<(), CommitError>,
     ) -> Result<FsCommitted, CommitError> {
         let file_id = {
@@ -1218,14 +1242,14 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn stage_fs_commit(
         &self,
         c: &FsCommit,
-        lent_to_writer: &impl Fn(u32) -> bool,
+        lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
         object_ok: &impl Fn(crate::disk::FileId) -> Result<(), CommitError>,
     ) -> Result<crate::disk::FileId, CommitError> {
-        let refuse = |m: String| CommitError::Refused(m);
+        let refuse = |m: String| CommitError::refused(ErrorKind::Conflict, m);
         let retry = |e: FileSystemError| CommitError::Retry(e.to_string());
         // Recorded whatever happens to the op: the misses are real either way.
         for &d in &c.missed {
-            self.mark_degraded(d, c.birth_txg.saturating_sub(1));
+            self.mark_degraded(d, c.birth_txg.prev());
         }
         let file_id = match &c.op {
             FsOp::WriteFile {
@@ -1241,11 +1265,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 let l = self
                     .lookup(path)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", path.display(), e)))?;
+                    .map_err(|e| CommitError::failed(path.display(), &e))?;
                 let current = match self.current_file(&l).await {
                     Ok(c) => c,
                     Err(FileSystemError::NotAFile) => {
-                        return Err(refuse(format!("{}: not a file", path.display())));
+                        return Err(CommitError::refused(
+                            ErrorKind::NotFile,
+                            format!("{}: not a file", path.display()),
+                        ));
                     }
                     Err(e) => return Err(retry(e)),
                 };
@@ -1266,15 +1293,18 @@ impl<D: BlockDevice> FileSystem<D> {
                 match &current {
                     Some((id, _)) => object_ok(*id)?,
                     None if c.lease.is_some() => {
-                        return Err(refuse(format!(
-                            "{}: a lease was given for a file that doesn't exist",
-                            path.display()
-                        )));
+                        return Err(CommitError::refused(
+                            ErrorKind::NotFound,
+                            format!(
+                                "{}: a lease was given for a file that doesn't exist",
+                                path.display()
+                            ),
+                        ));
                     }
                     None => {}
                 }
                 self.check_births(*min_birth, c.birth_txg).await?;
-                self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
+                self.claim_writer_allocs(allocs, &c.writer.resource, lent_to_writer)
                     .await?;
                 match self
                     .set_file_contents(l, current, *blksz, *size_bytes, tree.clone())
@@ -1282,7 +1312,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 {
                     Ok(id) => id,
                     Err(e) => {
-                        for &(start, len) in allocs {
+                        for &Extent { start, len } in allocs {
                             self.unallocate(start, len).await;
                         }
                         return Err(retry(e));
@@ -1292,16 +1322,16 @@ impl<D: BlockDevice> FileSystem<D> {
             FsOp::Mkdir { path } => self
                 .mkdir_locked(std::path::Path::new(path))
                 .await
-                .map_err(|e| refuse(format!("mkdir {}: {}", path, e)))?,
+                .map_err(|e| CommitError::failed(format!("mkdir {}", path), &e))?,
             FsOp::Delete { path, base } => {
                 let p = std::path::Path::new(path);
                 let l = self
                     .lookup(p)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", path, e)))?;
+                    .map_err(|e| CommitError::failed(path, &e))?;
                 match l.entry {
                     // Already gone (a resend, or someone else deleted it).
-                    None => 0,
+                    None => crate::disk::FileId::NONE,
                     Some(e) => {
                         let d = self.read_dnode(e.id).await.map_err(retry)?;
                         if base.as_ref().is_some_and(|b| *b != (e.id, d.tree.clone())) {
@@ -1313,8 +1343,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         object_ok(e.id)?;
                         self.delete_locked(p)
                             .await
-                            .map_err(|e| refuse(format!("delete {}: {}", path, e)))?;
-                        0
+                            .map_err(|e| CommitError::failed(format!("delete {}", path), &e))?;
+                        crate::disk::FileId::NONE
                     }
                 }
             }
@@ -1334,7 +1364,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 self.rename_locked(fp, tp)
                     .await
-                    .map_err(|e| refuse(format!("rename {} to {}: {}", from, to, e)))?
+                    .map_err(|e| CommitError::failed(format!("rename {} to {}", from, to), &e))?
                     .0
             }
             FsOp::UpdateFile {
@@ -1363,18 +1393,18 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 object_ok(*id)?;
                 self.check_births(*min_birth, c.birth_txg).await?;
-                self.claim_writer_allocs(allocs, &c.writer, lent_to_writer)
+                self.claim_writer_allocs(allocs, &c.writer.resource, lent_to_writer)
                     .await?;
                 dnode.tree = tree.clone();
                 dnode.size = *size;
                 dnode.attrs.touch();
                 if let Err(e) = self.write_dnode(*id, Some(dnode)).await {
-                    for &(start, len) in allocs {
+                    for &Extent { start, len } in allocs {
                         self.unallocate(start, len).await;
                     }
                     return Err(retry(e));
                 }
-                for &(start, len) in frees {
+                for &Extent { start, len } in frees {
                     let _ = self.free(start, len).await;
                 }
                 *id
@@ -1388,17 +1418,17 @@ impl<D: BlockDevice> FileSystem<D> {
             } => {
                 self.create_at_locked(*dir, name, *kind, attrs, *exclusive)
                     .await
-                    .map_err(|e| refuse(format!("create {}: {}", name, e)))?
+                    .map_err(|e| CommitError::failed(format!("create {}", name), &e))?
                     .0
             }
             FsOp::RemoveAt { dir, name, id } => {
                 let l = self
                     .lookup_at(*dir, name)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", name, e)))?;
+                    .map_err(|e| CommitError::failed(name, &e))?;
                 match l.entry {
                     // Already gone (a resend, or someone else removed it).
-                    None => 0,
+                    None => crate::disk::FileId::NONE,
                     Some(e) if e.id != *id => {
                         return Err(refuse(format!("{} isn't object {} any more", name, id)));
                     }
@@ -1406,8 +1436,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         object_ok(*id)?;
                         self.remove_at_locked(*dir, name)
                             .await
-                            .map_err(|e| refuse(format!("remove {}: {}", name, e)))?;
-                        0
+                            .map_err(|e| CommitError::failed(format!("remove {}", name), &e))?;
+                        crate::disk::FileId::NONE
                     }
                 }
             }
@@ -1422,11 +1452,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 let src = self
                     .lookup_at(*from_dir, from_name)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", from_name, e)))?;
+                    .map_err(|e| CommitError::failed(from_name, &e))?;
                 let dst = self
                     .lookup_at(*to_dir, to_name)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", to_name, e)))?;
+                    .map_err(|e| CommitError::failed(to_name, &e))?;
                 if at(&src) != Some(*id) {
                     if at(&dst) == Some(*id) {
                         // A resend of a rename already applied.
@@ -1442,21 +1472,23 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 self.rename_at_locked(src, dst)
                     .await
-                    .map_err(|e| refuse(format!("rename {} to {}: {}", from_name, to_name, e)))?
+                    .map_err(|e| {
+                        CommitError::failed(format!("rename {} to {}", from_name, to_name), &e)
+                    })?
                     .0
             }
             FsOp::SetAttrId { id, attrs } => {
                 // Attributes aren't contents: no lease needed.
                 self.set_attrs_id_locked(*id, attrs)
                     .await
-                    .map_err(|e| refuse(format!("object {}: {}", id, e)))?;
+                    .map_err(|e| CommitError::failed(format!("object {}", id), &e))?;
                 *id
             }
             FsOp::SetAttr { path, attrs } => {
                 let p = std::path::Path::new(path);
                 self.set_attrs_locked(p, attrs)
                     .await
-                    .map_err(|e| refuse(format!("{}: {}", path, e)))?
+                    .map_err(|e| CommitError::failed(path, &e))?
             }
         };
         Ok(file_id)
@@ -1466,17 +1498,17 @@ impl<D: BlockDevice> FileSystem<D> {
     /// one is being written queue up behind it and are covered by the next
     /// one together (see `sync`), so concurrent writers share TXGs instead
     /// of each paying for one. Returns the newest committed TXG.
-    async fn group_commit(&self) -> Result<u64, CommitError> {
+    async fn group_commit(&self) -> Result<Txg, CommitError> {
         self.sync()
             .await
             .map_err(|e| CommitError::Retry(e.to_string()))?;
-        Ok(self.open_txg().await.unwrap_or(1).saturating_sub(1))
+        Ok(self.open_txg().await.unwrap_or(Txg::from_raw(1)).prev())
     }
 
     /// Mark the metaslabs a cluster has lent out (after a committer start).
-    pub async fn mark_lent(&self, lent: impl IntoIterator<Item = u32>) {
+    pub async fn mark_lent(&self, lent: impl IntoIterator<Item = MetaslabIdx>) {
         for idx in lent {
-            if let Some(ms) = self.metaslabs.get(idx as usize) {
+            if let Some(ms) = self.metaslabs.get(idx.index()) {
                 ms.write().await.lent = true;
             }
         }
@@ -1486,7 +1518,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// none untouched by the open TXG (so the committer has no write in
     /// flight there). Marks it lent; the caller must `lend_abort` if the
     /// cluster refuses. Holds the commit lock, so no commit runs meanwhile.
-    pub async fn lend_pick(&self, min_free: u64) -> Option<(u32, Vec<(u64, u64)>)> {
+    pub async fn lend_pick(&self, min_free: u64) -> Option<(MetaslabIdx, Vec<Extent>)> {
         let _tx = self.begin_tx().await;
         let mut best: Option<(usize, u64)> = None;
         for (i, ms) in self.metaslabs.iter().enumerate() {
@@ -1503,24 +1535,27 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut ms = self.metaslabs[i].write().await;
         ms.lent = true;
         Some((
-            i as u32,
-            ms.free_extents.iter().map(|(&s, &l)| (s, l)).collect(),
+            MetaslabIdx::of_index(i),
+            ms.free_extents
+                .iter()
+                .map(|(&s, &l)| Extent::new(s, l))
+                .collect(),
         ))
     }
 
-    pub async fn lend_abort(&self, idx: u32) {
-        if let Some(ms) = self.metaslabs.get(idx as usize) {
+    pub async fn lend_abort(&self, idx: MetaslabIdx) {
+        if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.lent = false;
         }
     }
 
     /// Take a metaslab back (its return went through the cluster at
     /// `epoch`: the committer writes there with it from now on).
-    pub async fn unlend(&self, idx: u32, epoch: u64) {
+    pub async fn unlend(&self, idx: MetaslabIdx, epoch: Epoch) {
         if let Some(pool) = self.dev.pool() {
-            pool.disks.fence.set_metaslab_epoch(idx, epoch);
+            pool.disks().fence().set_metaslab_epoch(idx, epoch);
         }
-        if let Some(ms) = self.metaslabs.get(idx as usize) {
+        if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.lent = false;
         }
     }
@@ -1541,8 +1576,8 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn apply_dataset_commit(
         &self,
         c: &DatasetCommit,
-        lent_to_writer: impl Fn(u32) -> bool,
-    ) -> Result<u64, CommitError> {
+        lent_to_writer: impl Fn(MetaslabIdx) -> bool,
+    ) -> Result<Txg, CommitError> {
         let mut span = crate::trace::Span::new("committer.apply");
         {
             let _tx = self.begin_tx().await;
@@ -1560,13 +1595,13 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn stage_dataset_commit(
         &self,
         c: &DatasetCommit,
-        lent_to_writer: &impl Fn(u32) -> bool,
+        lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
     ) -> Result<(), CommitError> {
-        let refuse = |m: String| CommitError::Refused(m);
+        let refuse = |m: String| CommitError::refused(ErrorKind::Conflict, m);
         let vol = self
             .open_dataset(&c.dataset)
             .await
-            .map_err(|e| refuse(format!("dataset '{}': {}", c.dataset, e)))?;
+            .map_err(|e| CommitError::failed(format!("dataset '{}'", c.dataset), &e))?;
         let current = vol.obj.root_ptr();
         if current == c.new_root && c.new_root != c.base_root {
             // A resend of a commit already applied: just make sure it's durable.
@@ -1589,11 +1624,11 @@ impl<D: BlockDevice> FileSystem<D> {
         // An intent log left by an earlier holder must be replayed first
         // (attaching claims the volume, see `claim_dataset`).
         if let Some(l) = vol.log.lock().unwrap().as_ref()
-            && (l.ds_owner != c.ds_owner || l.ds_epoch != c.ds_epoch)
+            && l.ds != c.ds
         {
             return Err(refuse(format!(
                 "dataset '{}' has an unreplayed intent log from {}",
-                c.dataset, l.writer
+                c.dataset, l.writer.resource
             )));
         }
         if let Some(l) = &c.log {
@@ -1602,11 +1637,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 current.as_ref().is_some_and(|o| o.regions.contains(r))
                     || c.allocs.contains(&crate::zil::region_alloc(r))
             };
-            if l.ds_owner != c.ds_owner
-                || l.ds_epoch != c.ds_epoch
-                || l.writer != c.writer
-                || !l.regions.iter().all(known)
-            {
+            if l.ds != c.ds || l.writer != c.writer || !l.regions.iter().all(known) {
                 return Err(refuse(format!(
                     "dataset '{}': intent log doesn't belong to this commit",
                     c.dataset
@@ -1616,12 +1647,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
         self.check_births(c.min_birth, c.birth_txg).await?;
         // Every allocation must be free space in a metaslab lent to this writer.
-        self.claim_writer_allocs(&c.allocs, &c.writer, lent_to_writer)
+        self.claim_writer_allocs(&c.allocs, &c.writer.resource, lent_to_writer)
             .await?;
         let old_log = std::mem::replace(&mut *vol.log.lock().unwrap(), c.log.clone());
 
         if let Err(e) = self.update_dataset_dnode(&vol, c.new_root.clone()).await {
-            for &(start, len) in &c.allocs {
+            for &Extent { start, len } in &c.allocs {
                 self.unallocate(start, len).await;
             }
             *vol.log.lock().unwrap() = old_log;
@@ -1635,17 +1666,21 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         vol.obj.set_root_ptr(c.new_root.clone());
         // What a snapshot still has stays (see `crate::snapshot`).
-        let held = self.held_txg_of(vol.id).await.unwrap_or(u64::MAX);
-        let births = c.free_births.iter().copied().chain(std::iter::repeat(0));
-        let frees: Vec<(u64, u64, u64)> = c
+        let held = self.held_txg_of(vol.id).await.unwrap_or(Txg::MAX);
+        let births = c
+            .free_births
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(Txg::ZERO));
+        let frees: Vec<crate::types::Born> = c
             .frees
             .iter()
             .zip(births)
-            .map(|(&(s, l), b)| (s, l, b))
+            .map(|(&extent, birth)| crate::types::Born { extent, birth })
             .collect();
         let _ = self.free_unheld(frees, held).await;
         for &d in &c.missed {
-            self.mark_degraded(d, c.birth_txg.saturating_sub(1));
+            self.mark_degraded(d, c.birth_txg.prev());
         }
         Ok(())
     }

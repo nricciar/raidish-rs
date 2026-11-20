@@ -1,9 +1,11 @@
 //! Peer I/O over real TLS: a writer serving a volume's export to proxies.
 
 use super::*;
+use crate::export::BlockExporter;
 use crate::fs::FileSystem;
 use crate::nbd::NbdServer;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
+use crate::types::Epoch;
 use crate::vdev::Pool;
 use std::sync::atomic::AtomicU64;
 
@@ -19,7 +21,7 @@ struct Writer {
 
 #[async_trait]
 impl PeerVolumes for Writer {
-    fn export(&self, volume: &str, epoch: u64) -> Result<PeerExport, String> {
+    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String> {
         let mine = self.epoch.load(Ordering::SeqCst);
         if epoch != mine {
             return Err(format!("not the writer of {} at epoch {}", volume, epoch));
@@ -73,7 +75,13 @@ impl Setup {
     fn proxy_as(&self, tls: &crate::tls::TlsConfig, epoch: Arc<AtomicU64>) -> PeerIo {
         let connector = TlsConnector::from(Arc::new(tls.client_config().unwrap()));
         let port = self.port;
-        let locate = move || Some(("127.0.0.1".to_string(), port, epoch.load(Ordering::SeqCst)));
+        let locate = move || {
+            Some((
+                "127.0.0.1".to_string(),
+                port,
+                Epoch::from_raw(epoch.load(Ordering::SeqCst)),
+            ))
+        };
         PeerIo::new("vol", connector, Arc::new(locate))
     }
 }
@@ -205,7 +213,7 @@ async fn a_closed_connection_is_reconnected() {
 async fn retiring_moves_waiting_requests_to_the_next_backend() {
     let s = setup().await;
     let connector = TlsConnector::from(Arc::new(s.fixture.tls.client_config().unwrap()));
-    let nowhere = || None::<(String, u16, u64)>;
+    let nowhere = || None::<(String, u16, Epoch)>;
     let peer = Arc::new(PeerIo::new("vol", connector, Arc::new(nowhere)));
     let io = Arc::new(SwitchableIo::new(peer.clone()));
 
@@ -261,5 +269,27 @@ async fn a_burst_of_reads_is_answered_in_full() {
         tokio::time::timeout(Duration::from_secs(10), all)
             .await
             .unwrap_or_else(|_| panic!("round {}: replies left unsent", round));
+    }
+}
+
+/// A preamble of another protocol version is answered with what this node
+/// speaks, not misread.
+#[tokio::test]
+async fn another_protocol_version_is_refused_by_name() {
+    let s = setup().await;
+    let connector = TlsConnector::from(Arc::new(s.fixture.tls.client_config().unwrap()));
+    for line in ["RAIDISH-VOL/0 vol 7\n", "RAIDISH-HANDOFF vol 7 nbd\n"] {
+        let tls = dial(&connector, "127.0.0.1", s.port).await.unwrap();
+        let (rd, mut wr) = tokio::io::split(tls);
+        wr.write_all(line.as_bytes()).await.unwrap();
+        wr.flush().await.unwrap();
+        let answer = read_line(&mut BufReader::new(rd)).await.unwrap();
+        assert!(answer.starts_with("ERR "), "{:?} got {:?}", line, answer);
+        assert!(
+            answer.contains(PREAMBLE),
+            "{:?} names ours: {:?}",
+            line,
+            answer
+        );
     }
 }

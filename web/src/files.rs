@@ -8,6 +8,7 @@ use crate::fmt;
 use crate::session::{now_ms, tab_hidden};
 use crate::upload::{self, Upload};
 use gloo_timers::callback::Interval;
+use raidish::inode::ObjType;
 use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -226,7 +227,7 @@ impl Component for FileManager {
                 match r {
                     Ok(mut entries) => {
                         // Volumes are managed below, not here.
-                        entries.retain(|e| e.kind != "volume");
+                        entries.retain(|e| e.kind != ObjType::Volume);
                         self.selected
                             .retain(|n| entries.iter().any(|e| &e.name == n));
                         self.entries = Some(entries);
@@ -266,7 +267,7 @@ impl Component for FileManager {
                 let mut clash = Vec::new();
                 for f in &files {
                     if let Some(e) = entries.iter().find(|e| e.name == f.name()) {
-                        if e.kind != "file" {
+                        if e.kind != ObjType::File {
                             self.notice = Some(format!(
                                 "can't upload {}: there's a {} by that name here",
                                 f.name(),
@@ -369,7 +370,7 @@ impl Component for FileManager {
                     self.selected.extend(
                         entries
                             .iter()
-                            .filter(|e| e.kind != "volume")
+                            .filter(|e| e.kind != ObjType::Volume)
                             .map(|e| e.name.clone()),
                     );
                 }
@@ -500,7 +501,7 @@ impl Component for FileManager {
         });
         let total: u64 = entries
             .iter()
-            .filter(|e| e.kind == "file")
+            .filter(|e| e.kind == ObjType::File)
             .map(|e| e.size)
             .sum();
 
@@ -544,7 +545,7 @@ impl Component for FileManager {
                 )
             })
         };
-        let selectable = entries.iter().filter(|e| e.kind != "volume");
+        let selectable = entries.iter().filter(|e| e.kind != ObjType::Volume);
         let all_selected = selectable.clone().next().is_some()
             && selectable
                 .into_iter()
@@ -670,11 +671,12 @@ impl FileManager {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
         let full = join(dir, &e.name);
-        let (ico, kind) = match e.kind.as_str() {
-            "dir" => ("📁", "dir"),
-            "volume" => ("🖴", "volume"),
-            _ => ("📄", "file"),
+        let ico = match e.kind {
+            ObjType::Directory => "📁",
+            ObjType::Volume => "🖴",
+            _ => "📄",
         };
+        let kind = e.kind.name();
         let name = if e.is_dir() {
             let target = full.clone();
             html! {
@@ -682,7 +684,7 @@ impl FileManager {
                     <span class="ico">{ ico }</span>{ &e.name }
                 </button>
             }
-        } else if e.kind == "file" {
+        } else if e.kind == ObjType::File {
             html! {
                 <a class="name-link" href={api::download_url(&full)} download={e.name.clone()}>
                     <span class="ico">{ ico }</span>{ &e.name }
@@ -696,7 +698,7 @@ impl FileManager {
                 </a>
             }
         };
-        let actions = if e.kind == "volume" {
+        let actions = if e.kind == ObjType::Volume {
             html! { <a class="btn ghost small" href="#volumes">{ "Manage" }</a> }
         } else {
             let rename = {
@@ -723,7 +725,7 @@ impl FileManager {
             };
             html! {
                 <span class="row-actions">
-                    if e.kind == "file" {
+                    if e.kind == ObjType::File {
                         <a class="btn ghost small" href={api::download_url(&full)} download={e.name.clone()}>{ "Download" }</a>
                     }
                     if can_write {
@@ -739,7 +741,7 @@ impl FileManager {
             <tr class={classes!(checked.then_some("selected"))}>
                 if can_write {
                     <td class="sel">
-                        if e.kind != "volume" {
+                        if e.kind != ObjType::Volume {
                             <input type="checkbox" {checked} onchange={link.callback(move |_| Msg::Toggle(n.clone()))} />
                         }
                     </td>

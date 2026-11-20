@@ -25,10 +25,11 @@
 //! connect to outside a migration: a migration's TLS failure is noted
 //! against its target (`FactsHandle::note_migration`) until one succeeds.
 
-use crate::committer::CommitClient;
-use crate::vm::{El, Virsh, VmRuntime, parse_root};
+use crate::committer::PoolAdmin;
+use crate::types::Bytes;
+use crate::vm::{El, Virsh, VmError, VmRuntime, parse_root};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use serde::{Deserialize, Serialize};
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,113 +50,9 @@ const VIRSH_TIMEOUT: Duration = Duration::from_secs(15);
 /// A certificate expiring sooner than this is flagged.
 const EXPIRES_SOON_S: i64 = 14 * 24 * 3600;
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct NodeFacts {
-    /// `node-1`.
-    pub node: String,
-    /// When collected (ms since the epoch).
-    pub collected_at: u64,
-    /// The raidish version that collected them.
-    pub raidish: String,
-    pub host: HostFacts,
-    /// Peer I/O is on (`tls:` in the config): volumes can be shared with,
-    /// and handed to, other nodes without stopping (live migration).
-    pub peer_io: bool,
-    /// None: no `vm:` section, this node runs no VMs.
-    pub libvirt: Option<LibvirtFacts>,
-    /// The other nodes, as this one reaches them.
-    pub peers: BTreeMap<String, PeerFacts>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct HostFacts {
-    pub hostname: String,
-    pub kernel: String,
-    pub arch: String,
-    /// `AuthenticAMD`, `GenuineIntel`.
-    pub cpu_vendor: String,
-    /// `AMD Ryzen 9 5900X 12-Core Processor`.
-    pub cpu_model: String,
-    pub cpu_threads: u32,
-    pub memory_mb: u64,
-    /// `/dev/kvm` exists.
-    pub kvm: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct LibvirtFacts {
-    pub uri: String,
-    /// libvirt couldn't be asked: why (everything else is then empty).
-    pub error: Option<String>,
-    /// `12.0.0`.
-    pub libvirt_version: String,
-    /// `10.2.1`.
-    pub qemu_version: String,
-    /// `kvm` or `qemu` (emulated): what domcapabilities says guests get.
-    pub virt_type: String,
-    /// What `host-model` gives a guest here.
-    pub cpu: CpuFacts,
-    /// Named CPU models a guest can be given here.
-    pub cpu_models: Vec<String>,
-    /// Machine types (`pc-q35-10.2`, `q35`, ...).
-    pub machines: Vec<String>,
-    /// Active libvirt networks.
-    pub networks: Vec<String>,
-    /// Linux bridges.
-    pub bridges: Vec<String>,
-    /// The whole `virsh domcapabilities`, for `vm cpu-baseline`.
-    pub domcapabilities: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct CpuFacts {
-    /// `EPYC-Milan`.
-    pub model: String,
-    pub vendor: String,
-    /// Features on top of the model.
-    pub features: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct PeerFacts {
-    /// How it's reached (the host in its URL).
-    pub host: String,
-    /// Its libvirt, over TLS (None: this node has no libvirt to try from).
-    pub libvirt: Option<Probe>,
-    /// Its peer I/O port.
-    pub peer_io: Option<Probe>,
-    /// The last live migration from here to it, if it failed on TLS
-    /// (qemu's stream: nothing else tests that).
-    pub migrate_tls_error: Option<String>,
-}
-
-/// One check: ok, or why not and what to do.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct Probe {
-    pub ok: bool,
-    pub checked_at: u64,
-    pub error: Option<String>,
-    pub hint: Option<String>,
-    /// The certificate the server sent, if it got that far.
-    pub cert: Option<CertSummary>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default)]
-pub struct CertSummary {
-    pub subject: String,
-    pub ou: Option<String>,
-    pub issuer: String,
-    pub sans: Vec<String>,
-    /// Unix seconds.
-    pub not_after: i64,
-}
+pub use crate::api_types::{
+    CertSummary, CpuFacts, HostFacts, LibvirtFacts, NodeFacts, PeerFacts, Probe,
+};
 
 impl Probe {
     fn ok(cert: Option<CertSummary>) -> Probe {
@@ -239,26 +136,16 @@ pub fn parse_cpuinfo(s: &str) -> (String, String, u32) {
     (field("vendor_id"), field("model name"), threads)
 }
 
-/// `/proc/meminfo`'s MemTotal, in MiB.
-pub fn parse_meminfo_total(s: &str) -> u64 {
+/// `/proc/meminfo`'s `key` (`MemTotal`, `MemAvailable`; given in kB,
+/// which the kernel means as KiB). Zero if it isn't there.
+pub fn parse_meminfo(s: &str, key: &str) -> Bytes {
     s.lines()
         .find_map(|l| {
-            let rest = l.strip_prefix("MemTotal:")?;
+            let rest = l.strip_prefix(key)?.strip_prefix(':')?;
             rest.split_whitespace().next()?.parse::<u64>().ok()
         })
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
-}
-
-/// `/proc/meminfo`'s MemAvailable, in MiB.
-pub fn parse_meminfo_available(s: &str) -> u64 {
-    s.lines()
-        .find_map(|l| {
-            let rest = l.strip_prefix("MemAvailable:")?;
-            rest.split_whitespace().next()?.parse::<u64>().ok()
-        })
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
+        .map(Bytes::from_kib)
+        .unwrap_or_default()
 }
 
 /// `virsh version`: (libvirt, qemu).
@@ -361,14 +248,14 @@ pub fn host_facts() -> HostFacts {
         cpu_vendor,
         cpu_model,
         cpu_threads,
-        memory_mb: parse_meminfo_total(&read("/proc/meminfo")),
+        memory: parse_meminfo(&read("/proc/meminfo"), "MemTotal"),
         kvm: std::path::Path::new("/dev/kvm").exists(),
     }
 }
 
-/// Memory available on this host now, MiB.
-pub fn available_mb() -> u64 {
-    parse_meminfo_available(&read("/proc/meminfo"))
+/// Memory available on this host now.
+pub fn available_memory() -> Bytes {
+    parse_meminfo(&read("/proc/meminfo"), "MemAvailable")
 }
 
 fn bridges() -> Vec<String> {
@@ -384,10 +271,11 @@ fn bridges() -> Vec<String> {
     out
 }
 
-async fn timed<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::time::timeout(VIRSH_TIMEOUT, f)
-        .await
-        .unwrap_or_else(|_| Err(format!("no answer in {:?}", VIRSH_TIMEOUT)))
+async fn timed<T>(f: impl std::future::Future<Output = Result<T, VmError>>) -> Result<T, String> {
+    match tokio::time::timeout(VIRSH_TIMEOUT, f).await {
+        Ok(r) => r.map_err(String::from),
+        Err(_) => Err(format!("no answer in {:?}", VIRSH_TIMEOUT)),
+    }
 }
 
 pub async fn libvirt_facts(virsh: &Virsh, arch: &str) -> LibvirtFacts {
@@ -758,7 +646,7 @@ pub struct Collector {
     /// The cluster's CAs (empty without `tls:`).
     pub roots: Vec<CertificateDer<'static>>,
     pub peer_port: u16,
-    pub committer: CommitClient,
+    pub committer: crate::committer::Admin,
     pub state: FactsHandle,
 }
 

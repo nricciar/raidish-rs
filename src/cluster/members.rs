@@ -33,7 +33,7 @@ pub struct Members {
 /// every node knows every name without being told. Addresses (the hosts in
 /// disk URLs) are where to reach a node, not what it's called.
 pub fn node_name(id: u64) -> String {
-    format!("node-{}", id)
+    crate::types::NodeId::from_raw(id).name()
 }
 
 impl Members {
@@ -49,6 +49,13 @@ impl Members {
 
     pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.disks.keys().copied()
+    }
+
+    /// The base URL (no trailing `/`) of peer `node` (by name); None: not
+    /// a peer (this node, or unknown).
+    pub fn peer_url(&self, node: &str) -> Option<&str> {
+        let id: crate::types::NodeId = node.parse().ok()?;
+        self.peers.get(&id.get()).map(|u| u.trim_end_matches('/'))
     }
 }
 

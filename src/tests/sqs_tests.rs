@@ -41,7 +41,14 @@ async fn send_receive_delete() {
     assert_eq!(got[0].msg.receive_count, 1);
     // Hidden now.
     assert!(q.receive(10, None).await.unwrap().0.is_empty());
-    assert_eq!(q.counts().await.unwrap(), (0, 2, 0));
+    assert_eq!(
+        q.counts().await.unwrap(),
+        Counts {
+            visible: 0,
+            inflight: 2,
+            delayed: 0
+        }
+    );
 
     // Back to visible, received again: the first receipt is stale.
     let old = got[0].receipt.clone();
@@ -67,7 +74,14 @@ async fn send_receive_delete() {
         .await
         .unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 0);
-    assert_eq!(q.counts().await.unwrap(), (0, 0, 0));
+    assert_eq!(
+        q.counts().await.unwrap(),
+        Counts {
+            visible: 0,
+            inflight: 0,
+            delayed: 0
+        }
+    );
     assert!(matches!(
         q.delete(vec!["junk".into()]).await.unwrap()[0],
         Err(SqsError::ReceiptHandleIsInvalid(_))
@@ -84,7 +98,14 @@ async fn delays_waits_and_attributes() {
     }])
     .await
     .unwrap();
-    assert_eq!(q.counts().await.unwrap(), (0, 0, 1));
+    assert_eq!(
+        q.counts().await.unwrap(),
+        Counts {
+            visible: 0,
+            inflight: 0,
+            delayed: 1
+        }
+    );
     assert!(q.receive(1, None).await.unwrap().0.is_empty());
     // A long poll sees it once due.
     let t = std::time::Instant::now();
@@ -155,7 +176,12 @@ async fn dead_letters_retention_purge() {
     assert_eq!((got.len(), dead.len()), (0, 1));
     // Hidden while it moves; gone once moved.
     assert!(q.receive(1, Some(0)).await.unwrap().1.is_empty());
-    q.remove(dead[0].seq, dead[0].msg.nonce).await.unwrap();
+    q.remove(Receipt {
+        seq: dead[0].seq,
+        nonce: dead[0].msg.nonce,
+    })
+    .await
+    .unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 0);
 
     // Retention: old messages go (in the background, and on receive).
@@ -183,7 +209,14 @@ async fn dead_letters_retention_purge() {
     }
     q.purge().await.unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 0);
-    assert_eq!(q.counts().await.unwrap(), (0, 0, 0));
+    assert_eq!(
+        q.counts().await.unwrap(),
+        Counts {
+            visible: 0,
+            inflight: 0,
+            delayed: 0
+        }
+    );
 }
 
 #[tokio::test]

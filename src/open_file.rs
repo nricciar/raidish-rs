@@ -266,7 +266,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return self.writer_sync_file(&w, f, records, need).await;
         }
         if self.allocatable_blocks().await < need {
-            return Err(FileSystemError::UnableToAllocateBlocks(need));
+            return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
         }
         let mut dnode = match self.try_read_dnode(f.id).await? {
             Some(d) if d.is_file() => d,
@@ -335,7 +335,7 @@ impl<D: BlockDevice> FileSystem<D> {
             self.release_ptrs(&allocated).await;
             return Err(e.into());
         }
-        let ext = |p: &BlockPtr| (p.lba, p.asize as u64);
+        let ext = |p: &BlockPtr| p.extent();
         let op = FsOp::UpdateFile {
             id: f.id,
             base,
@@ -351,10 +351,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 f.obj.set_root(tree);
                 Ok(())
             }
-            Err(CommitError::Refused(m)) => {
+            Err(e @ CommitError::Refused { .. }) => {
                 // Definitely not applied: the space is ours to reuse.
                 self.release_ptrs(&allocated).await;
-                Err(FileSystemError::Conflict(m))
+                Err(e.into())
             }
             Err(CommitError::Restamp(open)) => {
                 // Not applied: rebuilt next round (the records stay dirty).

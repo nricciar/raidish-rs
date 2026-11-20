@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
+use crate::types::{Holding, LeaseRef, ep};
 use crate::vdev::Pool;
 
 const MB: u64 = 1024 * 1024;
@@ -325,10 +326,8 @@ async fn no_incremental_over_a_pending_intent_log() {
         *vol.log.lock().unwrap() = Some(crate::inode::DatasetLog {
             regions: Vec::new(),
             from_seq: 0,
-            writer: "writer/1".into(),
-            writer_epoch: 1,
-            ds_owner: "gone".into(),
-            ds_epoch: 1,
+            writer: LeaseRef::new(crate::types::res("writer/1"), ep(1)),
+            ds: Holding::new("gone", ep(1)),
         });
         let _tx = dst.begin_tx().await;
         dst.update_dataset_dnode(&vol, vol.obj.root_ptr())

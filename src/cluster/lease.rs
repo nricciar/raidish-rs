@@ -9,7 +9,9 @@
 
 use super::LeaseOp;
 use super::state::Response;
+use crate::types::{Epoch, Holder, Holding, LeaseRef, LeaseResource};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const LEASE_TTL: Duration = Duration::from_secs(10);
@@ -21,79 +23,161 @@ const RETRY_PAUSE: Duration = Duration::from_millis(500);
 /// lease has left once a renewal is due).
 const RENEW_ATTEMPT: Duration = Duration::from_millis(2500);
 
-/// Talks to whichever `listen` node answers (non-leaders forward).
-#[derive(Clone)]
-pub struct LeaseClient {
-    endpoints: Vec<String>,
-    http: reqwest::Client,
+/// Where leases are granted: the cluster's Raft state machine, in
+/// process (`Cluster`, which forwards to the leader) or over HTTP
+/// (`HttpLeases`, to any `listen` node).
+#[async_trait::async_trait]
+pub trait LeaseAuthority: Send + Sync {
+    async fn call(&self, op: &LeaseOp) -> Result<Response, String>;
+    async fn status(&self) -> Result<super::Status, String>;
 }
 
+/// Longest one call is waited on, in process as over HTTP (the HTTP
+/// client's own timeout).
+const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[async_trait::async_trait]
+impl LeaseAuthority for super::Cluster {
+    async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
+        tokio::time::timeout(CALL_TIMEOUT, self.lease(op, false))
+            .await
+            .unwrap_or_else(|_| Err(format!("no answer in {:?}", CALL_TIMEOUT)))
+    }
+    async fn status(&self) -> Result<super::Status, String> {
+        Ok(super::Cluster::status(self))
+    }
+}
+
+/// A handle on a [`LeaseAuthority`]: what lease holders keep.
+#[derive(Clone)]
+pub struct LeaseClient(Arc<dyn LeaseAuthority>);
+
 impl LeaseClient {
+    /// Over HTTP, to `endpoints` (any `listen` nodes).
     pub fn new(endpoints: Vec<String>) -> Self {
-        LeaseClient {
+        LeaseClient(Arc::new(HttpLeases::new(endpoints)))
+    }
+
+    /// This process's own cluster member: no HTTP to itself.
+    pub fn local(cluster: Arc<super::Cluster>) -> Self {
+        LeaseClient(cluster)
+    }
+
+    pub async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
+        self.0.call(op).await
+    }
+
+    pub async fn status(&self) -> Result<super::Status, String> {
+        self.0.status().await
+    }
+}
+
+/// Talks to whichever `listen` node answers (non-leaders forward).
+pub struct HttpLeases {
+    endpoints: Vec<String>,
+    http: reqwest::Client,
+    /// The endpoint that answered last: asked first next time. Usually
+    /// the leader, which answers without forwarding, so it wins.
+    preferred: AtomicUsize,
+}
+
+/// How long a call waits on the preferred endpoint before asking the
+/// others as well.
+const HEDGE_AFTER: Duration = Duration::from_millis(200);
+
+impl HttpLeases {
+    pub fn new(endpoints: Vec<String>) -> Self {
+        HttpLeases {
             endpoints: endpoints
                 .into_iter()
                 .map(|e| e.trim_end_matches('/').to_string())
                 .collect(),
-            http: crate::tls::http_builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("http client"),
+            http: crate::tls::http_client(Some(CALL_TIMEOUT)).expect("http client"),
+            preferred: AtomicUsize::new(0),
         }
     }
 
-    /// Send `op` to every endpoint at once; the first answer wins. One
-    /// node that's slow or half gone (shutting down, swapping) mustn't
-    /// hold the answer up: tried in turn, it took the whole of a renewal's
-    /// time, and a lease that was fine counted as lost. Every node forwards
-    /// to the leader, and each op is idempotent (a renewal, an acquire by
-    /// the same owner, a release), so a duplicate is harmless.
-    pub async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
+    /// `op` sent to endpoint `i`.
+    async fn ask(&self, i: usize, op: &LeaseOp) -> (usize, Result<Response, String>) {
+        let ep = &self.endpoints[i];
+        let url = format!("{}/api/v1/cluster/lease", ep);
+        let r = match self.http.post(&url).json(op).send().await {
+            Ok(resp) => match resp.json::<Result<Response, String>>().await {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        (i, r.map_err(|e| format!("{}: {}", ep, e)))
+    }
+}
+
+#[async_trait::async_trait]
+impl LeaseAuthority for HttpLeases {
+    /// Ask the endpoint that answered last; if it fails, or hasn't
+    /// answered within `HEDGE_AFTER`, ask the rest too, and take the first
+    /// answer. One node that's slow or half gone (shutting down, swapping)
+    /// mustn't hold the answer up: tried in turn, it took the whole of a
+    /// renewal's time, and a lease that was fine counted as lost. Asking
+    /// every node every time (as this once did) had each follower forward
+    /// a copy to the leader: every op applied up to once per node. Each op
+    /// is idempotent (a renewal, an acquire by the same owner, a release),
+    /// so the duplicates a hedge can still cause are harmless.
+    async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
         use futures::stream::{FuturesUnordered, StreamExt};
-        let mut pending: FuturesUnordered<_> = self
-            .endpoints
-            .iter()
-            .map(|ep| async move {
-                let url = format!("{}/api/v1/cluster/lease", ep);
-                let r = match self.http.post(&url).json(op).send().await {
-                    Ok(resp) => match resp.json::<Result<Response, String>>().await {
-                        Ok(r) => r,
-                        Err(e) => Err(e.to_string()),
-                    },
-                    Err(e) => Err(e.to_string()),
-                };
-                r.map_err(|e| format!("{}: {}", ep, e))
-            })
-            .collect();
+        let n = self.endpoints.len();
+        if n == 0 {
+            return Err("no cluster endpoints".into());
+        }
+        let first = self.preferred.load(Ordering::Relaxed) % n;
+        let mut pending = FuturesUnordered::new();
+        pending.push(self.ask(first, op));
+        let mut others = (1..n).map(|k| (first + k) % n);
+        let hedge = tokio::time::sleep(HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut hedged = n == 1;
         let mut errors = Vec::new();
-        while let Some(r) = pending.next().await {
-            match r {
-                Ok(r) => return Ok(r),
-                Err(e) => errors.push(e),
+        loop {
+            tokio::select! {
+                Some((i, r)) = pending.next() => match r {
+                    Ok(r) => {
+                        self.preferred.store(i, Ordering::Relaxed);
+                        return Ok(r);
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        if !hedged {
+                            hedged = true;
+                            pending.extend(others.by_ref().map(|i| self.ask(i, op)));
+                        }
+                        if pending.is_empty() {
+                            return Err(errors.join("; "));
+                        }
+                    }
+                },
+                _ = &mut hedge, if !hedged => {
+                    hedged = true;
+                    pending.extend(others.by_ref().map(|i| self.ask(i, op)));
+                }
             }
         }
-        Err(if errors.is_empty() {
-            "no cluster endpoints".into()
-        } else {
-            errors.join("; ")
-        })
     }
 
     /// Fetch `/api/v1/cluster/status` from the first node that answers.
-    pub async fn status(&self) -> Result<super::Status, String> {
-        let mut errors = Vec::new();
-        for ep in &self.endpoints {
+    async fn status(&self) -> Result<super::Status, String> {
+        use crate::net::{Answer, try_each};
+        try_each(self.endpoints.iter().map(String::as_str), |ep| async move {
             let url = format!("{}/api/v1/cluster/status", ep);
             match self.http.get(&url).send().await {
                 Ok(resp) => match resp.json().await {
-                    Ok(s) => return Ok(s),
-                    Err(e) => errors.push(format!("{}: {}", ep, e)),
+                    Ok(s) => Answer::Got(s),
+                    Err(e) => Answer::Unreachable(e.to_string()),
                 },
-                Err(e) => errors.push(format!("{}: {}", ep, e)),
+                Err(e) => Answer::Unreachable(e.to_string()),
             }
-        }
-        Err(errors.join("; "))
+        })
+        .await
+        .map_err(|e: crate::net::Tried<String>| e.to_string())
     }
 }
 
@@ -108,34 +192,102 @@ pub fn owner_id() -> String {
     format!("{}:{}:{}", host, std::process::id(), super::now_ms())
 }
 
+/// Where a [`HeldLease`] stands, from this holder's side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum HoldState {
+    Held = 0,
+    /// A `transfer` is in flight: a renewal refused meanwhile (the transfer
+    /// went through first) isn't a lost lease.
+    HandingOff = 1,
+    /// Let go (`release`, or a transfer went through): the renew loop
+    /// stops quietly.
+    Released = 2,
+}
+
+/// A [`HoldState`] shared with the renew loop.
+#[derive(Default)]
+struct AtomicHoldState(std::sync::atomic::AtomicU8);
+
+impl AtomicHoldState {
+    fn get(&self) -> HoldState {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => HoldState::Held,
+            1 => HoldState::HandingOff,
+            _ => HoldState::Released,
+        }
+    }
+
+    fn set(&self, s: HoldState) {
+        self.0.store(s as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Move `from` → `to` if it's still `from`.
+    fn advance(&self, from: HoldState, to: HoldState) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .compare_exchange(from as u8, to as u8, SeqCst, SeqCst)
+            .is_ok()
+    }
+}
+
 pub struct HeldLease {
     pub client: LeaseClient,
-    pub resource: String,
+    pub resource: LeaseResource,
     pub owner: String,
-    pub epoch: u64,
-    /// Set by `release`: the renew loop stops quietly.
-    released: std::sync::atomic::AtomicBool,
-    /// Set while `transfer` is in flight: a renewal refused meanwhile (the
-    /// transfer went through first) isn't a lost lease.
-    handing_off: std::sync::atomic::AtomicBool,
+    pub epoch: Epoch,
+    state: AtomicHoldState,
     /// When the last successful grant or renewal was *sent* (the lease is
     /// good for a TTL from then, at the earliest).
     renewed: std::sync::Mutex<Instant>,
 }
 
+/// Why [`HeldLease::transfer`] didn't hand the lease over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferError {
+    /// The lease is gone (lost or expired): nobody holds it as this holder.
+    Lost(String),
+    /// Refused for good (released, being handed off, not the holder): this
+    /// holder still has it, unless it was released.
+    Refused(String),
+    /// No answer: it may have gone through. The same transfer again says
+    /// which (repeated, it succeeds with the same epoch).
+    NoAnswer(String),
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferError::Lost(m) | TransferError::Refused(m) | TransferError::NoAnswer(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
 impl HeldLease {
+    /// This lease, as its holder: what a request made under it carries.
+    pub fn holding(&self) -> Holding {
+        Holding::new(self.owner.clone(), self.epoch)
+    }
+
+    /// This lease, by resource and epoch.
+    pub fn lease_ref(&self) -> LeaseRef {
+        LeaseRef::new(self.resource.clone(), self.epoch)
+    }
+
     /// Take `resource`, or say who has it.
     pub async fn acquire(
         client: LeaseClient,
-        resource: &str,
-        desc: &str,
+        resource: LeaseResource,
+        holder: Holder,
     ) -> Result<HeldLease, String> {
         let owner = owner_id();
         let sent = Instant::now();
         let op = LeaseOp::Acquire {
-            resource: resource.into(),
+            resource: resource.clone(),
             owner: owner.clone(),
-            desc: desc.into(),
+            holder,
             ttl_ms: LEASE_TTL.as_millis() as u64,
         };
         match client.call(&op).await? {
@@ -144,12 +296,12 @@ impl HeldLease {
             }
             Response::Held {
                 owner,
-                desc,
+                holder,
                 expires_ms,
             } => Err(format!(
                 "{} is held by {} ({}) for another {:.1}s",
                 resource,
-                desc,
+                holder,
                 owner,
                 expires_ms.saturating_sub(super::now_ms()) as f64 / 1000.0
             )),
@@ -163,18 +315,17 @@ impl HeldLease {
     /// this process asked for it, say): the lease counts from then.
     pub fn adopt(
         client: LeaseClient,
-        resource: &str,
+        resource: LeaseResource,
         owner: &str,
-        epoch: u64,
+        epoch: Epoch,
         sent: Instant,
     ) -> HeldLease {
         HeldLease {
             client,
-            resource: resource.into(),
+            resource,
             owner: owner.into(),
             epoch,
-            released: Default::default(),
-            handing_off: Default::default(),
+            state: Default::default(),
             renewed: std::sync::Mutex::new(sent),
         }
     }
@@ -182,39 +333,44 @@ impl HeldLease {
     /// Hand this lease straight to `to_owner` (see `Request::Transfer`):
     /// it's never free in between. On success this holder has let go (its
     /// renewals stop quietly, `on_lost` doesn't run) and the new holder's
-    /// epoch is returned, for it to [`HeldLease::adopt`]. On failure this
-    /// holder still has it, unless the error says it was lost; or, when
-    /// no node answered, it may have gone through: try again (the same
-    /// transfer repeated succeeds with the same epoch).
-    #[allow(dead_code)] // the volume handoff (MIG-1) is its user
-    pub async fn transfer(&self, to_owner: &str, to_desc: &str) -> Result<u64, String> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if self.released.load(SeqCst) {
-            return Err(format!("lease on {} was released", self.resource));
+    /// epoch is returned, for it to [`HeldLease::adopt`]. See
+    /// [`TransferError`] for what a failure leaves.
+    pub async fn transfer(
+        &self,
+        to_owner: &str,
+        to_holder: Holder,
+    ) -> Result<Epoch, TransferError> {
+        if !self.state.advance(HoldState::Held, HoldState::HandingOff) {
+            return Err(TransferError::Refused(match self.state.get() {
+                HoldState::HandingOff => format!("lease on {} is being handed off", self.resource),
+                _ => format!("lease on {} was released", self.resource),
+            }));
         }
-        self.handing_off.store(true, SeqCst);
         let op = LeaseOp::Transfer {
             resource: self.resource.clone(),
-            from_owner: self.owner.clone(),
-            from_epoch: self.epoch,
+            from: Holding::new(self.owner.clone(), self.epoch),
             to_owner: to_owner.into(),
-            to_desc: to_desc.into(),
+            to_holder,
             ttl_ms: LEASE_TTL.as_millis() as u64,
         };
         let r = self.client.call(&op).await;
         match r {
             Ok(Response::Granted { epoch, .. }) => {
-                self.released.store(true, SeqCst);
-                self.handing_off.store(false, SeqCst);
+                self.state.set(HoldState::Released);
                 Ok(epoch)
             }
             other => {
-                self.handing_off.store(false, SeqCst);
+                // Back to held, unless `release` ran meanwhile.
+                self.state.advance(HoldState::HandingOff, HoldState::Held);
                 Err(match other {
-                    Ok(Response::Lost) => format!("lease on {} was lost", self.resource),
-                    Ok(Response::Refused(why)) => why,
-                    Ok(other) => format!("unexpected lease reply: {:?}", other),
-                    Err(e) => e,
+                    Ok(Response::Lost) => {
+                        TransferError::Lost(format!("lease on {} was lost", self.resource))
+                    }
+                    Ok(Response::Refused(why)) => TransferError::Refused(why),
+                    Ok(other) => {
+                        TransferError::NoAnswer(format!("unexpected lease reply: {:?}", other))
+                    }
+                    Err(e) => TransferError::NoAnswer(e),
                 })
             }
         }
@@ -246,22 +402,20 @@ impl HeldLease {
                     // else, this process's own next attempt included).
                     let op = LeaseOp::Release {
                         resource,
-                        owner,
-                        epoch,
+                        holder: Holding::new(owner, epoch),
                     };
                     if let Err(e) = client.call(&op).await {
                         eprintln!("lease: release failed (it will expire): {}", e);
                     }
                     return;
                 };
-                if me.released.load(std::sync::atomic::Ordering::SeqCst) {
+                if me.state.get() == HoldState::Released {
                     return;
                 }
                 let sent = Instant::now();
                 let op = LeaseOp::Renew {
                     resource: me.resource.clone(),
-                    owner: me.owner.clone(),
-                    epoch: me.epoch,
+                    holder: Holding::new(me.owner.clone(), me.epoch),
                     ttl_ms: ttl.as_millis() as u64,
                 };
                 // Never wait on a renewal past the point where the lease
@@ -280,17 +434,17 @@ impl HeldLease {
                         *me.renewed.lock().unwrap() = sent;
                         pause = ttl / 3;
                     }
-                    Ok(_) if me.released.load(std::sync::atomic::Ordering::SeqCst) => return,
-                    // Refused while a transfer is in flight: it went through
-                    // (`transfer` sets `released`), or it didn't and the
-                    // next renewal finds out.
-                    Ok(_) if me.handing_off.load(std::sync::atomic::Ordering::SeqCst) => {
-                        pause = RETRY_PAUSE;
-                    }
-                    Ok(other) => {
-                        on_lost(format!("lease on {} lost ({:?})", me.resource, other));
-                        return;
-                    }
+                    Ok(_) => match me.state.get() {
+                        HoldState::Released => return,
+                        // Refused while a transfer is in flight: it went
+                        // through (`transfer` then lets go), or it didn't
+                        // and the next renewal finds out.
+                        HoldState::HandingOff => pause = RETRY_PAUSE,
+                        HoldState::Held => {
+                            on_lost(format!("lease on {} lost ({:?})", me.resource, result));
+                            return;
+                        }
+                    },
                     Err(e) => {
                         if valid_from.elapsed() >= ttl * 4 / 5 {
                             on_lost(format!(
@@ -319,12 +473,10 @@ impl HeldLease {
     }
 
     pub async fn release(&self) {
-        self.released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.set(HoldState::Released);
         let op = LeaseOp::Release {
             resource: self.resource.clone(),
-            owner: self.owner.clone(),
-            epoch: self.epoch,
+            holder: Holding::new(self.owner.clone(), self.epoch),
         };
         if let Err(e) = self.client.call(&op).await {
             eprintln!("lease: release failed (it will expire): {}", e);

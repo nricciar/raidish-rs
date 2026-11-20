@@ -27,8 +27,8 @@
 use crate::blkptr::BlockPtr;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::Lineage;
 use crate::object::{Dirty, INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
+use crate::types::Txg;
 use crate::volume::DIRTY_LIMIT_BYTES;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -54,7 +54,7 @@ pub struct SendHeader {
     /// sent from (informative).
     pub snapshot: String,
     pub guid: u64,
-    pub txg: u64,
+    pub txg: Txg,
     /// When it was taken, ns since the epoch.
     pub created_ns: u64,
     /// For an incremental stream: the snapshot it applies on top of.
@@ -157,10 +157,11 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<(crate::inode::SnapRef, TreeRoot, u64, u32), FileSystemError> {
         let id = self.dataset_id(name).await?;
         let head = self.read_dnode(id).await?;
-        let Some(Lineage::Head { snapshots, .. }) = &head.lineage else {
+        let Some(h) = head.head() else {
             return Err(FileSystemError::FileNotFound);
         };
-        let r = snapshots
+        let r = h
+            .snapshots
             .iter()
             .find(|s| s.name.split_once('@').map(|(_, s)| s) == Some(snap))
             .cloned()
@@ -388,7 +389,8 @@ impl<D: BlockDevice> FileSystem<D> {
             hash: blake3::Hasher::new(),
         };
         let header = read_header(&mut inp).await?;
-        crate::snapshot::split_name(&format!("{}@{}", name, header.snapshot))?;
+        crate::types::DatasetName::try_from(name)?;
+        crate::types::SnapshotName::try_from(header.snapshot.as_str())?;
         self.recv_begin(name, &header, force, true).await?;
         let result = self.recv_frames(name, &header, &mut inp).await;
         let result = match result {
@@ -429,7 +431,8 @@ impl<D: BlockDevice> FileSystem<D> {
         header: &SendHeader,
         force: bool,
     ) -> Result<(), FileSystemError> {
-        crate::snapshot::split_name(&format!("{}@{}", name, header.snapshot))?;
+        crate::types::DatasetName::try_from(name)?;
+        crate::types::SnapshotName::try_from(header.snapshot.as_str())?;
         self.recv_begin(name, header, force, false).await
     }
 
@@ -493,11 +496,11 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let id = self.dataset_id(name).await?;
         let head = self.read_dnode(id).await?;
-        if head.kind != header.format.root_kind() {
+        if head.kind() != header.format.root_kind() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "'{}' is a {}, the stream of a {} dataset",
                 name,
-                head.kind.name(),
+                head.kind().name(),
                 header.format.name()
             )));
         }
@@ -507,10 +510,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 name, head.size, head.blksz, header.size_bytes, header.volblocksize
             )));
         }
-        let snapshots = match &head.lineage {
-            Some(Lineage::Head { snapshots, .. }) => snapshots.clone(),
-            _ => Vec::new(),
-        };
+        let snapshots = head.head().map(|h| h.snapshots.clone()).unwrap_or_default();
         if snapshots.iter().any(|s| s.guid == header.guid) {
             return Err(FileSystemError::AlreadyExists);
         }
@@ -534,7 +534,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // Acknowledged writes of a writer that's gone, still only in its
         // intent log: the log would be replayed over whatever this
         // receives (rolling back with --force refuses it too).
-        if head.log.is_some() {
+        if head.log().is_some() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume '{}' has an intent log (it's running, or its writer's log \
                  is yet to be replayed)",

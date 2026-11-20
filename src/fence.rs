@@ -21,6 +21,8 @@
 
 use crate::disks::DISK_LABEL_BLOCKS;
 use crate::metaslab::MetaslabLayout;
+use crate::types::Epoch;
+use crate::types::MetaslabIdx;
 use crate::vdev::Topology;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Domain {
     Pool,
-    Metaslab(u32),
+    Metaslab(MetaslabIdx),
 }
 
 /// Where a raw block of a pool's leaf disk falls.
@@ -53,9 +55,9 @@ impl FenceMap {
         match self
             .topology
             .pool_range_of(disk, block - DISK_LABEL_BLOCKS)
-            .and_then(|(start, _)| self.layout.metaslab_for_block(start))
+            .and_then(|r| self.layout.metaslab_for_block(r.start))
         {
-            Some(i) => Domain::Metaslab(i as u32),
+            Some(i) => Domain::Metaslab(i),
             None => Domain::Pool,
         }
     }
@@ -73,16 +75,27 @@ impl FenceMap {
     }
 }
 
+/// A metaslab's fencing grant, as the cluster recorded it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grant {
+    /// Lent to a writer at this epoch: only that lend's writes are admitted
+    /// (a new committer doesn't change it).
+    Lent(Epoch),
+    /// Back with the committer since this epoch: the pool floor applies too.
+    Returned(Epoch),
+}
+
 /// The fencing state a disk server knows: from the cluster (what was
 /// granted) and from requests (newer epochs it saw first).
 #[derive(Debug, Default)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ServerFence {
     /// Pool floor: the newest pool epoch from the cluster or from requests.
     pool: AtomicU64,
-    /// Per metaslab: (lent, fencing epoch) from the cluster.
-    grants: RwLock<HashMap<u32, (bool, u64)>>,
+    /// Per metaslab: the grant from the cluster.
+    grants: RwLock<HashMap<MetaslabIdx, Grant>>,
     /// Per metaslab: newest epoch seen on an admitted write.
-    seen: RwLock<HashMap<u32, u64>>,
+    seen: RwLock<HashMap<MetaslabIdx, Epoch>>,
     /// Domain map; None until the pool's layout is known (then everything
     /// is the pool domain).
     map: RwLock<Option<FenceMap>>,
@@ -90,23 +103,28 @@ pub struct ServerFence {
     served: RwLock<Option<HashMap<usize, usize>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ServerFence {
     /// The pool floor (for status and tests).
-    pub fn pool_floor(&self) -> u64 {
-        self.pool.load(Ordering::SeqCst)
+    pub fn pool_floor(&self) -> Epoch {
+        Epoch::from_raw(self.pool.load(Ordering::SeqCst))
     }
 
     /// Raise the pool floor (cluster grant or a test).
-    pub fn raise_pool(&self, epoch: u64) {
-        self.pool.fetch_max(epoch, Ordering::SeqCst);
+    pub fn raise_pool(&self, epoch: Epoch) {
+        self.pool.fetch_max(epoch.get(), Ordering::SeqCst);
     }
 
     /// Take in the cluster's view: the pool epoch and every metaslab grant.
-    pub fn observe(&self, pool_epoch: u64, grants: impl IntoIterator<Item = (u32, bool, u64)>) {
+    pub fn observe(
+        &self,
+        pool_epoch: Epoch,
+        grants: impl IntoIterator<Item = (MetaslabIdx, Grant)>,
+    ) {
         self.raise_pool(pool_epoch);
         let mut g = self.grants.write().unwrap();
-        for (idx, lent, epoch) in grants {
-            g.insert(idx, (lent, epoch));
+        for (idx, grant) in grants {
+            g.insert(idx, grant);
         }
     }
 
@@ -123,15 +141,21 @@ impl ServerFence {
     }
 
     /// The current floor of `domain`.
-    pub fn floor(&self, domain: Domain) -> u64 {
-        let pool = self.pool.load(Ordering::SeqCst);
+    pub fn floor(&self, domain: Domain) -> Epoch {
+        let pool = self.pool_floor();
         match domain {
             Domain::Pool => pool,
             Domain::Metaslab(i) => {
-                let seen = self.seen.read().unwrap().get(&i).copied().unwrap_or(0);
+                let seen = self
+                    .seen
+                    .read()
+                    .unwrap()
+                    .get(&i)
+                    .copied()
+                    .unwrap_or_default();
                 let base = match self.grants.read().unwrap().get(&i) {
-                    Some(&(true, e)) => e,
-                    Some(&(false, e)) => e.max(pool),
+                    Some(&Grant::Lent(e)) => e,
+                    Some(&Grant::Returned(e)) => e.max(pool),
                     None => pool,
                 };
                 base.max(seen)
@@ -164,7 +188,7 @@ impl ServerFence {
         served_disk: usize,
         block: u64,
         count: u32,
-        epoch: u64,
+        epoch: Epoch,
         write: bool,
     ) -> bool {
         let domains = self.domains(served_disk, block, count);
@@ -182,7 +206,7 @@ impl ServerFence {
                 Domain::Pool => self.raise_pool(epoch),
                 Domain::Metaslab(i) => {
                     let mut seen = self.seen.write().unwrap();
-                    let e = seen.entry(i).or_insert(0);
+                    let e = seen.entry(i).or_default();
                     *e = (*e).max(epoch);
                 }
             }
@@ -192,39 +216,64 @@ impl ServerFence {
 }
 
 /// A pool client's epochs, as sent with its requests: the pool epoch (the
-/// committer's lease, 0 without one; the process-wide one from
-/// [`client`] counts too) and, per metaslab, the epoch of a lend to this
-/// client's writer or of a return to its committer. Each `DiskSet` has
-/// one, so a committer and a writer in one process fence separately.
+/// `pool` lease of the committer or command writing it, 0 without one)
+/// and, per metaslab, the epoch of a lend to this client's writer or of a
+/// return to its committer. Each `DiskSet` has one, so a committer and a
+/// writer in one process fence separately.
 #[derive(Debug, Default)]
 pub struct ClientFence {
     pool: AtomicU64,
-    metaslabs: RwLock<HashMap<u32, u64>>,
+    /// Run when a disk server refuses the pool epoch: another writer has
+    /// the pool now. It must never be retried.
+    on_stale: std::sync::OnceLock<fn()>,
+    metaslabs: RwLock<HashMap<MetaslabIdx, Epoch>>,
     map: RwLock<Option<FenceMap>>,
 }
 
-static CLIENT: std::sync::OnceLock<ClientFence> = std::sync::OnceLock::new();
+/// The epoch a request carries, and where it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// The pool lease epoch (or none).
+    Pool(Epoch),
+    /// A metaslab lent to this process's writer: a refusal means that
+    /// writer lost the metaslab, not that the pool has a new committer.
+    Lent(Epoch),
+}
 
-/// The process-wide client fence (only its pool epoch is used: the one a
-/// writing command's `pool` lease gave it).
-pub fn client() -> &'static ClientFence {
-    CLIENT.get_or_init(ClientFence::default)
+impl Stamp {
+    pub fn epoch(self) -> Epoch {
+        match self {
+            Stamp::Pool(e) | Stamp::Lent(e) => e,
+        }
+    }
 }
 
 impl ClientFence {
-    pub fn set_pool_epoch(&self, epoch: u64) {
-        self.pool.store(epoch, Ordering::SeqCst);
+    /// Run `f` once a disk server refuses our pool epoch.
+    pub fn on_stale(&self, f: fn()) {
+        let _ = self.on_stale.set(f);
     }
 
-    pub fn pool_epoch(&self) -> u64 {
-        self.pool.load(Ordering::SeqCst)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn stale(&self) {
+        if let Some(f) = self.on_stale.get() {
+            f();
+        }
     }
 
-    pub fn set_metaslab_epoch(&self, idx: u32, epoch: u64) {
+    pub fn set_pool_epoch(&self, epoch: Epoch) {
+        self.pool.store(epoch.get(), Ordering::SeqCst);
+    }
+
+    pub fn pool_epoch(&self) -> Epoch {
+        Epoch::from_raw(self.pool.load(Ordering::SeqCst))
+    }
+
+    pub fn set_metaslab_epoch(&self, idx: MetaslabIdx, epoch: Epoch) {
         self.metaslabs.write().unwrap().insert(idx, epoch);
     }
 
-    pub fn clear_metaslab(&self, idx: u32) {
+    pub fn clear_metaslab(&self, idx: MetaslabIdx) {
         self.metaslabs.write().unwrap().remove(&idx);
     }
 
@@ -233,27 +282,24 @@ impl ClientFence {
     }
 
     /// The epoch to send with a request for `count` raw blocks from
-    /// `block` of pool leaf `disk` (None: not a pool disk, or a flush), and
-    /// whether it came from a metaslab lent to this process's writer (so a
-    /// refusal means that writer lost the metaslab, not that the pool has a
-    /// new committer).
-    pub fn epoch_for(&self, disk: Option<usize>, block: u64, count: u32) -> (u64, bool) {
-        let pool = self.pool_epoch().max(client().pool_epoch());
+    /// `block` of pool leaf `disk` (None: not a pool disk, or a flush).
+    pub fn epoch_for(&self, disk: Option<usize>, block: u64, count: u32) -> Stamp {
+        let pool = Stamp::Pool(self.pool_epoch());
         let ms = self.metaslabs.read().unwrap();
         if ms.is_empty() {
-            return (pool, false);
+            return pool;
         }
         let map = self.map.read().unwrap();
         let (Some(map), Some(disk)) = (map.as_ref(), disk) else {
-            return (pool, false);
+            return pool;
         };
-        let mut out = (pool, false);
+        let mut out = pool;
         for d in map.domains(disk, block, count) {
             if let Domain::Metaslab(i) = d
                 && let Some(&e) = ms.get(&i)
-                && e > out.0
+                && e > out.epoch()
             {
-                out = (e, true);
+                out = Stamp::Lent(e);
             }
         }
         out

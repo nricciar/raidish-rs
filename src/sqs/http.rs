@@ -14,9 +14,10 @@ use super::{
     MAX_BATCH, MAX_VISIBILITY, MAX_WAIT_SECS, MsgAttr, NewMsg, Queue, Received, SqsError, md5_hex,
     md5_of_attrs,
 };
+use crate::committer::PoolAdmin;
 use crate::dataset::DatasetFormat;
 use crate::frontend::http::{self as fhttp, Body, full};
-use crate::frontend::{Frontend, Local};
+use crate::frontend::{Frontend, Local, Located};
 use crate::sigv4::{self, AuthError};
 use crate::vdev::Pool;
 use base64::Engine;
@@ -35,7 +36,7 @@ const MAX_REQUEST: usize = 4 << 20;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 pub async fn serve(fe: Arc<Frontend>, l: tokio::net::TcpListener) {
-    fhttp::serve(l, fe.tls.https.clone(), move |req| {
+    fhttp::serve(l, fe.tls().https.clone(), move |req| {
         let fe = fe.clone();
         async move { handle(fe, req).await }
     })
@@ -82,6 +83,14 @@ fn bad_value(m: impl Into<String>) -> ErrQ {
     eq("InvalidParameterValue", "InvalidParameterValue", m)
 }
 
+/// This node's SQS host, as queue URLs name it.
+fn host_of(fe: &Frontend) -> String {
+    match fe.config().sqs_port() {
+        Some(p) => format!("{}:{}", fe.addr(), p),
+        None => fe.addr(),
+    }
+}
+
 fn unavailable() -> ErrQ {
     ErrQ {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -118,12 +127,23 @@ impl From<SqsError> for ErrQ {
                 "The message referred to isn't in flight.",
             ),
             SqsError::Unavailable => unavailable(),
-            SqsError::Fs(m) => ErrQ {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                kind: "InternalError",
-                query: "InternalError",
-                message: m,
-            },
+            SqsError::Fs { kind, msg } => {
+                use crate::types::ErrorKind as K;
+                match kind {
+                    K::Invalid => eq("InvalidParameterValue", "InvalidParameterValue", msg),
+                    // Its lease is someone else's, or no committer: later.
+                    K::Unavailable | K::Conflict => ErrQ {
+                        message: msg,
+                        ..unavailable()
+                    },
+                    _ => ErrQ {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        kind: "InternalError",
+                        query: "InternalError",
+                        message: msg,
+                    },
+                }
+            }
         }
     }
 }
@@ -191,7 +211,7 @@ pub fn queue_of_url(url: &str) -> Option<String> {
 }
 
 pub fn arn(fe: &Frontend, name: &str) -> String {
-    format!("arn:aws:sqs:{}:{}:{}", fe.config.region(), ACCOUNT, name)
+    format!("arn:aws:sqs:{}:{}:{}", fe.config().region(), ACCOUNT, name)
 }
 
 fn url(host: &str, name: &str) -> String {
@@ -374,26 +394,24 @@ async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Resp
             None => return Err(missing("QueueUrl")),
         },
     };
-    if let Some(q) = &queue
-        && !matches!(fe.local(q).as_deref(), Some(Local::Queue(_)))
-    {
-        let route = fe
-            .route(q)
-            .filter(|r| r.format == DatasetFormat::Queue)
-            .ok_or_else(no_queue)?;
-        match route.owner {
-            Some(o) if o.node != fe.node && !fhttp::forwarded_parts(&parts.headers) => {
+    if let Some(q) = &queue {
+        let forwarded = fhttp::forwarded_parts(&parts.headers);
+        match fe.locate(q, DatasetFormat::Queue, forwarded, Local::queue) {
+            Located::Here(_) => {}
+            Located::There(o) => {
                 let req = Request::from_parts(parts, http_body_util::Full::new(bytes));
-                return fhttp::proxy(&fe.tls, req, &o.addr, fe.config.sqs_port())
+                let port = fe.config().sqs_port().ok_or_else(unavailable)?;
+                return fhttp::proxy(fe.tls(), req, &o.addr, port)
                     .await
                     .ok_or_else(unavailable);
             }
-            _ => return Err(unavailable()),
+            Located::Unavailable => return Err(unavailable()),
+            Located::Missing => return Err(no_queue()),
         }
     }
     let sha = hex::encode(Sha256::digest(&bytes));
     let signed = sigv4::verify(
-        &fe.auth,
+        fe.auth(),
         "sqs",
         &parts.method,
         &parts.uri,
@@ -409,7 +427,7 @@ async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Resp
         "ListDeadLetterSourceQueues",
     ];
     if !READS.contains(&target.as_str())
-        && fe.auth.role(&signed.access_key) < crate::pki::Role::Admin
+        && fe.auth().role(&signed.access_key) < crate::pki::Role::Admin
     {
         return Err(ErrQ {
             status: StatusCode::FORBIDDEN,
@@ -423,7 +441,7 @@ async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Resp
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{}:{}", fe.addr(), fe.config.sqs_port()));
+        .unwrap_or_else(|| host_of(fe));
     let sender = sender_of(&parts.headers);
     let out = dispatch(fe, &target, &input, &host, &sender).await?;
     Ok(json_response(out))
@@ -488,17 +506,17 @@ async fn call_inner(
     target: &str,
     mut input: Value,
 ) -> Result<Value, ErrQ> {
-    if let Some(Local::Queue(q)) = fe.local(name).as_deref() {
-        let host = format!("{}:{}", fe.addr(), fe.config.sqs_port());
-        return queue_op(fe, q, target, &input, &host, "raidish").await;
-    }
-    let route = fe
-        .route(name)
-        .filter(|r| r.format == DatasetFormat::Queue)
-        .ok_or_else(no_queue)?;
-    let owner = route.owner.ok_or_else(unavailable)?;
-    let (ak, sk) = fe.auth.internal()?;
-    let port = fe.config.sqs_port();
+    let owner = match fe.locate(name, DatasetFormat::Queue, false, Local::queue) {
+        Located::Here(q) => {
+            let host = host_of(fe);
+            return queue_op(fe, &q, target, &input, &host, "raidish").await;
+        }
+        Located::There(owner) => owner,
+        Located::Unavailable => return Err(unavailable()),
+        Located::Missing => return Err(no_queue()),
+    };
+    let (ak, sk) = fe.auth().internal()?;
+    let port = fe.config().sqs_port().ok_or_else(unavailable)?;
     let host = format!("{}:{}", owner.addr, port);
     input["QueueUrl"] = json!(url(&host, name));
     let body = input.to_string().into_bytes();
@@ -521,7 +539,7 @@ async fn call_inner(
     for (k, v) in sigv4::sign(
         &ak,
         &sk,
-        &fe.config.region(),
+        &fe.config().region(),
         "sqs",
         &Method::POST,
         &uri,
@@ -539,7 +557,7 @@ async fn call_inner(
     *req.method_mut() = Method::POST;
     *req.uri_mut() = "/".parse().unwrap();
     *req.headers_mut() = headers;
-    let resp = fhttp::proxy(&fe.tls, req, &owner.addr, port)
+    let resp = fhttp::proxy(fe.tls(), req, &owner.addr, port)
         .await
         .ok_or_else(unavailable)?;
     let status = resp.status();
@@ -592,7 +610,8 @@ async fn create_queue(fe: &Arc<Frontend>, input: &Value, host: &str) -> Result<V
     if name.ends_with(".fifo") {
         return Err(bad_value("FIFO queues aren't supported by raidish."));
     }
-    crate::committer::check_queue_name(&name).map_err(|e| bad_value(e.to_string()))?;
+    let queue =
+        crate::types::QueueName::try_from(name.as_str()).map_err(|e| bad_value(e.to_string()))?;
     let attrs = string_map(input, "Attributes")?;
     let tags = string_map(input, "tags")?;
     // Checked before anything's made.
@@ -626,18 +645,18 @@ async fn create_queue(fe: &Arc<Frontend>, input: &Value, host: &str) -> Result<V
         return Ok(json!({ "QueueUrl": url(host, &name) }));
     }
     let req = crate::committer::CreateDataset {
-        name: name.clone(),
+        name: queue.into(),
+
         format: DatasetFormat::Queue,
         props: Default::default(),
     };
-    if let Err(e) = fe.committer.create_dataset(&req).await {
-        let m = e.to_string();
-        if !m.to_ascii_lowercase().contains("exists") {
-            return Err(ErrQ {
-                message: m,
-                ..unavailable()
-            });
-        }
+    if let Err(e) = fe.committer().create_dataset(&req).await
+        && e.kind() != crate::types::ErrorKind::Exists
+    {
+        return Err(ErrQ {
+            message: e.to_string(),
+            ..unavailable()
+        });
     }
     let n = name.clone();
     fe.wait_routes(20, |routes| {
@@ -963,7 +982,7 @@ async fn queue_op(
             for (k, v) in meta.attrs.to_map() {
                 add(k, v);
             }
-            add("QueueArn", arn(fe, &q.name));
+            add("QueueArn", arn(fe, &q.tree.name));
             add("CreatedTimestamp", (meta.created_ms / 1000).to_string());
             add(
                 "LastModifiedTimestamp",
@@ -975,10 +994,10 @@ async fn queue_op(
                 "ApproximateNumberOfMessagesDelayed",
             ];
             if all || want.iter().any(|w| counts.contains(&w.as_str())) {
-                let (v, i, d) = q.counts().await?;
-                add(counts[0], v.to_string());
-                add(counts[1], i.to_string());
-                add(counts[2], d.to_string());
+                let c = q.counts().await?;
+                add(counts[0], c.visible.to_string());
+                add(counts[1], c.inflight.to_string());
+                add(counts[2], c.delayed.to_string());
             }
             for w in &want {
                 let known = w == "All"
@@ -1032,10 +1051,10 @@ async fn queue_op(
             Ok(json!({ "Tags": tags }))
         }
         "ListDeadLetterSourceQueues" => {
-            let me = arn(fe, &q.name);
+            let me = arn(fe, &q.tree.name);
             let mut urls = Vec::new();
             for (name, r) in fe.routes() {
-                if r.format != DatasetFormat::Queue || name == q.name {
+                if r.format != DatasetFormat::Queue || name == q.tree.name {
                     continue;
                 }
                 let a = call(
@@ -1189,7 +1208,7 @@ async fn move_dead(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, dead: Vec<super::De
                 "SentMs": m.sent_ms,
                 "ReceiveCount": m.receive_count,
                 "FirstReceiveMs": m.first_receive_ms,
-                "From": m.dead_from.clone().unwrap_or_else(|| q.name.clone()),
+                "From": m.dead_from.clone().unwrap_or_else(|| q.tree.name.clone()),
                 "Sender": m.sender,
             },
         });
@@ -1201,16 +1220,22 @@ async fn move_dead(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, dead: Vec<super::De
         }
         match call(fe, &target, "SendMessage", input).await {
             Ok(_) => {
-                if let Err(e) = q.remove(d.seq, m.nonce).await {
+                if let Err(e) = q
+                    .remove(super::Receipt {
+                        seq: d.seq,
+                        nonce: m.nonce,
+                    })
+                    .await
+                {
                     eprintln!(
                         "sqs '{}': dropping a message moved to '{}': {:?}",
-                        q.name, target, e
+                        q.tree.name, target, e
                     );
                 }
             }
             Err(e) => eprintln!(
                 "sqs '{}': moving a message to its dead-letter queue '{}': {}",
-                q.name, target, e.message
+                q.tree.name, target, e.message
             ),
         }
     }

@@ -11,9 +11,10 @@
 //! run of at most `max_record_blocks()` blocks, so a record never shares a
 //! RaidZ stripe with anything else.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::disk::{BLOCK_SIZE, BlockDevice, zeroed_blocks};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use crate::types::Txg;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
@@ -31,12 +32,34 @@ pub struct BlockPtr {
     /// Logical bytes stored in the record.
     pub lsize: u32,
     /// TXG in which the record was written.
-    pub birth_txg: u64,
+    pub birth_txg: Txg,
     /// blake3 of the record's `lsize` bytes.
     pub checksum: [u8; 32],
 }
 
 impl BlockPtr {
+    /// A record of `data` written at `lba` in `asize` blocks, in `txg`.
+    /// Refused if its sizes don't fit a pointer.
+    pub fn new(lba: u64, asize: u64, data: &[u8], txg: Txg) -> Result<Self, FileSystemError> {
+        let too_big = || {
+            FileSystemError::InvalidArgument(format!(
+                "a record of {} blocks, {} bytes",
+                asize,
+                data.len()
+            ))
+        };
+        if (data.len() as u64).div_ceil(BLOCK_SIZE as u64) > asize {
+            return Err(too_big());
+        }
+        Ok(BlockPtr {
+            lba,
+            asize: u32::try_from(asize).map_err(|_| too_big())?,
+            lsize: u32::try_from(data.len()).map_err(|_| too_big())?,
+            birth_txg: txg,
+            checksum: *blake3::hash(data).as_bytes(),
+        })
+    }
+
     /// The space this record occupies on disk.
     pub fn extent(&self) -> Extent {
         Extent {
@@ -72,6 +95,7 @@ pub fn coalesce_groups(ptrs: &[BlockPtr]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// Logical size of an object.
+#[cfg(test)]
 pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
     ptrs.iter().map(|p| p.lsize as u64).sum()
 }
@@ -102,13 +126,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 rest = tail;
 
                 self.write_record_blocks(lba, chunk).await?;
-                ptrs.push(BlockPtr {
-                    lba,
-                    asize: asize as u32,
-                    lsize: chunk.len() as u32,
-                    birth_txg: txg,
-                    checksum: *blake3::hash(chunk).as_bytes(),
-                });
+                ptrs.push(BlockPtr::new(lba, asize, chunk, txg)?);
                 lba += asize;
             }
         }
@@ -133,13 +151,7 @@ impl<D: BlockDevice> FileSystem<D> {
             self.unallocate(extent.start, extent.len).await;
             return Err(e);
         }
-        Ok(BlockPtr {
-            lba: extent.start,
-            asize: extent.len as u32,
-            lsize: data.len() as u32,
-            birth_txg: txg,
-            checksum: *blake3::hash(data).as_bytes(),
-        })
+        BlockPtr::new(extent.start, extent.len, data, txg)
     }
 
     /// Write `records` back to back at `start`, each in `record_blocks`
@@ -154,20 +166,20 @@ impl<D: BlockDevice> FileSystem<D> {
         debug_assert_eq!(record_blocks, self.align_blocks(record_blocks));
         let txg = self.open_txg().await?;
         let stride = record_blocks as usize * BLOCK_SIZE;
-        let mut buf = vec![0u8; stride * records.len()];
+        let mut blocks = zeroed_blocks(record_blocks as usize * records.len());
+        let buf = blocks.as_flattened_mut();
         let mut ptrs = Vec::with_capacity(records.len());
         for (i, data) in records.iter().enumerate() {
             assert!(data.len() <= stride, "record larger than its slot");
             buf[i * stride..i * stride + data.len()].copy_from_slice(data);
-            ptrs.push(BlockPtr {
-                lba: start + i as u64 * record_blocks,
-                asize: record_blocks as u32,
-                lsize: data.len() as u32,
-                birth_txg: txg,
-                checksum: *blake3::hash(data).as_bytes(),
-            });
+            ptrs.push(BlockPtr::new(
+                start + i as u64 * record_blocks,
+                record_blocks,
+                data,
+                txg,
+            )?);
         }
-        self.dev.write_blocks(start, &buf).await?;
+        self.dev.write_blocks(start, &blocks).await?;
         Ok(ptrs)
     }
 
@@ -177,8 +189,8 @@ impl<D: BlockDevice> FileSystem<D> {
         data: &[u8],
     ) -> Result<(), FileSystemError> {
         let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
-        let mut buf = vec![0u8; blocks as usize * BLOCK_SIZE];
-        buf[..data.len()].copy_from_slice(data);
+        let mut buf = zeroed_blocks(blocks as usize);
+        buf.as_flattened_mut()[..data.len()].copy_from_slice(data);
         self.dev.write_blocks(lba, &buf).await?;
         Ok(())
     }
@@ -221,8 +233,9 @@ impl<D: BlockDevice> FileSystem<D> {
         let first = ptrs[0].lba;
         let last = &ptrs[ptrs.len() - 1];
         let span = last.lba + last.data_blocks() - first;
-        let mut raw = vec![0u8; span as usize * BLOCK_SIZE];
+        let mut raw = zeroed_blocks(span as usize);
         let read_ok = self.dev.read_blocks(first, &mut raw).await.is_ok();
+        let raw = raw.as_flattened();
         let mut out = Vec::with_capacity(ptrs.len());
         for p in ptrs {
             if read_ok {
@@ -275,9 +288,9 @@ impl<D: BlockDevice> FileSystem<D> {
         check: &(dyn Fn(&[u8]) -> bool + Send + Sync),
         heal: bool,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let mut raw = vec![0u8; n as usize * BLOCK_SIZE];
+        let mut raw = zeroed_blocks(n as usize);
         self.dev.read_blocks(lba, &mut raw).await?;
-        let blocks: Vec<Vec<u8>> = raw.chunks(BLOCK_SIZE).map(|b| b.to_vec()).collect();
+        let blocks: Vec<Vec<u8>> = raw.iter().map(|b| b.to_vec()).collect();
 
         let assemble = |blocks: &[Vec<u8>]| -> Vec<u8> {
             let mut data: Vec<u8> = blocks.concat();

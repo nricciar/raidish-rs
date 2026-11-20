@@ -4,63 +4,13 @@
 
 use crate::session::token;
 use gloo_net::http::{Request, RequestBuilder, Response};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+pub use raidish::api_types::{
+    CheckView, CreateVolume, DirEntry, FactsView, MoveTo, NewName, NodeFacts, RenameRequest,
+    Verdict, VmDef, VmView, VolumeView,
+};
+pub use raidish::inode::DatasetProps;
 
-/// A directory entry (`GET /api/v1/dir/<path>`).
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct DirEntry {
-    pub name: String,
-    pub id: u64,
-    /// `file`, `dir` or `volume`.
-    pub kind: String,
-    pub size: u64,
-    #[serde(default)]
-    pub mode: u16,
-    #[serde(default)]
-    pub mtime_ns: u64,
-}
-
-impl DirEntry {
-    pub fn is_dir(&self) -> bool {
-        self.kind == "dir"
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub struct VolumeProps {
-    pub nodes: Vec<String>,
-    /// `nbd` or `nvme`; None: not auto-mounted.
-    pub automount: Option<String>,
-    pub enabled: bool,
-    pub move_to: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct SnapshotInfo {
-    /// `volume@snapshot`.
-    pub name: String,
-    pub txg: u64,
-    pub guid: u64,
-    pub created_ns: u64,
-    pub unique_bytes: u64,
-    pub clones: Vec<String>,
-}
-
-impl SnapshotInfo {
-    /// The part after `@`.
-    pub fn short(&self) -> &str {
-        self.name.split_once('@').map_or(&self.name, |(_, s)| s)
-    }
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct Volume {
-    pub name: String,
-    pub size_bytes: u64,
-    pub volblocksize: u32,
-    pub props: VolumeProps,
-    pub snapshots: Vec<SnapshotInfo>,
-}
+use serde::{Serialize, de::DeserializeOwned};
 
 /// `a/b c` → `a/b%20c` (each part encoded, the slashes kept).
 pub fn encode_path(path: &str) -> String {
@@ -157,7 +107,7 @@ pub async fn delete_tree(path: String, is_dir: bool) -> Result<u64, String> {
         if dir && !listed {
             stack.push((p.clone(), true, true));
             for e in list_dir(&p).await? {
-                if e.kind == "volume" {
+                if e.kind == raidish::inode::ObjType::Volume {
                     return Err(format!(
                         "{}/{} is a volume: delete it under Volumes",
                         p, e.name
@@ -173,36 +123,25 @@ pub async fn delete_tree(path: String, is_dir: bool) -> Result<u64, String> {
     Ok(removed)
 }
 
-#[derive(Serialize)]
-struct Rename<'a> {
-    from: &'a str,
-    to: &'a str,
-}
-
 pub async fn rename(from: &str, to: &str) -> Result<(), String> {
-    send_json(Request::post("/api/v1/rename"), &Rename { from, to })
+    let req = RenameRequest {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    send_json(Request::post("/api/v1/rename"), &req)
         .await
         .map(drop)
 }
 
 // ---- volumes ----
 
-pub async fn volumes() -> Result<Vec<Volume>, String> {
+pub async fn volumes() -> Result<Vec<VolumeView>, String> {
     json(send(Request::get("/api/v1/volumes")).await?).await
 }
 
-#[derive(Serialize)]
-struct CreateVolume<'a> {
-    name: &'a str,
-    size_bytes: u64,
-}
-
-#[derive(Serialize)]
-struct NewName<'a> {
-    name: &'a str,
-}
-
 pub async fn create_volume(name: &str, size_bytes: u64) -> Result<(), String> {
+    // Checked here too, so a bad name is said before anything is sent.
+    let name = raidish::types::DatasetName::user(name).map_err(|e| e.to_string())?;
     send_json(
         Request::post("/api/v1/volumes"),
         &CreateVolume { name, size_bytes },
@@ -217,7 +156,7 @@ pub async fn delete_volume(name: &str) -> Result<(), String> {
         .map(drop)
 }
 
-pub async fn set_props(name: &str, props: &VolumeProps) -> Result<(), String> {
+pub async fn set_props(name: &str, props: &DatasetProps) -> Result<(), String> {
     send_json(
         Request::put(&format!("/api/v1/volumes/{}/props", enc(name))),
         props,
@@ -229,7 +168,9 @@ pub async fn set_props(name: &str, props: &VolumeProps) -> Result<(), String> {
 pub async fn snapshot(volume: &str, snap: &str) -> Result<(), String> {
     send_json(
         Request::post(&format!("/api/v1/volumes/{}/snapshots", enc(volume))),
-        &NewName { name: snap },
+        &NewName {
+            name: snap.to_string(),
+        },
     )
     .await
     .map(drop)
@@ -252,7 +193,9 @@ pub async fn clone_snapshot(volume: &str, snap: &str, new: &str) -> Result<(), S
             enc(volume),
             enc(snap)
         )),
-        &NewName { name: new },
+        &NewName {
+            name: new.to_string(),
+        },
     )
     .await
     .map(drop)
@@ -292,70 +235,11 @@ pub fn parse_size(s: &str) -> Option<u64> {
 
 // ---- VMs ----
 
-pub use raidish::vm_def::{NewVm, VmHardware};
+pub use raidish::vm_def::NewVm;
 
-/// A valid VM name (as `raidish::vm::valid_name`).
+/// A valid VM name (`raidish::types::VmName`).
 pub fn valid_vm_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && !name.starts_with('.')
-}
-
-/// A VM (`GET /api/v1/vms`): its definition joined with libvirt's live
-/// state on the node holding its disks.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct Vm {
-    pub name: String,
-    pub change: u64,
-    /// The volume that places it (its first raidish disk).
-    pub anchor: String,
-    pub volumes: Vec<String>,
-    /// Why its XML is unusable.
-    pub error: Option<String>,
-    pub want_running: bool,
-    /// Where its disks are (where it runs, or would).
-    pub node: Option<String>,
-    /// libvirt's state there; None: not running.
-    pub state: Option<String>,
-    /// That node couldn't be asked.
-    pub unreachable: Option<String>,
-    pub restart_pending: bool,
-    pub vcpus: Option<u32>,
-    pub memory_kib: Option<u64>,
-    pub cpu_s: Option<f64>,
-    pub console: bool,
-    /// Why its node couldn't start it.
-    pub start_error: Option<String>,
-    /// What its XML configures.
-    #[serde(default)]
-    pub hw: VmHardware,
-}
-
-impl Vm {
-    /// Is libvirt running it (in any state)?
-    pub fn running(&self) -> bool {
-        self.state.is_some()
-    }
-    /// vCPUs: libvirt's while it runs, else the XML's.
-    pub fn vcpus(&self) -> Option<u32> {
-        self.vcpus.or(self.hw.vcpus)
-    }
-    /// Memory: libvirt's while it runs, else the XML's.
-    pub fn memory_kib(&self) -> Option<u64> {
-        self.memory_kib.or(self.hw.memory_kib)
-    }
-}
-
-/// A VM's stored definition (`GET /api/v1/vms/<name>/definition`).
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct VmDef {
-    pub xml: String,
-    /// Its change number: storing an edit of it names this, so an edit of
-    /// an older one is refused rather than undoing someone's change.
-    pub change: u64,
+    raidish::types::VmName::try_from(name).is_ok()
 }
 
 pub async fn vm_definition(name: &str) -> Result<VmDef, String> {
@@ -390,114 +274,12 @@ pub async fn vm_put(
     json(check(req.send().await.map_err(|e| e.to_string())?).await?).await
 }
 
-pub async fn vms() -> Result<Vec<Vm>, String> {
+pub async fn vms() -> Result<Vec<VmView>, String> {
     json(send(Request::get("/api/v1/vms")).await?).await
-}
-
-/// Why a move is ruled out, or isn't live (`level` `no`, `cold`, `warn`).
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct Reason {
-    pub level: String,
-    pub text: String,
-}
-
-/// Moving a VM to one node: `live`, `cold` or `no`.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct Verdict {
-    pub node: String,
-    pub mode: String,
-    pub reasons: Vec<Reason>,
-}
-
-impl Verdict {
-    /// The reasons that set its mode, joined.
-    pub fn why(&self) -> String {
-        let want = match self.mode.as_str() {
-            "no" => "no",
-            "cold" => "cold",
-            _ => "warn",
-        };
-        self.reasons
-            .iter()
-            .filter(|r| r.level == want)
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-}
-
-/// Where a VM can move (`GET /api/v1/vms/<name>/check`).
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct CheckView {
-    pub running_on: Option<String>,
-    pub verdicts: Vec<Verdict>,
 }
 
 pub async fn vm_check(name: &str) -> Result<CheckView, String> {
     json(send(Request::get(&format!("/api/v1/vms/{}/check", enc(name)))).await?).await
-}
-
-/// One check of a node's (`crate::node_facts::Probe`).
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct Probe {
-    pub ok: bool,
-    pub error: Option<String>,
-    pub hint: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct PeerFacts {
-    pub host: String,
-    pub libvirt: Option<Probe>,
-    pub peer_io: Option<Probe>,
-    pub migrate_tls_error: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct HostFacts {
-    pub hostname: String,
-    pub cpu_model: String,
-    pub cpu_threads: u32,
-    pub memory_mb: u64,
-    pub kvm: bool,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct CpuFacts {
-    pub model: String,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct LibvirtFacts {
-    pub error: Option<String>,
-    pub libvirt_version: String,
-    pub qemu_version: String,
-    pub virt_type: String,
-    pub cpu: CpuFacts,
-    pub networks: Vec<String>,
-}
-
-/// What a node reported about itself (`crate::node_facts::NodeFacts`).
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct NodeFacts {
-    pub node: String,
-    pub collected_at: u64,
-    pub host: HostFacts,
-    pub peer_io: bool,
-    pub libvirt: Option<LibvirtFacts>,
-    pub peers: std::collections::BTreeMap<String, PeerFacts>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-pub struct FactsView {
-    pub nodes: std::collections::BTreeMap<String, NodeFacts>,
-    pub live: Vec<String>,
 }
 
 pub async fn node_facts() -> Result<FactsView, String> {
@@ -515,15 +297,13 @@ pub async fn vm_action(name: &str, action: &str) -> Result<(), String> {
     .map(drop)
 }
 
-#[derive(Serialize)]
-struct MoveTo<'a> {
-    node: &'a str,
-}
-
 pub async fn vm_move(name: &str, node: &str) -> Result<(), String> {
     send_json(
         Request::post(&format!("/api/v1/vms/{}/move", enc(name))),
-        &MoveTo { node },
+        &MoveTo {
+            node: node.to_string(),
+            live: false,
+        },
     )
     .await
     .map(drop)

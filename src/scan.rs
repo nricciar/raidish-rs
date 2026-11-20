@@ -22,18 +22,25 @@
 
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
-use crate::fs::{FileSystem, FileSystemError, LabelState, parse_label};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::events::{EventKind, Subject};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::fs::LabelState;
+use crate::fs::{FileSystem, FileSystemError, parse_label};
 use crate::fsck::{Node, table_node};
 use crate::object::TreeRoot;
+use crate::types::Txg;
 use crate::vdev::StripeCheck;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanReport {
     /// Only records born at or after this TXG were checked (0 = everything).
-    pub since: u64,
+    pub since: Txg,
     pub repair: bool,
     pub records: u64,
     pub bytes: u64,
@@ -88,7 +95,7 @@ impl ScanReport {
 
 impl std::fmt::Display for ScanReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = if self.since == 0 {
+        let what = if self.since == Txg::ZERO {
             "scrub".to_string()
         } else {
             format!("resilver (TXG >= {})", self.since)
@@ -160,7 +167,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Check everything; with `repair`, fix what's wrong and bring degraded
     /// disks back in sync.
     pub async fn scrub(&self, repair: bool) -> Result<ScanReport, FileSystemError> {
-        self.scan(Some(0), repair).await
+        self.scan(Some(Txg::ZERO), repair).await
     }
 
     /// Rebuild what degraded (online) disks missed. Does nothing if no
@@ -176,8 +183,8 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let degraded = self.degraded_disks();
         let missed = self.unaccounted_misses();
-        (0..pool.disks.len()).any(|d| {
-            pool.disks.is_online(d)
+        (0..pool.disks().len()).any(|d| {
+            pool.disks().is_online(d)
                 && (degraded.get(d).is_some_and(|t| t.is_some())
                     || missed.get(d).copied().unwrap_or(false))
         })
@@ -185,7 +192,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// `since`: None = resilver (worked out from the degraded disks once
     /// the snapshot is taken).
-    async fn scan(&self, since: Option<u64>, repair: bool) -> Result<ScanReport, FileSystemError> {
+    async fn scan(&self, since: Option<Txg>, repair: bool) -> Result<ScanReport, FileSystemError> {
         let repair = repair && !self.read_only;
         let _one = self.scan_lock.lock().await;
         let pool = self.dev.pool();
@@ -202,7 +209,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let since = match since {
                 Some(s) => s,
                 None => {
-                    let online = |d: usize| pool.is_some_and(|p| p.disks.is_online(d));
+                    let online = |d: usize| pool.is_some_and(|p| p.disks().is_online(d));
                     match (0..degraded.len())
                         .filter(|&d| online(d))
                         .filter_map(|d| degraded[d])
@@ -241,21 +248,21 @@ impl<D: BlockDevice> FileSystem<D> {
             && let Some(pool) = pool
         {
             let degraded = self.degraded_disks();
-            for d in 0..pool.disks.len() {
+            for d in 0..pool.disks().len() {
                 let covered = degraded[d].is_some_and(|t| t >= since);
-                let in_sync = pool.disks.is_online(d)
-                    && pool.disks.miss_count(d) == misses_at_start[d]
+                let in_sync = pool.disks().is_online(d)
+                    && pool.disks().miss_count(d) == misses_at_start[d]
                     && !report.shards.is_unreadable(d)
                     && !report.shards.has_write_failed(d);
                 if !(covered && in_sync) {
                     continue;
                 }
-                if pool.disks.is_fenced(d) {
+                if pool.disks().is_fenced(d) {
                     if let Err(e) = self.write_disk_label(d).await {
                         eprintln!("disk {}: label write failed: {}", d, e);
                         continue;
                     }
-                    pool.disks.set_fenced(d, false);
+                    pool.disks().set_fenced(d, false);
                 }
                 self.degraded.lock().unwrap()[d] = None;
                 report.cleared.push(d);
@@ -273,14 +280,14 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn scan_tree(
         &self,
         root: TreeRoot,
-        since: u64,
+        since: Txg,
         repair: &(dyn Fn(&BlockPtr) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) -> Result<(), FileSystemError> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
         let mut stack: Vec<Node> = table_node(&root).into_iter().collect();
         // Snapshots share subtrees with their volumes: each record once.
-        let mut seen: std::collections::HashSet<(u64, u64)> = Default::default();
+        let mut seen: std::collections::HashSet<(u64, Txg)> = Default::default();
 
         while let Some(node) = stack.pop() {
             if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
@@ -332,7 +339,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let blocks = self.align_blocks(ptr.data_blocks());
             let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
             padded[..data.len()].copy_from_slice(&data);
-            match pool.root.verify_blocks(ptr.lba, &padded, repair).await {
+            match pool.root().verify_blocks(ptr.lba, &padded, repair).await {
                 Ok(check) => report.shards.add(&check),
                 Err(e) => {
                     report.errors.push(format!("record at {}: {}", ptr.lba, e));
@@ -354,7 +361,8 @@ impl<D: BlockDevice> FileSystem<D> {
         let (Some(w), Some(pool)) = (self.writer.clone(), self.dev.pool()) else {
             return Ok(None);
         };
-        let lent: std::collections::HashSet<u32> = w.lent.lock().unwrap().iter().copied().collect();
+        let lent: std::collections::HashSet<crate::types::MetaslabIdx> =
+            w.lent.lock().unwrap().iter().copied().collect();
         if lent.is_empty() {
             return Ok(None);
         }
@@ -363,7 +371,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(None);
         };
         let Some(since) = (0..newest.degraded.len())
-            .filter(|&d| pool.disks.is_online(d))
+            .filter(|&d| pool.disks().is_online(d))
             .filter_map(|d| newest.degraded[d])
             .min()
         else {
@@ -374,7 +382,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let in_lent = move |p: &BlockPtr| {
             layout
                 .metaslab_for_block(p.lba)
-                .is_some_and(|i| lent.contains(&(i as u32)))
+                .is_some_and(|i| lent.contains(&i))
         };
         let mut report = ScanReport {
             since,
@@ -392,14 +400,14 @@ impl<D: BlockDevice> FileSystem<D> {
         let Some(pool) = self.dev.pool() else {
             return;
         };
-        let score = |b: &[u8]| parse_label(b).ok().map(|(txg, _)| txg);
+        let score = |b: &[u8]| parse_label(b).ok().map(|(txg, _)| txg.get());
         let header = (0, self.header.spacemap_start);
         let spacemaps = (
             self.layout.spacemap_start,
             self.layout.data_start - self.layout.spacemap_start,
         );
         for (lba, blocks) in [header, spacemaps] {
-            match pool.root.verify_labels(lba, blocks, repair, &score).await {
+            match pool.root().verify_labels(lba, blocks, repair, &score).await {
                 Ok(scan) => {
                     report.label_stripes += scan.units;
                     report.shards.add(&scan.check);
@@ -427,8 +435,8 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
 ) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
     if let Some(pool) = fs.dev.pool() {
-        for d in 0..pool.disks.len() {
-            if let Some(mut events) = pool.disks.disks[d].reconnects() {
+        for d in 0..pool.disks().len() {
+            if let Some(mut events) = pool.disks().disk(d).reconnects() {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     while events.changed().await.is_ok() {
@@ -450,21 +458,21 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
             if fs.needs_resilver() {
                 match fs.resilver().await {
                     Ok(report) => {
-                        if report.since > 0 || !report.cleared.is_empty() {
+                        if report.since > Txg::ZERO || !report.cleared.is_empty() {
                             eprintln!("{}", report);
                             if let Some(ev) = &events {
-                                ev.clear("resilver");
+                                ev.clear(&Subject::Pool);
                                 let line = report.summary();
                                 if report.is_clean() {
                                     ev.info(
-                                        "resilver.done",
-                                        "pool",
+                                        EventKind::ResilverDone,
+                                        Subject::Pool,
                                         format!("Resilver finished: {}", line),
                                     );
                                 } else {
                                     ev.warn(
-                                        "resilver.incomplete",
-                                        "pool",
+                                        EventKind::ResilverIncomplete,
+                                        Subject::Pool,
                                         format!("Resilver incomplete (will retry): {}", line),
                                     );
                                 }
@@ -480,10 +488,9 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
                         eprintln!("resilver failed: {}", e);
                         if let Some(ev) = &events {
                             ev.once(
-                                "resilver",
                                 crate::events::Level::Error,
-                                "resilver.failed",
-                                "pool",
+                                EventKind::ResilverFailed,
+                                Subject::Pool,
                                 format!("Resilver failed: {}", e),
                             );
                         }

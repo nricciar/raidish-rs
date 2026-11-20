@@ -146,3 +146,22 @@ async fn a_pause_dropped_without_a_new_backend_keeps_the_old_one() {
     io.sync().await.unwrap();
     assert_eq!(*log.lock().unwrap(), vec!["a read 0", "a zero 4", "b sync"]);
 }
+
+#[tokio::test]
+async fn one_sync_loop_per_file_system() {
+    let pool = crate::test_util::TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    let count = |fs: &Arc<crate::fs::FileSystem<crate::vdev::Pool>>| {
+        let ptr = Arc::as_ptr(fs) as *const ();
+        SYNC_LOOPS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.as_ptr() as *const () == ptr)
+            .count()
+    };
+    ensure_sync_loop(&fs, "nbd");
+    ensure_sync_loop(&fs, "nvme");
+    ensure_sync_loop(&fs, "nbd");
+    assert_eq!(count(&fs), 1);
+}

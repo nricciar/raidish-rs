@@ -24,15 +24,16 @@
 //! from this node, after catching up with the newest committed root
 //! (close-to-open: a change is visible to every node once committed).
 
-use crate::cluster::lease::{HeldLease, LeaseClient};
+use crate::api_error::ApiError;
 use crate::committer::object_resource;
 use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
+use crate::object_lease::ObjectLeases;
+use crate::types::{Holder, HolderRole};
 use crate::vdev::Pool;
 use crate::writer::ObjLease;
-use async_trait::async_trait;
 use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::futures::stream::{BoxStream, StreamExt};
 use rocket::http::Status;
@@ -48,45 +49,6 @@ use tokio::io::AsyncReadExt;
 /// This node's writer, once the agent has one.
 pub type WriterSlot = Arc<std::sync::RwLock<Option<Arc<FileSystem<Pool>>>>>;
 
-/// A held `obj/<id>` lease.
-#[async_trait]
-pub trait ObjectGuard: Send + Sync {
-    fn lease(&self) -> ObjLease;
-    async fn release(&self);
-}
-
-/// Where uploads take their `obj/<id>` leases.
-#[async_trait]
-pub trait ObjectLeases: Send + Sync {
-    /// Take `resource` (and keep renewing it until released), or say who has it.
-    async fn take(&self, resource: &str, desc: &str) -> Result<Box<dyn ObjectGuard>, String>;
-}
-
-struct Held(Arc<HeldLease>);
-
-#[async_trait]
-impl ObjectGuard for Held {
-    fn lease(&self) -> ObjLease {
-        ObjLease {
-            owner: self.0.owner.clone(),
-            epoch: self.0.epoch,
-        }
-    }
-    async fn release(&self) {
-        self.0.release().await
-    }
-}
-
-#[async_trait]
-impl ObjectLeases for LeaseClient {
-    async fn take(&self, resource: &str, desc: &str) -> Result<Box<dyn ObjectGuard>, String> {
-        let held = Arc::new(HeldLease::acquire(self.clone(), resource, desc).await?);
-        // If it's lost, the upload's commit is refused: nothing to do here.
-        held.hold(|m| eprintln!("files: {}", m));
-        Ok(Box::new(Held(held)))
-    }
-}
-
 pub struct FilesState {
     pub node: String,
     pub writer: WriterSlot,
@@ -95,28 +57,10 @@ pub struct FilesState {
     pub leases: Arc<dyn ObjectLeases>,
 }
 
-type ApiError = (Status, String);
-
-fn api_err(e: FileSystemError) -> ApiError {
-    let status = match &e {
-        FileSystemError::FileNotFound | FileSystemError::DirectoryNotFound => Status::NotFound,
-        FileSystemError::NotAFile
-        | FileSystemError::NotADirectory
-        | FileSystemError::InvalidArgument(_) => Status::BadRequest,
-        FileSystemError::AlreadyExists | FileSystemError::Conflict(_) => Status::Conflict,
-        FileSystemError::Unavailable(_) | FileSystemError::NotFormatted => {
-            Status::ServiceUnavailable
-        }
-        FileSystemError::UnableToAllocateBlocks(_) => Status::InsufficientStorage,
-        _ => Status::InternalServerError,
-    };
-    (status, e.to_string())
-}
-
 fn unavailable() -> ApiError {
-    (
+    ApiError::new(
         Status::ServiceUnavailable,
-        "this node has no pool writer yet (is a committer running?)".into(),
+        "this node has no pool writer yet (is a committer running?)",
     )
 }
 
@@ -212,40 +156,7 @@ impl<'r> rocket::request::FromRequest<'r> for RangeHeader {
     }
 }
 
-/// What a `Range` header asks of a `size`-byte file.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ByteRange {
-    /// No (usable) range: the whole file.
-    All,
-    Part(std::ops::Range<u64>),
-    /// Nothing of the file is in it (`416`).
-    Unsatisfiable,
-}
-
-/// Parse `bytes=a-b`, `bytes=a-` or `bytes=-n`. Anything else (another
-/// unit, several ranges, garbage) is ignored, as RFC 9110 allows.
-pub(crate) fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
-    let Some(spec) = header.and_then(|h| h.trim().strip_prefix("bytes=")) else {
-        return ByteRange::All;
-    };
-    if spec.contains(',') {
-        return ByteRange::All;
-    }
-    let Some((a, b)) = spec.trim().split_once('-') else {
-        return ByteRange::All;
-    };
-    let (a, b) = (a.trim(), b.trim());
-    let range = match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(first), Ok(last)) if first <= last => first..last.saturating_add(1).min(size),
-        (Ok(first), Err(_)) if b.is_empty() => first..size,
-        (Err(_), Ok(n)) if a.is_empty() => size.saturating_sub(n)..size,
-        _ => return ByteRange::All,
-    };
-    if range.start >= size || range.is_empty() {
-        return ByteRange::Unsatisfiable;
-    }
-    ByteRange::Part(range)
-}
+pub(crate) use crate::frontend::http::{ByteRange, parse_range};
 
 /// A file's bytes: all of them (`200`) or a range (`206`).
 pub struct FileBody {
@@ -274,13 +185,16 @@ async fn file_body<D: BlockDevice + 'static>(
     path: &Path,
     range: Option<&str>,
 ) -> Result<FileBody, ApiError> {
-    let dnode = file_dnode(&fs, path).await.map_err(api_err)?;
+    let dnode = file_dnode(&fs, path).await?;
     let size = dnode.size;
     let (range, part) = match parse_range(range, size) {
         ByteRange::All => (0..size, None),
         ByteRange::Part(r) => (r.clone(), Some((r, size))),
         ByteRange::Unsatisfiable => {
-            return Err((Status::RangeNotSatisfiable, format!("bytes */{}", size)));
+            return Err(ApiError::new(
+                Status::RangeNotSatisfiable,
+                format!("bytes */{}", size),
+            ));
         }
     };
     Ok(FileBody {
@@ -302,40 +216,13 @@ async fn get_file(
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DirEntry {
-    pub name: String,
-    /// The pool-wide object number.
-    pub id: FileId,
-    /// `file`, `dir` or `volume`.
-    pub kind: String,
-    pub size: u64,
-    #[serde(default)]
-    pub mode: u16,
-    /// Last modification, ns since the epoch.
-    #[serde(default)]
-    pub mtime_ns: u64,
-}
-
-/// An object's size and attributes (`GET /api/v1/stat`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Stat {
-    pub id: FileId,
-    pub kind: String,
-    pub size: u64,
-    pub mode: u16,
-    pub uid: u32,
-    pub gid: u32,
-    pub nlink: u32,
-    pub mtime_ns: u64,
-    pub ctime_ns: u64,
-}
+pub use crate::api_types::{DirEntry, RenameRequest, Stat};
 
 impl Stat {
     fn of(id: FileId, d: &Dnode) -> Self {
         Stat {
             id,
-            kind: d.kind.name().into(),
+            kind: d.kind(),
             size: if d.is_directory() { 0 } else { d.size },
             mode: d.attrs.mode,
             uid: d.attrs.uid,
@@ -359,7 +246,7 @@ async fn list<D: BlockDevice>(
         out.push(DirEntry {
             name: name.clone(),
             id: e.id,
-            kind: d.kind.name().into(),
+            kind: d.kind(),
             size: if d.is_directory() { 0 } else { d.size },
             mode: d.attrs.mode,
             mtime_ns: d.attrs.mtime_ns,
@@ -373,7 +260,7 @@ async fn list_any(st: &FilesState, path: &Path) -> Result<Json<Vec<DirEntry>>, A
         Reader::Writer(fs) => list(&fs, path).await,
         Reader::ReadOnly(fs) => list(&fs, path).await,
     };
-    r.map(Json).map_err(api_err)
+    r.map(Json).map_err(ApiError::from)
 }
 
 #[get("/api/v1/dir")]
@@ -456,22 +343,23 @@ async fn put_file(
     st: &State<FilesState>,
 ) -> Result<Json<Written>, ApiError> {
     let fs = st.writer()?;
-    fs.refresh_root().await.map_err(api_err)?;
+    fs.refresh_root().await?;
     let existed = match fs.file_id(&path).await {
         Ok(_) => true,
         Err(FileSystemError::FileNotFound) => false,
-        Err(e) => return Err(api_err(e)),
+        Err(e) => return Err(e.into()),
     };
     // Make sure it exists, so there's an object to lease (like O_CREAT).
-    let id = fs.create_file(&path).await.map_err(api_err)?;
+    let id = fs.create_file(&path).await?;
     let guard = st
         .leases
         .take(
-            &object_resource(id),
-            &format!("upload {} {}", st.node, path.display()),
+            object_resource(id),
+            Holder::new(HolderRole::Files, Some(&st.node))
+                .with_detail(format!("upload {}", path.display())),
         )
         .await
-        .map_err(|m| (Status::Conflict, m))?;
+        .map_err(|m| ApiError::new(Status::Conflict, m))?;
     let limit = limits
         .get("upload")
         .unwrap_or(DEFAULT_UPLOAD_LIMIT_GIB.gibibytes());
@@ -484,7 +372,7 @@ async fn put_file(
         }
     }
     guard.release().await;
-    let size = r.map_err(api_err)?;
+    let size = r?;
     Ok(Json(Written { id, size }))
 }
 
@@ -538,16 +426,17 @@ async fn patch_file(
     st: &State<FilesState>,
 ) -> Result<Json<Written>, ApiError> {
     let fs = st.writer()?;
-    fs.refresh_root().await.map_err(api_err)?;
-    let id = fs.file_id(&path).await.map_err(api_err)?;
+    fs.refresh_root().await?;
+    let id = fs.file_id(&path).await?;
     let guard = st
         .leases
         .take(
-            &object_resource(id),
-            &format!("write {} {}", st.node, path.display()),
+            object_resource(id),
+            Holder::new(HolderRole::Files, Some(&st.node))
+                .with_detail(format!("write {}", path.display())),
         )
         .await
-        .map_err(|m| (Status::Conflict, m))?;
+        .map_err(|m| ApiError::new(Status::Conflict, m))?;
     let limit = limits
         .get("upload")
         .unwrap_or(DEFAULT_UPLOAD_LIMIT_GIB.gibibytes());
@@ -566,7 +455,7 @@ async fn patch_file(
     }
     .await;
     guard.release().await;
-    let size = r.map_err(api_err)?;
+    let size = r?;
     Ok(Json(Written { id, size }))
 }
 
@@ -586,13 +475,7 @@ async fn stat_path(
         Reader::Writer(fs) => stat(&fs, &path).await,
         Reader::ReadOnly(fs) => stat(&fs, &path).await,
     };
-    r.map(Json).map_err(api_err)
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RenameRequest {
-    pub from: String,
-    pub to: String,
+    r.map(Json).map_err(ApiError::from)
 }
 
 #[post("/api/v1/rename", data = "<req>")]
@@ -602,11 +485,11 @@ async fn rename(
     st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
-    fs.refresh_root().await.map_err(api_err)?;
+    fs.refresh_root().await?;
     fs.rename(Path::new(&req.from), Path::new(&req.to))
         .await
         .map(Json)
-        .map_err(api_err)
+        .map_err(ApiError::from)
 }
 
 #[patch("/api/v1/attrs/<path..>", data = "<req>")]
@@ -617,8 +500,11 @@ async fn set_attrs(
     st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
-    fs.refresh_root().await.map_err(api_err)?;
-    fs.set_attrs(&path, &req).await.map(Json).map_err(api_err)
+    fs.refresh_root().await?;
+    fs.set_attrs(&path, &req)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
 }
 
 #[delete("/api/v1/files/<path..>")]
@@ -628,8 +514,8 @@ async fn delete_file(
     st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
-    fs.refresh_root().await.map_err(api_err)?;
-    fs.delete(&path).await.map(Json).map_err(api_err)
+    fs.refresh_root().await?;
+    fs.delete(&path).await.map(Json).map_err(ApiError::from)
 }
 
 #[put("/api/v1/dir/<path..>")]
@@ -639,7 +525,7 @@ async fn make_dir(
     st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
-    fs.mkdir(&path).await.map(Json).map_err(api_err)
+    fs.mkdir(&path).await.map(Json).map_err(ApiError::from)
 }
 
 pub fn routes() -> Vec<rocket::Route> {

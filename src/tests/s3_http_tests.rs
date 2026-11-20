@@ -6,6 +6,7 @@ use crate::frontend::testing::Fixture;
 use crate::frontend::{Owner, Route};
 use crate::pki::Role;
 use crate::test_util::TestPool;
+use crate::types::ep;
 use std::collections::BTreeMap;
 
 struct S3 {
@@ -57,7 +58,7 @@ async fn server(pool: &TestPool) -> S3 {
         },
     );
     fe.set_routes(routes, BTreeMap::new());
-    fe.serve_local("b", DatasetFormat::S3, fs.clone(), 1)
+    fe.serve_local("b", DatasetFormat::S3, fs.clone(), ep(1))
         .await
         .unwrap();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -330,7 +331,7 @@ async fn listings() {
             None => "/b?list-type=2&max-keys=2".to_string(),
         };
         let x = parse_xml(&s.req("GET", &q, &[], b"").await.body).unwrap();
-        keys.extend(x.all("Contents").map(|c| c.text_of("Key").unwrap()));
+        keys.extend(x.find_all("Contents").map(|c| c.text_of("Key").unwrap()));
         match x.text_of("NextContinuationToken") {
             Some(t) => token = Some(t),
             None => break,
@@ -358,7 +359,7 @@ async fn listings() {
     );
     let x = parse_xml(&s.req("GET", "/b?list-type=2", &[], b"").await.body).unwrap();
     let left: Vec<_> = x
-        .all("Contents")
+        .find_all("Contents")
         .map(|c| c.text_of("Key").unwrap())
         .collect();
     assert_eq!(left, ["a/2", "a/b/3", "d e"]);
@@ -487,6 +488,20 @@ async fn multipart_and_copies() {
         .await;
     assert_eq!(r.status, 200, "{}", r.text());
     let e = parse_xml(&r.body).unwrap().text_of("ETag").unwrap();
+    // A last byte of u64::MAX: refused, not overflowed.
+    let max = format!("bytes=0-{}", u64::MAX);
+    let bad = s
+        .req(
+            "PUT",
+            &format!("/b/small?partNumber=2&uploadId={}", id),
+            &[
+                ("x-amz-copy-source", "b/big"),
+                ("x-amz-copy-source-range", &max),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(bad.status, 400, "{}", bad.text());
     let done = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
         e

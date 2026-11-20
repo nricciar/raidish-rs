@@ -2,7 +2,7 @@
 //! roll back, destroy. Every change goes to the committer (any node passes
 //! it on); the list is re-read after each and every few seconds.
 
-use crate::api::{self, Volume, VolumeProps};
+use crate::api::{self, DatasetProps, VolumeView};
 use crate::cluster::Status;
 use crate::dialog::{Dialog, Field, Spec, Values};
 use crate::fmt;
@@ -26,7 +26,9 @@ pub struct Props {
 #[derive(Clone)]
 pub enum Action {
     Create,
-    Settings(String),
+    /// The volume, and its props as they were (what the form doesn't show
+    /// is kept).
+    Settings(String, DatasetProps),
     Delete(String),
     Snapshot(String),
     Clone(String, String),
@@ -36,7 +38,7 @@ pub enum Action {
 
 pub enum Msg {
     Load,
-    Loaded(Result<Vec<Volume>, String>),
+    Loaded(Result<Vec<VolumeView>, String>),
     Expand(String),
     Ask(Spec, Action),
     Submit(Values),
@@ -47,7 +49,7 @@ pub enum Msg {
 }
 
 pub struct Volumes {
-    volumes: Option<Vec<Volume>>,
+    volumes: Option<Vec<VolumeView>>,
     error: Option<String>,
     loading: bool,
     expanded: BTreeSet<String>,
@@ -60,14 +62,17 @@ pub struct Volumes {
     _timer: Interval,
 }
 
+/// The server's rules (`raidish::types`), checked before asking.
 fn check_name(name: &str, what: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
         return Err(format!("a {} name is needed", what));
     }
-    if n.contains(['/', '@']) || n.chars().any(char::is_whitespace) {
-        return Err(format!("a {} name can't contain '/', '@' or spaces", what));
-    }
+    let checked = match what {
+        "snapshot" => raidish::types::SnapshotName::try_from(n).map(drop),
+        _ => raidish::types::DatasetName::user(n).map(drop),
+    };
+    checked.map_err(|e| e.to_string())?;
     Ok(n.to_string())
 }
 
@@ -128,7 +133,7 @@ impl Component for Volumes {
                 self.loading = false;
                 match r {
                     Ok(mut v) => {
-                        v.sort_by(|a, b| a.name.cmp(&b.name));
+                        v.sort_by(|a, b| a.info.name.cmp(&b.info.name));
                         self.volumes = Some(v);
                         self.error = None;
                     }
@@ -167,21 +172,25 @@ impl Component for Volumes {
                                 Ok(format!("Created {} ({})", name, fmt::bytes(size)))
                             });
                         }
-                        Action::Settings(name) => {
+                        Action::Settings(name, was) => {
                             let nodes: Vec<String> = get("nodes")
                                 .split([',', ' '])
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(String::from)
                                 .collect();
-                            let automount = Some(get("automount")).filter(|s| !s.is_empty());
+                            let automount = match get("automount").as_str() {
+                                "" => None,
+                                t => Some(t.parse::<raidish::inode::Transport>()?),
+                            };
                             let move_to =
                                 Some(get("move_to").trim().to_string()).filter(|s| !s.is_empty());
-                            let props = VolumeProps {
+                            let props = DatasetProps {
                                 nodes,
                                 automount,
                                 enabled: !get("enabled").is_empty(),
                                 move_to,
+                                ..was.clone()
                             };
                             let name = name.clone();
                             self.run(ctx, async move {
@@ -370,29 +379,32 @@ impl Volumes {
     /// Who runs `name` now, from the cluster's `ds/<name>` lease.
     fn running(&self, ctx: &Context<Self>, name: &str) -> Option<String> {
         let c = ctx.props().cluster.as_ref()?;
-        let lease = c.state.leases.get(&format!("ds/{}", name))?;
+        let lease = c
+            .state
+            .leases
+            .get(&raidish::types::LeaseResource::dataset(name))?;
         (!lease.released && c.remaining_ms(lease, now_ms()) > 0.0).then(|| {
-            if lease.desc.is_empty() {
-                lease.owner.clone()
-            } else {
-                lease.desc.clone()
-            }
+            lease
+                .holder
+                .node
+                .clone()
+                .unwrap_or_else(|| lease.holder.to_string())
         })
     }
 
-    fn volume_rows(&self, ctx: &Context<Self>, vol: &Volume) -> Html {
+    fn volume_rows(&self, ctx: &Context<Self>, vol: &VolumeView) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
-        let name = vol.name.clone();
+        let name = vol.info.name.clone();
         let open = self.expanded.contains(&name);
         let running = self.running(ctx, &name);
-        let status = match (&running, vol.props.enabled) {
+        let status = match (&running, vol.info.props.enabled) {
             (Some(by), _) => html! { <span class="tag ok" title={by.clone()}>{ "RUNNING" }</span> },
             (None, false) => html! { <span class="tag idle">{ "DISABLED" }</span> },
             (None, true) => html! { <span class="tag idle">{ "STOPPED" }</span> },
         };
-        let export = match &vol.props.automount {
-            Some(t) => html! { <span class="kind volume">{ t.to_uppercase() }</span> },
+        let export = match &vol.info.props.automount {
+            Some(t) => html! { <span class="kind volume">{ t.to_string().to_uppercase() }</span> },
             None => html! { <span class="muted">{ "manual" }</span> },
         };
         let toggle = {
@@ -411,7 +423,7 @@ impl Volumes {
             })
         };
         let settings = {
-            let (n, p) = (name.clone(), vol.props.clone());
+            let (n, p) = (name.clone(), vol.info.props.clone());
             link.callback(move |_| {
                 Msg::Ask(
                     Spec::new(&format!("{} settings", n), "Save")
@@ -422,7 +434,7 @@ impl Volumes {
                         .field(Field::select(
                             "automount",
                             "Export",
-                            p.automount.as_deref().unwrap_or(""),
+                            &p.automount.map(|t| t.to_string()).unwrap_or_default(),
                             &[
                                 ("", "Manual (raidish nbd / nvme)"),
                                 ("nbd", "NBD, automatically"),
@@ -439,7 +451,7 @@ impl Volumes {
                                 .placeholder("stay where it is")
                                 .hint("a node to move it to while that node is up"),
                         ),
-                    Action::Settings(n.clone()),
+                    Action::Settings(n.clone(), p.clone()),
                 )
             })
         };
@@ -463,7 +475,7 @@ impl Volumes {
                 <td class="sel"><button class="expander" onclick={toggle.clone()} title="Snapshots and details">
                     { if open { "▾" } else { "▸" } }</button></td>
                 <td><button class="name-link" onclick={toggle}><span class="ico">{ "🖴" }</span>{ &name }</button></td>
-                <td class="num">{ fmt::bytes(vol.size_bytes) }</td>
+                <td class="num">{ fmt::bytes(vol.info.size_bytes) }</td>
                 <td>{ export }</td>
                 <td>{ status }
                     if let Some(by) = &running { <span class="small muted run-by">{ by }</span> }
@@ -483,11 +495,11 @@ impl Volumes {
             if open {
                 <tr class="vol-detail"><td></td><td colspan="6">
                     <div class="kv small">
-                        <span>{ "Block size" }</span><span>{ fmt::bytes(vol.volblocksize as u64) }</span>
+                        <span>{ "Block size" }</span><span>{ fmt::bytes(vol.info.volblocksize as u64) }</span>
                         <span>{ "Placement" }</span><span>{
-                            if vol.props.nodes.is_empty() { "any node".to_string() } else { vol.props.nodes.join(" → ") }
+                            if vol.info.props.nodes.is_empty() { "any node".to_string() } else { vol.info.props.nodes.join(" → ") }
                         }</span>
-                        if let Some(m) = &vol.props.move_to {
+                        if let Some(m) = &vol.info.props.move_to {
                             <span>{ "Moving to" }</span><span>{ m }</span>
                         }
                         <span>{ "Fragmentation" }</span>
@@ -505,7 +517,7 @@ impl Volumes {
         }
     }
 
-    fn snapshots(&self, ctx: &Context<Self>, vol: &Volume, running: bool) -> Html {
+    fn snapshots(&self, ctx: &Context<Self>, vol: &VolumeView, running: bool) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
         if vol.snapshots.is_empty() {
@@ -521,7 +533,7 @@ impl Volumes {
                 </tr></thead>
                 <tbody>
                 { for vol.snapshots.iter().enumerate().map(|(i, s)| {
-                    let (v, snap) = (vol.name.clone(), s.short().to_string());
+                    let (v, snap) = (vol.info.name.clone(), s.short().to_string());
                     let clone = {
                         let (v, snap) = (v.clone(), snap.clone());
                         link.callback(move |_| Msg::Ask(
@@ -555,7 +567,7 @@ impl Volumes {
                         <tr>
                             <td class="mono">{ format!("@{}", snap) }</td>
                             <td class="when muted">{ fmt::date_ns(s.created_ns) }</td>
-                            <td class="num">{ s.txg }</td>
+                            <td class="num">{ s.txg.to_string() }</td>
                             <td class="num">{ fmt::bytes(s.unique_bytes) }</td>
                             <td class="small">{ if has_clones { s.clones.join(", ") } else { "—".into() } }</td>
                             <td class="acts">

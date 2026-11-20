@@ -2,6 +2,7 @@
 //! follows the same sequence as the Linux initiator.
 
 use super::*;
+use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
 use crate::vdev::Pool;

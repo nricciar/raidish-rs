@@ -9,9 +9,10 @@
 //! `crate::frontend`); that node checks its signature.
 
 use super::{Bucket, CHUNK, MAX_PUT, ObjectMeta, Part, S3Error, Segment};
+use crate::committer::PoolAdmin;
 use crate::dataset::DatasetFormat;
 use crate::frontend::http::{self as fhttp, Body, BodyError, PayloadReader, empty, full};
-use crate::frontend::{Frontend, Local};
+use crate::frontend::{Frontend, Local, Located};
 use crate::sigv4::{self, AuthError};
 use crate::vdev::Pool;
 use base64::Engine;
@@ -71,7 +72,7 @@ const KEPT_HEADERS: &[&str] = &[
 const MAX_USER_META: usize = 2048;
 
 pub async fn serve(fe: Arc<Frontend>, l: TcpListener) {
-    fhttp::serve(l, fe.tls.https.clone(), move |req| {
+    fhttp::serve(l, fe.tls().https.clone(), move |req| {
         let fe = fe.clone();
         async move { handle(fe, req).await }
     })
@@ -127,10 +128,17 @@ impl From<S3Error> for Err3 {
             S3Error::KeyTooLong => e3(S::BAD_REQUEST, "KeyTooLongError", "Your key is too long."),
             S3Error::InvalidArgument(m) => e3(S::BAD_REQUEST, "InvalidArgument", m),
             S3Error::Unavailable => unavailable(),
-            S3Error::Fs(crate::fs::FileSystemError::Unavailable(m)) => {
-                e3(S::SERVICE_UNAVAILABLE, "ServiceUnavailable", m)
+            S3Error::Fs(e) => {
+                use crate::types::ErrorKind as K;
+                match e.kind() {
+                    K::Invalid => e3(S::BAD_REQUEST, "InvalidArgument", e.message()),
+                    // Its lease is someone else's, or no committer: later.
+                    K::Unavailable | K::Conflict => {
+                        e3(S::SERVICE_UNAVAILABLE, "ServiceUnavailable", e.message())
+                    }
+                    _ => e3(S::INTERNAL_SERVER_ERROR, "InternalError", e.to_string()),
+                }
             }
-            S3Error::Fs(e) => e3(S::INTERNAL_SERVER_ERROR, "InternalError", e.to_string()),
         }
     }
 }
@@ -254,79 +262,18 @@ impl Xml {
     }
 }
 
-/// An XML element, parsed.
-#[derive(Debug, Default)]
-struct El {
-    name: String,
-    text: String,
-    children: Vec<El>,
-}
-
-impl El {
-    fn child(&self, n: &str) -> Option<&El> {
-        self.children.iter().find(|c| c.name == n)
-    }
-    fn all<'a>(&'a self, n: &'a str) -> impl Iterator<Item = &'a El> + 'a {
-        self.children.iter().filter(move |c| c.name == n)
-    }
-    fn text_of(&self, n: &str) -> Option<String> {
-        self.child(n).map(|c| c.text.trim().to_string())
-    }
-}
-
-fn parse_xml(b: &[u8]) -> Result<El, Err3> {
-    use quick_xml::events::Event;
-    let bad = || {
-        e3(
-            StatusCode::BAD_REQUEST,
-            "MalformedXML",
-            "The XML you provided was not well-formed",
-        )
-    };
-    let mut r = quick_xml::Reader::from_reader(b);
-    let mut stack: Vec<El> = vec![El::default()];
-    let mut buf = Vec::new();
-    loop {
-        match r.read_event_into(&mut buf).map_err(|_| bad())? {
-            Event::Start(s) => {
-                let name = String::from_utf8_lossy(s.local_name().as_ref()).into_owned();
-                stack.push(El {
-                    name,
-                    ..Default::default()
-                });
-            }
-            Event::Empty(s) => {
-                let name = String::from_utf8_lossy(s.local_name().as_ref()).into_owned();
-                stack.last_mut().unwrap().children.push(El {
-                    name,
-                    ..Default::default()
-                });
-            }
-            Event::End(_) => {
-                let el = stack.pop().ok_or_else(bad)?;
-                stack.last_mut().ok_or_else(bad)?.children.push(el);
-            }
-            Event::Text(t) => {
-                let t = t.unescape().map_err(|_| bad())?;
-                stack.last_mut().unwrap().text.push_str(&t);
-            }
-            Event::CData(t) => {
-                stack
-                    .last_mut()
-                    .unwrap()
-                    .text
-                    .push_str(&String::from_utf8_lossy(&t));
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    let mut top = stack.pop().ok_or_else(bad)?;
-    if !stack.is_empty() || top.children.len() != 1 {
-        return Err(bad());
-    }
-    Ok(top.children.remove(0))
+/// A request body's XML; malformed is S3's `MalformedXML`.
+fn parse_xml(b: &[u8]) -> Result<crate::xml::El, Err3> {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|x| crate::xml::parse_root(x).ok())
+        .ok_or_else(|| {
+            e3(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                "The XML you provided was not well-formed",
+            )
+        })
 }
 
 // ---- times ----------------------------------------------------------------
@@ -390,7 +337,7 @@ fn target(
             )
         })
     };
-    if let Some(domain) = &fe.config.s3_domain
+    if let Some(domain) = &fe.config().s3_domain
         && let Some(b) = host.strip_suffix(&format!(".{}", domain))
         && !b.is_empty()
     {
@@ -512,28 +459,25 @@ async fn route(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Response<Bo
     let mut local = None;
     let mut exists = false;
     if let Some(b) = &bucket_name {
-        match fe.local(b).as_deref() {
-            Some(Local::S3(bk)) => {
-                local = Some(bk.clone());
+        match fe.locate(b, DatasetFormat::S3, fhttp::forwarded(&req), Local::bucket) {
+            Located::Here(bk) => {
+                local = Some(bk);
                 exists = true;
             }
-            _ => {
-                if let Some(r) = fe.route(b).filter(|r| r.format == DatasetFormat::S3) {
-                    match r.owner {
-                        Some(o) if o.node != fe.node && !fhttp::forwarded(&req) => {
-                            return fhttp::proxy(&fe.tls, req, &o.addr, fe.config.s3_port())
-                                .await
-                                .ok_or_else(unavailable);
-                        }
-                        _ => return Err(unavailable()),
-                    }
-                }
+            Located::There(o) => {
+                let port = fe.config().s3_port().ok_or_else(unavailable)?;
+                return fhttp::proxy(fe.tls(), req, &o.addr, port)
+                    .await
+                    .ok_or_else(unavailable);
             }
+            Located::Unavailable => return Err(unavailable()),
+            // Only a bucket's creation goes on (below).
+            Located::Missing => {}
         }
     }
     let (parts, body) = req.into_parts();
     let signed = sigv4::verify(
-        &fe.auth,
+        fe.auth(),
         "s3",
         &parts.method,
         &parts.uri,
@@ -542,7 +486,7 @@ async fn route(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Response<Bo
     )?;
     // A readonly token's keys read (GET, HEAD) and nothing else.
     if !matches!(parts.method, Method::GET | Method::HEAD)
-        && fe.auth.role(&signed.access_key) < crate::pki::Role::Admin
+        && fe.auth().role(&signed.access_key) < crate::pki::Role::Admin
     {
         return Err(e3(
             StatusCode::FORBIDDEN,
@@ -622,39 +566,43 @@ async fn create_bucket(
     name: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
-    crate::committer::check_bucket_name(name)
+    let bucket = crate::types::BucketName::try_from(name)
         .map_err(|e| e3(StatusCode::BAD_REQUEST, "InvalidBucketName", e.to_string()))?;
     let body = r.small_body(64 * 1024).await?;
     if !body.iter().all(|b| b.is_ascii_whitespace()) {
         let x = parse_xml(&body)?;
         if let Some(loc) = x.text_of("LocationConstraint")
             && !loc.is_empty()
-            && loc != fe.config.region()
+            && loc != fe.config().region()
         {
             return Err(e3(
                 StatusCode::BAD_REQUEST,
                 "IllegalLocationConstraintException",
-                format!("This node's region is {}", fe.config.region()),
+                format!("This node's region is {}", fe.config().region()),
             ));
         }
     }
     let req = crate::committer::CreateDataset {
-        name: name.to_string(),
+        name: bucket.into(),
+
         format: DatasetFormat::S3,
         props: Default::default(),
     };
-    match fe.committer.create_dataset(&req).await {
+    match fe.committer().create_dataset(&req).await {
         Ok(()) => {}
         Err(e) => {
-            let m = e.to_string();
-            if m.to_ascii_lowercase().contains("exists") {
+            if e.kind() == crate::types::ErrorKind::Exists {
                 return Err(e3(
                     StatusCode::CONFLICT,
                     "BucketAlreadyExists",
                     "The requested bucket name is not available.",
                 ));
             }
-            return Err(e3(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", m));
+            return Err(e3(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                e.to_string(),
+            ));
         }
     }
     // Answer once it's served somewhere (the agents place it).
@@ -686,13 +634,13 @@ async fn bucket_op(
     match r.method.clone() {
         Method::HEAD => {
             let mut resp = ok_empty(StatusCode::OK);
-            if let Ok(v) = HeaderValue::from_str(&fe.config.region()) {
+            if let Ok(v) = HeaderValue::from_str(&fe.config().region()) {
                 resp.headers_mut().insert("x-amz-bucket-region", v);
             }
             Ok(resp)
         }
         Method::GET if r.has("location") => {
-            let region = fe.config.region();
+            let region = fe.config().region();
             let v = if region == "us-east-1" {
                 String::new()
             } else {
@@ -743,7 +691,7 @@ async fn delete_bucket(fe: &Arc<Frontend>, bk: &Arc<Bucket<Pool>>) -> Result<Res
         bk.reopen();
         return Err(not_empty());
     }
-    match fe.delete_service(&bk.name).await {
+    match fe.delete_service(&bk.tree.name).await {
         Ok(true) => Ok(ok_empty(StatusCode::NO_CONTENT)),
         Ok(false) => Err(no_bucket()),
         Err(m) => {
@@ -811,7 +759,7 @@ async fn list_objects(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>,
         .list(&prefix, after.as_deref(), delimiter.as_deref(), max)
         .await?;
     let mut x = Xml::new("ListBucketResult");
-    x.el("Name", &bk.name).el("Prefix", &enc(&prefix));
+    x.el("Name", &bk.tree.name).el("Prefix", &enc(&prefix));
     if let Some(d) = &delimiter {
         x.el("Delimiter", &enc(d));
     }
@@ -872,7 +820,10 @@ async fn delete_objects(bk: &Arc<Bucket<Pool>>, r: &mut Req) -> Result<Response<
     let body = r.small_body(2 << 20).await?;
     let x = parse_xml(&body)?;
     let quiet = x.text_of("Quiet").as_deref() == Some("true");
-    let keys: Vec<String> = x.all("Object").filter_map(|o| o.text_of("Key")).collect();
+    let keys: Vec<String> = x
+        .find_all("Object")
+        .filter_map(|o| o.text_of("Key"))
+        .collect();
     if keys.len() > 1000 {
         return Err(e3(
             StatusCode::BAD_REQUEST,
@@ -925,7 +876,7 @@ async fn list_uploads(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>,
     let truncated = all.len() > max;
     all.truncate(max);
     let mut x = Xml::new("ListMultipartUploadsResult");
-    x.el("Bucket", &bk.name)
+    x.el("Bucket", &bk.tree.name)
         .el("KeyMarker", key_marker)
         .el("UploadIdMarker", id_marker.unwrap_or(""))
         .el("Prefix", prefix)
@@ -1131,38 +1082,6 @@ async fn put_object(
     Ok(resp)
 }
 
-/// A byte range of an object, inclusive.
-fn parse_range(h: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
-    let spec = h.trim().strip_prefix("bytes=")?;
-    if spec.contains(',') {
-        return None; // several ranges: the whole object
-    }
-    let (a, b) = spec.split_once('-')?;
-    let (a, b) = (a.trim(), b.trim());
-    let r = if a.is_empty() {
-        let n: u64 = b.parse().ok()?;
-        if n == 0 {
-            return Some(Err(()));
-        }
-        (size.saturating_sub(n), size.checked_sub(1)?)
-    } else {
-        let s: u64 = a.parse().ok()?;
-        let e: u64 = if b.is_empty() {
-            size.saturating_sub(1)
-        } else {
-            b.parse().ok()?
-        };
-        if s >= size {
-            return Some(Err(()));
-        }
-        (s, e.min(size - 1))
-    };
-    if r.0 > r.1 {
-        return None;
-    }
-    Some(Ok(r))
-}
-
 /// Whether `etag` is among a conditional header's ETags.
 fn etag_in(list: &str, etag: &str) -> bool {
     list.split(',')
@@ -1335,26 +1254,32 @@ async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
         let start: u64 = meta.segments[..n - 1].iter().map(|s| s.size).sum();
         let len = meta.segments.get(n - 1).map_or(0, |s| s.size);
         if len > 0 {
-            range = Some((start, start + len - 1));
+            range = Some(start..start + len);
         }
-    } else if let Some(h) = r.h("range") {
-        match parse_range(h, size) {
-            Some(Ok(rg)) => range = Some(rg),
-            Some(Err(())) => {
+    } else {
+        match fhttp::parse_range(r.h("range"), size) {
+            fhttp::ByteRange::Part(rg) => range = Some(rg),
+            fhttp::ByteRange::Unsatisfiable => {
                 return Err(e3(
                     StatusCode::RANGE_NOT_SATISFIABLE,
                     "InvalidRange",
                     "The requested range is not satisfiable",
                 ));
             }
-            None => {}
+            fhttp::ByteRange::All => {}
         }
     }
-    let (start, end, status) = match range {
-        Some((a, b)) => (a, b, StatusCode::PARTIAL_CONTENT),
-        None => (0, size.saturating_sub(1), StatusCode::OK),
+    let status = match range {
+        Some(_) => StatusCode::PARTIAL_CONTENT,
+        None => StatusCode::OK,
     };
-    let len = if size == 0 { 0 } else { end - start + 1 };
+    let span = range.clone().unwrap_or(0..size);
+    // `end` is the last byte (HTTP's ranges are inclusive).
+    let (start, end, len) = (
+        span.start,
+        span.end.saturating_sub(1),
+        span.end - span.start,
+    );
     let body = if r.method == Method::HEAD || len == 0 {
         empty()
     } else {
@@ -1381,7 +1306,7 @@ async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
 async fn open_source(
     fe: &Arc<Frontend>,
     r: &Req,
-    range: Option<(u64, u64)>,
+    range: Option<std::ops::Range<u64>>,
 ) -> Result<(String, String, ObjectMeta, Body), Err3> {
     let src = r.h("x-amz-copy-source").unwrap_or("");
     let src = src.split('?').next().unwrap_or("");
@@ -1415,14 +1340,14 @@ async fn open_source(
             ));
         }
         let (a, z) = match range {
-            Some((a, z)) if meta.size == 0 || z >= meta.size || a > z => {
+            Some(rg) if meta.size == 0 || rg.end > meta.size => {
                 return Err(e3(
                     StatusCode::BAD_REQUEST,
                     "InvalidRange",
                     "The specified copy source range is not satisfiable",
                 ));
             }
-            Some(rg) => rg,
+            Some(rg) => (rg.start, rg.end - 1),
             None => (0, meta.size.saturating_sub(1)),
         };
         let body = if meta.size == 0 {
@@ -1438,8 +1363,8 @@ async fn open_source(
         .filter(|r| r.format == DatasetFormat::S3)
         .ok_or_else(no_bucket)?;
     let owner = route.owner.ok_or_else(unavailable)?;
-    let (ak, sk) = fe.auth.internal()?;
-    let port = fe.config.s3_port();
+    let (ak, secret) = fe.auth().internal()?;
+    let port = fe.config().s3_port().ok_or_else(unavailable)?;
     let path = format!(
         "/{}/{}",
         sigv4::uri_encode(sb.as_bytes(), true),
@@ -1452,10 +1377,10 @@ async fn open_source(
         "host",
         HeaderValue::from_str(&host).map_err(|_| unavailable())?,
     );
-    if let Some((a, z)) = range {
+    if let Some(rg) = range {
         headers.insert(
             "range",
-            HeaderValue::from_str(&format!("bytes={}-{}", a, z)).unwrap(),
+            HeaderValue::from_str(&format!("bytes={}-{}", rg.start, rg.end - 1)).unwrap(),
         );
     }
     for n in [
@@ -1475,8 +1400,8 @@ async fn open_source(
         .map_err(|_| unavailable())?;
     for (k, v) in sigv4::sign(
         &ak,
-        &sk,
-        &fe.config.region(),
+        &secret,
+        &fe.config().region(),
         "s3",
         &Method::GET,
         &full_uri,
@@ -1492,7 +1417,7 @@ async fn open_source(
     *req.method_mut() = Method::GET;
     *req.uri_mut() = uri;
     *req.headers_mut() = headers;
-    let resp = fhttp::proxy(&fe.tls, req, &owner.addr, port)
+    let resp = fhttp::proxy(fe.tls(), req, &owner.addr, port)
         .await
         .ok_or_else(unavailable)?;
     match resp.status() {
@@ -1588,7 +1513,7 @@ async fn copy_object(
         .h("x-amz-metadata-directive")
         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
     let (sb, sk, src, body) = open_source(fe, r, None).await?;
-    if sb == bk.name && sk == key && !replace {
+    if sb == bk.tree.name && sk == key && !replace {
         return Err(e3(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -1636,7 +1561,9 @@ async fn create_upload(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Res
     let meta = meta_from(r)?;
     let id = bk.create_upload(key, meta).await?;
     let mut x = Xml::new("InitiateMultipartUploadResult");
-    x.el("Bucket", &bk.name).el("Key", key).el("UploadId", &id);
+    x.el("Bucket", &bk.tree.name)
+        .el("Key", key)
+        .el("UploadId", &id);
     Ok(xml_response(
         StatusCode::OK,
         x.done("InitiateMultipartUploadResult"),
@@ -1694,7 +1621,7 @@ async fn upload_part_copy(
             let spec = h.trim().strip_prefix("bytes=").unwrap_or("");
             let (a, b) = spec.split_once('-').unwrap_or(("", ""));
             match (a.parse::<u64>(), b.parse::<u64>()) {
-                (Ok(a), Ok(b)) if a <= b => Some((a, b)),
+                (Ok(a), Ok(b)) if a <= b && b < u64::MAX => Some(a..b + 1),
                 _ => {
                     return Err(e3(
                         StatusCode::BAD_REQUEST,
@@ -1706,8 +1633,9 @@ async fn upload_part_copy(
         }
         None => None,
     };
+    let wanted = range.as_ref().map(|rg| rg.end - rg.start);
     let (_, _, src, body) = open_source(fe, r, range).await?;
-    let expected = range.map(|(a, b)| b - a + 1).unwrap_or(src.size);
+    let expected = wanted.unwrap_or(src.size);
     let (seg, md5) = copy_into(bk, body, Some(expected)).await?;
     let part = Part {
         body: seg.body,
@@ -1741,7 +1669,7 @@ async fn list_parts(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
     let truncated = parts.len() > max;
     parts.truncate(max);
     let mut x = Xml::new("ListPartsResult");
-    x.el("Bucket", &bk.name)
+    x.el("Bucket", &bk.tree.name)
         .el("Key", key)
         .el("UploadId", id)
         .el("PartNumberMarker", &marker.to_string())
@@ -1776,7 +1704,7 @@ async fn complete_upload(
     let body = r.small_body(4 << 20).await?;
     let x = parse_xml(&body)?;
     let mut parts = Vec::new();
-    for p in x.all("Part") {
+    for p in x.find_all("Part") {
         let n: u32 = p
             .text_of("PartNumber")
             .and_then(|n| n.parse().ok())
@@ -1797,11 +1725,11 @@ async fn complete_upload(
         &format!(
             "https://{}/{}/{}",
             host,
-            bk.name,
+            bk.tree.name,
             sigv4::uri_encode(key.as_bytes(), false)
         ),
     )
-    .el("Bucket", &bk.name)
+    .el("Bucket", &bk.tree.name)
     .el("Key", &key)
     .el("ETag", &format!("\"{}\"", meta.etag));
     Ok(xml_response(

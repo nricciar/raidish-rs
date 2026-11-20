@@ -6,6 +6,7 @@ use crate::fmt;
 use crate::session::{Shared, Snapshot};
 use raidish::fs::LabelState;
 use raidish::inspect::{DiskReport, Health};
+use raidish::types::NodeId;
 use raidish::vdev::Topology;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -77,7 +78,7 @@ pub fn Hero(p: &HeroProps) -> Html {
                         if r.fault_tolerance == 1 { "" } else { "s" }) }
                 </p>
                 <div class="facts">
-                    <Fact label="TXG" value={fmt::count(r.txg)} sub={r.committed_ms.map(|t| format!("committed {}", fmt::ago(t as f64, p.now)))} />
+                    <Fact label="TXG" value={fmt::count(r.txg.get())} sub={r.committed_ms.map(|t| format!("committed {}", fmt::ago(t as f64, p.now)))} />
                     <Fact label="Disks" value={format!("{}/{}", r.disks.len() - offline, r.disks.len())}
                         sub={Some(if offline > 0 { format!("{} unavailable", offline) } else { String::from("all online") })} />
                     <Fact label="Resilver" value={if resilver > 0 { format!("{} disk{}", resilver, if resilver == 1 { "" } else { "s" }) } else { "none".into() }}
@@ -229,12 +230,12 @@ fn disk_card(d: &DiskReport, p: &TopologyProps) -> Html {
         .and_then(|c| c.owner_of(d.index))
         .map(|m| match &m.addr {
             Some(a) => format!(
-                "node-{} · {}",
-                m.id,
+                "{} · {}",
+                NodeId::from_raw(m.id),
                 a.trim_start_matches("https://")
                     .trim_start_matches("http://")
             ),
-            None => format!("node-{} · this node", m.id),
+            None => format!("{} · this node", NodeId::from_raw(m.id)),
         });
     let history = p.history.get(d.index);
     // Mean round trip over each refresh interval.
@@ -354,11 +355,11 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
             <div class="kv">
                 <span>{ "Leader" }</span>
                 <span>
-                    if let Some(l) = s.leader { { format!("node-{}", l) } }
+                    if let Some(l) = s.leader { { NodeId::from_raw(l).name() } }
                     else { <span class="tag bad">{ "no quorum" }</span> }
                 </span>
                 <span>{ "Raft term" }</span><span>{ s.term }</span>
-                <span>{ "Lease epoch" }</span><span>{ s.state.epoch }</span>
+                <span>{ "Lease epoch" }</span><span>{ s.state.epoch.to_string() }</span>
                 <span>{ "Layout" }</span><span class="mono">{ s.fingerprint.clone() }</span>
             </div>
             <h3>{ "Members" }</h3>
@@ -368,7 +369,7 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     html! {
                         <li>
                             <span class={classes!("dot", if quorum { "ok" } else { "warn" })}></span>
-                            <span class="mono">{ format!("node-{}", m.id) }</span>
+                            <span class="mono">{ NodeId::from_raw(m.id).name() }</span>
                             if leader { <span class="crown" title="leader">{ "♛" }</span> }
                             <span class="muted">{ m.addr.clone().unwrap_or_else(|| "this node".to_string()) }</span>
                             <span class="muted small">{ format!("disks {}", m.disks.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) }</span>
@@ -392,8 +393,8 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     };
                     html! {
                         <li class={cls}>
-                            <span class="mono">{ res.clone() }</span>
-                            <span>{ l.desc.clone() }</span>
+                            <span class="mono">{ res.to_string() }</span>
+                            <span>{ l.holder.to_string() }</span>
                             <span class="muted small">{ format!("{} · epoch {}", l.owner, l.epoch) }</span>
                             <span class={classes!("tag", cls)}>{ state }</span>
                         </li>

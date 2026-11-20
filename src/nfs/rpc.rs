@@ -180,23 +180,15 @@ pub fn frame(msg: &[u8]) -> Vec<u8> {
 
 /// Serve `dispatch` on `listener` until the task is dropped.
 pub async fn serve(listener: TcpListener, dispatch: Arc<dyn Dispatch>) {
-    loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("nfs: accept: {}", e);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let _ = sock.set_nodelay(true);
+    crate::net::accept_loop(listener, "nfs", move |sock, peer| {
         let dispatch = dispatch.clone();
-        tokio::spawn(async move {
+        async move {
             if let Err(e) = connection(sock, dispatch).await {
                 eprintln!("nfs: {}: {}", peer, e);
             }
-        });
-    }
+        }
+    })
+    .await
 }
 
 async fn connection(

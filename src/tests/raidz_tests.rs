@@ -254,14 +254,23 @@ async fn range_io_round_trips_at_every_alignment() {
         for blocks in [1usize, 2, 3, 4, 5, 6, 7, 31] {
             let start = lba + start_off;
             let data = pattern(blocks, (start + blocks as u64) as u8);
-            raidz.write_blocks(start, &data).await.unwrap();
+            raidz
+                .write_blocks(start, crate::disk::as_blocks(&data).unwrap())
+                .await
+                .unwrap();
             let mut got = vec![0u8; data.len()];
-            raidz.read_blocks(start, &mut got).await.unwrap();
+            raidz
+                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .await
+                .unwrap();
             assert_eq!(got, data, "before flush: start {} blocks {}", start, blocks);
 
             raidz.flush().await.unwrap();
             let mut got = vec![0u8; data.len()];
-            raidz.read_blocks(start, &mut got).await.unwrap();
+            raidz
+                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .await
+                .unwrap();
             assert_eq!(got, data, "after flush: start {} blocks {}", start, blocks);
             lba += 60;
         }
@@ -278,11 +287,17 @@ async fn full_stripe_write_supersedes_buffered_partial() {
         .await
         .unwrap();
     let fresh = pattern(3, 2);
-    raidz.write_blocks(30, &fresh).await.unwrap();
+    raidz
+        .write_blocks(30, crate::disk::as_blocks(&fresh).unwrap())
+        .await
+        .unwrap();
     raidz.flush().await.unwrap();
 
     let mut got = vec![0u8; fresh.len()];
-    raidz.read_blocks(30, &mut got).await.unwrap();
+    raidz
+        .read_blocks(30, crate::disk::as_blocks_mut(&mut got).unwrap())
+        .await
+        .unwrap();
     assert_eq!(got, fresh);
 }
 
@@ -290,7 +305,10 @@ async fn full_stripe_write_supersedes_buffered_partial() {
 async fn full_stripe_writes_have_valid_parity() {
     let (raidz, _t) = create_test_raidz().await;
     let data = pattern(12, 5);
-    raidz.write_blocks(60, &data).await.unwrap();
+    raidz
+        .write_blocks(60, crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
     raidz.flush().await.unwrap();
 
     // Every way of rebuilding each data block from the other disks must

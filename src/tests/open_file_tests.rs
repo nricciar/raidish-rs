@@ -222,7 +222,7 @@ async fn rename_refuses_what_it_must() {
         .await
         .unwrap();
     assert_eq!(
-        fs.stat(Path::new("/empty/sub")).await.unwrap().1.kind,
+        fs.stat(Path::new("/empty/sub")).await.unwrap().1.kind(),
         ObjType::Directory
     );
     clean(&fs).await;

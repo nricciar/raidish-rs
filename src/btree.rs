@@ -44,11 +44,14 @@ use crate::object::{Dirty, ObjTree};
 use crate::zil::KeyedOp;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
+#[cfg(not(target_arch = "wasm32"))]
 use std::ops::Bound;
 use std::sync::Arc;
 
 const MAGIC: u64 = 0x5241_4944_4b56_5431; // "RAIDKVT1"
-const VERSION: u32 = 1;
+/// 2: `Header.root` is an `Option<NonZeroU64>`.
+const VERSION: u32 = 2;
 /// The largest value.
 pub const MAX_VALUE: usize = 64 << 20;
 
@@ -56,8 +59,8 @@ pub const MAX_VALUE: usize = 64 << 20;
 pub(crate) struct Header {
     magic: u64,
     version: u32,
-    /// The root node (0: the tree is empty).
-    pub root: u64,
+    /// The root node (None: the tree is empty).
+    pub root: Option<NonZeroU64>,
     /// Levels of branches above the leaves.
     pub height: u32,
     /// The lowest node id never handed out.
@@ -73,7 +76,7 @@ impl Default for Header {
         Header {
             magic: MAGIC,
             version: VERSION,
-            root: 0,
+            root: None,
             height: 0,
             next_id: 1,
             free: Vec::new(),
@@ -114,8 +117,16 @@ fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, FileSystemError> {
 fn decode<T: for<'a> Deserialize<'a>>(buf: &[u8], what: &str) -> Result<T, FileSystemError> {
     let bad = || FileSystemError::InvalidArgument(format!("malformed B+tree {}", what));
     let len = u32::from_le_bytes(buf.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
-    let body = buf.get(4..4 + len).ok_or_else(bad)?;
-    bincode::deserialize(body).map_err(|_| bad())
+    let body = buf
+        .get(4..len.checked_add(4).ok_or_else(bad)?)
+        .ok_or_else(bad)?;
+    // What `encode` wrote (`bincode::serialize`'s encoding), all of it.
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(body)
+        .map_err(|_| bad())
 }
 
 /// Encoded size of `v` (with its length prefix).
@@ -220,11 +231,13 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     /// Whether it changed nothing (yet).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.writes.is_empty() && !self.header_dirty
     }
 
     /// The longest key this tree takes.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn max_key(&self) -> usize {
         self.lim.max_key
     }
@@ -271,7 +284,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     fn alloc_run(&mut self, n: u64) -> Result<u64, FileSystemError> {
         let first = self.header.next_id;
         if first + n > self.lim.capacity {
-            return Err(FileSystemError::UnableToAllocateBlocks(n));
+            return Err(FileSystemError::NoSpace(format!("{} blocks", n)));
         }
         self.header.next_id += n;
         self.header_dirty = true;
@@ -314,6 +327,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn read_val(&self, v: &Val) -> Result<Vec<u8>, FileSystemError> {
         match v {
             Val::Inline(b) => Ok(b.clone()),
@@ -334,10 +348,14 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
 
     /// The path from the root to the leaf that holds `key`: (id, node) per
     /// level, and the child index taken at each branch.
-    async fn descend(&self, key: &[u8]) -> Result<(Vec<(u64, Node)>, Vec<usize>), FileSystemError> {
+    async fn descend(
+        &self,
+        root: NonZeroU64,
+        key: &[u8],
+    ) -> Result<(Vec<(u64, Node)>, Vec<usize>), FileSystemError> {
         let mut path = Vec::new();
         let mut idxs = Vec::new();
-        let mut id = self.header.root;
+        let mut id = root.get();
         for depth in 0..=self.header.height {
             let n = self.node(id).await?;
             match &n {
@@ -363,11 +381,12 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         unreachable!()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
-        if self.header.root == 0 {
+        let Some(root) = self.header.root else {
             return Ok(None);
-        }
-        let (mut path, _) = self.descend(key).await?;
+        };
+        let (mut path, _) = self.descend(root, key).await?;
         let Some((_, Node::Leaf(entries))) = path.pop() else {
             unreachable!()
         };
@@ -399,17 +418,17 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     pub(crate) async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
         self.check_sizes(key, value)?;
         let val = self.make_val(value)?;
-        if self.header.root == 0 {
+        let Some(root) = self.header.root else {
             let id = self.alloc()?;
             self.put_node(id, &Node::Leaf(vec![(key.to_vec(), val)]))?;
-            self.header.root = id;
+            self.header.root = NonZeroU64::new(id);
             self.header.height = 0;
             self.header.entries = 1;
             self.effects
                 .push(KeyedOp::Put(key.to_vec(), value.to_vec()));
             return Ok(false);
-        }
-        let (mut path, idxs) = self.descend(key).await?;
+        };
+        let (mut path, idxs) = self.descend(root, key).await?;
         let replaced = {
             let Some((_, Node::Leaf(entries))) = path.last_mut() else {
                 unreachable!()
@@ -436,10 +455,10 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
 
     /// Remove `key`. Returns whether it was there.
     pub(crate) async fn delete(&mut self, key: &[u8]) -> Result<bool, FileSystemError> {
-        if self.header.root == 0 {
+        let Some(root) = self.header.root else {
             return Ok(false);
-        }
-        let (mut path, idxs) = self.descend(key).await?;
+        };
+        let (mut path, idxs) = self.descend(root, key).await?;
         let removed = {
             let Some((_, Node::Leaf(entries))) = path.last_mut() else {
                 unreachable!()
@@ -487,18 +506,18 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
                             children: vec![id, rid],
                         },
                     )?;
-                    self.header.root = root;
+                    self.header.root = NonZeroU64::new(root);
                     self.header.height += 1;
                 } else {
                     match node {
                         Node::Leaf(e) if e.is_empty() => {
                             self.release(id);
-                            self.header.root = 0;
+                            self.header.root = None;
                             self.header.height = 0;
                         }
                         Node::Branch { keys, children } if keys.is_empty() => {
                             self.release(id);
-                            self.header.root = children[0];
+                            self.header.root = NonZeroU64::new(children[0]);
                             self.header.height -= 1;
                         }
                         n => self.put_node(id, &n)?,
@@ -560,6 +579,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     /// Up to `limit` entries with keys in `(start, end)`, in key order.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn range(
         &self,
         start: Bound<&[u8]>,
@@ -576,6 +596,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
 
     /// As `range`, values unread (see `read_val`): large ones cost a read
     /// each, which a scan of keys doesn't need.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn range_raw(
         &self,
         start: Bound<&[u8]>,
@@ -583,7 +604,10 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Val)>, FileSystemError> {
         let mut out = Vec::new();
-        if self.header.root == 0 || limit == 0 {
+        let Some(root) = self.header.root else {
+            return Ok(out);
+        };
+        if limit == 0 {
             return Ok(out);
         }
         let below_end = |k: &[u8]| match end {
@@ -598,7 +622,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         };
         // Branches on the way down, with the next child to visit.
         let mut stack: Vec<(Vec<u64>, usize)> = Vec::new();
-        let mut id = self.header.root;
+        let mut id = root.get();
         // First descent: towards `start`.
         let mut seek = match start {
             Bound::Included(s) | Bound::Excluded(s) => Some(s),
@@ -646,6 +670,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     /// Apply every change made through this transaction at once, and
     /// queue them for the intent log as one entry: a replay redoes all of
     /// them or none, as a commit has them all or none.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn apply_logged(mut self) -> Result<(), FileSystemError> {
         let op = match self.effects.len() {
             0 => None,
@@ -784,10 +809,10 @@ pub(crate) async fn check<D: BlockDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> 
     let mut used: BTreeSet<u64> = BTreeSet::new();
     used.insert(0);
     let mut count = 0u64;
-    if h.root != 0 {
+    if let Some(root) = h.root {
         // (node, depth, lower bound (incl.), upper bound (excl.))
         type Visit = (u64, u32, Option<Vec<u8>>, Option<Vec<u8>>);
-        let mut stack: Vec<Visit> = vec![(h.root, 0, None, None)];
+        let mut stack: Vec<Visit> = vec![(root.get(), 0, None, None)];
         while let Some((id, depth, lo, hi)) = stack.pop() {
             if id == 0 || id >= h.next_id {
                 r.errors.push(format!("node id {} out of range", id));

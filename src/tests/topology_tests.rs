@@ -3,6 +3,7 @@
 use super::*;
 use crate::fs::FileSystem;
 use crate::test_util::TestPool;
+use crate::types::MetaslabIdx;
 use std::path::Path;
 
 fn raidz(parity: usize, disks: std::ops::Range<usize>) -> Topology {
@@ -304,10 +305,14 @@ async fn stripe_requests_crossing_chunks_are_split() {
     let dev = pool.dev().await;
     // Chunks are 30 blocks: 20..80 touches chunks 0, 1 and 2.
     let data = pattern(60 * BLOCK_SIZE, 7);
-    dev.write_blocks(20, &data).await.unwrap();
+    dev.write_blocks(20, crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
     dev.flush().await.unwrap();
     let mut back = vec![0u8; data.len()];
-    dev.read_blocks(20, &mut back).await.unwrap();
+    dev.read_blocks(20, crate::disk::as_blocks_mut(&mut back).unwrap())
+        .await
+        .unwrap();
     assert!(back == data);
     let check = dev.root.verify_blocks(20, &data, false).await.unwrap();
     assert_eq!(check.mismatched.iter().sum::<u64>(), 0);
@@ -355,7 +360,10 @@ async fn fence_domains_match_placement_on_every_layout() {
             } else {
                 rec as usize * BLOCK_SIZE
             };
-            fs.dev.write_blocks(at, &buf[..len]).await.unwrap();
+            fs.dev
+                .write_blocks(at, crate::disk::as_blocks(&buf[..len]).unwrap())
+                .await
+                .unwrap();
         }
         fs.dev.flush().await.unwrap();
 
@@ -370,7 +378,7 @@ async fn fence_domains_match_placement_on_every_layout() {
                     changed += 1;
                     assert_eq!(
                         map.domain_of(d, b),
-                        Domain::Metaslab(k as u32),
+                        Domain::Metaslab(MetaslabIdx::of_index(k)),
                         "{}: disk {} raw block {}",
                         what,
                         d,

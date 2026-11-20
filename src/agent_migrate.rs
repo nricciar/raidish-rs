@@ -22,7 +22,7 @@
 
 use crate::cluster::LeaseOp;
 use crate::cluster::lease::LeaseClient;
-use crate::committer::CommitClient;
+use crate::committer::PoolAdmin;
 use crate::node_facts::FactsHandle;
 use crate::vm::{DomMeta, Incoming, Virsh};
 use std::time::{Duration, Instant};
@@ -51,6 +51,12 @@ pub(super) enum Failure {
 impl From<String> for Failure {
     fn from(e: String) -> Self {
         Failure::Failed(e)
+    }
+}
+
+impl From<crate::vm::VmError> for Failure {
+    fn from(e: crate::vm::VmError) -> Self {
+        Failure::Failed(e.to_string())
     }
 }
 
@@ -97,7 +103,7 @@ pub(super) struct Job {
     pub timeout: Duration,
     /// This node's facts, and the committer for the target's.
     pub facts: FactsHandle,
-    pub committer: CommitClient,
+    pub committer: crate::committer::Admin,
 }
 
 impl Job {
@@ -119,9 +125,8 @@ impl Job {
         let to = self.ready().await?.resolved(&self.host);
         let xml = self.virsh.dumpxml_migratable(&self.name).await?;
         let meta = DomMeta {
-            owner: String::new(),
+            owner: crate::vm::DomOwner::Migrating,
             node: to.node.clone(),
-            migrating: true,
             ..self.meta.clone()
         };
         let xml = crate::vm::retarget(&xml, &to, &meta)?;

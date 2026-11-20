@@ -21,7 +21,7 @@ fn node(name: &str, cpu: &str, qemu: &str) -> NodeFacts {
         host: HostFacts {
             arch: "x86_64".into(),
             cpu_model: cpu.into(),
-            memory_mb: 4096,
+            memory: Bytes::from_mib(4096),
             kvm: true,
             ..Default::default()
         },
@@ -73,7 +73,7 @@ fn reads_what_a_domain_needs() {
     let n = needs(VM).unwrap();
     assert_eq!(n.virt_type, "kvm");
     assert_eq!(n.machine.as_deref(), Some("pc-q35-10.2"));
-    assert_eq!(n.memory_mb, 512);
+    assert_eq!(n.memory, Bytes::from_mib(512));
     assert_eq!(n.cpu_mode.as_deref(), Some("custom"));
     assert_eq!(n.cpu_model.as_deref(), Some("EPYC-Milan"));
     assert_eq!(n.cpu_features, vec!["pku"]);
@@ -83,8 +83,8 @@ fn reads_what_a_domain_needs() {
     assert_eq!(
         needs("<domain><memory>1048576</memory></domain>")
             .unwrap()
-            .memory_mb,
-        1024
+            .memory,
+        Bytes::from_mib(1024)
     );
 }
 
@@ -162,7 +162,7 @@ fn what_only_rules_out_live_makes_it_cold() {
     let (a, b) = pair();
     let live = Live {
         cpu: Some(Err("host CPU lacks avx512f".into())),
-        available_mb: Some(2048),
+        available: Some(Bytes::from_mib(2048)),
     };
     let v = check(&n, "node-1", Some(&a), Some(&b), Some(&live));
     assert_eq!(v.mode, Mode::Cold);
@@ -217,7 +217,7 @@ fn not_enough_memory_is_a_warning() {
     let (a, b) = pair();
     let live = Live {
         cpu: Some(Ok("identical".into())),
-        available_mb: Some(100),
+        available: Some(Bytes::from_mib(100)),
     };
     let v = check(
         &needs(VM).unwrap(),
@@ -230,7 +230,7 @@ fn not_enough_memory_is_a_warning() {
     assert!(
         v.reasons
             .iter()
-            .any(|r| r.level == "warn" && r.text.contains("100 MiB"))
+            .any(|r| r.level == ReasonLevel::Warn && r.text.contains("100 MiB"))
     );
 }
 

@@ -92,6 +92,7 @@ impl<'a> Reader<'a> {
         &self.buf[self.pos..]
     }
 
+    #[cfg(test)]
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }

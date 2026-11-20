@@ -33,48 +33,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use x509_parser::prelude::*;
 
-/// What a certificate (or token) may do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// Dashboard and other read-only access.
-    Readonly,
-    /// Everything the command line does.
-    Admin,
-    /// A `listen` node: everything, plus Raft between peers.
-    Node,
-}
-
-impl Role {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Role::Readonly => "readonly",
-            Role::Admin => "admin",
-            Role::Node => "node",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for Role {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "readonly" => Ok(Role::Readonly),
-            "admin" => Ok(Role::Admin),
-            "node" => Ok(Role::Node),
-            _ => Err(format!(
-                "unknown role '{}' (expected node, admin or readonly)",
-                s
-            )),
-        }
-    }
-}
+pub use crate::api_types::Role;
 
 /// What a PEM certificate says, for `cert status` and the auth layer.
 #[derive(Debug, Clone)]
@@ -86,7 +45,6 @@ pub struct CertInfo {
     pub is_ca: bool,
     pub sans: Vec<String>,
     pub issuer: String,
-    pub not_before: OffsetDateTime,
     pub not_after: OffsetDateTime,
     /// blake3 of the DER, first 16 hex digits.
     pub fingerprint: String,
@@ -163,7 +121,6 @@ pub fn inspect_der(der: &[u8]) -> Result<CertInfo, String> {
         is_ca,
         sans,
         issuer,
-        not_before: cert.validity().not_before.to_datetime(),
         not_after: cert.validity().not_after.to_datetime(),
         fingerprint: blake3::hash(der).to_hex()[..16].to_string(),
         der: der.to_vec(),
@@ -589,6 +546,22 @@ pub fn hosts_in(paths: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// A token's lifetime: `90d`, `12h`, `30m`, `45s` or plain seconds.
+pub fn parse_duration(s: &str) -> Result<i64, String> {
+    let (num, mult) = match s.chars().last() {
+        Some('d') => (&s[..s.len() - 1], 86400),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('s') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    num.parse::<i64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("bad duration '{}' (try 90d, 12h, 30m)", s))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //! made here), or an imported libvirt domain XML. Either way it's stored
 //! through the VM API, which checks it.
 
-use crate::api::{self, NewVm, Volume};
+use crate::api::{self, NewVm, VolumeView};
 use crate::app::Route;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
@@ -22,7 +22,7 @@ pub enum Mode {
 pub enum Msg {
     Mode(Mode),
     Set(&'static str, String),
-    Volumes(Vec<Volume>),
+    Volumes(Vec<VolumeView>),
     Picked(web_sys::File),
     Read(Result<String, String>),
     Submit,
@@ -39,7 +39,7 @@ pub struct NewVmDialog {
     iso: String,
     network: String,
     xml: String,
-    volumes: Vec<Volume>,
+    volumes: Vec<VolumeView>,
     busy: bool,
     error: Option<String>,
 }
@@ -227,7 +227,7 @@ impl NewVmDialog {
             NewVm {
                 name: name.to_string(),
                 vcpus,
-                memory_mib: memory >> 20,
+                memory: raidish::types::Bytes::new(memory),
                 disk: raidish::vm_def::disk_volume(name),
                 iso: (!self.iso.is_empty()).then(|| self.iso.clone()),
                 network: (!network.is_empty()).then(|| network.to_string()),
@@ -283,8 +283,8 @@ impl NewVmDialog {
                     <select {onchange}>
                         <option value="" selected={self.iso.is_empty()}>{ "None" }</option>
                         { for self.volumes.iter().map(|v| html! {
-                            <option value={v.name.clone()} selected={v.name == self.iso}>
-                                { format!("{} ({})", v.name, crate::fmt::bytes(v.size_bytes)) }
+                            <option value={v.info.name.clone()} selected={v.info.name == self.iso}>
+                                { format!("{} ({})", v.info.name, crate::fmt::bytes(v.info.size_bytes)) }
                             </option>
                         }) }
                     </select>

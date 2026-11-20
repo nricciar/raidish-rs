@@ -8,6 +8,7 @@ use crate::disk::{BlockDevice, IoStats};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
 use crate::inode::ObjType;
 use crate::metaslab::SPACEMAP_SLOTS;
+use crate::types::Txg;
 use crate::vdev::Topology;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +30,7 @@ pub struct DiskReport {
     pub online: bool,
     pub label: LabelState,
     /// Earliest TXG it may have missed (needs a resilver), if any.
-    pub degraded_since: Option<u64>,
+    pub degraded_since: Option<Txg>,
     /// Failed writes/flushes seen by this process.
     pub missed_writes: u64,
     pub fenced: bool,
@@ -53,11 +54,11 @@ pub struct PoolReport {
     pub fault_tolerance: usize,
     pub failures_left: usize,
     pub disks: Vec<DiskReport>,
-    pub txg: u64,
+    pub txg: Txg,
     /// Unix milliseconds of the last commit.
     pub committed_ms: Option<u64>,
     /// Rewind targets: (txg, unix ms), newest first.
-    pub ring: Vec<(u64, u64)>,
+    pub ring: Vec<(Txg, u64)>,
     pub total_blocks: u64,
     pub metaslab_count: u64,
     pub used_blocks: u64,
@@ -79,7 +80,7 @@ pub struct MetaslabReport {
     /// Free extents: a rough fragmentation measure.
     pub free_extents: usize,
     pub active_slot: Option<u64>,
-    pub synced_txg: u64,
+    pub synced_txg: Txg,
     pub dirty: bool,
 }
 
@@ -349,24 +350,24 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut disks = Vec::new();
         let mut raw_blocks = 0;
         if let Some(pool) = self.dev.pool() {
-            for (d, caddy) in pool.disks.disks.iter().enumerate() {
+            for (d, caddy) in pool.disks().caddies().iter().enumerate() {
                 let capacity = caddy.capacity_blocks().await.ok();
                 raw_blocks += capacity.unwrap_or(0);
                 disks.push(DiskReport {
                     index: d,
                     path: caddy.path().to_string(),
                     local: caddy.is_local(),
-                    online: pool.disks.is_online(d),
+                    online: pool.disks().is_online(d),
                     label: self.check_disk_label(d).await,
                     degraded_since: degraded.get(d).copied().flatten(),
-                    missed_writes: pool.disks.miss_count(d),
-                    fenced: pool.disks.is_fenced(d),
+                    missed_writes: pool.disks().miss_count(d),
+                    fenced: pool.disks().is_fenced(d),
                     capacity_blocks: capacity,
                     io: caddy.io_stats(),
                 });
             }
         }
-        let topology = self.dev.pool().map(|p| p.topology.clone());
+        let topology = self.dev.pool().map(|p| p.topology().clone());
         let (health, tolerance, left) = match &topology {
             Some(t) => {
                 let margin = margin(t, &disks);
@@ -403,7 +404,7 @@ impl<D: BlockDevice> FileSystem<D> {
             fault_tolerance: tolerance,
             failures_left: left,
             disks,
-            txg: ub.as_ref().map_or(0, |u| u.txg),
+            txg: ub.as_ref().map_or(Txg::ZERO, |u| u.txg),
             committed_ms: ub.as_ref().map(|u| u.timestamp),
             ring: self
                 .uberblock_ring()
@@ -550,7 +551,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Walk the namespace from the root directory.
         let root = self.root_dir();
-        let mut dirs: Vec<(String, u64)> = vec![(String::new(), root)];
+        let mut dirs: Vec<(String, crate::disk::FileId)> = vec![(String::new(), root)];
         while let Some((prefix, dir_id)) = dirs.pop() {
             let Ok(dir) = self.read_dnode(dir_id).await else {
                 continue;
@@ -569,12 +570,12 @@ impl<D: BlockDevice> FileSystem<D> {
                     continue;
                 };
                 // Only the dataset directory links anything else.
-                if !matches!(d.kind, ObjType::File | ObjType::Directory) {
+                if !matches!(d.kind(), ObjType::File | ObjType::Directory) {
                     continue;
                 }
                 let owner = owners.len() as u32;
                 owners.push(path.clone());
-                let block_kind = match d.kind {
+                let block_kind = match d.kind() {
                     ObjType::Directory => BlockKind::Directory,
                     _ => BlockKind::Data,
                 };
@@ -583,7 +584,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     allocated += e.len();
                     push(&mut spans, e.start(), e.len(), block_kind, Some(owner));
                 }
-                let (kind, size, vbs) = match d.kind {
+                let (kind, size, vbs) = match d.kind() {
                     ObjType::File => (ObjectKind::File, d.size, None),
                     ObjType::Directory => {
                         dirs.push((path.clone(), entry.id));

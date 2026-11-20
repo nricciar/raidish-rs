@@ -83,7 +83,7 @@ async fn stores_checks_and_reopens() {
     let st = VmStore::open(fs).await.unwrap();
     let all = st.list().await.unwrap();
     assert_eq!(all.keys().collect::<Vec<_>>(), vec!["one", "two"]);
-    assert_eq!(all["one"].spec().volumes, vec!["a"]);
+    assert_eq!(all["one"].spec().volumes(), vec!["a"]);
     assert_eq!(all["two"].change, 4);
 }
 

@@ -29,6 +29,7 @@ use crate::disk::BLOCK_SIZE;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use crate::types::Txg;
 use crate::zil::KeyedOp;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap};
@@ -216,17 +217,17 @@ impl DirtyState {
 /// so entries never go stale. Evicts oldest-inserted first, bounded by bytes.
 #[derive(Default)]
 struct RecordCache {
-    map: HashMap<(u64, u64), Arc<Vec<u8>>>,
-    order: std::collections::VecDeque<(u64, u64)>,
+    map: HashMap<(u64, Txg), Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(u64, Txg)>,
     bytes: usize,
 }
 
 impl RecordCache {
-    fn get(&self, key: (u64, u64)) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, key: (u64, Txg)) -> Option<Arc<Vec<u8>>> {
         self.map.get(&key).cloned()
     }
 
-    fn insert(&mut self, key: (u64, u64), data: Arc<Vec<u8>>) {
+    fn insert(&mut self, key: (u64, Txg), data: Arc<Vec<u8>>) {
         if self.map.contains_key(&key) {
             return;
         }
@@ -293,7 +294,7 @@ pub struct ObjTree {
     pub(crate) dirty: Mutex<DirtyState>,
     /// Indirect blocks keyed by (lba, birth_txg): immutable once written, and
     /// a reused lba always has a newer birth TXG.
-    cache: Mutex<HashMap<(u64, u64), Arc<Indirect>>>,
+    cache: Mutex<HashMap<(u64, Txg), Arc<Indirect>>>,
     records: Mutex<RecordCache>,
 }
 
@@ -927,7 +928,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     prev_end = Some((run[run.len() - 1].0, e.start + e.len));
                     continue;
                 }
-                Err(FileSystemError::UnableToAllocateBlocks(_)) => run.chunks(run_max).collect(),
+                Err(FileSystemError::NoSpace(_)) => run.chunks(run_max).collect(),
                 Err(e) => {
                     self.release_jobs(&jobs).await;
                     return Err(e);
@@ -945,7 +946,7 @@ impl<D: BlockDevice> FileSystem<D> {
                             records: chunk.to_vec(),
                         });
                     }
-                    Err(FileSystemError::UnableToAllocateBlocks(_)) => {
+                    Err(FileSystemError::NoSpace(_)) => {
                         jobs.extend(chunk.iter().map(|&(i, b)| SyncJob::Single(i, b)));
                     }
                     Err(e) => {

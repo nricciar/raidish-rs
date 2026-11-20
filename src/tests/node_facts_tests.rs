@@ -15,8 +15,13 @@ fn reads_the_host() {
     assert_eq!(m, "AMD Ryzen 9 5900X 12-Core Processor");
     assert_eq!(n, 2);
     let mem = "MemTotal:        2048000 kB\nMemFree: 1 kB\nMemAvailable:    1024000 kB\n";
-    assert_eq!(parse_meminfo_total(mem), 2000);
-    assert_eq!(parse_meminfo_available(mem), 1000);
+    assert_eq!(parse_meminfo(mem, "MemTotal"), Bytes::from_kib(2048000));
+    assert_eq!(parse_meminfo(mem, "MemAvailable"), Bytes::from_kib(1024000));
+    assert_eq!(
+        parse_meminfo(mem, "Mem"),
+        Bytes::default(),
+        "whole keys only"
+    );
     let ver = "Compiled against library: libvirt 12.0.0\nUsing library: libvirt 12.0.0\n\
                Using API: QEMU 12.0.0\nRunning hypervisor: QEMU 10.2.1\n";
     assert_eq!(

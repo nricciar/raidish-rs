@@ -137,7 +137,7 @@ fn host(f: &NodeFacts, v: &FactsView) -> Html {
                 "{} ({} threads, {} MiB{})",
                 if f.host.cpu_model.is_empty() { "?" } else { &f.host.cpu_model },
                 f.host.cpu_threads,
-                f.host.memory_mb,
+                f.host.memory.mib(),
                 if f.host.kvm { ", KVM" } else { ", no KVM" }
             ) }</div>
             <div class="muted small">{ sub }</div>

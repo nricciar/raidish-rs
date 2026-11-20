@@ -5,7 +5,6 @@
 use crate::app::Route;
 use crate::session::{now_ms, tab_hidden};
 use gloo_timers::callback::Interval;
-use serde::Deserialize;
 use std::collections::VecDeque;
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
@@ -54,27 +53,7 @@ fn remember_height(h: Option<f64>) {
     }
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-pub struct Event {
-    pub seq: u64,
-    pub ts_ms: u64,
-    pub node: String,
-    /// `info`, `warn` or `error`.
-    pub level: String,
-    pub kind: String,
-    #[serde(default)]
-    pub subject: Option<String>,
-    pub message: String,
-    #[serde(default)]
-    pub by: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-pub struct Page {
-    pub events: Vec<Event>,
-    pub next: u64,
-    pub first: u64,
-}
+pub use raidish::api_types::{Event, EventPage as Page, Level, Subject};
 
 async fn fetch(query: String) -> Result<Page, String> {
     let resp = crate::session::get(&format!("/api/v1/events?{}", query))
@@ -120,8 +99,8 @@ impl Filter {
     fn shows(&self, e: &Event) -> bool {
         match self {
             Filter::All => true,
-            Filter::Warnings => e.level != "info",
-            Filter::Errors => e.level == "error",
+            Filter::Warnings => e.level != Level::Info,
+            Filter::Errors => e.level == Level::Error,
         }
     }
 }
@@ -214,7 +193,7 @@ impl Component for Activity {
                 }
                 let more = page.events.len() >= 1000;
                 for e in page.events {
-                    if !first_read && !self.open && e.level != "info" {
+                    if !first_read && !self.open && e.level != Level::Info {
                         self.unseen += 1;
                     }
                     self.events.push_front(e);
@@ -322,7 +301,7 @@ impl Component for Activity {
                     if let Some(e) = &self.error {
                         <span class="muted">{ format!("Activity log unavailable: {}", e) }</span>
                     } else if let Some(e) = latest {
-                        <span class={classes!("dot", level_class(&e.level))}></span>
+                        <span class={classes!("dot", level_class(e.level))}></span>
                         <span class="muted mono">{ when(e.ts_ms, true) }</span>
                         <span class="ellipsis">{ &e.message }</span>
                     } else if self.next.is_some() {
@@ -409,11 +388,7 @@ impl Activity {
                 needle.is_empty()
                     || e.message.to_lowercase().contains(&needle)
                     || e.node.to_lowercase().contains(&needle)
-                    || e.subject
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&needle)
+                    || e.subject.to_string().to_lowercase().contains(&needle)
                     || e.by
                         .as_deref()
                         .unwrap_or("")
@@ -473,20 +448,24 @@ impl Activity {
 type Event_ = yew::events::Event;
 
 fn row(e: &Event) -> Html {
-    let subject = e.subject.as_deref().unwrap_or("");
-    let object = match subject.split_once('/') {
-        Some(("vm", name)) => html! {
-            <a href={Route::Vms(Some(name.to_string())).href()}>{ format!("VM {}", name) }</a>
+    let named = |kind: &str, name: &dyn std::fmt::Display| {
+        html! { <span>{ format!("{} {}", kind, name) }</span> }
+    };
+    let object = match &e.subject {
+        Subject::Vm(name) => html! {
+            <a href={Route::Vms(Some(name.clone())).href()}>{ format!("VM {}", name) }</a>
         },
-        Some((kind, name)) if kind != "pool" && kind != "cluster" => {
-            html! { <span>{ format!("{} {}", kind, name) }</span> }
+        Subject::Node(n) => named("node", n),
+        Subject::Disk(d) => named("disk", d),
+        Subject::Dataset(f, n) => named(raidish::api_types::format_slug(*f), n),
+        s @ (Subject::Pool | Subject::Cluster) => {
+            html! { <span class="muted">{ s.to_string() }</span> }
         }
-        _ => html! { <span class="muted">{ subject }</span> },
     };
     html! {
-        <tr key={e.seq.to_string()} class={classes!(level_class(&e.level))}>
+        <tr key={e.seq.to_string()} class={classes!(level_class(e.level))}>
             <td class="mono muted nowrap" title={full_time(e.ts_ms)}>{ when(e.ts_ms, false) }</td>
-            <td><span class={classes!("tag", level_class(&e.level))}>{ level_name(&e.level) }</span></td>
+            <td><span class={classes!("tag", level_class(e.level))}>{ level_name(e.level) }</span></td>
             <td>{ &e.message }</td>
             <td class="nowrap">{ object }</td>
             <td class="nowrap muted">{ &e.node }</td>
@@ -495,19 +474,19 @@ fn row(e: &Event) -> Html {
     }
 }
 
-fn level_class(level: &str) -> &'static str {
+fn level_class(level: Level) -> &'static str {
     match level {
-        "error" => "bad",
-        "warn" => "warn",
-        _ => "ok",
+        Level::Error => "bad",
+        Level::Warn => "warn",
+        Level::Info => "ok",
     }
 }
 
-fn level_name(level: &str) -> &'static str {
+fn level_name(level: Level) -> &'static str {
     match level {
-        "error" => "ERROR",
-        "warn" => "WARN",
-        _ => "INFO",
+        Level::Error => "ERROR",
+        Level::Warn => "WARN",
+        Level::Info => "INFO",
     }
 }
 

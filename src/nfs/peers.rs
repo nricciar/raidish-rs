@@ -5,13 +5,14 @@
 //! only), as bincode. The NFSv4 state owner is whoever holds the `nfs4`
 //! lease (`own_v4_state`), and keeps its client records in the cluster.
 
-use super::backend::{Backend, Forward, Forwarded, Peers, lease_node};
+use super::backend::{Backend, Forward, Forwarded, Peers};
 use super::v4::{self, V4Cluster, V4Forward, V4Forwarded};
 use crate::cluster::lease::{HeldLease, LeaseClient};
 use crate::cluster::state::{NFS4, Response};
 use crate::cluster::{Cluster, LeaseOp, now_ms};
 use crate::committer::object_resource;
 use crate::disk::FileId;
+use crate::types::{Epoch, Holder, HolderRole, Holding};
 use crate::vdev::Pool;
 use async_trait::async_trait;
 use rocket::data::{Data, ToByteUnit};
@@ -28,7 +29,7 @@ pub struct ClusterPeers {
     http: reqwest::Client,
     leases: LeaseClient,
     /// The `nfs4` lease (owner, epoch), while this node holds it.
-    nfs4: std::sync::Mutex<Option<(String, u64)>>,
+    nfs4: std::sync::Mutex<Option<(String, Epoch)>>,
     /// Every node's NFS address (see `with_locations`), by node id.
     locations: Vec<(u64, String)>,
     /// The NFS port (the same on every node).
@@ -53,10 +54,7 @@ impl ClusterPeers {
     pub fn new(cluster: Arc<Cluster>, leases: LeaseClient) -> Self {
         ClusterPeers {
             cluster,
-            http: crate::tls::http_builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .expect("http client"),
+            http: crate::tls::http_client(Some(Duration::from_secs(60))).expect("http client"),
             leases,
             nfs4: Default::default(),
             locations: Vec::new(),
@@ -146,8 +144,7 @@ impl ClusterPeers {
 
     /// The base URL of node `name` (`node-<id>`).
     fn url_of(&self, name: &str) -> Option<String> {
-        let id: u64 = name.strip_prefix("node-")?.parse().ok()?;
-        self.cluster.members.peers.get(&id).cloned()
+        self.cluster.members.peer_url(name).map(str::to_string)
     }
 }
 
@@ -155,10 +152,10 @@ impl ClusterPeers {
 impl Peers for ClusterPeers {
     fn holder(&self, id: FileId) -> Option<String> {
         let l = self.cluster.lease_state(&object_resource(id))?;
-        if l.released || l.expires_ms <= now_ms() {
+        if !l.is_live(now_ms()) {
             return None;
         }
-        lease_node(&l.desc).map(String::from)
+        l.holder.node_as(HolderRole::Nfs).map(String::from)
     }
 
     async fn forward(&self, node: &str, req: &Forward) -> Result<Forwarded, String> {
@@ -169,11 +166,11 @@ impl Peers for ClusterPeers {
 #[async_trait]
 impl V4Cluster for ClusterPeers {
     fn owner(&self) -> Option<String> {
-        let l = self.cluster.lease_state(NFS4)?;
-        if l.released || l.expires_ms <= now_ms() {
+        let l = self.cluster.lease_state(&NFS4)?;
+        if !l.is_live(now_ms()) {
             return None;
         }
-        l.desc.strip_prefix("nfs4 ").map(String::from)
+        l.holder.node_as(HolderRole::Nfs4).map(String::from)
     }
 
     async fn forward(&self, node: &str, req: &V4Forward) -> Result<V4Forwarded, String> {
@@ -208,8 +205,7 @@ impl V4Cluster for ClusterPeers {
         let op = LeaseOp::NfsClient {
             client: hex(client),
             present,
-            nfs_owner: owner,
-            nfs_epoch: epoch,
+            nfs: Holding::new(owner, epoch),
         };
         match self.leases.call(&op).await? {
             Response::Recorded => Ok(()),
@@ -222,14 +218,19 @@ impl V4Cluster for ClusterPeers {
 /// while it does (handing it back if the lease is lost).
 pub async fn own_v4_state(server: Arc<v4::Server<Pool>>, peers: Arc<ClusterPeers>, node: String) {
     loop {
-        let held =
-            match HeldLease::acquire(peers.leases.clone(), NFS4, &format!("nfs4 {}", node)).await {
-                Ok(h) => Arc::new(h),
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
+        let held = match HeldLease::acquire(
+            peers.leases.clone(),
+            NFS4,
+            Holder::new(HolderRole::Nfs4, Some(&node)),
+        )
+        .await
+        {
+            Ok(h) => Arc::new(h),
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         *peers.nfs4.lock().unwrap() = Some((held.owner.clone(), held.epoch));
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = lost.clone();

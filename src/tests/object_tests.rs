@@ -83,14 +83,17 @@ fn record_cache_is_bounded() {
     let rec = Arc::new(vec![0u8; 48 * 1024]);
     let n = RECORD_CACHE_BYTES / rec.len() * 2;
     for i in 0..n as u64 {
-        c.insert((i, 1), rec.clone());
+        c.insert((i, Txg::from_raw(1)), rec.clone());
     }
     assert!(c.bytes <= RECORD_CACHE_BYTES);
     assert_eq!(c.map.len(), c.order.len());
-    assert!(c.get((0, 1)).is_none(), "oldest evicted");
-    assert!(c.get((n as u64 - 1, 1)).is_some(), "newest kept");
+    assert!(c.get((0, Txg::from_raw(1))).is_none(), "oldest evicted");
+    assert!(
+        c.get((n as u64 - 1, Txg::from_raw(1))).is_some(),
+        "newest kept"
+    );
     // Same lba, newer birth TXG: a different entry, never a stale hit.
-    assert!(c.get((n as u64 - 1, 2)).is_none());
+    assert!(c.get((n as u64 - 1, Txg::from_raw(2))).is_none());
 }
 
 /// A growable object gains levels as writes go past what its tree

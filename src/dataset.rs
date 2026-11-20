@@ -39,6 +39,7 @@ use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, DatasetProps, Dnode, ObjType};
 use crate::object::{Dirty, ObjTree, Sizing};
+use crate::types::Txg;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,7 @@ use std::sync::{Arc, Mutex};
 pub const DEFAULT_FS: &str = "fs";
 
 /// How a dataset's contents are laid out.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatasetFormat {
     /// Directories and files; the root is a directory. Changed through the
     /// committer, object by object (`crate::writer::FsOp`).
@@ -143,16 +144,9 @@ impl DatasetFormat {
     }
 }
 
-/// Refuse names a dataset can't have. `@` separates a snapshot's name from
-/// its dataset's, and `:` a dataset from a path in it.
+/// Refuse names a dataset can't have (see `crate::types::DatasetName`).
 pub(crate) fn check_dataset_name(name: &str) -> Result<(), FileSystemError> {
-    crate::inode::check_name(name)?;
-    if name.contains('@') || name.contains(':') {
-        return Err(FileSystemError::InvalidArgument(format!(
-            "bad dataset name '{}' (no '@' or ':')",
-            name
-        )));
-    }
+    crate::types::DatasetName::try_from(name)?;
     Ok(())
 }
 
@@ -165,7 +159,7 @@ pub struct DatasetEntry {
     /// Names this dataset in any pool.
     pub guid: u64,
     /// The TXG it was created in.
-    pub created_txg: u64,
+    pub created_txg: Txg,
     /// When it was created (ms since the epoch; S3 shows it as a bucket's
     /// creation date).
     pub created_ms: u64,
@@ -265,7 +259,7 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         dnode: &Dnode,
     ) -> Result<DatasetIndex, FileSystemError> {
-        if dnode.kind != ObjType::Datasets {
+        if dnode.kind() != ObjType::Datasets {
             return Err(FileSystemError::InvalidArgument(
                 "not the dataset directory".into(),
             ));
@@ -290,12 +284,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The object number of the dataset directory.
     pub fn datasets_object(&self) -> FileId {
-        self.datasets_obj.load(std::sync::atomic::Ordering::SeqCst)
+        FileId::from_raw(self.datasets_obj.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// The root directory of the default posix dataset: `/`.
     pub fn root_dir(&self) -> FileId {
-        self.root_dir.load(std::sync::atomic::Ordering::SeqCst)
+        FileId::from_raw(self.root_dir.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Dataset `name`'s entry (uncommitted changes included).
@@ -308,6 +302,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Tree dataset `name`'s root object number.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn dataset_id(&self, name: &str) -> Result<FileId, FileSystemError> {
         let e = self.dataset_entry(name).await?;
         if !e.format.is_tree() {
@@ -330,14 +325,16 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let dnode = self.read_dnode(e.root).await?;
-        if dnode.kind != e.format.root_kind() {
+        if dnode.kind() != e.format.root_kind() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "dataset '{}': its root object {} is a {}",
                 name,
                 e.root,
-                dnode.kind.name()
+                dnode.kind().name()
             )));
         }
+        let props = dnode.props().cloned().unwrap_or_default();
+        let log = dnode.log().cloned();
         let ds = Arc::new(Dataset {
             name: name.to_string(),
             id: e.root,
@@ -350,8 +347,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 dnode.size,
                 dnode.tree,
             ),
-            props: Mutex::new(dnode.props.unwrap_or_default()),
-            log: Mutex::new(dnode.log),
+            props: Mutex::new(props),
+            log: Mutex::new(log),
             cursor: Mutex::new(None),
             fold_from: Mutex::new(None),
             in_doubt: Mutex::new(None),
@@ -380,7 +377,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 format: e.format,
                 guid: e.guid,
                 created_ms: e.created_ms,
-                props: d.props.unwrap_or_default(),
+                props: d.props().cloned().unwrap_or_default(),
             });
         }
         Ok(out)
@@ -409,7 +406,7 @@ impl<D: BlockDevice> FileSystem<D> {
         mut root: Dnode,
     ) -> Result<FileId, FileSystemError> {
         check_dataset_name(name)?;
-        debug_assert_eq!(root.kind, format.root_kind());
+        debug_assert_eq!(root.kind(), format.root_kind());
         let mut index = self.datasets().await?;
         if index.datasets.contains_key(name) {
             return Err(FileSystemError::AlreadyExists);
@@ -417,18 +414,18 @@ impl<D: BlockDevice> FileSystem<D> {
         let id = self.alloc_object();
         // A posix root is its own parent (its `..`); anything else is
         // linked from the dataset directory.
-        root.parent = if format == DatasetFormat::Posix {
+        root.parent = Some(if format == DatasetFormat::Posix {
             id
         } else {
             self.datasets_object()
-        };
+        });
         self.write_dnode(id, Some(root)).await?;
         index.datasets.insert(
             name.to_string(),
             DatasetEntry {
                 root: id,
                 format,
-                guid: crate::fs::new_guid(id),
+                guid: crate::fs::new_guid(id.get()),
                 created_txg: self.open_txg().await?,
                 created_ms: crate::fs::now_ms(),
             },
@@ -470,7 +467,7 @@ impl<D: BlockDevice> FileSystem<D> {
         {
             self.free(p.lba, p.asize as u64).await?;
         }
-        for r in dnode.log.iter().flat_map(|l| &l.regions) {
+        for r in dnode.log().iter().flat_map(|l| &l.regions) {
             self.free(r.start, r.len).await?;
         }
         self.write_dnode(e.root, None).await?;
@@ -524,7 +521,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// its tree is untouched and everything allocated is given back. If the
     /// pool is too full for the data, holes (TRIM / zeroed records) are still
     /// committed on their own so a guest can free space, and the call returns
-    /// `UnableToAllocateBlocks` because some data is still not durable.
+    /// `NoSpace` because some data is still not durable.
     ///
     /// Also returns the datasets it left clean (synced, or nothing dirty):
     /// one failing doesn't hold the others back.
@@ -572,7 +569,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let result = self.sync_dataset(&vol, &taken).await;
             if result.is_ok() {
                 synced = Some(taken.clone());
-            } else if matches!(result, Err(FileSystemError::UnableToAllocateBlocks(_))) {
+            } else if matches!(result, Err(FileSystemError::NoSpace(_))) {
                 let holes: BTreeMap<u64, Dirty> = taken
                     .iter()
                     .filter(|(_, r)| r.is_hole())
@@ -612,7 +609,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return self.writer_sync_dataset(&w, vol, records, need).await;
         }
         if self.allocatable_blocks().await < need {
-            return Err(FileSystemError::UnableToAllocateBlocks(need));
+            return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
         }
 
         // Everything allocated here, so a failure can hand it all back, and
@@ -642,7 +639,10 @@ impl<D: BlockDevice> FileSystem<D> {
         self.free_unheld(
             replaced
                 .iter()
-                .map(|p| (p.lba, p.asize as u64, p.birth_txg))
+                .map(|p| crate::types::Born {
+                    extent: p.extent(),
+                    birth: p.birth_txg,
+                })
                 .collect(),
             held,
         )
@@ -661,8 +661,14 @@ impl<D: BlockDevice> FileSystem<D> {
             ptr: root,
             levels: vol.obj.levels(),
         };
-        dnode.props = Some(vol.props.lock().unwrap().clone());
-        dnode.log = vol.log.lock().unwrap().clone();
+        let Some(head) = dnode.head_mut() else {
+            return Err(FileSystemError::Internal(format!(
+                "dataset '{}' (object {}) isn't a tree root",
+                vol.name, vol.id
+            )));
+        };
+        head.props = vol.props.lock().unwrap().clone();
+        head.log = vol.log.lock().unwrap().clone();
         self.write_dnode(vol.id, Some(dnode)).await
     }
 

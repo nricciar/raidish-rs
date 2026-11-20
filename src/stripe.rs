@@ -8,7 +8,7 @@
 //! Requests that cross a boundary are split. A stripe tolerates no more
 //! failures than its weakest child.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev, lcm, max_record_blocks};
 use async_trait::async_trait;
@@ -78,7 +78,7 @@ impl BlockDevice for Stripe {
         results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].read_block(local, buf).await
     }
@@ -97,23 +97,23 @@ impl BlockDevice for Stripe {
         Ok(min / self.chunk * self.chunk * self.children.len() as u64)
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let segs = self.segments(start, buf.len() as u64);
         let mut rest = buf;
         let mut reads = Vec::new();
         for s in &segs {
-            let (part, tail) = rest.split_at_mut(s.len as usize * BLOCK_SIZE);
+            let (part, tail) = rest.split_at_mut(s.len as usize);
             rest = tail;
             reads.push(self.children[s.child].read_blocks(s.local, part));
         }
         futures::future::try_join_all(reads).await.map(|_| ())
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        let segs = self.segments(start, buf.len() as u64);
         let writes = segs.iter().map(|s| {
-            let at = s.offset as usize * BLOCK_SIZE;
-            self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize * BLOCK_SIZE])
+            let at = s.offset as usize;
+            self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize])
         });
         futures::future::try_join_all(writes).await.map(|_| ())
     }

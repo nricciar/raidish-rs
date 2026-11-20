@@ -9,6 +9,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::service_tree::spawn_while_alive;
 use pb::compare::{CompareResult, CompareTarget, TargetUnion};
 use pb::range_request::{SortOrder, SortTarget};
 use pb::request_op::Request;
@@ -50,7 +51,6 @@ pub enum EtcdError {
     ValueProvided,
     LeaseProvided,
     TooManyOps,
-    TooLarge,
     /// A key longer than the tree takes.
     KeyTooLong(usize),
     /// This node doesn't serve the dataset (any more).
@@ -78,7 +78,6 @@ impl std::fmt::Display for EtcdError {
             EtcdError::ValueProvided => "etcdserver: value is provided",
             EtcdError::LeaseProvided => "etcdserver: lease is provided",
             EtcdError::TooManyOps => "etcdserver: too many operations in txn request",
-            EtcdError::TooLarge => "etcdserver: request is too large",
             EtcdError::KeyTooLong(n) => {
                 return write!(f, "etcdserver: key is too long (at most {} bytes)", n);
             }
@@ -105,11 +104,22 @@ impl EtcdError {
             | EtcdError::ValueProvided
             | EtcdError::LeaseProvided
             | EtcdError::TooManyOps
-            | EtcdError::TooLarge
             | EtcdError::KeyTooLong(_) => Code::InvalidArgument,
             EtcdError::NotServing => Code::Unavailable,
-            EtcdError::Fs(FileSystemError::InvalidArgument(_)) => Code::InvalidArgument,
-            EtcdError::Fs(_) => Code::Unavailable,
+            EtcdError::Fs(e) => {
+                use crate::types::ErrorKind as K;
+                match e.kind() {
+                    K::Invalid | K::NotDir | K::NotFile => Code::InvalidArgument,
+                    K::NotFound => Code::NotFound,
+                    K::Exists => Code::AlreadyExists,
+                    K::NotEmpty => Code::FailedPrecondition,
+                    K::NoSpace => Code::ResourceExhausted,
+                    K::Forbidden => Code::PermissionDenied,
+                    K::Internal => Code::Internal,
+                    // Its lease is someone else's, or no committer: retry.
+                    K::Conflict | K::Unavailable => Code::Unavailable,
+                }
+            }
         };
         tonic::Status::new(code, self.to_string())
     }
@@ -181,17 +191,10 @@ struct LeaseRec {
     ttl: i64,
 }
 
-fn enc<T: Serialize>(v: &T) -> Vec<u8> {
-    bincode::serialize(v).expect("encoding")
-}
+use crate::service_tree::enc_bin as enc;
 
 fn dec<T: for<'a> Deserialize<'a>>(b: &[u8], what: &str) -> Result<T> {
-    bincode::deserialize(b).map_err(|e| {
-        EtcdError::Fs(FileSystemError::InvalidArgument(format!(
-            "corrupt etcd {}: {}",
-            what, e
-        )))
-    })
+    Ok(crate::service_tree::dec_bin(b, &format!("etcd {}", what))?)
 }
 
 fn be(v: i64) -> [u8; 8] {
@@ -374,6 +377,12 @@ pub struct EtcdStore<D: BlockDevice> {
     stopped: watch::Sender<bool>,
 }
 
+impl<D: BlockDevice + 'static> crate::service_tree::Served for EtcdStore<D> {
+    fn is_stopped(&self) -> bool {
+        *self.stopped.borrow()
+    }
+}
+
 /// A request's view of the header fields.
 fn header_of<D: BlockDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseHeader> {
     Some(pb::ResponseHeader {
@@ -437,32 +446,15 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
             stopped: watch::Sender::new(false),
         });
         // Background work, for as long as the store is served.
-        let weak = Arc::downgrade(&s);
-        tokio::spawn(async move {
-            loop {
-                let Some(s) = weak.upgrade() else { return };
-                if *s.stopped.borrow() {
-                    return;
-                }
-                if let Err(e) = s.compact_some().await {
-                    eprintln!("etcd '{}': compacting: {}", s.name, e);
-                }
-                let notify = s.compactor.clone();
-                drop(s);
-                let _ = tokio::time::timeout(Duration::from_secs(5), notify.notified()).await;
+        let wake = Some(s.compactor.clone());
+        spawn_while_alive(&s, Duration::from_secs(5), wake, |s| async move {
+            if let Err(e) = s.compact_some().await {
+                eprintln!("etcd '{}': compacting: {}", s.name, e);
             }
         });
-        let weak = Arc::downgrade(&s);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let Some(s) = weak.upgrade() else { return };
-                if *s.stopped.borrow() {
-                    return;
-                }
-                if let Err(e) = s.expire_leases().await {
-                    eprintln!("etcd '{}': expiring leases: {}", s.name, e);
-                }
+        spawn_while_alive(&s, Duration::from_millis(500), None, |s| async move {
+            if let Err(e) = s.expire_leases().await {
+                eprintln!("etcd '{}': expiring leases: {}", s.name, e);
             }
         });
         Ok(s)
@@ -472,7 +464,8 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
     pub fn stop(&self) {
         self.stopped.send_replace(true);
         self.durable.send_modify(|_| {});
-        self.compactor.notify_waiters();
+        // A permit, not a wake-up: its loop may be mid-pass, not waiting.
+        self.compactor.notify_one();
     }
 
     pub fn is_stopped(&self) -> bool {

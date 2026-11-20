@@ -1,4 +1,4 @@
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
@@ -22,14 +22,29 @@ pub const MAX_DISKS: usize = 64;
 /// per disk, so the pool knows which disks missed data.
 #[derive(Debug)]
 pub struct DiskSet {
-    pub disks: Arc<Vec<Caddy>>,
+    disks: Arc<Vec<Caddy>>,
     fenced: AtomicU64,
     misses: Vec<AtomicU64>,
     /// The epochs this pool client's remote requests carry (see `crate::fence`).
-    pub fence: Arc<crate::fence::ClientFence>,
+    fence: Arc<crate::fence::ClientFence>,
 }
 
 impl DiskSet {
+    /// Disk `index`.
+    pub fn disk(&self, index: usize) -> &Caddy {
+        &self.disks[index]
+    }
+
+    /// Every disk, in pool order (shared with the disk server).
+    pub fn caddies(&self) -> &Arc<Vec<Caddy>> {
+        &self.disks
+    }
+
+    /// The epochs this pool client's remote requests carry.
+    pub fn fence(&self) -> &crate::fence::ClientFence {
+        &self.fence
+    }
+
     pub fn len(&self) -> usize {
         self.disks.len()
     }
@@ -42,15 +57,22 @@ impl DiskSet {
         self.disks[index].is_local()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn new(paths: &[&str]) -> Self {
         Self::new_with(paths, DiskOptions::default()).await
     }
 
     pub async fn new_with(paths: &[&str], opts: DiskOptions) -> Self {
+        Self::new_fenced(paths, opts, Default::default()).await
+    }
+
+    /// Open `paths`, their requests carrying `fence`'s epochs.
+    pub async fn new_fenced(
+        paths: &[&str],
+        opts: DiskOptions,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Self {
         assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
         let results = join_all(paths.iter().map(|path| Disk::open_with(path, opts))).await;
-        let fence = Arc::new(crate::fence::ClientFence::default());
 
         let disks: Vec<Caddy> = results
             .into_iter()
@@ -126,12 +148,12 @@ impl DiskSet {
         Ok(min.saturating_sub(DISK_LABEL_BLOCKS))
     }
 
-    /// Read `buf.len() / BLOCK_SIZE` consecutive shards of `disk` starting at `shard`.
+    /// Read `buf.len()` consecutive shards of `disk` starting at `shard`.
     pub async fn read_shards(
         &self,
         disk: usize,
         shard: u64,
-        buf: &mut [u8],
+        buf: &mut [Block],
     ) -> Result<(), DiskError> {
         if self.is_fenced(disk) {
             return Err(DiskError::UnhealthyDisk);
@@ -144,14 +166,19 @@ impl DiskSet {
         &self,
         disk: usize,
         shard: u64,
-        buf: &mut [u8],
+        buf: &mut [Block],
     ) -> Result<(), DiskError> {
         self.disks[disk]
             .read_blocks(shard + DISK_LABEL_BLOCKS, buf)
             .await
     }
 
-    pub async fn write_shards(&self, disk: usize, shard: u64, buf: &[u8]) -> Result<(), DiskError> {
+    pub async fn write_shards(
+        &self,
+        disk: usize,
+        shard: u64,
+        buf: &[Block],
+    ) -> Result<(), DiskError> {
         let r = self.disks[disk]
             .write_blocks(shard + DISK_LABEL_BLOCKS, buf)
             .await;
@@ -168,7 +195,7 @@ impl DiskSet {
         &self,
         disk: usize,
         copy: u64,
-        buf: &mut [u8],
+        buf: &mut Block,
     ) -> Result<(), DiskError> {
         assert!(copy < DISK_LABEL_BLOCKS);
         self.disks[disk].read_block(copy, buf).await
@@ -193,7 +220,7 @@ pub enum Caddy {
 
 #[async_trait]
 impl BlockDevice for Caddy {
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.map_err(|e| {
@@ -220,7 +247,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.map_err(|e| {
@@ -230,7 +257,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.map_err(|e| {

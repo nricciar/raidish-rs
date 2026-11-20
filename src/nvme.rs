@@ -18,10 +18,14 @@
 //! Set `RAIDISH_NVME_TRACE=1` to log every command.
 
 use crate::disk::BlockDevice;
+use crate::export::{
+    BlockExporter, ExportLife, ExportSession, ExportTable, Exported, export_closed,
+};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::nbd::{DEFAULT_BIND, ExportLife, ExportSession, ensure_sync_loop, export_closed};
+use crate::nbd::DEFAULT_BIND;
+use crate::volume_io::ensure_sync_loop;
 use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -241,6 +245,21 @@ struct Export {
     io: Arc<SwitchableIo>,
 }
 
+impl Exported for Export {
+    fn volume(&self) -> &str {
+        &self.volume
+    }
+    fn size(&self) -> u64 {
+        self.nsze * LBA_SIZE
+    }
+    fn life(&self) -> &ExportLife {
+        &self.life
+    }
+    fn io(&self) -> &Arc<SwitchableIo> {
+        &self.io
+    }
+}
+
 impl Export {
     fn new(volume: &str, size: u64, io: Arc<dyn VolumeIo>) -> Self {
         let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
@@ -278,7 +297,7 @@ struct QueueInfo {
 struct Target<D: BlockDevice> {
     fs: Arc<FileSystem<D>>,
     /// By subsystem NQN.
-    exports: Mutex<BTreeMap<String, Arc<Export>>>,
+    exports: ExportTable<Export>,
     ctrls: Mutex<HashMap<u16, Arc<Controller>>>,
     next_cntlid: AtomicU16,
 }
@@ -305,12 +324,10 @@ pub struct NvmeTcpServer<D: BlockDevice> {
 }
 
 /// The NVMe/TCP port.
-#[allow(dead_code)]
 pub const NVME_PORT: u16 = 4420;
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-#[allow(dead_code)]
 impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
@@ -328,22 +345,13 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         NvmeTcpServer {
             target: Arc::new(Target {
                 fs,
-                exports: Mutex::new(BTreeMap::new()),
+                exports: ExportTable::new("nvme", subsystem_nqn),
                 ctrls: Mutex::new(HashMap::new()),
                 next_cntlid: AtomicU16::new(1),
             }),
             bind: bind.into(),
             port,
         }
-    }
-
-    /// Export volume `volume` as subsystem `subsystem_nqn(volume)`,
-    /// written by this node.
-    pub async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
-        Self::check_name(volume)?;
-        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
-        let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
-        self.add_export_io(volume, size, io)
     }
 
     fn check_name(volume: &str) -> Result<(), FileSystemError> {
@@ -356,65 +364,6 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         Ok(())
     }
 
-    /// Export `volume`, `size` bytes, with its I/O going to `io`.
-    pub fn add_export_io(
-        &self,
-        volume: &str,
-        size: u64,
-        io: Arc<dyn VolumeIo>,
-    ) -> Result<(), FileSystemError> {
-        Self::check_name(volume)?;
-        let nqn = subsystem_nqn(volume);
-        let mut exports = self.target.exports.lock().unwrap();
-        if exports.contains_key(&nqn) {
-            return Err(FileSystemError::AlreadyExists);
-        }
-        exports.insert(nqn, Arc::new(Export::new(volume, size, io)));
-        Ok(())
-    }
-
-    /// The backend of `volume`'s export, to pause or switch it.
-    pub fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
-        let exports = self.target.exports.lock().unwrap();
-        Some(exports.get(&subsystem_nqn(volume))?.io.clone())
-    }
-
-    /// `volume`'s export for another node's proxy (see `crate::peer_io`):
-    /// its connections count as the export's, so removing it drains them.
-    pub fn peer_export(&self, volume: &str) -> Option<crate::peer_io::PeerExport> {
-        let export = self
-            .target
-            .exports
-            .lock()
-            .unwrap()
-            .get(&subsystem_nqn(volume))?
-            .clone();
-        Some(crate::peer_io::PeerExport {
-            size: export.nsze * LBA_SIZE,
-            io: export.io.clone(),
-            session: export.life.join()?,
-        })
-    }
-
-    /// Stop exporting `volume`: new connects are refused, its queues are
-    /// closed once their in-flight commands finish, then everything is
-    /// committed. Returns false if it wasn't exported.
-    pub async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
-        let nqn = subsystem_nqn(volume);
-        let Some(export) = self.target.exports.lock().unwrap().remove(&nqn) else {
-            return Ok(false);
-        };
-        export.life.close(&format!("nvme: {}", nqn)).await;
-        export.io.sync().await?;
-        Ok(true)
-    }
-
-    /// Names of the exported volumes, sorted by NQN.
-    pub fn exports(&self) -> Vec<String> {
-        let exports = self.target.exports.lock().unwrap();
-        exports.values().map(|e| e.volume.clone()).collect()
-    }
-
     /// Bind `bind:port` and serve until the listener fails.
     pub async fn run(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
@@ -424,7 +373,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Serve connections from an already-bound listener.
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         ensure_sync_loop(&self.target.fs, "nvme");
-        for e in self.target.exports.lock().unwrap().values() {
+        for e in self.target.exports.all() {
             println!(
                 "NVMe/TCP target {} (volume '{}', {} x {} byte LBAs)",
                 e.nqn, e.volume, e.nsze, LBA_SIZE
@@ -432,15 +381,56 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         }
         println!("NVMe/TCP listening on {}", listener.local_addr()?);
 
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            let target = self.target.clone();
-            tokio::spawn(async move {
+        let target = self.target.clone();
+        crate::net::accept_loop(listener, "nvme", move |stream, addr| {
+            let target = target.clone();
+            async move {
                 if let Err(e) = handle_connection(target, stream, addr.to_string()).await {
                     eprintln!("nvme: {}: {}", addr, e);
                 }
-            });
-        }
+            }
+        })
+        .await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
+    /// Exported as subsystem `subsystem_nqn(volume)`.
+    async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
+        Self::check_name(volume)?;
+        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
+        let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
+        self.add_export_io(volume, size, io)
+    }
+
+    fn add_export_io(
+        &self,
+        volume: &str,
+        size: u64,
+        io: Arc<dyn VolumeIo>,
+    ) -> Result<(), FileSystemError> {
+        Self::check_name(volume)?;
+        self.target.exports.insert(Export::new(volume, size, io))
+    }
+
+    fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
+        self.target.exports.export_io(volume)
+    }
+
+    fn peer_export(&self, volume: &str) -> Option<crate::peer_io::PeerExport> {
+        self.target.exports.peer_export(volume)
+    }
+
+    async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
+        self.target.exports.remove(volume).await
+    }
+
+    /// Sorted by NQN.
+    #[cfg(test)]
+    fn exports(&self) -> Vec<String> {
+        self.target.exports.volumes()
     }
 }
 
@@ -794,7 +784,7 @@ fn fabrics<D: BlockDevice>(
                 dw0: ((in_data as u32) << 16) | offset,
                 ..Completion::err(SCT_FABRICS, SC_CONNECT_INVALID_PARAM)
             };
-            let Some(export) = target.exports.lock().unwrap().get(&subnqn).cloned() else {
+            let Some(export) = target.exports.by_key(&subnqn) else {
                 return Some(bad(true, 256));
             };
             if sqsize == 0 || sqsize >= QUEUE_ENTRIES {
@@ -988,10 +978,8 @@ async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
     };
     let fail = |what: &str, e: crate::fs::FileSystemError| {
         eprintln!("nvme: {} {} failed: {}", what, sqe.cid(), e);
-        match e {
-            crate::fs::FileSystemError::UnableToAllocateBlocks(_) => {
-                Completion::generic(SC_CAPACITY_EXCEEDED)
-            }
+        match e.kind() {
+            crate::types::ErrorKind::NoSpace => Completion::generic(SC_CAPACITY_EXCEEDED),
             _ => Completion::generic(SC_INTERNAL),
         }
     };

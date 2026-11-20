@@ -19,6 +19,8 @@ use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Dnode, Lookup};
 use crate::object::TreeRoot;
+use crate::types::MetaslabIdx;
+use crate::types::Txg;
 use crate::writer::{CommitError, FsOp, ObjLease, path_string};
 use std::path::{Path, PathBuf};
 
@@ -39,7 +41,7 @@ pub struct FileWriter<'a, D: BlockDevice> {
     pending: Vec<u8>,
     size: u64,
     /// Lent metaslabs pinned by what's written (a writer only), one per record.
-    pinned: Vec<u32>,
+    pinned: Vec<MetaslabIdx>,
 }
 
 /// How many times a record write borrows more space before giving up
@@ -204,8 +206,8 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         if let Some(w) = &self.fs.writer {
             for p in ptrs {
                 if let Some(idx) = self.fs.layout.metaslab_for_block(p.lba) {
-                    w.pin(idx as u32);
-                    self.pinned.push(idx as u32);
+                    w.pin(idx);
+                    self.pinned.push(idx);
                 }
             }
         }
@@ -218,7 +220,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         let ptr = loop {
             self.reserve(blocks).await?;
             match fs.write_record(chunk).await {
-                Err(FileSystemError::UnableToAllocateBlocks(_))
+                Err(FileSystemError::NoSpace(_))
                     if fs.writer.is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
                 {
                     attempt += 1;
@@ -246,7 +248,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
                     self.indirects = indirects;
                     return Ok(tree);
                 }
-                Err(FileSystemError::UnableToAllocateBlocks(_))
+                Err(FileSystemError::NoSpace(_))
                     if fs.writer.is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
                 {
                     fs.release_ptrs(&indirects).await;
@@ -324,7 +326,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
     }
 
     /// The lowest TXG the records and indirects are stamped with.
-    fn min_birth(&self) -> Option<u64> {
+    fn min_birth(&self) -> Option<Txg> {
         self.leaves
             .iter()
             .chain(&self.indirects)
@@ -335,7 +337,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
     /// Stamp the records with `txg` and rebuild the indirect blocks over
     /// them. A record's birth is in the pointer to it, not in the record:
     /// the data stays where it is.
-    async fn restamp(&mut self, txg: u64) -> Result<TreeRoot, FileSystemError> {
+    async fn restamp(&mut self, txg: Txg) -> Result<TreeRoot, FileSystemError> {
         for p in &mut self.leaves {
             p.birth_txg = txg;
         }
@@ -363,17 +365,17 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
                     .leaves
                     .iter()
                     .chain(&self.indirects)
-                    .map(|p| (p.lba, p.asize as u64))
+                    .map(|p| p.extent())
                     .collect(),
                 base: self.base.clone(),
                 min_birth: self.min_birth(),
             };
             match self.fs.writer_commit_fs(w, op, self.lease.clone()).await {
                 Ok(c) => return Ok(c.file_id),
-                Err(CommitError::Refused(m)) => {
+                Err(e @ CommitError::Refused { .. }) => {
                     // Definitely not applied: the space is ours to reuse.
                     self.release().await;
-                    return Err(FileSystemError::Conflict(m));
+                    return Err(e.into());
                 }
                 Err(CommitError::Restamp(open)) if attempts < 3 => {
                     // Stamped below the birth floor (a snapshot was taken
