@@ -600,6 +600,11 @@ fn interval_helpers() {
     assert_eq!(m, BTreeMap::from([(10, 10)]));
     assert_eq!(insert_range(&mut m, 18, 4), vec![Extent::new(18, 2)]);
     assert_eq!(m, BTreeMap::from([(10, 12)]));
+    // Empty ranges change nothing, even touching an extent's ends.
+    for at in [10, 15, 22] {
+        assert!(insert_range(&mut m, at, 0).is_empty());
+        assert_eq!(m, BTreeMap::from([(10, 12)]));
+    }
     assert_eq!(clip(&m, 12, 15), BTreeMap::from([(12, 3)]));
     assert_eq!(complement(&m, 0, 30), BTreeMap::from([(0, 10), (22, 8)]));
     let other = BTreeMap::from([(5, 7), (20, 5)]);

@@ -25,6 +25,98 @@ pub const UBERBLOCK_VERSION: u32 = 2;
 pub const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 pub const BLOCK_PAYLOAD_SIZE: usize = BLOCK_SIZE - BLOCK_HEADER_SIZE;
 pub const SUPERBLOCK_LBA: u64 = 0;
+
+/// Holds back the release of deferred frees (see `scan_hold`) while it
+/// lives. Frees deferred meanwhile go at the first commit after it drops.
+pub(crate) struct FreeHold(Arc<AtomicUsize>);
+
+impl FreeHold {
+    pub(crate) fn new(hold: &Arc<AtomicUsize>) -> Self {
+        hold.fetch_add(1, Ordering::SeqCst);
+        FreeHold(hold.clone())
+    }
+}
+
+impl Drop for FreeHold {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Keeps the space under a repair from being freed and reused while the
+/// repair is in flight (audit D5a): on a committer, its deferred frees
+/// (`FreeHold`); on a writer, a pin on the lent metaslabs, so they aren't
+/// given back meanwhile (only the committer frees and reuses space, and it
+/// can't touch lent space; if it reclaims it anyway, the writer lost its
+/// lease, and the disk servers fence its writes out).
+pub(crate) enum RepairHold {
+    /// Held for its drop.
+    Frees(#[allow(dead_code)] FreeHold),
+    Pinned(
+        Arc<crate::writer::WriterState>,
+        Vec<crate::types::MetaslabIdx>,
+    ),
+}
+
+impl Drop for RepairHold {
+    fn drop(&mut self) {
+        if let RepairHold::Pinned(w, pins) = self {
+            for &idx in pins.iter() {
+                w.unpin(idx);
+            }
+        }
+    }
+}
+
+impl RepairHold {
+    /// The metaslabs pinned (none for a committer's hold).
+    pub(crate) fn pinned(&self) -> &[crate::types::MetaslabIdx] {
+        match self {
+            RepairHold::Frees(_) => &[],
+            RepairHold::Pinned(_, pins) => pins,
+        }
+    }
+
+    /// Pin those of `want` still lent to writer `w`; with `all`, None
+    /// unless every one of them is.
+    pub(crate) fn pin_lent(
+        w: &Arc<crate::writer::WriterState>,
+        want: impl IntoIterator<Item = crate::types::MetaslabIdx>,
+        all: bool,
+    ) -> Option<RepairHold> {
+        // Under the lent list's lock: giving a metaslab back checks the
+        // pins and takes it off the list under that lock too.
+        let lent = w.lent.lock().unwrap();
+        let want: Vec<_> = want.into_iter().collect();
+        let pins: Vec<_> = want.iter().copied().filter(|i| lent.contains(i)).collect();
+        if all && pins.len() != want.len() {
+            return None;
+        }
+        for &idx in &pins {
+            w.pin(idx);
+        }
+        Some(RepairHold::Pinned(w.clone(), pins))
+    }
+}
+
+impl<D: BlockDevice> FileSystem<D> {
+    /// A hold for repairing pool blocks `lba..lba + n`, or None if this
+    /// process mustn't repair them: a writer repairs only in space lent to
+    /// it. The committer can't see a writer's hold, and the writer's writes
+    /// anywhere else are fenced out.
+    pub(crate) fn repair_hold(&self, lba: u64, n: u64) -> Option<RepairHold> {
+        let Some(w) = &self.writer else {
+            return Some(RepairHold::Frees(FreeHold::new(&self.scan_hold)));
+        };
+        let first = self.layout.metaslab_for_block(lba)?;
+        let last = self
+            .layout
+            .metaslab_for_block(lba.checked_add(n.max(1) - 1)?)?;
+        let span =
+            (first.index()..=last.index()).map(|i| crate::types::MetaslabIdx::from_raw(i as u32));
+        RepairHold::pin_lent(w, span, true)
+    }
+}
 pub const UBERBLOCK_MAGIC: u64 = 0x5241494449534855; // "RAIDISHU"
 /// Fewest copies kept of the superblock and of each uberblock.
 pub const LABEL_COPIES: u64 = 3;
@@ -364,6 +456,17 @@ pub struct BlockHeader {
     pub payload_len: u32,
 }
 
+/// A label's checksum: over the header fields as well as the payload, so a
+/// flipped bit in the TXG (which decides which copy is newest) is caught.
+fn label_checksum(txg: Txg, payload: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&LABEL_MAGIC.to_le_bytes());
+    h.update(&txg.get().to_le_bytes());
+    h.update(&(payload.len() as u32).to_le_bytes());
+    h.update(payload);
+    *h.finalize().as_bytes()
+}
+
 /// Validate a self-describing label block in place; returns (txg, payload length).
 pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
     let header: BlockHeader = bincode::deserialize(&buf[..BLOCK_HEADER_SIZE])?;
@@ -375,7 +478,7 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
         return Err(FileSystemError::ChecksumMismatch);
     }
     let payload = &buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload_len];
-    if *blake3::hash(payload).as_bytes() != header.checksum {
+    if label_checksum(header.txg, payload) != header.checksum {
         return Err(FileSystemError::ChecksumMismatch);
     }
     Ok((header.txg, payload_len))
@@ -384,7 +487,21 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
 /// Read a pool device's superblock without loading the pool (None: not
 /// formatted, or unreadable).
 pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
+    probe_superblock_of(dev).await.ok().flatten()
+}
+
+/// No copy of the superblock could be read.
+#[derive(Debug)]
+pub struct Unreadable;
+
+/// `read_superblock_of`, telling the two Nones apart: `Ok(None)` if a copy
+/// was read and none is a superblock (not formatted), `Err` if no copy
+/// could be read at all.
+pub async fn probe_superblock_of<D: BlockDevice>(
+    dev: &D,
+) -> Result<Option<Superblock>, Unreadable> {
     let header = HeaderLayout::new(dev.pool().map_or(1, |p| p.align()));
+    let mut read_any = false;
     for mirror in 0..header.superblock_blocks {
         let mut buf = [0u8; BLOCK_SIZE];
         if dev
@@ -394,6 +511,7 @@ pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
         {
             continue;
         }
+        read_any = true;
         let Ok((_, len)) = parse_label(&buf) else {
             continue;
         };
@@ -401,10 +519,10 @@ pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
             bincode::deserialize::<Superblock>(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len])
             && sb.magic == FS_ID
         {
-            return Some(sb);
+            return Ok(Some(sb));
         }
     }
-    None
+    if read_any { Ok(None) } else { Err(Unreadable) }
 }
 
 /// An early-fold request: raised by a flush, taken by the sync loop.
@@ -470,6 +588,10 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) read_only: bool,
     /// See `Uberblock::degraded`; persisted with every commit.
     pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<Txg>>>>,
+    /// Per disk: how many times it has been marked degraded (this process).
+    /// A resilver clears a disk only if no mark came while it scanned: one
+    /// that did is a write the scan's snapshot doesn't have (audit D4).
+    degraded_marks: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Per-disk missed-write counts already folded into `degraded`.
     pub(crate) miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Record alignment in blocks (the pool's, or 1 for a plain device).
@@ -485,6 +607,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// Next pool-wide object number (persisted in every uberblock).
     pub(crate) next_object: Arc<AtomicU64>,
     /// Serializes a writer's intent log appends (see `crate::zil`).
+    /// Taken through `lock_log_io`, whose guard proves it held.
     pub(crate) log_io: Arc<Mutex<()>>,
     /// A volume's intent log is filling up: the background sync loop (see
     /// `crate::nbd::ensure_sync_loop`) folds early, so the next region is
@@ -526,6 +649,7 @@ impl<D: BlockDevice> FileSystem<D> {
             clean_at: Default::default(),
             read_only: false,
             degraded: Arc::new(std::sync::Mutex::new(vec![None; disks])),
+            degraded_marks: Arc::new(std::sync::Mutex::new(vec![0; disks])),
             miss_seen: Arc::new(std::sync::Mutex::new(vec![0; disks])),
             align,
             header: HeaderLayout::new(align),
@@ -678,15 +802,19 @@ impl<D: BlockDevice> FileSystem<D> {
             ptr: None,
             levels: 0,
         }));
+        // (After the table and metaslabs are in place: a tx journals into
+        // the ones it began with.)
+        let mut tx = fs.begin_tx().await;
+        let tx = &mut tx;
         // The dataset directory, and the default posix dataset's root.
         let datasets = fs.alloc_object();
         fs.datasets_obj.store(datasets.get(), Ordering::SeqCst);
-        fs.write_dnode(datasets, Some(Dnode::datasets(fs.file_blksz())))
+        fs.write_dnode(tx, datasets, Some(Dnode::datasets(fs.file_blksz())))
             .await?;
         let root = fs.alloc_object();
         let mut dir = Dnode::directory(fs.file_blksz());
         dir.parent = Some(root);
-        fs.write_dnode(root, Some(dir)).await?;
+        fs.write_dnode(tx, root, Some(dir)).await?;
         let mut index = DatasetIndex::default();
         index.datasets.insert(
             DEFAULT_FS.to_string(),
@@ -698,9 +826,10 @@ impl<D: BlockDevice> FileSystem<D> {
                 created_ms: now_ms(),
             },
         );
-        fs.write_datasets(&index).await?;
+        fs.write_datasets(tx, &index).await?;
         fs.root_dir.store(root.get(), Ordering::SeqCst);
-        fs.commit_txg().await?;
+        fs.commit_locked(tx).await?;
+        tx.applied();
 
         Ok(fs)
     }
@@ -909,7 +1038,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 .filter(|u| u.txg < uber.txg)
                 .map(|u| u.objects.clone())
                 .collect();
-            let _tx = fs.begin_tx().await;
+            let mut tx = fs.begin_tx().await;
+            let tx = &mut tx;
             // Never forced: freeing what an unreadable part of the chosen
             // tree references would destroy data salvage could still get.
             let report = fs
@@ -922,14 +1052,23 @@ impl<D: BlockDevice> FileSystem<D> {
                     ))
                 })?;
             eprintln!("rewind: {}", report);
-            let txg = fs.commit_locked().await?;
+            // Committed above every discarded TXG (audit D3): a disk that
+            // missed the rewind (degraded, offline) still has their
+            // uberblocks, and newest-wins must never pick one again; nor
+            // may a copy of one outrank the tombstones below in a repair.
+            if let Some(newest) = ring.iter().map(|u| u.txg).max()
+                && let Some(u) = fs.uberblock.lock().await.as_mut()
+            {
+                u.txg = u.txg.max(newest);
+            }
+            let txg = fs.commit_locked(tx).await?;
             eprintln!("rewind: committed as TXG {}", txg);
             // The discarded TXGs must never be imported again: their space
             // is free now and about to be reused.
             for u in ring.iter().filter(|u| {
                 u.txg > uber.txg && u.txg.slot(UBERBLOCK_SLOTS) != txg.slot(UBERBLOCK_SLOTS)
             }) {
-                if let Err(e) = fs.invalidate_uberblock_slot(u.txg).await {
+                if let Err(e) = fs.invalidate_uberblock_slot(u.txg, txg).await {
                     eprintln!(
                         "WARNING: rewind: could not erase discarded TXG {}: {}",
                         u.txg, e
@@ -989,15 +1128,21 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(w) = self.writer.clone() {
             return self.writer_mkdir(&w, path).await;
         }
-        let _tx = self.begin_tx().await;
-        let id = self.mkdir_locked(path).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.mkdir_locked(tx, path).await;
+        let id = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
     /// `mkdir` under `begin_tx`, without committing (the committer applies
     /// writers' mkdirs this way). An existing directory is fine.
-    pub(crate) async fn mkdir_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
+    pub(crate) async fn mkdir_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+        path: &Path,
+    ) -> Result<FileId, FileSystemError> {
         let l = self.lookup(path).await?;
         if let Some(e) = l.entry {
             if e.kind != crate::inode::ObjType::Directory {
@@ -1005,7 +1150,8 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             return Ok(e.id);
         }
-        self.link_new(l, Dnode::directory(self.file_blksz())).await
+        self.link_new(tx, l, Dnode::directory(self.file_blksz()))
+            .await
     }
 
     /// Create or replace a file with `data`. On a pool this process
@@ -1016,26 +1162,26 @@ impl<D: BlockDevice> FileSystem<D> {
             f.write(data).await?;
             return f.finish().await;
         }
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         let l = self.lookup(path).await?;
         let current = self.current_file(&l).await?;
         let blksz = self.file_blksz();
-        let mut allocated = Vec::new();
-        let written = match self.write_tree(blksz as usize, data, &mut allocated).await {
+        // The tx gives them back if the op fails or is dropped.
+        let tree = {
+            let mut allocs = tx.allocs();
+            self.write_tree(blksz as usize, data, &mut allocs.ptrs)
+                .await
+        };
+        let r = match tree {
             Ok(tree) => {
-                self.set_file_contents(l, current, blksz, data.len() as u64, tree)
+                self.set_file_contents(tx, l, current, blksz, data.len() as u64, tree)
                     .await
             }
             Err(e) => Err(e),
         };
-        let id = match written {
-            Ok(id) => id,
-            Err(e) => {
-                self.release_ptrs(&allocated).await;
-                return Err(e);
-            }
-        };
-        self.commit_locked().await?;
+        let id = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
@@ -1044,9 +1190,11 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(w) = self.writer.clone() {
             return self.writer_delete(&w, path, None).await;
         }
-        let _tx = self.begin_tx().await;
-        let id = self.delete_locked(path).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.delete_locked(tx, path).await;
+        let id = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
@@ -1055,9 +1203,11 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(w) = self.writer.clone() {
             return self.writer_rename(&w, from, to).await;
         }
-        let _tx = self.begin_tx().await;
-        let (id, _) = self.rename_locked(from, to).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.rename_locked(tx, from, to).await;
+        let (id, _) = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
@@ -1070,9 +1220,11 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(w) = self.writer.clone() {
             return self.writer_set_attrs(&w, path, set).await;
         }
-        let _tx = self.begin_tx().await;
-        let id = self.set_attrs_locked(path, set).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.set_attrs_locked(tx, path, set).await;
+        let id = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
@@ -1110,12 +1262,14 @@ impl<D: BlockDevice> FileSystem<D> {
             };
             return Ok(self.writer_commit_fs(&w, op, None).await?.file_id);
         }
-        let _tx = self.begin_tx().await;
-        let (id, created) = self
-            .create_at_locked(dir, name, kind, attrs, exclusive)
-            .await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self
+            .create_at_locked(tx, dir, name, kind, attrs, exclusive)
+            .await;
+        let (id, created) = tx.check(r).await?;
         if created {
-            self.commit_locked().await?;
+            self.commit_locked(tx).await?;
         }
         Ok(id)
     }
@@ -1139,22 +1293,28 @@ impl<D: BlockDevice> FileSystem<D> {
             self.writer_commit_fs(&w, op, None).await?;
             return Ok(id);
         }
-        let _tx = self.begin_tx().await;
-        let id = self.remove_at_locked(dir, name).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.remove_at_locked(tx, dir, name).await;
+        let id = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
     /// `remove_at` under `begin_tx`, without committing.
     pub(crate) async fn remove_at_locked(
         &self,
+        tx: &mut crate::tx::Tx,
         dir: FileId,
         name: &str,
     ) -> Result<FileId, FileSystemError> {
         let l = self.lookup_at(dir, name).await?;
         let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        let id = self.unlink(tx, l).await?;
+        // Only once it's gone (this can't be undone); no sync can run
+        // before this, under the tx.
         self.discard_file(entry.id);
-        self.unlink(l).await
+        Ok(id)
     }
 
     /// Move entry `from_name` of `from_dir` to `to_name` in `to_dir` (see
@@ -1185,11 +1345,13 @@ impl<D: BlockDevice> FileSystem<D> {
             self.writer_commit_fs(&w, op, None).await?;
             return Ok(id);
         }
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         let src = self.lookup_at(from_dir, from_name).await?;
         let dst = self.lookup_at(to_dir, to_name).await?;
-        let (id, _) = self.rename_at_locked(src, dst).await?;
-        self.commit_locked().await?;
+        let r = self.rename_at_locked(tx, src, dst).await;
+        let (id, _) = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 
@@ -1207,18 +1369,27 @@ impl<D: BlockDevice> FileSystem<D> {
             self.writer_commit_fs(&w, op, None).await?;
             return Ok(());
         }
-        let _tx = self.begin_tx().await;
-        self.set_attrs_id_locked(id, set).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.set_attrs_id_locked(tx, id, set).await;
+        tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(())
     }
 
     /// `delete` under `begin_tx`, without committing.
-    pub(crate) async fn delete_locked(&self, path: &Path) -> Result<FileId, FileSystemError> {
+    pub(crate) async fn delete_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+        path: &Path,
+    ) -> Result<FileId, FileSystemError> {
         let l = self.lookup(path).await?;
         let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        let id = self.unlink(tx, l).await?;
+        // Only once it's gone (this can't be undone); no sync can run
+        // before this, under the tx.
         self.discard_file(entry.id);
-        self.unlink(l).await
+        Ok(id)
     }
 
     /// Make every write completed before this call durable.
@@ -1245,11 +1416,11 @@ impl<D: BlockDevice> FileSystem<D> {
             self.commits_done.load(Ordering::SeqCst) >= need
                 || only.is_some_and(|n| self.clean_since(n, need))
         };
-        let _guard = self.commit_lock.lock().await;
+        let mut tx = self.begin_tx().await;
         if covered() {
             return Ok(());
         }
-        match self.commit_locked().await {
+        match self.commit_locked(&mut tx).await {
             Ok(_) => Ok(()),
             Err(_) if covered() => Ok(()),
             Err(e) => Err(e),
@@ -1283,8 +1454,8 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Only after step 4 does in-memory state advance (active slots, deferred
     /// frees). On failure, the TXG stays open and can be retried.
     pub(crate) async fn commit_txg(&self) -> Result<Txg, FileSystemError> {
-        let _guard = self.commit_lock.lock().await;
-        self.commit_locked().await
+        let mut tx = self.begin_tx().await;
+        self.commit_locked(&mut tx).await
     }
 
     /// Commit only if `still_needed()` holds once the commit lock is ours:
@@ -1294,25 +1465,55 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         still_needed: impl Fn() -> bool,
     ) -> Result<(), FileSystemError> {
-        let _guard = self.commit_lock.lock().await;
+        let mut tx = self.begin_tx().await;
         if still_needed() {
-            self.commit_locked().await?;
+            self.commit_locked(&mut tx).await?;
         }
         Ok(())
     }
 
-    /// Start a metadata transaction: excludes commits (and other metadata
-    /// operations) until dropped, so no commit can capture a half-done
-    /// operation. Finish with `commit_locked` while holding it.
-    pub(crate) async fn begin_tx(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.commit_lock.lock().await
+    /// Start a metadata transaction (see `crate::tx`): excludes commits
+    /// (and other metadata operations) until dropped, so no commit can
+    /// capture a half-done operation, and undoes one that fails. Finish
+    /// with `commit_locked`.
+    pub(crate) async fn begin_tx(&self) -> crate::tx::Tx {
+        crate::tx::Tx::begin(
+            &self.commit_lock,
+            self.objects.clone(),
+            self.metaslabs.clone(),
+            self.layout,
+        )
+        .await
     }
 
-    pub(crate) async fn commit_locked(&self) -> Result<Txg, FileSystemError> {
+    /// Commit the open TXG under `tx`. What it takes stands, whether it
+    /// succeeds or not (see `crate::tx`).
+    pub(crate) async fn commit_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+    ) -> Result<Txg, FileSystemError> {
+        debug_assert!(tx.is_of(&self.commit_lock), "another pool's tx");
+        tx.begin_commit();
+        let r = self.commit_in(tx).await;
+        tx.end_commit();
+        r
+    }
+
+    async fn commit_in(&self, tx: &mut crate::tx::Tx) -> Result<Txg, FileSystemError> {
+        // A disk server refused our pool epoch: someone else commits the
+        // pool now, and the vdev already failed whatever it refused. Write
+        // nothing more (audit R2a).
+        if let Some(pool) = self.dev.pool()
+            && pool.disks().fence().is_stale()
+        {
+            return Err(FileSystemError::DiskError(
+                crate::disk::DiskError::StaleEpoch,
+            ));
+        }
         if let Some(w) = self.writer.clone() {
             // A volume writer commits through the committer.
             let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
-            let (r, clean) = self.writer_commit(&w).await;
+            let (r, clean) = self.writer_commit(tx, &w).await;
             // Each dataset's commit is durable once the committer took it.
             self.note_clean(id, &clean);
             if r.is_ok() {
@@ -1331,12 +1532,12 @@ impl<D: BlockDevice> FileSystem<D> {
         let txg = self.open_txg().await?;
         // Volumes sync all-or-nothing each, so whatever did sync is safe to
         // commit; a failure is reported after the TXG is durable.
-        let (clean, volumes) = self.sync_datasets_noting().await;
-        let files = self.sync_files().await;
+        let (clean, volumes) = self.sync_datasets_noting(tx).await;
+        let files = self.sync_files(tx).await;
         let volumes = volumes.and(files);
         span.mark("objects");
         // Then the object table, which now points at every new tree.
-        self.sync_table().await?;
+        self.sync_table(tx).await?;
         span.mark("table");
         let root = self.objects.root();
 
@@ -1368,7 +1569,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write the object table's changed records into the open TXG. On
     /// failure they stay dirty and nothing visible changes.
-    async fn sync_table(&self) -> Result<(), FileSystemError> {
+    async fn sync_table(&self, tx: &mut crate::tx::Tx) -> Result<(), FileSystemError> {
         let Some(taken) = self.objects.begin_sync() else {
             return Ok(());
         };
@@ -1381,7 +1582,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 self.objects.set_root(root);
                 self.objects.end_sync(&taken, Some(&taken));
                 for p in &replaced {
-                    self.free(p.lba, p.asize as u64).await?;
+                    self.free(tx, p.lba, p.asize as u64).await?;
                 }
                 Ok(())
             }
@@ -1409,10 +1610,32 @@ impl<D: BlockDevice> FileSystem<D> {
                         eprintln!("disk {} missed writes; degraded since TXG {}", d, since);
                     }
                     degraded[d] = Some(degraded[d].map_or(since, |t| t.min(since)));
+                    self.degraded_marks.lock().unwrap()[d] += 1;
                 }
             }
         }
         degraded.clone()
+    }
+
+    /// `disk` has everything (a resilver found it so): persisted at the
+    /// next commit. Only under the tx, so no commit or label write can come
+    /// between the check that allowed it and the clear, and only if `disk`
+    /// hasn't been marked since `mark` (`degraded_mark`, taken when the scan
+    /// began): a mark since is a miss the scan didn't see, such as a
+    /// writer's (audit D4). Whether it was cleared.
+    pub(crate) fn clear_degraded(&self, _tx: &crate::tx::Tx, disk: usize, mark: u64) -> bool {
+        let mut degraded = self.degraded.lock().unwrap();
+        if self.degraded_marks.lock().unwrap()[disk] != mark {
+            return false;
+        }
+        degraded[disk] = None;
+        true
+    }
+
+    /// How many times `disk` has been marked (see `clear_degraded`).
+    pub(crate) fn degraded_mark(&self, disk: usize) -> u64 {
+        let _degraded = self.degraded.lock().unwrap();
+        self.degraded_marks.lock().unwrap()[disk]
     }
 
     /// Mark `disk` as needing everything from TXG `since` (persisted at the
@@ -1420,6 +1643,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) fn mark_degraded(&self, disk: usize, since: Txg) {
         let mut degraded = self.degraded.lock().unwrap();
         degraded[disk] = Some(degraded[disk].map_or(since, |t| t.min(since)));
+        self.degraded_marks.lock().unwrap()[disk] += 1;
     }
 
     /// Per disk: have writes failed since the last commit folded them into
@@ -1564,13 +1788,17 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Overwrite the ring slot holding TXG `txg` with an invalid (zero-magic)
-    /// uberblock, so it can't be imported any more.
-    async fn invalidate_uberblock_slot(&self, txg: Txg) -> Result<(), FileSystemError> {
+    /// uberblock, so it can't be imported any more. The tombstone is a
+    /// label of TXG `at` (the rewind's commit, above everything discarded):
+    /// a stale copy of the discarded uberblock on a disk that missed this
+    /// is older, so label repair rewrites it with the tombstone, never the
+    /// other way round (audit D3).
+    async fn invalidate_uberblock_slot(&self, txg: Txg, at: Txg) -> Result<(), FileSystemError> {
         let slot_blocks = self.header.uberblock_slot_blocks;
         let base_lba = self.header.uberblock_start + txg.slot(UBERBLOCK_SLOTS) * slot_blocks;
         let blank = Uberblock::blank();
         let mut buf = [0u8; BLOCK_SIZE];
-        self.prepare_block_buffer(Txg::ZERO, &bincode::serialize(&blank)?, &mut buf)?;
+        self.prepare_block_buffer(at, &bincode::serialize(&blank)?, &mut buf)?;
         for copy in 0..slot_blocks {
             self.dev.write_block(base_lba + copy, &buf).await?;
         }
@@ -1616,7 +1844,7 @@ impl<D: BlockDevice> FileSystem<D> {
         data: &[u8],
         buf: &mut [u8; BLOCK_SIZE],
     ) -> Result<(), FileSystemError> {
-        let checksum = *blake3::hash(data).as_bytes();
+        let checksum = label_checksum(txg, data);
         let header = BlockHeader {
             magic: LABEL_MAGIC,
             txg,

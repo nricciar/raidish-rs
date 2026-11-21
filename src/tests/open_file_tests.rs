@@ -256,3 +256,26 @@ async fn attributes_persist() {
     fs.close_file(&f).await.unwrap();
     assert!(fs.stat(Path::new("/f")).await.unwrap().1.attrs.mtime_ns > 42);
 }
+
+/// N1: a sync of an open file the pool no longer has open (forgotten
+/// meanwhile, its writes never committed) fails rather than succeeds: no
+/// commit syncs it any more.
+#[tokio::test]
+async fn syncing_a_file_closed_under_its_writes_fails() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.write_file(Path::new("/f"), b"0123456789").await.unwrap();
+    let f = fs.open_file(Path::new("/f"), None).await.unwrap();
+    fs.file_write(&f, 0, b"AB").await.unwrap();
+    fs.discard_file(f.id);
+    assert!(matches!(
+        fs.file_sync(&f).await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    assert_eq!(fs.read_file(Path::new("/f")).await.unwrap(), b"0123456789");
+    // Opened again: syncs as ever.
+    let g = fs.open_file(Path::new("/f"), None).await.unwrap();
+    fs.file_write(&g, 0, b"CD").await.unwrap();
+    fs.file_sync(&g).await.unwrap();
+    assert_eq!(fs.read_file(Path::new("/f")).await.unwrap(), b"CD23456789");
+}

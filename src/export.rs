@@ -121,6 +121,7 @@ impl<E: Exported> ExportTable<E> {
             size: e.size(),
             io: e.io().clone(),
             session: e.life().join()?,
+            from: crate::types::Epoch::NONE,
         })
     }
 

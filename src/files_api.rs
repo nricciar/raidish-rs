@@ -38,7 +38,6 @@ use rocket::data::{Data, Limits, ToByteUnit};
 use rocket::futures::stream::{BoxStream, StreamExt};
 use rocket::http::Status;
 use rocket::response::Responder;
-use rocket::response::stream::ByteStream;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
 use serde::{Deserialize, Serialize};
@@ -97,14 +96,15 @@ async fn file_dnode<D: BlockDevice>(
 }
 
 /// Records read this many at a time while streaming a file out.
-const STREAM_RECORDS: usize = 8;
+pub(crate) const STREAM_RECORDS: usize = 8;
 
-/// Bytes `range` of the file, read a few records at a time.
+/// Bytes `range` of the file, read a few records at a time. A piece that
+/// can't be read is an error, which ends the stream.
 fn record_stream<D: BlockDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     dnode: Dnode,
     range: std::ops::Range<u64>,
-) -> BoxStream<'static, Vec<u8>> {
+) -> BoxStream<'static, Result<Vec<u8>, FileSystemError>> {
     let chunk = dnode.blksz as u64 * STREAM_RECORDS as u64;
     let obj = Arc::new(ObjTree::new(
         dnode.blksz as usize,
@@ -128,17 +128,51 @@ fn record_stream<D: BlockDevice + 'static>(
                 fs.object_read(&obj, offset, &mut buf).await.map(|_| buf)
             }
         })
-        .scan((), |_, r| {
-            std::future::ready(match r {
-                Ok(bytes) => Some(bytes),
-                Err(e) => {
-                    // The status is already sent: end the body short.
-                    eprintln!("files: reading records: {}", e);
-                    None
-                }
-            })
+        .scan(false, |failed, r| {
+            std::future::ready((!*failed).then(|| {
+                *failed = r.is_err();
+                r
+            }))
         })
         .boxed()
+}
+
+/// A response body read from a stream of pieces. A piece that fails fails
+/// the read, which ends the body short of its declared `Content-Length`:
+/// the server then cuts the connection (or resets the stream) instead of
+/// ending it as if the file ended there.
+struct PieceReader {
+    pieces: BoxStream<'static, Result<Vec<u8>, FileSystemError>>,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl tokio::io::AsyncRead for PieceReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        loop {
+            let me = &mut *self;
+            if me.at < me.buf.len() {
+                let n = out.remaining().min(me.buf.len() - me.at);
+                out.put_slice(&me.buf[me.at..me.at + n]);
+                me.at += n;
+                return Poll::Ready(Ok(()));
+            }
+            match me.pieces.poll_next_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(b))) => (me.buf, me.at) = (b, 0),
+                Poll::Ready(Some(Err(e))) => {
+                    eprintln!("files: reading records: {}", e);
+                    return Poll::Ready(Err(std::io::Error::other(e.to_string())));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+    }
 }
 
 /// The request's `Range` header, if any.
@@ -160,13 +194,26 @@ pub(crate) use crate::frontend::http::{ByteRange, parse_range};
 
 /// A file's bytes: all of them (`200`) or a range (`206`).
 pub struct FileBody {
-    stream: BoxStream<'static, Vec<u8>>,
+    stream: BoxStream<'static, Result<Vec<u8>, FileSystemError>>,
+    /// Bytes the body holds.
+    len: u64,
     part: Option<(std::ops::Range<u64>, u64)>,
 }
 
 impl<'r> Responder<'r, 'r> for FileBody {
-    fn respond_to(self, req: &'r rocket::Request<'_>) -> rocket::response::Result<'r> {
-        let mut r = ByteStream(self.stream).respond_to(req)?;
+    fn respond_to(self, _req: &'r rocket::Request<'_>) -> rocket::response::Result<'r> {
+        let mut r = rocket::Response::build()
+            .streamed_body(PieceReader {
+                pieces: self.stream,
+                buf: Vec::new(),
+                at: 0,
+            })
+            .finalize();
+        // Declared, so a body that ends short is an error to the client:
+        // Rocket ends a streamed body that fails as if it were complete (it
+        // drops hyper's sender rather than aborting it), and hyper closes
+        // the connection when fewer bytes than declared were sent.
+        r.set_raw_header("Content-Length", self.len.to_string());
         r.set_raw_header("Accept-Ranges", "bytes");
         r.set_raw_header("Content-Type", "application/octet-stream");
         if let Some((range, size)) = self.part {
@@ -197,8 +244,18 @@ async fn file_body<D: BlockDevice + 'static>(
             ));
         }
     };
+    // The first piece is read before the status goes out, so a file that
+    // can't be read from the start fails with an error status. A later
+    // piece can only abort the body (see `PieceReader`).
+    let len = range.end - range.start;
+    let mut stream = record_stream(fs, dnode, range);
+    let first = match stream.next().await {
+        Some(Err(e)) => return Err(e.into()),
+        first => first,
+    };
     Ok(FileBody {
-        stream: record_stream(fs, dnode, range),
+        stream: rocket::futures::stream::iter(first).chain(stream).boxed(),
+        len,
         part,
     })
 }
@@ -351,6 +408,17 @@ async fn put_file(
     };
     // Make sure it exists, so there's an object to lease (like O_CREAT).
     let id = fs.create_file(&path).await?;
+    // The file as made: only that, untouched since, is this upload's to
+    // remove on failure. Another request may have made it first (and even
+    // written it) since we looked; one with content is theirs.
+    let made = if existed {
+        None
+    } else {
+        file_dnode(&fs, &path)
+            .await
+            .ok()
+            .filter(|d| d.size == 0 && d.tree.ptr.is_none())
+    };
     let guard = st
         .leases
         .take(
@@ -364,10 +432,18 @@ async fn put_file(
         .get("upload")
         .unwrap_or(DEFAULT_UPLOAD_LIMIT_GIB.gibibytes());
     let r = upload(&fs, &path, data, limit, guard.lease()).await;
-    if r.is_err() && !existed {
-        // Don't leave the empty file this upload made behind (still under
-        // the lease, so it's still ours).
-        if let Err(e) = fs.delete_leased(&path, Some(guard.lease())).await {
+    if r.is_err()
+        && let Some(made) = made
+    {
+        // Don't leave the empty file this upload made behind. Under the
+        // lease nobody else changes it now, but another upload of the same
+        // path may have (holding the lease first) since it was made: then
+        // it's theirs (audit N3).
+        let now = file_dnode(&fs, &path).await.ok();
+        if fs.file_id(&path).await.ok() == Some(id)
+            && now.as_ref() == Some(&made)
+            && let Err(e) = fs.delete_leased(&path, Some(guard.lease())).await
+        {
             eprintln!("files: removing {}: {}", path.display(), e);
         }
     }
@@ -448,10 +524,17 @@ async fn patch_file(
                 path.display()
             )));
         }
-        let written = patch_body(&fs, &f, data, limit, offset.unwrap_or(0), size).await;
-        // Commit what was written either way (or drop it on a conflict).
-        let closed = fs.close_file(&f).await;
-        written.and(closed).map(|_| f.size())
+        // What's left from before is committed first, so what's dirty
+        // after is this request's alone (the lease keeps other writers out).
+        fs.file_sync(&f).await?;
+        if let Err(e) = patch_body(&fs, &f, data, limit, offset.unwrap_or(0), size).await {
+            // A body cut short or too big: not committed (and the file
+            // isn't closed, which would commit it).
+            fs.file_discard(&f).await;
+            return Err(e);
+        }
+        let size = f.size();
+        fs.close_file(&f).await.map(|_| size)
     }
     .await;
     guard.release().await;

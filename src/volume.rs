@@ -104,16 +104,18 @@ impl<D: BlockDevice> FileSystem<D> {
                 self.max_volblocksize()
             )));
         }
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         let levels = levels_for(size_bytes.div_ceil(volblocksize as u64));
         let file_id = self
             .create_dataset_locked(
+                tx,
                 name,
                 DatasetFormat::Block,
                 Dnode::volume(volblocksize, size_bytes, levels),
             )
             .await?;
-        self.commit_locked().await?;
+        self.commit_locked(tx).await?;
         Ok(file_id)
     }
 
@@ -242,7 +244,8 @@ impl<D: BlockDevice> FileSystem<D> {
             // Under the commit lock, so nothing commits between reading the
             // records and queueing them: what's read is what's committed, and
             // writes queued by others (dirty) are left alone.
-            let _tx = self.begin_tx().await;
+            let mut tx = self.begin_tx().await;
+            let tx = &mut tx;
             let root = vol.obj.root();
             let mut current: Vec<(u64, BlockPtr)> = Vec::with_capacity(n);
             for &idx in &indices[at..at + n] {
@@ -268,7 +271,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                 }
             }
-            self.commit_locked().await?;
+            self.commit_locked(tx).await?;
         }
         let after = frag_of(&self.tree_leaves(&vol.obj.root()).await?);
         Ok((before, after))

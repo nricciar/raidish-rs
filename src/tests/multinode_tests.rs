@@ -343,6 +343,95 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     assert!(fs.fsck(false).await.unwrap().is_clean());
 }
 
+/// R2b, over the wire: a committer write spanning a metaslab returned to it
+/// and a plain one goes out as two requests, each stamped for its own
+/// domain. With one stamp (the return's, newer than the pool epoch) the
+/// plain metaslab's floor rose to it, and the committer's next pool-stamped
+/// write there was refused: it fenced itself out.
+#[tokio::test]
+async fn a_write_across_a_returned_metaslab_doesnt_fence_the_committer() {
+    let s = setup(&["a"]).await;
+    let server = TestDiskServer::start(&s.pool.paths).await;
+    let map = FenceMap::new(s.pool.topology.clone(), s.committer.fs.layout);
+    server.floor.set_map(Some(map.clone()));
+    let all: Vec<usize> = (0..s.pool.paths.len()).collect();
+    let dev = s.pool.dev_remote(&server, &all).await;
+    let disks = dev.disks().clone();
+    let fence = disks.fence();
+    fence.set_map(map.clone());
+    let pool = s.auth.state().pool_epoch();
+    fence.set_pool_epoch(pool);
+    server.floor.observe(pool, []);
+
+    // The last raw block of metaslab 0 on disk 0, and metaslab 1's first.
+    let shard = (0..u64::MAX)
+        .map(|sh| sh + crate::disks::DISK_LABEL_BLOCKS)
+        .find(|&b| map.domain_of(0, b + 1) == crate::fence::Domain::Metaslab(crate::types::ms(1)))
+        .unwrap()
+        - crate::disks::DISK_LABEL_BLOCKS;
+    let returned = Epoch::from_raw(pool.get() + 5);
+    fence.set_returned(crate::types::ms(0), returned);
+    server.floor.observe(
+        pool,
+        [(crate::types::ms(0), crate::fence::Grant::Returned(returned))],
+    );
+
+    // Rewrite what's there (the pool's own blocks), across the boundary...
+    let mut two = crate::disk::zeroed_blocks(2);
+    disks.read_shards(0, shard, &mut two).await.unwrap();
+    disks.write_shards(0, shard, &two).await.unwrap();
+    // ...then metaslab 1 alone, with the pool epoch.
+    disks.write_shards(0, shard + 1, &two[1..]).await.unwrap();
+    assert!(!fence.is_stale());
+    assert_eq!(
+        server
+            .floor
+            .floor(crate::fence::Domain::Metaslab(crate::types::ms(1))),
+        pool
+    );
+}
+
+/// D5a: a writer repairs only in space lent to it, and what it repairs
+/// stays lent (it can't be given back and lent or reused) until the repair
+/// is done. Outside its lent space it doesn't repair at all: no hold of a
+/// writer's keeps the committer from freeing and reusing the block.
+#[tokio::test]
+async fn a_writers_repairs_pin_its_lent_space() {
+    let s = setup(&["a"]).await;
+    let a = writer(&s, s.pool.dev().await, "a").await;
+    attach(&s, &a, "a", "oa").await;
+    a.fs.block_write("a", 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    a.fs.sync().await.unwrap();
+    // Done with the volume: its intent log no longer pins its metaslab.
+    a.fs.detach_dataset("a").await.unwrap();
+    let w = a.fs.writer.clone().unwrap();
+    let lent = w.lent.lock().unwrap().clone();
+    assert!(w.pinned.lock().unwrap().is_empty());
+    let idx = lent[0];
+    let layout = a.fs.layout;
+    let start = |i: crate::types::MetaslabIdx| {
+        layout.data_start + i.index() as u64 * layout.metaslab_size_blocks
+    };
+    let other = (0..layout.metaslab_count as u32)
+        .map(crate::types::MetaslabIdx::from_raw)
+        .find(|i| !lent.contains(i))
+        .unwrap();
+    assert!(a.fs.repair_hold(start(other), 1).is_none(), "not lent");
+    assert!(a.fs.repair_hold(0, 1).is_none(), "not a metaslab");
+
+    let hold = a.fs.repair_hold(start(idx) + 3, 2).unwrap();
+    assert_eq!(hold.pinned(), &[idx]);
+    a.fs.return_metaslabs().await;
+    assert!(w.lent.lock().unwrap().contains(&idx), "pinned: kept");
+    drop(hold);
+    a.fs.return_metaslabs().await;
+    assert!(!w.lent.lock().unwrap().contains(&idx));
+    // Given back: no longer this writer's to repair.
+    assert!(a.fs.repair_hold(start(idx), 1).is_none());
+}
+
 /// An authority whose view of the cluster lags (a committer on a Raft
 /// follower): proposals go through, `state()` shows an older snapshot.
 struct Lagging {

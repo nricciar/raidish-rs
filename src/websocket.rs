@@ -5,14 +5,25 @@
 //! a contiguous range of `count` blocks (at most `WS_MAX_BLOCKS`).
 //!
 //! ```text
-//! request:  [op:1][disk:2][block:8][count:4][id:8][epoch:8][data: count*4096 for writes]
+//! request:  [op:1][disk:2][block:8][count:4][id:8][epoch:8][stamp:1][budget_ms:4][data: count*4096 for writes]
 //! response: [status:1][id:8][data: count*4096 for reads]
 //! ```
 //! All integers are little endian.
 //!
-//! `epoch` is the sender's pool lease epoch (0 without one). The server
-//! remembers the newest epoch it has seen (from requests or from the
-//! cluster) and refuses writes and flushes with an older one: `StaleEpoch`.
+//! `epoch` is the sender's pool lease epoch (0 without one) with `stamp` 0,
+//! or a metaslab's lend (1) or return (2) epoch (see `crate::fence::Stamp`).
+//! The server remembers the newest epoch it has seen (from requests or from
+//! the cluster) and refuses writes with an older one: `StaleEpoch`; and
+//! writes stamped with the wrong kind for where they land (in a lent
+//! metaslab, not its lend; in the pool domain, not a pool epoch): `Fenced`.
+//! A request carries one stamp, so a client splits a range whose blocks
+//! need different ones.
+//!
+//! `budget_ms` is how long the client waits for the reply (0: no limit). A
+//! write the server can't start within half of it is refused, `Expired`,
+//! rather than landing after the client gave up on it (audit D5b); so is
+//! one whose connection has closed. A server that hasn't finished starting
+//! (see `crate::fence::Ready`) refuses writes with `NotReady`.
 //!
 //! A client names the version it speaks when it connects (`/ws?v=N`,
 //! [`BLOCK_PROTOCOL`]); a node refuses any other before the upgrade, so
@@ -24,7 +35,7 @@ use crate::disk::DiskError;
 use crate::types::Epoch;
 
 /// This framing's version. Bump it with any change to the messages.
-pub const BLOCK_PROTOCOL: u32 = 1;
+pub const BLOCK_PROTOCOL: u32 = 4;
 
 /// A disk's websocket `url`, asking for [`BLOCK_PROTOCOL`].
 pub fn versioned(url: &str) -> String {
@@ -32,7 +43,7 @@ pub fn versioned(url: &str) -> String {
     format!("{}{}v={}", url, sep, BLOCK_PROTOCOL)
 }
 
-pub const WS_REQUEST_HEADER_LEN: usize = 31;
+pub const WS_REQUEST_HEADER_LEN: usize = 36;
 pub const WS_RESPONSE_HEADER_LEN: usize = 9;
 /// Largest range in one message (1 MiB of data).
 pub const WS_MAX_BLOCKS: u32 = 256;
@@ -71,6 +82,12 @@ pub enum WsStatus {
     StaleEpoch = 3,
     /// The connection's role may not write (see `crate::auth`).
     Forbidden = 4,
+    /// A write into a metaslab lent to a writer, not stamped with that lend.
+    Fenced = 5,
+    /// A write before the server's fence is ready (`crate::fence::Ready`).
+    NotReady = 6,
+    /// A write the client had given up on before it could start.
+    Expired = 7,
 }
 
 impl TryFrom<u8> for WsStatus {
@@ -83,6 +100,9 @@ impl TryFrom<u8> for WsStatus {
             2 => Ok(WsStatus::InvalidRequest),
             3 => Ok(WsStatus::StaleEpoch),
             4 => Ok(WsStatus::Forbidden),
+            5 => Ok(WsStatus::Fenced),
+            6 => Ok(WsStatus::NotReady),
+            7 => Ok(WsStatus::Expired),
             _ => Err(()),
         }
     }
@@ -92,18 +112,22 @@ impl From<DiskError> for WsStatus {
     fn from(error: DiskError) -> Self {
         match error {
             DiskError::StaleEpoch => WsStatus::StaleEpoch,
+            DiskError::Fenced => WsStatus::Fenced,
+            DiskError::NotReady => WsStatus::NotReady,
             _ => WsStatus::ErrorNotFound,
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the header's fields
 pub fn encode_request(
     op: WsOp,
     disk: u16,
     block: u64,
     count: u32,
     id: u64,
-    epoch: Epoch,
+    stamp: crate::fence::Stamp,
+    budget: std::time::Duration,
     data: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(WS_REQUEST_HEADER_LEN + data.map_or(0, |d| d.len()));
@@ -112,7 +136,10 @@ pub fn encode_request(
     out.extend_from_slice(&block.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&epoch.to_le_bytes());
+    out.extend_from_slice(&stamp.epoch().to_le_bytes());
+    out.push(stamp.kind());
+    let budget_ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&budget_ms.to_le_bytes());
     if let Some(data) = data {
         out.extend_from_slice(data);
     }
@@ -169,6 +196,17 @@ impl<'a> WsRequest<'a> {
 
     pub fn epoch(&self) -> Epoch {
         Epoch::from_le_bytes(self.data[23..31].try_into().unwrap())
+    }
+
+    /// The stamp, or None for a kind this version doesn't know.
+    pub fn stamp(&self) -> Option<crate::fence::Stamp> {
+        crate::fence::Stamp::from_wire(self.data[31], self.epoch())
+    }
+
+    /// How long the client waits for the reply (None: no limit).
+    pub fn budget(&self) -> Option<std::time::Duration> {
+        let ms = u32::from_le_bytes(self.data[32..36].try_into().unwrap());
+        (ms > 0).then(|| std::time::Duration::from_millis(ms as u64))
     }
 
     /// Write payload, if it is exactly `count` blocks.

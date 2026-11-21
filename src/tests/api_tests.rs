@@ -1,28 +1,39 @@
 use super::*;
-use crate::disk::{BLOCK_SIZE, Disk, DiskError};
+use crate::disk::{BLOCK_SIZE, BlockDevice, Disk, DiskError};
 use crate::test_util::{TestDiskServer, TestPool, fast_disk_options};
 use crate::types::{Epoch, ep};
 use crate::websocket::{WsOp, WsStatus, decode_response, encode_request};
 
-async fn local_disks(pool: &TestPool) -> Arc<Vec<Caddy>> {
+use crate::disks::Caddy;
+
+/// The pool's disks, served behind a fence that has done its startup.
+async fn local_disks(pool: &TestPool) -> FencedDisks {
     let mut disks = Vec::new();
     for p in &pool.paths {
         let p = p.to_str().unwrap();
         disks.push(Caddy::Healthy(p.to_string(), Disk::open(p).await.unwrap()));
     }
-    Arc::new(disks)
+    FencedDisks::new(Arc::new(disks), Arc::new(EpochFloor::ready()))
 }
 
 async fn send(
-    disks: &Arc<Vec<Caddy>>,
-    floor: &EpochFloor,
+    disks: &FencedDisks,
     op: WsOp,
     block: u64,
     epoch: Epoch,
     data: Option<&[u8]>,
 ) -> (WsStatus, Vec<u8>) {
-    let req = encode_request(op, 0, block, 1, 42, epoch, data);
-    let resp = handle_ws_message(&req, disks, floor).await;
+    let req = encode_request(
+        op,
+        0,
+        block,
+        1,
+        42,
+        crate::fence::Stamp::Pool(epoch),
+        std::time::Duration::ZERO,
+        data,
+    );
+    let resp = handle_ws_message(&req, disks).await;
     let (status, id) = decode_response(&resp).unwrap();
     assert_eq!(id, 42);
     (
@@ -35,36 +46,35 @@ async fn send(
 async fn stale_epoch_writes_are_refused() {
     let pool = TestPool::new().await;
     let disks = local_disks(&pool).await;
-    let floor = EpochFloor::default();
     let a = vec![0xAAu8; BLOCK_SIZE];
     let b = vec![0xBBu8; BLOCK_SIZE];
 
     // Writer at epoch 5.
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(5), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(5), Some(&a)).await;
     assert_eq!(s, WsStatus::Success);
 
     // A new writer (epoch 6) shows up; its first read raises the floor.
-    let (s, data) = send(&disks, &floor, WsOp::Read, 7, ep(6), None).await;
+    let (s, data) = send(&disks, WsOp::Read, 7, ep(6), None).await;
     assert_eq!(s, WsStatus::Success);
     assert_eq!(data, a);
 
     // The old writer is now fenced: writes are refused, the block is
     // untouched. Reads still work, and so do flushes (they only make
     // admitted writes durable).
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(5), Some(&b)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(5), Some(&b)).await;
     assert_eq!(s, WsStatus::StaleEpoch);
-    let (s, _) = send(&disks, &floor, WsOp::Flush, 0, ep(5), None).await;
+    let (s, _) = send(&disks, WsOp::Flush, 0, ep(5), None).await;
     assert_eq!(s, WsStatus::Success);
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(0), Some(&b)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(0), Some(&b)).await;
     assert_eq!(s, WsStatus::StaleEpoch, "no epoch at all is older still");
-    let (s, data) = send(&disks, &floor, WsOp::Read, 7, ep(5), None).await;
+    let (s, data) = send(&disks, WsOp::Read, 7, ep(5), None).await;
     assert_eq!(s, WsStatus::Success);
     assert_eq!(data, a);
 
     // The new writer can write.
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(6), Some(&b)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(6), Some(&b)).await;
     assert_eq!(s, WsStatus::Success);
-    let (_, data) = send(&disks, &floor, WsOp::Read, 7, ep(6), None).await;
+    let (_, data) = send(&disks, WsOp::Read, 7, ep(6), None).await;
     assert_eq!(data, b);
 }
 
@@ -72,13 +82,12 @@ async fn stale_epoch_writes_are_refused() {
 async fn floor_from_the_cluster_fences_too() {
     let pool = TestPool::new().await;
     let disks = local_disks(&pool).await;
-    let floor = EpochFloor::default();
     // The cluster applied a pool grant at epoch 3 (no request seen yet).
-    floor.raise_pool(ep(3));
+    disks.floor().raise_pool(ep(3));
     let a = vec![1u8; BLOCK_SIZE];
-    let (s, _) = send(&disks, &floor, WsOp::Write, 1, ep(2), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 1, ep(2), Some(&a)).await;
     assert_eq!(s, WsStatus::StaleEpoch);
-    let (s, _) = send(&disks, &floor, WsOp::Write, 1, ep(3), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 1, ep(3), Some(&a)).await;
     assert_eq!(s, WsStatus::Success);
 }
 
@@ -87,9 +96,8 @@ async fn unfenced_server_accepts_epoch_zero() {
     // No leases anywhere: the old single-writer setup keeps working.
     let pool = TestPool::new().await;
     let disks = local_disks(&pool).await;
-    let floor = EpochFloor::default();
     let a = vec![9u8; BLOCK_SIZE];
-    let (s, _) = send(&disks, &floor, WsOp::Write, 3, ep(0), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 3, ep(0), Some(&a)).await;
     assert_eq!(s, WsStatus::Success);
 }
 
@@ -162,7 +170,16 @@ fn disk_urls_ask_for_this_block_protocol() {
 #[test]
 fn old_protocol_headers_are_rejected() {
     // A 23-byte (pre-epoch) read request is too short to parse.
-    let mut req = encode_request(WsOp::Read, 0, 0, 1, 7, ep(0), None);
+    let mut req = encode_request(
+        WsOp::Read,
+        0,
+        0,
+        1,
+        7,
+        crate::fence::Stamp::Pool(ep(0)),
+        std::time::Duration::ZERO,
+        None,
+    );
     req.truncate(23);
     assert!(WsRequest::parse(&req).is_none());
 }
@@ -171,20 +188,30 @@ fn old_protocol_headers_are_rejected() {
 async fn readonly_connections_cannot_write_or_fence() {
     let pool = TestPool::new().await;
     let disks = local_disks(&pool).await;
-    let floor = EpochFloor::default();
     let a = vec![0xAAu8; BLOCK_SIZE];
     let ro = |op, block, epoch, data: Option<&[u8]>| {
-        let req = encode_request(op, 0, block, 1, 9, epoch, data);
-        let (disks, floor) = (&disks, &floor);
+        let req = encode_request(
+            op,
+            0,
+            block,
+            1,
+            9,
+            crate::fence::Stamp::Pool(epoch),
+            std::time::Duration::ZERO,
+            data,
+        );
+        let disks = &disks;
         async move {
-            let resp = handle_ws_message_as(&req, disks, floor, false).await;
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let now = tokio::time::Instant::now();
+            let resp = handle_ws_message_as(&req, disks, false, now, closed).await;
             let (status, id) = decode_response(&resp).unwrap();
             assert_eq!(id, 9);
             WsStatus::try_from(status).unwrap()
         }
     };
 
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(5), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(5), Some(&a)).await;
     assert_eq!(s, WsStatus::Success);
     assert_eq!(
         ro(WsOp::Write, 7, ep(99), Some(&a)).await,
@@ -194,6 +221,52 @@ async fn readonly_connections_cannot_write_or_fence() {
     // A read claiming a huge epoch doesn't raise the floor...
     assert_eq!(ro(WsOp::Read, 7, ep(1_000), None).await, WsStatus::Success);
     // ...so the real writer at epoch 5 is not fenced out.
-    let (s, _) = send(&disks, &floor, WsOp::Write, 7, ep(5), Some(&a)).await;
+    let (s, _) = send(&disks, WsOp::Write, 7, ep(5), Some(&a)).await;
+    assert_eq!(s, WsStatus::Success);
+}
+
+#[tokio::test]
+async fn malformed_requests_dont_raise_the_floor() {
+    let pool = TestPool::new().await;
+    let disks = local_disks(&pool).await;
+    let a = vec![1u8; BLOCK_SIZE];
+    let huge = ep(u64::MAX);
+    // Unknown disk, a count past the limit, data not matching the count:
+    // refused before admission, so none of them fences anyone out.
+    let bad_disk = encode_request(
+        WsOp::Write,
+        99,
+        1,
+        1,
+        1,
+        crate::fence::Stamp::Pool(huge),
+        std::time::Duration::ZERO,
+        Some(&a),
+    );
+    let bad_count = encode_request(
+        WsOp::Read,
+        0,
+        1,
+        u32::MAX,
+        2,
+        crate::fence::Stamp::Pool(huge),
+        std::time::Duration::ZERO,
+        None,
+    );
+    let short = encode_request(
+        WsOp::Write,
+        0,
+        1,
+        2,
+        3,
+        crate::fence::Stamp::Pool(huge),
+        std::time::Duration::ZERO,
+        Some(&a),
+    );
+    for req in [bad_disk, bad_count, short] {
+        let (status, _) = decode_response(&handle_ws_message(&req, &disks).await).unwrap();
+        assert_ne!(WsStatus::try_from(status).unwrap(), WsStatus::Success);
+    }
+    let (s, _) = send(&disks, WsOp::Write, 1, ep(1), Some(&a)).await;
     assert_eq!(s, WsStatus::Success);
 }

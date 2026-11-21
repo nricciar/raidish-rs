@@ -291,6 +291,28 @@ impl MetaslabState {
         self.dirty = true;
     }
 
+    /// Take back a pending free of exactly `[start, start + len)` (an
+    /// operation undone, see `crate::tx`). False if there's none.
+    pub(crate) fn unfree(&mut self, start: u64, len: u64) -> bool {
+        match self
+            .freeing
+            .iter()
+            .rposition(|e| e.start == start && e.len == len)
+        {
+            Some(i) => {
+                self.freeing.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Return allocated space that nothing committed references.
+    pub(crate) fn unallocate(&mut self, start: u64, len: u64) {
+        Self::insert_free(&mut self.free_extents, start, len);
+        self.dirty = true;
+    }
+
     /// Every released extent (free, freeing or deferred), merged.
     pub(crate) fn released_map(&self) -> BTreeMap<u64, u64> {
         let mut released = BTreeMap::new();
@@ -500,7 +522,13 @@ pub(crate) struct SyncedMetaslab {
 impl<D: BlockDevice> FileSystem<D> {
     /// Free an extent. The space is not reusable until `TXG_DEFER_SIZE` TXGs
     /// after the TXG in which the free is committed.
-    pub(crate) async fn free(&self, start: u64, len: u64) -> Result<(), FileSystemError> {
+    pub(crate) async fn free(
+        &self,
+        tx: &mut crate::tx::Tx,
+
+        start: u64,
+        len: u64,
+    ) -> Result<(), FileSystemError> {
         if len == 0 {
             return Ok(());
         }
@@ -529,6 +557,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         ms.freeing.push(Extent { start, len });
         ms.dirty = true;
+        tx.journal(crate::tx::Undo::Freed { start, len });
         Ok(())
     }
 
@@ -537,9 +566,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// no deferral: no uberblock can point at it.
     pub(crate) async fn unallocate(&self, start: u64, len: u64) {
         if let Some(idx) = self.layout.metaslab_for_block(start) {
-            let mut ms = self.metaslabs[idx.index()].write().await;
-            MetaslabState::insert_free(&mut ms.free_extents, start, len);
-            ms.dirty = true;
+            self.metaslabs[idx.index()]
+                .write()
+                .await
+                .unallocate(start, len);
         }
     }
 
@@ -710,7 +740,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Release the deferred frees a scan held back (call after the hold is
     /// dropped). Takes the commit lock so it can't interleave with a sync.
     pub(crate) async fn release_held_frees(&self) {
-        let _guard = self.begin_tx().await;
+        let _tx = self.begin_tx().await;
         if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return;
         }
@@ -792,9 +822,10 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Read a slot: valid at TXG `t` only if every block is a good label
     /// from TXG `t`. A disk that missed writes while it was away returns
-    /// stale but well-formed blocks, so blocks that disagree are also rebuilt
-    /// from parity, and the slot is taken at the newest TXG (no newer than
-    /// `max_txg`) that every block can reach. Healed blocks are repaired.
+    /// stale but well-formed blocks, so every block is also read from the
+    /// other copies / rebuilt from parity, and the slot is taken at the
+    /// newest TXG (no newer than `max_txg`) that every block can reach.
+    /// Blocks that came from elsewhere are repaired.
     async fn read_slot(&self, lba: u64, max_txg: Txg) -> Option<(Txg, Vec<u8>)> {
         // versions[b]: every (txg, payload, came-from-parity) seen for block b.
         let mut versions: SlotVersions = Vec::new();
@@ -809,23 +840,11 @@ impl<D: BlockDevice> FileSystem<D> {
             versions.push(v);
         }
 
-        let consistent = |versions: &SlotVersions| {
-            let first = versions.first()?.first()?.0;
-            versions
-                .iter()
-                .all(|v| v.len() == 1 && v[0].0 == first)
-                .then_some(first)
-        };
-        if let Some(t) = consistent(&versions)
-            && t <= max_txg
-        {
-            return Some((
-                t,
-                versions.into_iter().flat_map(|v| v[0].1.clone()).collect(),
-            ));
-        }
-
-        // Disagreement: add every rebuild of every block as an alternative.
+        // Every other copy / rebuild of every block is an alternative too,
+        // even when the normal read looks consistent: a member that missed
+        // commits (back from an outage, or silently dropping writes) serves
+        // well-formed slots from an older TXG, and on a mirror it can be the
+        // one serving every block of both slots (audit D2).
         for (b, v) in versions.iter_mut().enumerate() {
             if let Ok(c) = self.dev.reconstruct_candidates(lba + b as u64).await {
                 for rebuilt in c.rebuilt.into_iter().flatten() {

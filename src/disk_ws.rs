@@ -185,6 +185,9 @@ impl WsConn {
         self.state.closed_tx.subscribe()
     }
 
+    /// Send `op` for `count` blocks from `block`: as one request, or one
+    /// per run of blocks needing the same stamp (`ClientFence::stamps`),
+    /// in order, with read payloads joined.
     async fn request(
         &self,
         op: WsOp,
@@ -194,13 +197,44 @@ impl WsConn {
         count: u32,
         data: Option<&[u8]>,
     ) -> Result<Bytes, DiskError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let stamp = match (op, fence) {
-            (_, None) => Stamp::Pool(crate::types::Epoch::NONE),
-            (WsOp::Flush | WsOp::Info, Some((_, f))) => Stamp::Pool(f.pool_epoch()),
-            (_, Some((i, f))) => f.epoch_for(Some(*i), block, count),
+        let runs = match (op, fence) {
+            (_, None) => vec![(block, count, Stamp::Pool(crate::types::Epoch::NONE))],
+            (WsOp::Flush | WsOp::Info, Some((_, f))) => {
+                vec![(block, count, Stamp::Pool(f.pool_epoch()))]
+            }
+            (_, Some((i, f))) => f.stamps(Some(*i), block, count),
         };
-        let epoch = stamp.epoch();
+        if let [(block, count, stamp)] = runs[..] {
+            return self
+                .request_one(op, disk_id, fence, block, count, stamp, data)
+                .await;
+        }
+        let mut out = bytes::BytesMut::new();
+        for (b, n, stamp) in runs {
+            let piece = data.map(|d| {
+                let from = (b - block) as usize * crate::disk::BLOCK_SIZE;
+                &d[from..from + n as usize * crate::disk::BLOCK_SIZE]
+            });
+            let r = self
+                .request_one(op, disk_id, fence, b, n, stamp, piece)
+                .await?;
+            out.extend_from_slice(&r);
+        }
+        Ok(out.freeze())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_one(
+        &self,
+        op: WsOp,
+        disk_id: u16,
+        fence: Option<&(usize, Arc<crate::fence::ClientFence>)>,
+        block: u64,
+        count: u32,
+        stamp: Stamp,
+        data: Option<&[u8]>,
+    ) -> Result<Bytes, DiskError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let (tx, rx) = oneshot::channel();
         self.state.pending.insert(id, tx);
@@ -210,7 +244,16 @@ impl WsConn {
         }
 
         // One deadline covers queueing for the sink, sending and the reply.
-        let msg = encode_request(op, disk_id, block, count, id, epoch, data);
+        let msg = encode_request(
+            op,
+            disk_id,
+            block,
+            count,
+            id,
+            stamp,
+            self.opts.request_timeout,
+            data,
+        );
         let exchange = async {
             self.sink
                 .lock()
@@ -239,9 +282,11 @@ impl WsConn {
                 }
             };
         let r = check_status(status);
-        // Our pool epoch refused: another committer or writer has the pool
-        // now (a lent metaslab's refusal is the writer's own business).
-        if let (Err(DiskError::StaleEpoch), Stamp::Pool(_), Some((_, f))) = (&r, stamp, fence) {
+        // Our pool (or return) epoch refused: another committer or writer
+        // has the pool now (a lent metaslab's refusal is the writer's own
+        // business).
+        if let (Err(DiskError::StaleEpoch), true, Some((_, f))) = (&r, stamp.is_committers(), fence)
+        {
             f.stale();
         }
         r.map(|_| payload)

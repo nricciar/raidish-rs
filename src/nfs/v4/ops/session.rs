@@ -9,7 +9,7 @@ impl<D: BlockDevice + 'static> Server<D> {
         r: &mut Reader<'_>,
         w: &mut Writer,
         count: u32,
-        pre: Option<(u64, u32)>,
+        pre: Option<Presequenced>,
     ) -> XdrResult<Seq> {
         let sid: [u8; 16] = r.fixed(16)?.try_into().unwrap();
         let seqid = r.u32()?;
@@ -19,9 +19,14 @@ impl<D: BlockDevice + 'static> Server<D> {
         if count > state::MAX_OPS {
             return Ok(Seq::Run(err::TOO_MANY_OPS, None));
         }
-        if let Some((client, slots)) = pre {
+        if let Some(Presequenced {
+            client,
+            slots,
+            grants,
+        }) = pre
+        {
             ctx.client = Some(client);
-            ctx.trusted = true;
+            ctx.grants = Some(grants);
             w.fixed(&sid).u32(seqid).u32(slotid);
             w.u32(slots - 1).u32(slots - 1).u32(0);
             return Ok(Seq::Run(err::OK, None));

@@ -8,7 +8,7 @@
 //! A request for a bucket another node runs is proxied there (see
 //! `crate::frontend`); that node checks its signature.
 
-use super::{Bucket, CHUNK, MAX_PUT, ObjectMeta, Part, S3Error, Segment};
+use super::{Bucket, CHUNK, MAX_PUT, ObjectMeta, Part, Reading, S3Error, Segment};
 use crate::committer::PoolAdmin;
 use crate::dataset::DatasetFormat;
 use crate::frontend::http::{self as fhttp, Body, BodyError, PayloadReader, empty, full};
@@ -1147,8 +1147,13 @@ fn plan(meta: &ObjectMeta, start: u64, end: u64) -> Vec<(u64, u64, usize, usize)
 }
 
 /// Bytes `start..=end` of `meta`, as a streamed body.
-fn object_body(bk: &Arc<Bucket<Pool>>, meta: &ObjectMeta, start: u64, end: u64) -> Body {
-    let hold = bk.reading(meta);
+fn object_body(
+    bk: &Arc<Bucket<Pool>>,
+    meta: &ObjectMeta,
+    hold: Reading<Pool>,
+    start: u64,
+    end: u64,
+) -> Body {
     let steps = if meta.size == 0 {
         Vec::new()
     } else {
@@ -1220,7 +1225,7 @@ fn object_headers(resp: &mut Response<Body>, meta: &ObjectMeta, r: &Req, checksu
 }
 
 async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Response<Body>, Err3> {
-    let meta = bk.head(key).await?.ok_or(S3Error::NoSuchKey)?;
+    let (meta, hold) = bk.head_held(key).await?.ok_or(S3Error::NoSuchKey)?;
     if let Err(code) = conditions(r, "", &meta) {
         let mut resp = ok_empty(code);
         if code == StatusCode::NOT_MODIFIED {
@@ -1283,7 +1288,7 @@ async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
     let body = if r.method == Method::HEAD || len == 0 {
         empty()
     } else {
-        object_body(bk, &meta, start, end)
+        object_body(bk, &meta, hold, start, end)
     };
     let mut resp = fhttp::status(status, body);
     let checksums = range.is_none()
@@ -1331,7 +1336,7 @@ async fn open_source(
     if let Some(l) = fe.local(&sb)
         && let Local::S3(b) = &*l
     {
-        let meta = b.head(&sk).await?.ok_or(S3Error::NoSuchKey)?;
+        let (meta, hold) = b.head_held(&sk).await?.ok_or(S3Error::NoSuchKey)?;
         if let Err(code) = conditions(r, "x-amz-copy-source-", &meta) {
             return Err(e3(
                 code,
@@ -1353,7 +1358,7 @@ async fn open_source(
         let body = if meta.size == 0 {
             empty()
         } else {
-            object_body(b, &meta, a, z)
+            object_body(b, &meta, hold, a, z)
         };
         return Ok((sb, sk, meta, body));
     }

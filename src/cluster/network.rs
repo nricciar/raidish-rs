@@ -97,6 +97,11 @@ impl Conn {
             ));
             return Err(RPCError::Unreachable(Unreachable::new(&e)));
         }
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            // A node catching up after losing its Raft state: no vote.
+            let e = std::io::Error::other(format!("{} isn't voting yet (catching up)", addr));
+            return Err(RPCError::Unreachable(Unreachable::new(&e)));
+        }
         let result: Result<Resp, RaftError<NodeId, E>> = resp
             .json()
             .await

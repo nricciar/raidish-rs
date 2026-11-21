@@ -271,7 +271,11 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Replace the dataset directory's contents (in the open TXG).
-    pub(crate) async fn write_datasets(&self, index: &DatasetIndex) -> Result<(), FileSystemError> {
+    pub(crate) async fn write_datasets(
+        &self,
+        tx: &mut crate::tx::Tx,
+        index: &DatasetIndex,
+    ) -> Result<(), FileSystemError> {
         let id = self.datasets_object();
         let mut dnode = self.read_dnode(id).await?;
         let data = if index.datasets.is_empty() {
@@ -279,7 +283,7 @@ impl<D: BlockDevice> FileSystem<D> {
         } else {
             bincode::serialize(index)?
         };
-        self.replace_contents(id, &mut dnode, &data).await
+        self.replace_contents(tx, id, &mut dnode, &data).await
     }
 
     /// The object number of the dataset directory.
@@ -401,6 +405,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `begin_tx`, without committing). Returns the root's object number.
     pub(crate) async fn create_dataset_locked(
         &self,
+        tx: &mut crate::tx::Tx,
         name: &str,
         format: DatasetFormat,
         mut root: Dnode,
@@ -419,7 +424,7 @@ impl<D: BlockDevice> FileSystem<D> {
         } else {
             self.datasets_object()
         });
-        self.write_dnode(id, Some(root)).await?;
+        self.write_dnode(tx, id, Some(root)).await?;
         index.datasets.insert(
             name.to_string(),
             DatasetEntry {
@@ -430,21 +435,27 @@ impl<D: BlockDevice> FileSystem<D> {
                 created_ms: crate::fs::now_ms(),
             },
         );
-        self.write_datasets(&index).await?;
+        self.write_datasets(tx, &index).await?;
         Ok(id)
     }
 
     /// Delete tree dataset `name` and free what only it references (it
     /// must not be running, and must have no snapshots).
     pub async fn delete_dataset(&self, name: &str) -> Result<(), FileSystemError> {
-        let _tx = self.begin_tx().await;
-        self.delete_dataset_locked(name).await?;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r = self.delete_dataset_locked(tx, name).await;
+        tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(())
     }
 
     /// `delete_dataset` under `begin_tx`, without committing.
-    pub(crate) async fn delete_dataset_locked(&self, name: &str) -> Result<(), FileSystemError> {
+    pub(crate) async fn delete_dataset_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+        name: &str,
+    ) -> Result<(), FileSystemError> {
         let mut index = self.datasets().await?;
         let e = index
             .datasets
@@ -460,19 +471,19 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let dnode = self.read_dnode(e.root).await?;
         // Blocks a snapshot or the origin has stay theirs.
-        let held = self.unlink_dataset_lineage(e.root, &dnode).await?;
+        let held = self.unlink_dataset_lineage(tx, e.root, &dnode).await?;
         for p in self
             .unique_blocks(&dnode.tree, dnode.blksz as usize, held, None)
             .await?
         {
-            self.free(p.lba, p.asize as u64).await?;
+            self.free(tx, p.lba, p.asize as u64).await?;
         }
         for r in dnode.log().iter().flat_map(|l| &l.regions) {
-            self.free(r.start, r.len).await?;
+            self.free(tx, r.start, r.len).await?;
         }
-        self.write_dnode(e.root, None).await?;
+        self.write_dnode(tx, e.root, None).await?;
         index.datasets.remove(name);
-        self.write_datasets(&index).await?;
+        self.write_datasets(tx, &index).await?;
         self.close_dataset(name);
         Ok(())
     }
@@ -483,17 +494,19 @@ impl<D: BlockDevice> FileSystem<D> {
         name: &str,
         props: DatasetProps,
     ) -> Result<(), FileSystemError> {
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         let vol = self.open_dataset(name).await?;
         let before = std::mem::replace(&mut *vol.props.lock().unwrap(), props);
-        match self.update_dataset_dnode(&vol, vol.obj.root_ptr()).await {
-            Ok(()) => {}
-            Err(e) => {
-                *vol.props.lock().unwrap() = before;
-                return Err(e);
-            }
+        {
+            let vol = vol.clone();
+            tx.on_rollback(move || *vol.props.lock().unwrap() = before);
         }
-        self.commit_locked().await?;
+        let r = self
+            .update_dataset_dnode(tx, &vol, vol.obj.root_ptr())
+            .await;
+        tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(())
     }
 
@@ -525,7 +538,10 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// Also returns the datasets it left clean (synced, or nothing dirty):
     /// one failing doesn't hold the others back.
-    pub(crate) async fn sync_datasets_noting(&self) -> (Vec<String>, Result<(), FileSystemError>) {
+    pub(crate) async fn sync_datasets_noting(
+        &self,
+        tx: &mut crate::tx::Tx,
+    ) -> (Vec<String>, Result<(), FileSystemError>) {
         let mut clean = Vec::new();
         let vols: Vec<Arc<Dataset>> = self
             .open_datasets
@@ -566,7 +582,7 @@ impl<D: BlockDevice> FileSystem<D> {
             };
 
             let mut synced: Option<Arc<BTreeMap<u64, Dirty>>> = None;
-            let result = self.sync_dataset(&vol, &taken).await;
+            let result = self.sync_dataset(tx, &vol, &taken, true).await;
             if result.is_ok() {
                 synced = Some(taken.clone());
             } else if matches!(result, Err(FileSystemError::NoSpace(_))) {
@@ -575,7 +591,9 @@ impl<D: BlockDevice> FileSystem<D> {
                     .filter(|(_, r)| r.is_hole())
                     .map(|(k, r)| (*k, r.clone()))
                     .collect();
-                if !holes.is_empty() && self.sync_dataset(&vol, &holes).await.is_ok() {
+                // Without folding the log: what it holds beyond these
+                // holes is still uncommitted, and only the log has it.
+                if !holes.is_empty() && self.sync_dataset(tx, &vol, &holes, false).await.is_ok() {
                     synced = Some(Arc::new(holes));
                 }
             }
@@ -601,12 +619,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
     async fn sync_dataset(
         &self,
+        tx: &mut crate::tx::Tx,
         vol: &Dataset,
         records: &BTreeMap<u64, Dirty>,
+        fold: bool,
     ) -> Result<(), FileSystemError> {
         let need = self.sync_reservation(vol, records);
         if let Some(w) = self.writer.clone() {
-            return self.writer_sync_dataset(&w, vol, records, need).await;
+            return self.writer_sync_dataset(&w, vol, records, need, fold).await;
         }
         if self.allocatable_blocks().await < need {
             return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
@@ -628,7 +648,14 @@ impl<D: BlockDevice> FileSystem<D> {
         };
 
         // Point the dnode at the new tree; only then is anything freed.
-        if let Err(e) = self.update_dataset_dnode(vol, new_root.ptr.clone()).await {
+        // Not folding: the log stays as the dnode has it, whatever `vol.log`
+        // says (a replay clears that before the commit that makes its
+        // writes durable: a holes-only retry mustn't drop the log under
+        // writes it didn't commit, audit S4b).
+        if let Err(e) = self
+            .update_dataset_dnode_with(tx, vol, new_root.ptr.clone(), !fold)
+            .await
+        {
             self.release_ptrs(&allocated).await;
             return Err(e);
         }
@@ -637,6 +664,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // What a snapshot still has stays (see `crate::snapshot`).
         let held = self.held_txg_of(vol.id).await?;
         self.free_unheld(
+            tx,
             replaced
                 .iter()
                 .map(|p| crate::types::Born {
@@ -653,8 +681,21 @@ impl<D: BlockDevice> FileSystem<D> {
     /// its current settings and intent log. On failure nothing changed.
     pub(crate) async fn update_dataset_dnode(
         &self,
+        tx: &mut crate::tx::Tx,
         vol: &Dataset,
         root: Option<BlockPtr>,
+    ) -> Result<(), FileSystemError> {
+        self.update_dataset_dnode_with(tx, vol, root, false).await
+    }
+
+    /// `update_dataset_dnode`; with `keep_log`, the intent log stays as the
+    /// dnode has it rather than `vol.log`.
+    pub(crate) async fn update_dataset_dnode_with(
+        &self,
+        tx: &mut crate::tx::Tx,
+        vol: &Dataset,
+        root: Option<BlockPtr>,
+        keep_log: bool,
     ) -> Result<(), FileSystemError> {
         let mut dnode = self.read_dnode(vol.id).await?;
         dnode.tree = crate::object::TreeRoot {
@@ -668,8 +709,10 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         };
         head.props = vol.props.lock().unwrap().clone();
-        head.log = vol.log.lock().unwrap().clone();
-        self.write_dnode(vol.id, Some(dnode)).await
+        if !keep_log {
+            head.log = vol.log.lock().unwrap().clone();
+        }
+        self.write_dnode(tx, vol.id, Some(dnode)).await
     }
 
     /// Forget an open dataset (on delete); its unsynced writes are discarded.

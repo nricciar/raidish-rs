@@ -39,8 +39,7 @@ async fn put(b: &Arc<Bucket<Pool>>, key: &str, body: &[u8]) -> ObjectMeta {
 }
 
 async fn get(b: &Arc<Bucket<Pool>>, key: &str) -> Option<Vec<u8>> {
-    let meta = b.head(key).await.unwrap()?;
-    let _hold = b.reading(&meta);
+    let (meta, _hold) = b.head_held(key).await.unwrap()?;
     let mut out = Vec::new();
     for s in &meta.segments {
         let mut chunk = 0;
@@ -86,7 +85,15 @@ async fn objects_small_and_large() {
     assert!(!b.delete_object("small").await.unwrap());
     b.collect().await.unwrap();
     assert_eq!(chunks(&fs).await, 1);
-    assert_eq!(b.head("dir/large").await.unwrap().unwrap().size, 9);
+    assert_eq!(
+        b.head_held("dir/large")
+            .await
+            .map(|o| o.map(|(m, _)| m))
+            .unwrap()
+            .unwrap()
+            .size,
+        9
+    );
 }
 
 #[tokio::test]
@@ -94,7 +101,7 @@ async fn bodies_being_read_stay() {
     let pool = TestPool::new().await;
     let (fs, b) = bucket(&pool).await;
     let m = put(&b, "k", &data(5000, 3)).await;
-    let hold = b.reading(&m);
+    let (_, hold) = b.head_held("k").await.unwrap().unwrap();
     b.delete_object("k").await.unwrap();
     b.collect().await.unwrap();
     // Still readable by whoever holds it.
@@ -126,6 +133,33 @@ async fn listings_with_prefixes_and_delimiters() {
     let l = b.list("photos/", None, Some("/"), 1000).await.unwrap();
     assert_eq!(keys(&l), vec!["photos/x.jpg"]);
     assert_eq!(l.prefixes, vec!["photos/2023/", "photos/2024/"]);
+    // A marker after the prefix but not under it (or not on a character
+    // boundary of it) is just a key to list after, not a panic.
+    for marker in ["q/", "photos", "é/", "photos\u{e9}/"] {
+        b.list("photos/", Some(marker), Some("/"), 1000)
+            .await
+            .unwrap();
+    }
+    // The prefix itself as the marker (audit X2: once an underflow): all
+    // of it, as with no marker.
+    let l = b
+        .list("photos/", Some("photos/"), Some("/"), 1000)
+        .await
+        .unwrap();
+    assert_eq!(keys(&l), vec!["photos/x.jpg"]);
+    assert_eq!(l.prefixes, vec!["photos/2023/", "photos/2024/"]);
+    // After a rolled-up prefix: past everything under it.
+    let l = b
+        .list("photos/", Some("photos/2023/"), Some("/"), 1000)
+        .await
+        .unwrap();
+    assert_eq!(keys(&l), vec!["photos/x.jpg"]);
+    assert_eq!(l.prefixes, vec!["photos/2024/"]);
+    let l = b
+        .list("phot\u{e9}s/", Some("photos/"), Some("/"), 1000)
+        .await
+        .unwrap();
+    assert!(l.objects.is_empty());
     // Paged: two at a time, prefixes counting.
     let mut seen = Vec::new();
     let mut after: Option<String> = None;

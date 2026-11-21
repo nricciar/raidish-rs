@@ -303,13 +303,16 @@ pub trait Vdev: BlockDevice + std::fmt::Debug {
     /// Verify `blocks` self-describing label blocks (superblock, uberblocks,
     /// space map slots) starting at aligned `lba`. They have no parent
     /// checksum, so `score` decides which version is right. Never-written
-    /// (all zero) units are fine.
+    /// (all zero) units are fine. Members `stale` marks (by pool disk:
+    /// degraded ones) don't vote while the others can decide alone: their
+    /// copies are only repaired (audit D3).
     async fn verify_labels(
         &self,
         lba: BlockId,
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<LabelScan, RaidZError>;
 }
 

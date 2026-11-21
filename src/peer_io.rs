@@ -7,8 +7,10 @@
 //!
 //! The wire: mutual TLS with the cluster's CA, node certificates only. The
 //! proxy sends one line, `RAIDISH-VOL/1 <volume> <epoch>`, naming the lease
-//! epoch it believes the writer holds; the writer answers `OK <size>` if
-//! it does (and serves the volume), else `ERR <why>` and hangs up. Then it's
+//! epoch it believes the writer holds; the writer answers `OK <size>
+//! <from>` if it does (and serves the volume), else `ERR <why>` and hangs
+//! up. `<from>` is the epoch of the writer it took the volume over from in
+//! a clean handoff (0: none), see below. Then it's
 //! the NBD transmission phase, exactly as an NBD client speaks it (see
 //! `crate::nbd::serve_requests`): concurrent requests matched by handle.
 //!
@@ -17,7 +19,15 @@
 //! then: block writes are idempotent, so one that may have landed already
 //! is safe to repeat.
 //!
-//! The preambles carry this protocol's version (`/1`); a node answers one
+//! A write the writer acknowledged lives in its memory until a flush (or
+//! its next commit). So the proxy remembers whether writes acknowledged
+//! under the writer's epoch are still unflushed, and when it next reaches
+//! a writer of another epoch, one that didn't take the volume over from
+//! that one in a clean handoff (which commits everything first), the next
+//! FLUSH fails: those writes may be gone, and the flush must not say
+//! otherwise (audit A2).
+//!
+//! The preambles carry this protocol's version (`/2`); a node answers one
 //! of another version with `ERR`, naming its own.
 
 use crate::fs::FileSystemError;
@@ -43,7 +53,7 @@ pub const DEFAULT_PORT: u16 = 10810;
 
 /// A proxy's preamble, with this protocol's version. Bump the version
 /// (here and in `HANDOFF`) with any change to what follows it.
-const PREAMBLE: &str = "RAIDISH-VOL/1";
+const PREAMBLE: &str = "RAIDISH-VOL/2";
 /// What a writer handing a volume over starts with:
 /// `RAIDISH-HANDOFF/1 <volume> <epoch> <transport>`.
 pub const HANDOFF: &str = "RAIDISH-HANDOFF/1";
@@ -59,6 +69,10 @@ pub struct PeerExport {
     pub size: u64,
     pub io: Arc<SwitchableIo>,
     pub session: ExportSession,
+    /// The epoch of the writer this one took the volume over from in a
+    /// clean handoff (`Epoch::NONE`: it didn't). Writes that one
+    /// acknowledged were all committed before the handoff.
+    pub from: Epoch,
 }
 
 /// A peer connection's reading side, after its first line.
@@ -167,7 +181,7 @@ async fn serve_conn(
             return Ok(());
         }
     };
-    wr.write_all(format!("OK {}\n", export.size).as_bytes())
+    wr.write_all(format!("OK {} {}\n", export.size, export.from).as_bytes())
         .await?;
     wr.flush().await?;
     crate::nbd::serve_requests(rd, wr, volume, export.io, export.session).await
@@ -229,11 +243,19 @@ type Reply = Result<Vec<u8>, u32>;
 
 /// One connection to the writer, shared by every request.
 struct Conn {
+    /// The writer's lease epoch, and the one it took the volume over from
+    /// cleanly (see `PeerExport::from`).
+    epoch: Epoch,
+    from: Epoch,
     writer: Mutex<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
     /// Requests sent and not answered: handle → (read length, reply).
     pending: StdMutex<HashMap<u64, (Option<u32>, oneshot::Sender<Reply>)>>,
     next: AtomicU64,
     dead: AtomicBool,
+    /// The task reading replies: stopped on `kill`, so the stream's read
+    /// half goes with it (the write half goes with the last `Arc`, and
+    /// nothing is written once dead), not left open until a timeout.
+    reader: StdMutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Conn {
@@ -241,11 +263,44 @@ impl Conn {
     fn kill(&self) {
         self.dead.store(true, Ordering::SeqCst);
         self.pending.lock().unwrap().clear(); // dropped senders: the waiters see it
+        if let Some(r) = self.reader.lock().unwrap().take() {
+            r.abort();
+        }
+    }
+}
+
+/// Kills its connection when dropped while armed (see `PeerIo::send`).
+struct KillOnDrop<'a>(Option<&'a Conn>);
+
+impl Drop for KillOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            c.kill();
+        }
+    }
+}
+
+/// What a proxy's acknowledged writes are owed (see the module docs).
+#[derive(Default)]
+struct Durability {
+    /// The epoch of the writer the writes below were acknowledged by.
+    epoch: Epoch,
+    /// Writes acknowledged, and how many of them a flush covered.
+    acked: u64,
+    flushed: u64,
+    /// Some acknowledged writes may be lost: the next flush fails.
+    lost: bool,
+}
+
+impl Durability {
+    fn from_lost(&self, c: &Conn) -> bool {
+        c.from != self.epoch
     }
 }
 
 /// A volume's I/O, proxied to its writer on another node.
 pub struct PeerIo {
+    durability: StdMutex<Durability>,
     volume: String,
     connector: TlsConnector,
     locate: Arc<dyn Locate>,
@@ -264,6 +319,7 @@ const LOG_EVERY_MS: u64 = 5000;
 impl PeerIo {
     pub fn new(volume: &str, connector: TlsConnector, locate: Arc<dyn Locate>) -> Self {
         PeerIo {
+            durability: Default::default(),
             volume: volume.to_string(),
             connector,
             locate,
@@ -316,11 +372,48 @@ impl PeerIo {
             .map_err(|_| format!("{}:{}: timed out", addr, port))?
             .map_err(|e| format!("{}:{}: {}", addr, port, e))?;
         *slot = Some(c.clone());
+        self.reached(&c);
         println!(
             "peer-io: '{}' proxied to {}:{} (epoch {})",
             self.volume, addr, port, epoch
         );
         Ok(c)
+    }
+
+    /// A connection to writer `c` is up: writes some other writer
+    /// acknowledged and nobody flushed are lost, unless `c` took the
+    /// volume over from that writer cleanly.
+    fn reached(&self, c: &Conn) {
+        let mut d = self.durability.lock().unwrap();
+        if d.epoch == c.epoch {
+            return;
+        }
+        if d.acked > d.flushed && d.from_lost(c) {
+            eprintln!(
+                "peer-io: '{}': writes acknowledged at epoch {} were never flushed, and the \
+                 writer now (epoch {}) didn't take over from that one cleanly: the next \
+                 flush fails",
+                self.volume, d.epoch, c.epoch
+            );
+            d.lost = true;
+        }
+        d.epoch = c.epoch;
+        d.flushed = d.acked;
+    }
+
+    /// Acknowledged writes not covered by a flush yet, or already known
+    /// lost (an unclean writer change seen, not yet reported by a flush):
+    /// if this proxy is retired for a writer that didn't take over cleanly,
+    /// they're lost. Ask once nothing is in flight (after `pause_owned`).
+    pub fn unflushed(&self) -> bool {
+        let d = self.durability.lock().unwrap();
+        d.lost || d.acked > d.flushed
+    }
+
+    /// Acknowledged writes already known lost and not yet reported (see
+    /// `unflushed`): what a clean takeover must still report.
+    pub fn lost(&self) -> bool {
+        self.durability.lock().unwrap().lost
     }
 
     async fn connect(&self, addr: &str, port: u16, epoch: Epoch) -> Result<Arc<Conn>, String> {
@@ -332,17 +425,25 @@ impl PeerIo {
         wr.flush().await.map_err(|e| e.to_string())?;
         let mut rd = BufReader::new(rd);
         let answer = read_line(&mut rd).await.map_err(|e| e.to_string())?;
-        if answer.strip_prefix("OK ").is_none() {
+        let Some(ok) = answer.strip_prefix("OK ") else {
             return Err(answer.strip_prefix("ERR ").unwrap_or(&answer).to_string());
-        }
+        };
+        let from = ok
+            .split(' ')
+            .nth(1)
+            .and_then(|f| f.parse::<Epoch>().ok())
+            .ok_or_else(|| format!("bad answer: {}", answer))?;
         let conn = Arc::new(Conn {
+            epoch,
+            from,
             writer: Mutex::new(wr),
             pending: StdMutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             dead: AtomicBool::new(false),
+            reader: StdMutex::new(None),
         });
         let c = conn.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             if let Err(e) = read_replies(rd, &c).await
                 && !c.dead.load(Ordering::SeqCst)
             {
@@ -350,6 +451,11 @@ impl PeerIo {
             }
             c.kill();
         });
+        *conn.reader.lock().unwrap() = Some(reader.abort_handle());
+        if conn.dead.load(Ordering::SeqCst) {
+            // Died before the handle was stored: stop it now.
+            reader.abort();
+        }
         Ok(conn)
     }
 
@@ -382,10 +488,28 @@ impl PeerIo {
         msg.extend_from_slice(data);
         let sent = {
             let mut w = conn.writer.lock().await;
-            match w.write_all(&msg).await {
+            // Killed while this waited for the stream: a frame cut short
+            // may be on it, so nothing more may follow.
+            if conn.dead.load(Ordering::SeqCst) {
+                conn.pending.lock().unwrap().remove(&handle);
+                return Err(None);
+            }
+            // Dropped mid-write (a caller giving up), the stream would hold
+            // part of a frame, and the next request's bytes would be read
+            // as the rest of it: as data, written to the volume. Kill the
+            // connection instead, unless the whole frame went out.
+            let mut torn = KillOnDrop(Some(conn));
+            let r = match w.write_all(&msg).await {
                 Ok(()) => w.flush().await,
                 Err(e) => Err(e),
+            };
+            // A failed write may have left part of a frame too: stay armed,
+            // so the connection is killed (by `torn`, dropped before `w`)
+            // before any waiting request can take the stream (audit A4).
+            if r.is_ok() {
+                torn.0 = None;
             }
+            r
         };
         if sent.is_err() {
             conn.kill();
@@ -419,9 +543,25 @@ impl PeerIo {
             }
             let attempt = async {
                 let conn = self.conn().await.map_err(|e| (None, e))?;
-                self.send(&conn, cmd, offset, len, data)
+                // What a flush sent now covers (acknowledged before it).
+                let covers = self.durability.lock().unwrap().acked;
+                let r = self
+                    .send(&conn, cmd, offset, len, data)
                     .await
-                    .map_err(|e| (e, String::from("connection lost")))
+                    .map_err(|e| (e, String::from("connection lost")))?;
+                let mut d = self.durability.lock().unwrap();
+                if cmd == NBD_CMD_FLUSH {
+                    if d.epoch == conn.epoch {
+                        d.flushed = d.flushed.max(covers);
+                    }
+                } else if cmd != NBD_CMD_READ {
+                    if d.epoch != conn.epoch {
+                        // Acknowledged by a writer since replaced: can't tell.
+                        d.lost = true;
+                    }
+                    d.acked += 1;
+                }
+                Ok(r)
             };
             let why = tokio::select! {
                 r = attempt => match r {
@@ -534,7 +674,15 @@ impl VolumeIo for PeerIo {
         Ok(())
     }
     async fn flush(&self) -> Result<(), FileSystemError> {
-        self.call(NBD_CMD_FLUSH, 0, 0, &[]).await.map(|_| ())
+        self.call(NBD_CMD_FLUSH, 0, 0, &[]).await?;
+        let lost = std::mem::take(&mut self.durability.lock().unwrap().lost);
+        if lost {
+            return Err(FileSystemError::Unavailable(format!(
+                "volume '{}': writes acknowledged by its previous writer were lost with it",
+                self.volume
+            )));
+        }
+        Ok(())
     }
     /// What this node has to commit for the volume: nothing (the writer
     /// commits). A flush makes what was written here durable there.

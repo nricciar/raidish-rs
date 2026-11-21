@@ -90,6 +90,8 @@ impl<D: BlockDevice + Send + Sync + 'static> VolumeIo for LocalIo<D> {
 /// [`pause`]: SwitchableIo::pause
 pub struct SwitchableIo {
     backend: Arc<RwLock<Arc<dyn VolumeIo>>>,
+    /// The next flush fails (see `poison`).
+    lost: std::sync::atomic::AtomicBool,
 }
 
 /// Requests are held back while this lives; see [`SwitchableIo::pause`].
@@ -114,7 +116,25 @@ impl SwitchableIo {
     pub fn new(io: Arc<dyn VolumeIo>) -> Self {
         SwitchableIo {
             backend: Arc::new(RwLock::new(io)),
+            lost: Default::default(),
         }
+    }
+
+    /// Writes this export acknowledged may be lost (the backend that took
+    /// them is gone, and its replacement didn't get them in a clean
+    /// handoff): fail the next flush, so whoever relies on it learns
+    /// (audit A2).
+    pub fn poison(&self) {
+        self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take_lost(&self) -> Result<(), FileSystemError> {
+        if self.lost.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(FileSystemError::Unavailable(
+                "writes acknowledged by the volume's previous writer were lost with it".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Hold new requests back once those in flight have finished.
@@ -207,11 +227,13 @@ impl VolumeIo for SwitchableIo {
     }
     async fn flush(&self) -> Result<(), FileSystemError> {
         self.run(|io| Box::pin(async move { io.flush().await }))
-            .await
+            .await?;
+        self.take_lost()
     }
     async fn sync(&self) -> Result<(), FileSystemError> {
         self.run(|io| Box::pin(async move { io.sync().await }))
-            .await
+            .await?;
+        self.take_lost()
     }
 }
 

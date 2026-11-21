@@ -27,16 +27,29 @@ pub use crate::fence::Domain;
 pub enum MetaslabGrant {
     /// Lent to writer lease `writer` (`writer/<node>` at its epoch);
     /// `epoch` (the lend's) fences the metaslab's data.
-    Lent { writer: LeaseRef, epoch: Epoch },
+    ///
+    /// `from` (in both): the epoch of the grant this one replaced (none:
+    /// the first), so a resent `Lend` or `Return` can tell it already
+    /// happened (audit R4d).
+    Lent {
+        writer: LeaseRef,
+        epoch: Epoch,
+        #[serde(default)]
+        from: Epoch,
+    },
     /// Back with the committer since `epoch`.
-    Returned { epoch: Epoch },
+    Returned {
+        epoch: Epoch,
+        #[serde(default)]
+        from: Epoch,
+    },
 }
 
 impl MetaslabGrant {
     /// The epoch of the lend or return.
     pub fn epoch(&self) -> Epoch {
         match self {
-            MetaslabGrant::Lent { epoch, .. } | MetaslabGrant::Returned { epoch } => *epoch,
+            MetaslabGrant::Lent { epoch, .. } | MetaslabGrant::Returned { epoch, .. } => *epoch,
         }
     }
 
@@ -52,7 +65,7 @@ impl MetaslabGrant {
     pub fn fence(&self) -> crate::fence::Grant {
         match self {
             MetaslabGrant::Lent { epoch, .. } => crate::fence::Grant::Lent(*epoch),
-            MetaslabGrant::Returned { epoch } => crate::fence::Grant::Returned(*epoch),
+            MetaslabGrant::Returned { epoch, .. } => crate::fence::Grant::Returned(*epoch),
         }
     }
 }
@@ -101,14 +114,25 @@ pub enum LeaseOp {
         nfs: Holding,
     },
     /// The committer (`pool`, the current `pool` holder) lends metaslab
-    /// `idx` to writer lease `writer`.
+    /// `idx` to writer lease `writer`, if its grant is still the one of
+    /// epoch `after` (none: never granted). Sent again after it was
+    /// applied, it's answered as the first time; after anything else
+    /// happened to the metaslab, refused (audit R4d).
     Lend {
         idx: MetaslabIdx,
         writer: LeaseRef,
         pool: Holding,
+        #[serde(default)]
+        after: Epoch,
     },
-    /// The committer takes metaslab `idx` back.
-    Return { idx: MetaslabIdx, pool: Holding },
+    /// The committer takes metaslab `idx` back from the lend of epoch
+    /// `lend`. Idempotent like `Lend`.
+    Return {
+        idx: MetaslabIdx,
+        pool: Holding,
+        #[serde(default)]
+        lend: Epoch,
+    },
     /// Whether VM `name` should be running (see `crate::vm`). Only the
     /// intent: what actually runs is whatever libvirt says on the node that
     /// holds the VM's disk.
@@ -196,6 +220,13 @@ impl Lease {
 pub struct ClusterState {
     /// The newest epoch handed out (none yet: `Epoch::NONE`).
     pub epoch: Epoch,
+    /// The newest leader time applied: the state machine's clock. It never
+    /// goes back, so a new leader whose clock is behind can't un-expire a
+    /// lease (or extend one) by stamping an earlier time (audit R3a). A
+    /// leader clock far *ahead* still expires leases early: bounded clock
+    /// skew between nodes (well under a lease's safety margin) is assumed.
+    #[serde(default)]
+    pub clock_ms: u64,
     /// Every resource ever leased. Released or expired leases stay, so the
     /// resource's last epoch is never forgotten.
     pub leases: BTreeMap<LeaseResource, Lease>,
@@ -233,7 +264,7 @@ impl ClusterState {
             Domain::Pool => self.pool_epoch(),
             Domain::Metaslab(i) => match self.metaslabs.get(&i) {
                 Some(MetaslabGrant::Lent { epoch, .. }) => *epoch,
-                Some(MetaslabGrant::Returned { epoch }) => (*epoch).max(self.pool_epoch()),
+                Some(MetaslabGrant::Returned { epoch, .. }) => (*epoch).max(self.pool_epoch()),
                 None => self.pool_epoch(),
             },
         }
@@ -246,6 +277,9 @@ impl ClusterState {
 
     /// The live lease on `resource`, if any.
     pub fn live_lease(&self, resource: &LeaseResource, now_ms: u64) -> Option<&Lease> {
+        // Never earlier than the cluster's own clock: a reader whose clock
+        // lags must not see a lease the cluster has expired as live.
+        let now_ms = now_ms.max(self.clock_ms);
         self.leases.get(resource).filter(|l| l.is_live(now_ms))
     }
 
@@ -275,6 +309,7 @@ impl ClusterState {
     /// The nodes whose agents are running (hold their live `node/` lease),
     /// with their leases.
     pub fn live_nodes(&self, now_ms: u64) -> impl Iterator<Item = (&str, &Lease)> {
+        let now_ms = now_ms.max(self.clock_ms);
         self.leases.iter().filter_map(move |(r, l)| match r {
             LeaseResource::Node(n) if l.is_live(now_ms) => Some((n.as_str(), l)),
             _ => None,
@@ -294,20 +329,43 @@ impl ClusterState {
     }
 
     pub fn apply(&mut self, req: &Request) -> Response {
-        let now_ms = req.now_ms;
+        self.clock_ms = self.clock_ms.max(req.now_ms);
+        let now_ms = self.clock_ms;
         match &req.op {
-            LeaseOp::Lend { idx, writer, pool } => {
+            LeaseOp::Lend {
+                idx,
+                writer,
+                pool,
+                after,
+            } => {
                 if !self.holds(&POOL, pool, now_ms) {
                     return Response::Refused("not the committer".into());
                 }
-                if !self.is_live(writer, now_ms) {
-                    return Response::Refused(format!("{} is not live", writer));
-                }
-                if let Some(w) = self.lent_to(*idx) {
+                let current = self.metaslabs.get(idx);
+                if let Some(MetaslabGrant::Lent {
+                    writer: w,
+                    epoch,
+                    from,
+                }) = current
+                {
+                    // This very lend, sent again: answered as the first time.
+                    if w == writer && from == after {
+                        return Response::Fenced { epoch: *epoch };
+                    }
                     return Response::Refused(format!(
                         "metaslab {} is lent to {}",
                         idx, w.resource
                     ));
+                }
+                let now = current.map_or(Epoch::NONE, MetaslabGrant::epoch);
+                if now != *after {
+                    return Response::Refused(format!(
+                        "metaslab {} changed hands (its grant is of epoch {}, not {})",
+                        idx, now, after
+                    ));
+                }
+                if !self.is_live(writer, now_ms) {
+                    return Response::Refused(format!("{} is not live", writer));
                 }
                 self.epoch = self.epoch.next();
                 self.metaslabs.insert(
@@ -315,18 +373,36 @@ impl ClusterState {
                     MetaslabGrant::Lent {
                         writer: writer.clone(),
                         epoch: self.epoch,
+                        from: *after,
                     },
                 );
                 Response::Fenced { epoch: self.epoch }
             }
-            LeaseOp::Return { idx, pool } => {
+            LeaseOp::Return { idx, pool, lend } => {
                 if !self.holds(&POOL, pool, now_ms) {
                     return Response::Refused("not the committer".into());
                 }
+                match self.metaslabs.get(idx) {
+                    Some(MetaslabGrant::Lent { epoch, .. }) if epoch == lend => {}
+                    // This very return, sent again.
+                    Some(MetaslabGrant::Returned { epoch, from }) if from == lend => {
+                        return Response::Fenced { epoch: *epoch };
+                    }
+                    other => {
+                        return Response::Refused(format!(
+                            "metaslab {} isn't on the lend of epoch {} ({:?})",
+                            idx, lend, other
+                        ));
+                    }
+                }
                 self.epoch = self.epoch.next();
-                self.metaslabs
-                    .insert(*idx, MetaslabGrant::Returned { epoch: self.epoch });
-
+                self.metaslabs.insert(
+                    *idx,
+                    MetaslabGrant::Returned {
+                        epoch: self.epoch,
+                        from: *lend,
+                    },
+                );
                 Response::Fenced { epoch: self.epoch }
             }
             LeaseOp::Acquire {

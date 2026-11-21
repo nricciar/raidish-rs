@@ -298,9 +298,10 @@ pub enum ServerMode {
 /// restarted and made to misbehave.
 pub struct TestDiskServer {
     pub port: u16,
-    disks: std::sync::Arc<Vec<crate::disks::Caddy>>,
+    pub disks: std::sync::Arc<crate::fenced_disks::FencedDisks>,
     mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    /// The server's lease epoch floor (see `api::EpochFloor`).
+    /// The server's lease epoch floor (see `api::EpochFloor`). Ready: a
+    /// test that wants the startup barrier swaps in one that isn't.
     pub floor: std::sync::Arc<crate::api::EpochFloor>,
     tasks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
@@ -316,12 +317,23 @@ impl TestDiskServer {
                 crate::disk::Disk::open(p).await.unwrap(),
             ));
         }
+        Self::start_with(disks, std::sync::Arc::new(crate::api::EpochFloor::ready())).await
+    }
+
+    /// Serve `disks` behind `floor`.
+    pub async fn start_with(
+        disks: Vec<crate::disks::Caddy>,
+        floor: std::sync::Arc<crate::api::EpochFloor>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = TestDiskServer {
             port: listener.local_addr().unwrap().port(),
-            disks: std::sync::Arc::new(disks),
+            disks: std::sync::Arc::new(crate::fenced_disks::FencedDisks::new(
+                std::sync::Arc::new(disks),
+                floor.clone(),
+            )),
             mode: Default::default(),
-            floor: Default::default(),
+            floor,
             tasks: Default::default(),
         };
         server.serve(listener);
@@ -365,15 +377,22 @@ impl TestDiskServer {
     fn serve(&self, listener: tokio::net::TcpListener) {
         use futures_util::{SinkExt, StreamExt};
         let (disks, mode, tasks) = (self.disks.clone(), self.mode.clone(), self.tasks.clone());
-        let floor = self.floor.clone();
         let accept = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (disks, mode, floor) = (disks.clone(), mode.clone(), floor.clone());
+                let (disks, mode) = (disks.clone(), mode.clone());
                 let conn = tokio::spawn(async move {
                     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
                     let (mut sink, mut source) = ws.split();
+                    // Set however the connection ends (`stop` aborts it).
+                    struct Closed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for Closed {
+                        fn drop(&mut self) {
+                            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let closed = Closed(Default::default());
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                     let writer = tokio::spawn(async move {
                         while let Some(r) = rx.recv().await {
@@ -399,10 +418,15 @@ impl TestDiskServer {
                                 {
                                     continue;
                                 }
-                                let (disks, tx, floor) = (disks.clone(), tx.clone(), floor.clone());
+                                let received = tokio::time::Instant::now();
+                                let (disks, tx, closed) =
+                                    (disks.clone(), tx.clone(), closed.0.clone());
                                 tokio::spawn(async move {
                                     let _ = tx.send(
-                                        crate::api::handle_ws_message(&data, &disks, &floor).await,
+                                        crate::api::handle_ws_message_as(
+                                            &data, &disks, true, received, closed,
+                                        )
+                                        .await,
                                     );
                                 });
                             }
@@ -524,4 +548,94 @@ pub async fn fake_json_server(
         }
     });
     (url, hits)
+}
+
+pub use crate::disk::fault::{FaultDisk, FaultError, FaultHandle, FaultStats};
+
+/// A test pool whose every member disk sits behind its own `FaultHandle`
+/// (indexed like the pool's disks). The handles outlive the pools opened
+/// over them, so faults carry across crash/reopen.
+pub struct FaultPool {
+    pub pool: TestPool,
+    pub disks: Vec<FaultHandle>,
+}
+
+impl TestPool {
+    /// An `n`-way mirror.
+    pub async fn mirror(n: usize) -> Self {
+        Self::with_topology(Topology::Mirror {
+            disks: (0..n).collect(),
+        })
+        .await
+    }
+
+    /// raidz`parity` over `n` disks.
+    pub async fn raidz(parity: usize, n: usize) -> Self {
+        Self::with_topology(Topology::RaidZ {
+            parity,
+            disks: (0..n).collect(),
+        })
+        .await
+    }
+
+    /// Put a fault layer in front of every disk.
+    pub fn faulty(self) -> FaultPool {
+        let disks = self
+            .paths
+            .iter()
+            .map(|p| FaultDisk::open(p).unwrap())
+            .collect();
+        FaultPool { pool: self, disks }
+    }
+}
+
+impl FaultPool {
+    pub async fn mirror(n: usize) -> Self {
+        TestPool::mirror(n).await.faulty()
+    }
+
+    pub async fn raidz(parity: usize, n: usize) -> Self {
+        TestPool::raidz(parity, n).await.faulty()
+    }
+
+    pub fn disk(&self, i: usize) -> &FaultHandle {
+        &self.disks[i]
+    }
+
+    /// Clear every disk's switches.
+    pub fn heal(&self) {
+        for d in &self.disks {
+            d.heal();
+        }
+    }
+
+    /// A fresh `Pool` over the fault disks (what a process opening the pool
+    /// gets).
+    pub fn dev(&self) -> Pool {
+        let caddies = self
+            .disks
+            .iter()
+            .map(|h| {
+                crate::disks::Caddy::Healthy(
+                    h.path().to_string_lossy().into_owned(),
+                    crate::disk::Disk::faulty(h.clone()),
+                )
+            })
+            .collect();
+        Pool::new(
+            Arc::new(DiskSet::from_caddies(caddies)),
+            self.pool.topology.clone(),
+        )
+        .unwrap()
+    }
+
+    pub async fn format(&self) -> FileSystem<Pool> {
+        let dev = self.dev();
+        let blocks = self.pool.format_blocks(&dev).await;
+        FileSystem::format(dev, blocks).await.unwrap()
+    }
+
+    pub async fn load(&self) -> FileSystem<Pool> {
+        FileSystem::load(self.dev()).await.unwrap()
+    }
 }

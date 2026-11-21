@@ -129,11 +129,15 @@ async fn a_deep_tree_shrinks_back_to_nothing() {
         crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
     };
     assert_eq!((h.root, h.height, h.entries), (None, 0, 0));
-    // Every node's record was freed (only the header is left).
+    // Every node's record was freed: what's left is the header and the
+    // pages the spilled free ids are listed in, and every other id is free.
     let id = fs.dataset_id("t").await.unwrap();
     let d = fs.read_dnode(id).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
-    assert_eq!(leaves.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0]);
+    assert_eq!(leaves[0].0, 0);
+    let lists = leaves.len() as u64 - 1;
+    assert_eq!(h.free_chain.is_some(), lists > 0);
+    assert_eq!(h.free_total + lists, h.next_id - 1);
 }
 
 #[tokio::test]
@@ -248,4 +252,117 @@ fn decode_takes_all_of_a_record_or_nothing() {
     let mut short = encode(&1u64).unwrap();
     short[..4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(decode::<u64>(&short, "t").is_err());
+}
+
+/// Overflow pages that are all zeros are committed as holes: they must
+/// read back as zeros (and pass the tree check), not as missing pages.
+#[tokio::test]
+async fn zero_overflow_pages_read_back() {
+    let pool = TestPool::new().await;
+    let fs = small_kv(&pool, "t").await;
+    let mut model = BTreeMap::new();
+    let mut middle = value(1, 0, 200_000);
+    middle[40_000..120_000].fill(0);
+    let mut tail = value(2, 0, 100_000);
+    tail[50_000..].fill(0);
+    for (i, v) in [vec![0u8; 100_000], middle, tail].into_iter().enumerate() {
+        let k = key(i as u64, 10);
+        fs.kv_put("t", &k, &v).await.unwrap();
+        model.insert(k, v);
+    }
+    verify(&fs, "t", &model).await;
+    for (k, v) in &model {
+        assert_eq!(fs.kv_get("t", k).await.unwrap().as_ref(), Some(v));
+    }
+}
+
+/// S6c-1: a long-lived tree whose large values keep changing reuses the
+/// ids it frees: `next_id` stays near the most it held at once (here a few
+/// hundred), far below what the churn wrote in all (tens of thousands of
+/// pages), and the tree check finds every id used or free.
+#[tokio::test]
+async fn churning_large_values_reuses_freed_ids() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    let capacity = 4096;
+    fs.create_kv_with("t", VOLBLOCK_ALIGN, capacity)
+        .await
+        .unwrap();
+    let blksz = VOLBLOCK_ALIGN as usize;
+    let mut model = BTreeMap::new();
+    let mut rng = Rng(7);
+    let mut pages_written = 0;
+    for round in 0..2000u64 {
+        let k = key(rng.below(8), 10);
+        if rng.below(5) == 0 {
+            fs.kv_delete("t", &k).await.unwrap();
+            model.remove(&k);
+        } else {
+            let len = blksz + rng.below(30 * blksz as u64) as usize;
+            pages_written += len.div_ceil(blksz);
+            let v = value(round, round, len);
+            fs.kv_put("t", &k, &v)
+                .await
+                .unwrap_or_else(|e| panic!("round {}: {}", round, e));
+            model.insert(k, v);
+        }
+        if round % 500 == 499 {
+            verify(&fs, "t", &model).await;
+        }
+    }
+    verify(&fs, "t", &model).await;
+    let h = {
+        let ds = fs.open_kv("t").await.unwrap();
+        crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
+    };
+    assert!(pages_written > 5 * capacity as usize);
+    // 8 values of at most 31 pages, an id list each, a replacement in
+    // flight, the leaves and the free lists' pages.
+    assert!(h.next_id < 600, "next_id {} after churn", h.next_id);
+}
+
+/// S6c-1: freeing far more ids at once than the header's free list holds
+/// (deleting a big set of large values) keeps them all, spilled into id
+/// lists, and filling the tree again reuses them rather than new ids.
+#[tokio::test]
+async fn ids_freed_in_bulk_are_all_kept_for_reuse() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    let capacity = 4096;
+    fs.create_kv_with("t", VOLBLOCK_ALIGN, capacity)
+        .await
+        .unwrap();
+    let blksz = VOLBLOCK_ALIGN as usize;
+    let mut first_next_id = None;
+    for cycle in 0..6u64 {
+        let mut model = BTreeMap::new();
+        for i in 0..40 {
+            let (k, v) = (key(cycle * 100 + i, 10), value(i, cycle, 30 * blksz));
+            fs.kv_put("t", &k, &v)
+                .await
+                .unwrap_or_else(|e| panic!("cycle {} put {}: {}", cycle, i, e));
+            model.insert(k, v);
+        }
+        verify(&fs, "t", &model).await;
+        let next_id = {
+            let ds = fs.open_kv("t").await.unwrap();
+            crate::btree::Txn::begin(&fs, &ds.obj)
+                .await
+                .unwrap()
+                .header
+                .next_id
+        };
+        let first = *first_next_id.get_or_insert(next_id);
+        assert!(
+            next_id <= first + 64,
+            "cycle {}: next_id {} (first fill: {})",
+            cycle,
+            next_id,
+            first
+        );
+        for k in model.keys() {
+            fs.kv_delete("t", k).await.unwrap();
+        }
+        verify(&fs, "t", &BTreeMap::new()).await;
+    }
 }

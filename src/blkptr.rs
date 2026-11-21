@@ -147,7 +147,15 @@ impl<D: BlockDevice> FileSystem<D> {
         );
         let txg = self.open_txg().await?;
         let extent = self.allocate_contiguous(blocks).await?;
-        if let Err(e) = self.write_record_blocks(extent.start, data).await {
+        let unwritten = crate::tx::Unwritten::new(
+            extent.start,
+            extent.len,
+            self.metaslabs.clone(),
+            self.layout,
+        );
+        let r = self.write_record_blocks(extent.start, data).await;
+        unwritten.disarm();
+        if let Err(e) = r {
             self.unallocate(extent.start, extent.len).await;
             return Err(e);
         }
@@ -302,6 +310,16 @@ impl<D: BlockDevice> FileSystem<D> {
         if check(&data) {
             return Ok(data);
         }
+
+        // Rebuilding and repairing can take a while: keep these blocks from
+        // being freed, reallocated and rewritten before the repair lands on
+        // them (audit D5a; see `RepairHold`). Only here, not on every read:
+        // under steady reads that would never let frees go. A pointer that
+        // was already freed TXG_DEFER_SIZE commits before this read began
+        // is the caller's bug either way. A writer repairs only its own
+        // lent space: elsewhere no hold of its reaches the committer.
+        let hold = if heal { self.repair_hold(lba, n) } else { None };
+        let heal = hold.is_some();
 
         // Rebuild every block several ways (see `Candidates`), then test
         // hypotheses about which disks are bad; the record checksum decides.

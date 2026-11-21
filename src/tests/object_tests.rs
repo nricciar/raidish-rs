@@ -35,9 +35,11 @@ async fn sync_obj(fs: &FileSystem<Pool>, obj: &ObjTree) {
             .await
             .unwrap();
         obj.set_root(root);
+        let mut tx = fs.begin_tx().await;
         for p in &replaced {
-            fs.free(p.lba, p.asize as u64).await.unwrap();
+            fs.free(&mut tx, p.lba, p.asize as u64).await.unwrap();
         }
+        tx.applied();
         obj.end_sync(&taken, Some(&taken));
     }
     fs.sync().await.unwrap();

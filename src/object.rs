@@ -357,6 +357,25 @@ impl ObjTree {
     }
 
     /// Replace record `idx` whole (`Data` is zero-padded to `blksz`).
+    /// Dirty record `idx`, if there is one (what `restore_record` puts
+    /// back, see `crate::tx`).
+    pub(crate) fn dirty_record(&self, idx: u64) -> Option<Dirty> {
+        self.dirty.lock().unwrap().records.get(&idx).cloned()
+    }
+
+    /// Set dirty record `idx` back to `prior` (None: not dirty).
+    pub(crate) fn restore_record(&self, idx: u64, prior: Option<Dirty>) {
+        let mut d = self.dirty.lock().unwrap();
+        match prior {
+            Some(r) => {
+                d.records.insert(idx, r);
+            }
+            None => {
+                d.records.remove(&idx);
+            }
+        }
+    }
+
     pub(crate) fn put_record(&self, idx: u64, rec: Dirty) {
         let rec = match rec {
             Dirty::Data(mut b) => {
@@ -423,6 +442,24 @@ impl ObjTree {
         d.syncing = Some(taken.clone());
         d.ops_cut = d.next_op;
         Some(taken)
+    }
+
+    /// `begin_sync`, and the size that goes with exactly those records
+    /// (read under the same lock that writes and truncates change both
+    /// under): a sync that committed the size as of later, after a truncate
+    /// meanwhile, would point a smaller file at a tree still holding the
+    /// records past its end, and a later extend would read them back
+    /// instead of zeros (audit S6c-2).
+    pub(crate) fn begin_sync_sized(&self) -> (Option<Arc<BTreeMap<u64, Dirty>>>, u64) {
+        let mut d = self.dirty.lock().unwrap();
+        let size = self.size();
+        if d.records.is_empty() {
+            return (None, size);
+        }
+        let taken = Arc::new(std::mem::take(&mut d.records));
+        d.syncing = Some(taken.clone());
+        d.ops_cut = d.next_op;
+        (Some(taken), size)
     }
 
     /// Finish a sync of `taken`: records not in `synced` (all of them when
@@ -507,7 +544,19 @@ impl<D: BlockDevice> FileSystem<D> {
         obj: &ObjTree,
         idx: u64,
     ) -> Result<Option<Arc<Vec<u8>>>, FileSystemError> {
-        let Some(ptr) = self.tree_lookup(obj, &obj.root(), 0, idx).await? else {
+        self.read_committed_record_at(obj, &obj.root(), idx).await
+    }
+
+    /// `read_committed_record` in the tree at `root`: for a caller that
+    /// checks afterwards that `root` is still the committed one (a root
+    /// read twice could differ between the reads).
+    pub(crate) async fn read_committed_record_at(
+        &self,
+        obj: &ObjTree,
+        root: &TreeRoot,
+        idx: u64,
+    ) -> Result<Option<Arc<Vec<u8>>>, FileSystemError> {
+        let Some(ptr) = self.tree_lookup(obj, root, 0, idx).await? else {
             return Ok(None);
         };
         let key = (ptr.lba, ptr.birth_txg);
@@ -638,6 +687,14 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(0);
         }
         let bs = obj.blksz;
+        // A growable object's size moves with each record, under the dirty
+        // lock, so a sync (which takes the records and the size together,
+        // see `begin_sync_sized`) never commits records past its size.
+        let grow = |end: u64| {
+            if obj.sizing == Sizing::Growable {
+                obj.size.fetch_max(end, Ordering::SeqCst);
+            }
+        };
 
         let mut done = 0;
         while done < len {
@@ -660,6 +717,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 let mut d = obj.dirty.lock().unwrap();
                 d.records.insert(idx, rec);
                 d.mark_whole(idx);
+                grow(pos + n as u64);
             } else {
                 loop {
                     {
@@ -667,6 +725,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         if let Some(Dirty::Data(buf)) = d.records.get_mut(&idx) {
                             apply(buf);
                             d.mark_range(idx, at, at + n);
+                            grow(pos + n as u64);
                             break;
                         }
                         // Base on what's being synced, if anything.
@@ -679,28 +738,34 @@ impl<D: BlockDevice> FileSystem<D> {
                             apply(&mut buf);
                             d.records.insert(idx, Dirty::Data(buf));
                             d.mark_range(idx, at, at + n);
+                            grow(pos + n as u64);
                             break;
                         }
                     }
                     // Read-modify-write against the committed tree.
-                    let mut buf = match self.read_committed_record(obj, idx).await? {
+                    // The record as of exactly this root (audit S2): the
+                    // check below then holds even if the root changed and
+                    // came back (an empty tree's `None`).
+                    let base_root = obj.root();
+                    let mut buf = match self.read_committed_record_at(obj, &base_root, idx).await? {
                         Some(committed) => committed.as_ref().clone(),
                         None => vec![0u8; bs],
                     };
                     let mut d = obj.dirty.lock().unwrap();
-                    if d.get(idx).is_some() {
-                        continue; // raced with another writer; retry on top of theirs
+                    // Raced with another writer: retry on top of theirs. Theirs
+                    // may be dirty still, or already committed (a sync took it
+                    // and finished meanwhile: the tree changed under the read).
+                    if d.get(idx).is_some() || obj.root() != base_root {
+                        continue;
                     }
                     apply(&mut buf);
                     d.records.insert(idx, Dirty::Data(buf));
                     d.mark_range(idx, at, at + n);
+                    grow(pos + n as u64);
                     break;
                 }
             }
             done += n;
-        }
-        if obj.sizing == Sizing::Growable {
-            obj.size.fetch_max(offset + len as u64, Ordering::SeqCst);
         }
         Ok(done)
     }
@@ -729,8 +794,19 @@ impl<D: BlockDevice> FileSystem<D> {
                     .await?;
             }
             let first_gone = new_size.div_ceil(bs);
-            let committed = self.tree_leaves_from(obj, &obj.root(), first_gone).await?;
-            let mut d = obj.dirty.lock().unwrap();
+            // The committed records past the end, as of the root that's
+            // still committed once the dirty lock is ours: a sync that
+            // finished in between committed records the leaves read missed.
+            // While the root stands, a sync under way has its records in
+            // `syncing` (it sets the root before `end_sync`).
+            let (committed, mut d) = loop {
+                let root = obj.root();
+                let committed = self.tree_leaves_from(obj, &root, first_gone).await?;
+                let d = obj.dirty.lock().unwrap();
+                if obj.root() == root {
+                    break (committed, d);
+                }
+            };
             let mut gone: Vec<u64> = d.records.split_off(&first_gone).into_keys().collect();
             if let Some(s) = &d.syncing {
                 gone.extend(s.range(first_gone..).map(|(k, _)| *k));
@@ -740,8 +816,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 d.records.insert(idx, Dirty::Hole);
                 d.mark_whole(idx);
             }
+            // With the holes, under the same lock (see `begin_sync_sized`).
+            obj.size.store(new_size, Ordering::SeqCst);
+        } else {
+            let _d = obj.dirty.lock().unwrap();
+            obj.size.store(new_size, Ordering::SeqCst);
         }
-        obj.size.store(new_size, Ordering::SeqCst);
         Ok(())
     }
 

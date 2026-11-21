@@ -114,6 +114,10 @@ pub(super) struct Shared {
     /// The volumes this node writes, by `ds/` lease epoch: what peers may
     /// proxy to.
     pub writing: Mutex<BTreeMap<String, Epoch>>,
+    /// Volumes taken over here in a clean handoff: name → (the epoch this
+    /// node writes it at, the epoch of the writer it came from). What peer
+    /// proxies are told (see `PeerExport::from`).
+    pub handed_from: Mutex<BTreeMap<String, (Epoch, Epoch)>>,
 }
 
 impl Shared {
@@ -124,6 +128,7 @@ impl Shared {
             writer: Mutex::new(None),
             slots: Mutex::new(BTreeMap::new()),
             writing: Mutex::new(BTreeMap::new()),
+            handed_from: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -176,6 +181,12 @@ pub(super) async fn take_over(
     }
     match proxy {
         Some((p, paused)) => {
+            // Taken over cleanly from its writer, which made what it
+            // acknowledged durable; but writes an earlier, unclean writer
+            // change lost are still owed a failed flush (audit A2).
+            if p.peer.lost() {
+                p.io.poison();
+            }
             paused.set(Arc::new(LocalIo::new(w.fs.clone(), name)));
             p.peer.retire();
         }
@@ -209,9 +220,14 @@ impl PeerVolumes for Shared {
             .unwrap()
             .clone()
             .ok_or("no writer here")?;
+        let from = match self.handed_from.lock().unwrap().get(volume) {
+            Some(&(now, from)) if now == epoch => from,
+            _ => Epoch::NONE,
+        };
         [Transport::Nbd, Transport::Nvme]
             .into_iter()
             .find_map(|t| w.exporter(t).peer_export(volume))
+            .map(|e| PeerExport { from, ..e })
             .ok_or_else(|| format!("{} isn't exported here", volume))
     }
 
@@ -316,6 +332,10 @@ impl PeerVolumes for Shared {
                     .lock()
                     .unwrap()
                     .insert(volume.to_string(), new_epoch);
+                self.handed_from
+                    .lock()
+                    .unwrap()
+                    .insert(volume.to_string(), (new_epoch, epoch));
                 let device = proxy.as_ref().and_then(|p| p.device.clone());
                 self.slots.lock().unwrap().insert(
                     volume.to_string(),

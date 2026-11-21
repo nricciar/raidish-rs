@@ -134,3 +134,35 @@ fn uberblocks_validate_what_they_claim() {
         assert!(b.validate(Txg::from_raw(7)).is_err(), "{:?}", b);
     }
 }
+
+/// A label's TXG is covered by its checksum: a flipped bit there is
+/// caught, not taken for an older or newer copy.
+#[test]
+fn label_checksum_covers_the_txg() {
+    use crate::types::Txg;
+    let payload = b"space map".to_vec();
+    let header = BlockHeader {
+        magic: LABEL_MAGIC,
+        txg: Txg::from_raw(12),
+        checksum: label_checksum(Txg::from_raw(12), &payload),
+        payload_len: payload.len() as u32,
+    };
+    let mut buf = vec![0u8; BLOCK_SIZE];
+    let hb = bincode::serialize(&header).unwrap();
+    buf[..hb.len()].copy_from_slice(&hb);
+    buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + payload.len()].copy_from_slice(&payload);
+    assert_eq!(
+        parse_label(&buf).unwrap(),
+        (Txg::from_raw(12), payload.len())
+    );
+    let flipped = BlockHeader {
+        txg: Txg::from_raw(12 ^ 1 << 3),
+        ..header
+    };
+    let hb = bincode::serialize(&flipped).unwrap();
+    buf[..hb.len()].copy_from_slice(&hb);
+    assert!(matches!(
+        parse_label(&buf),
+        Err(FileSystemError::ChecksumMismatch)
+    ));
+}

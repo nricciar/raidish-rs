@@ -23,6 +23,23 @@ fn renew(owner: &str, epoch: Epoch, now_ms: u64, ttl_ms: u64) -> Request {
     .stamp(now_ms)
 }
 
+/// A reader whose clock lags the cluster's doesn't see a lease the
+/// cluster has expired as live (`ClusterState::clock_ms`).
+#[test]
+fn a_lagging_clock_doesnt_revive_an_expired_lease() {
+    let mut s = ClusterState::default();
+    s.apply(&acquire("a", 0, 100));
+    assert!(s.live_lease(&POOL, 50).is_some());
+    // Any request moves the cluster's clock on (this one is refused).
+    s.apply(&renew("nobody", ep(9), 500, 100));
+    assert_eq!(
+        s.live_lease(&POOL, 50),
+        None,
+        "expired at 100, clock at 500"
+    );
+    assert_eq!(s.live_nodes(50).count(), 0);
+}
+
 #[test]
 fn lease_grant_hold_expire() {
     let mut s = ClusterState::default();
@@ -598,7 +615,11 @@ async fn swapped_nodes_are_detected() {
         );
     }
 
-    // The agreeing two still work.
+    // Node 3 finds itself at odds with every peer and sits out, so its
+    // own hopeless elections don't keep the others' candidates stepping
+    // down; the agreeing two don't blame themselves, and still work.
+    assert!(wait_until(10, || nodes[2].cluster.misconfigured()).await);
+    assert!(!nodes[0].cluster.misconfigured() && !nodes[1].cluster.misconfigured());
     let good: Vec<&TestNode> = nodes[..2].iter().collect();
     assert!(wait_until(10, || leader_of(&good).is_some()).await);
     for n in &nodes {
@@ -617,6 +638,7 @@ fn lend(
         idx,
         writer: LeaseRef::new(crate::types::res(writer), writer_epoch),
         pool: Holding::new("c", pool_epoch),
+        after: Epoch::NONE,
     }
     .stamp(now_ms)
 }
@@ -642,12 +664,18 @@ fn metaslab_lend_and_return() {
     );
     assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 3);
     assert_eq!(s.fence_epoch(Domain::Pool), 1);
-    // Not twice, not by someone who isn't the committer, not to a writer
-    // that isn't live.
-    assert!(matches!(
+    // The same lend sent again (a retry whose answer was lost) is answered
+    // as the first time (audit R4d); to anyone else, refused.
+    assert_eq!(
         s.apply(&lend(ms(3), "writer/2", ep(2), ep(1), 20)),
+        Response::Fenced { epoch: ep(3) }
+    );
+    assert!(matches!(
+        s.apply(&lend(ms(3), "writer/9", ep(2), ep(1), 20)),
         Response::Refused(_)
     ));
+    // Not by someone who isn't the committer, not to a writer that isn't
+    // live.
     assert!(matches!(
         s.apply(&lend(ms(4), "writer/2", ep(2), ep(9), 20)),
         Response::Refused(_)
@@ -665,13 +693,29 @@ fn metaslab_lend_and_return() {
     s.apply(&acquire("c2", 2000, 1000)); // epoch 4
     assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 3);
     assert_eq!(s.fence_epoch(Domain::Metaslab(ms(4))), 4);
-    let ret = LeaseOp::Return {
-        idx: ms(3),
-        pool: Holding::new("c2", ep(4)),
-    }
-    .stamp(2100);
-    assert_eq!(s.apply(&ret), Response::Fenced { epoch: ep(5) });
+    let ret = |lend: Epoch| {
+        LeaseOp::Return {
+            idx: ms(3),
+            pool: Holding::new("c2", ep(4)),
+            lend,
+        }
+        .stamp(2100)
+    };
+    assert!(
+        matches!(s.apply(&ret(ep(2))), Response::Refused(_)),
+        "not that lend"
+    );
+    assert_eq!(s.apply(&ret(ep(3))), Response::Fenced { epoch: ep(5) });
     assert_eq!(s.fence_epoch(Domain::Metaslab(ms(3))), 5);
+    assert!(s.lent_to(ms(3)).is_none());
+    // Resent: the same answer, nothing changes.
+    assert_eq!(s.apply(&ret(ep(3))), Response::Fenced { epoch: ep(5) });
+    // A lend resent after the return doesn't lend it again: it names the
+    // grant it replaced, and that's gone.
+    assert!(matches!(
+        s.apply(&lend(ms(3), "writer/2", ep(2), ep(4), 2200)),
+        Response::Refused(_)
+    ));
     assert!(s.lent_to(ms(3)).is_none());
 }
 
@@ -711,12 +755,19 @@ fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
         s.apply(&rec("n1", ep(epoch.get() - 1), false, 2000)),
         Response::Refused(_)
     ));
-    assert!(matches!(
-        s.apply(&rec("n1", epoch, false, 20_000)),
-        Response::Refused(_)
-    ));
     assert!(s.nfs_clients.contains_key("6162"));
     assert_eq!(s.apply(&rec("n1", epoch, false, 3000)), Response::Recorded);
+    assert!(s.nfs_clients.is_empty());
+    assert!(matches!(
+        s.apply(&rec("n1", epoch, true, 20_000)),
+        Response::Refused(_)
+    ));
+    // The state machine's clock doesn't go back (audit R3a): a leader
+    // stamping an earlier time can't bring the expired lease back.
+    assert!(matches!(
+        s.apply(&rec("n1", epoch, true, 3000)),
+        Response::Refused(_)
+    ));
     assert!(s.nfs_clients.is_empty());
 }
 
@@ -1124,4 +1175,349 @@ fn raft_data_of_another_version_is_refused() {
     std::fs::write(old.join("log.json"), "{}").unwrap();
     let e = Store::open(&old, fence()).err().unwrap();
     assert!(e.contains("older raidish"), "{}", e);
+}
+
+fn answer(r: Response) -> String {
+    serde_json::to_string(&Ok::<Response, String>(r)).unwrap()
+}
+
+/// R3b: a transfer that may have gone through (no answer) or found the
+/// lease gone leaves the holder in doubt: not `fresh` (until a renewal
+/// says it's still this holder's). Only a refusal puts it back as held.
+#[tokio::test]
+async fn a_transfer_in_doubt_isnt_fresh() {
+    use crate::test_util::fake_json_server;
+    let quick = std::time::Duration::ZERO;
+    let held = |url: String| {
+        HeldLease::adopt(
+            LeaseClient::new(vec![url]),
+            POOL,
+            "o",
+            ep(3),
+            std::time::Instant::now(),
+        )
+    };
+    let to = || crate::types::Holder::default().with_detail("b");
+    for (reply, fresh_after) in [
+        (Some(answer(Response::Lost)), false),
+        (Some(answer(Response::Refused("no".into()))), true),
+        (Some("not json".to_string()), false),
+    ] {
+        let (url, _) = fake_json_server(reply.clone(), quick).await;
+        let l = held(url);
+        assert!(l.fresh());
+        assert!(l.transfer("b", to()).await.is_err());
+        assert_eq!(l.fresh(), fresh_after, "{:?}", reply);
+    }
+}
+
+/// R3a: a lease adopted well into its TTL is renewed at once, not a third
+/// of a TTL after `hold` (by then too late to try: lost unrenewed).
+#[tokio::test]
+async fn a_late_hold_renews_at_once() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let (url, hits) = fake_json_server(
+        Some(answer(Response::Granted {
+            epoch: ep(3),
+            expires_ms: u64::MAX,
+        })),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let l = std::sync::Arc::new(HeldLease::adopt(
+        LeaseClient::new(vec![url]),
+        POOL,
+        "o",
+        ep(3),
+        std::time::Instant::now() - lease::LEASE_TTL / 2,
+    ));
+    let lost = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    l.hold(move |_| flag.store(true, SeqCst));
+    assert!(
+        wait_until(2, || hits.load(SeqCst) > 0).await,
+        "renewed at once"
+    );
+    assert!(l.fresh());
+    assert!(!lost.load(SeqCst));
+}
+
+/// R1b / R2b: a linearizable read, from the leader or a follower, has
+/// everything committed before it; a disk server's fence becomes ready
+/// from one (learning the pool epoch); and with no quorum there's no
+/// read, so a fence that starts then stays `Starting`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_reads_and_the_fence_barrier() {
+    use crate::fence::{Ready, ServerFence};
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let nodes = vec![
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+        start_node("n3", &pool, ports[2], dir.path()).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(wait_until(10, || leader_of(&all).is_some()).await);
+    let client = LeaseClient::new(vec![nodes[0].url.clone()]);
+    let held = HeldLease::acquire(client, POOL, crate::types::Holder::default())
+        .await
+        .unwrap();
+    let t = Duration::from_secs(5);
+    for n in &nodes {
+        let state = n.cluster.linearizable_state(t).await.unwrap();
+        assert_eq!(state.pool_epoch(), held.epoch, "on {}", n.cluster.name);
+        let fence = Arc::new(ServerFence::default());
+        assert_eq!(fence.readiness(), Ready::Starting);
+        fence.mark_unmapped();
+        tokio::time::timeout(t, crate::api::sync_fence(n.cluster.clone(), fence.clone()))
+            .await
+            .unwrap();
+        assert_eq!(fence.readiness(), Ready::Ready);
+        assert_eq!(fence.pool_floor(), held.epoch);
+    }
+
+    // Quorum lost: a lone node has no linearizable read.
+    stop_node(&nodes[1]).await;
+    stop_node(&nodes[2]).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        nodes[0]
+            .cluster
+            .linearizable_state(Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+    let fence = Arc::new(ServerFence::default());
+    fence.mark_unmapped();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        crate::api::sync_fence(nodes[0].cluster.clone(), fence.clone()),
+    )
+    .await;
+    assert!(r.is_err(), "the barrier passed with no quorum");
+    assert_eq!(fence.readiness(), Ready::Starting);
+    stop_node(&nodes[0]).await;
+}
+
+/// A linearizable read asked for before there's a leader (a cluster just
+/// started, or mid-election) waits for one, up to its timeout, rather
+/// than failing at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_linearizable_read_waits_for_a_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let nodes = vec![
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+        start_node("n3", &pool, ports[2], dir.path()).await,
+    ];
+    let reads = nodes
+        .iter()
+        .map(|n| n.cluster.linearizable_state(Duration::from_secs(15)));
+    for (n, r) in nodes.iter().zip(futures::future::join_all(reads).await) {
+        assert!(r.is_ok(), "on {}: {:?}", n.cluster.name, r.err());
+    }
+    for n in &nodes {
+        stop_node(n).await;
+    }
+}
+
+/// Three nodes formed and holding a pool lease: (nodes, the lease's epoch).
+async fn formed(
+    dir: &std::path::Path,
+    pool: &[String],
+    ports: &[u16; 3],
+) -> (Vec<TestNode>, Epoch) {
+    let nodes = vec![
+        start_node("n1", pool, ports[0], dir).await,
+        start_node("n2", pool, ports[1], dir).await,
+        start_node("n3", pool, ports[2], dir).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(
+        wait_until(15, || leader_of(&all).is_some()).await,
+        "no leader"
+    );
+    assert!(wait_until(10, || nodes.iter().all(|n| n.cluster.status().voting)).await);
+    let client = LeaseClient::new(nodes.iter().map(|n| n.url.clone()).collect());
+    let a = HeldLease::acquire(
+        client,
+        POOL,
+        crate::types::Holder::default().with_detail("a"),
+    )
+    .await
+    .unwrap();
+    let epoch = a.epoch;
+    assert!(wait_until(5, || nodes.iter().all(|n| n.floor.pool_floor() == epoch)).await);
+    std::mem::forget(a);
+    (nodes, epoch)
+}
+
+/// R4b: a node without Raft state never forms a group on its own, neither
+/// on a first start (until every member is there and new) nor after being
+/// wiped while the others are down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_without_state_never_forms_a_group_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    // First start, alone: it waits for the others.
+    let n1 = start_node("n1", &pool, ports[0], dir.path()).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let s = n1.cluster.status();
+    assert!(!s.initialized && !s.voting, "{:?}", s);
+    stop_node(&n1).await;
+    drop(n1);
+
+    let (nodes, _) = formed(dir.path(), &pool, &ports).await;
+    for n in &nodes {
+        stop_node(n).await;
+    }
+    drop(nodes);
+    // n3 wiped, the others down: it must not start a group of its own.
+    std::fs::remove_dir_all(dir.path().join("n3")).unwrap();
+    let n3 = start_node("n3", &pool, ports[2], dir.path()).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let s = n3.cluster.status();
+    assert!(!s.initialized && !s.voting, "{:?}", s);
+    stop_node(&n3).await;
+}
+
+/// R4b: a wiped node comes back while the leader is down. The survivor
+/// alone isn't a quorum, and the wiped node has lost the log it
+/// acknowledged and its votes: it must not vote for the survivor (which
+/// may be missing entries committed with the wiped node's help). Once the
+/// old leader is back, it catches up and votes again, with the group's
+/// state and membership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wiped_node_catches_up_before_it_votes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let (nodes, epoch) = formed(dir.path(), &pool, &ports).await;
+    let leader = leader_of(&nodes.iter().collect::<Vec<_>>()).unwrap();
+    let mut rest = nodes.iter().filter(|n| n.cluster.name != leader);
+    let (survivor, wiped) = (rest.next().unwrap(), rest.next().unwrap());
+    let (wiped_name, wiped_port) = (
+        wiped.cluster.name.clone(),
+        ports[pool_index(&nodes, &wiped.cluster.name)],
+    );
+    let leader_port = ports[pool_index(&nodes, &leader)];
+    let old_leader = nodes.iter().find(|n| n.cluster.name == leader).unwrap();
+    stop_node(old_leader).await;
+    stop_node(wiped).await;
+    std::fs::remove_dir_all(dir.path().join(&wiped_name)).unwrap();
+    let back = start_node(&wiped_name, &pool, wiped_port, dir.path()).await;
+
+    // The survivor's elections get no vote from it.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert!(
+        leader_of(&[survivor, &back]).is_none(),
+        "elected with the vote of a node that lost its state"
+    );
+    assert!(!back.cluster.status().voting);
+
+    // The old leader returns: a leader again, and the wiped node catches up.
+    let returned = start_node(&leader, &pool, leader_port, dir.path()).await;
+    let three = [survivor, &back, &returned];
+    assert!(
+        wait_until(15, || leader_of(&three).is_some()).await,
+        "no leader"
+    );
+    assert!(
+        wait_until(20, || back.cluster.status().voting).await,
+        "never caught up"
+    );
+    assert_eq!(back.floor.pool_floor(), epoch);
+    assert!(!dir.path().join(&wiped_name).join(CATCHING_UP).exists());
+    let voters: Vec<u64> = back
+        .cluster
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    assert_eq!(voters, back.cluster.members.ids().collect::<Vec<_>>());
+    for n in [survivor, &back, &returned] {
+        stop_node(n).await;
+    }
+}
+
+fn pool_index(nodes: &[TestNode], name: &str) -> usize {
+    nodes.iter().position(|n| n.cluster.name == name).unwrap()
+}
+
+/// R4b: on a new group, a node that initialized but stopped before it
+/// started voting (its marker still there) is still a new group's member.
+/// Both nodes of a 2-node group in that state must elect a leader once
+/// restarted, not wait forever to catch up from a leader only they can elect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_stopped_between_initializing_and_voting_still_forms_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port()];
+    let pool = urls(&ports);
+    // Each alone (so its bootstrap waits), initialized by hand: the state
+    // a stop right after `initialize` leaves.
+    for (i, name) in ["n1", "n2"].iter().enumerate() {
+        let n = start_node(name, &pool, ports[i], dir.path()).await;
+        let initial: BTreeMap<u64, BasicNode> = n
+            .cluster
+            .members
+            .ids()
+            .map(|id| (id, BasicNode::default()))
+            .collect();
+        n.cluster.raft.initialize(initial).await.unwrap();
+        assert!(wait_until(5, || n.cluster.status().initialized).await);
+        assert!(!n.cluster.status().voting);
+        stop_node(&n).await;
+    }
+    for name in ["n1", "n2"] {
+        assert!(dir.path().join(name).join(CATCHING_UP).exists());
+    }
+    let nodes = [
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(
+        wait_until(15, || leader_of(&all).is_some()).await,
+        "no leader"
+    );
+    assert!(wait_until(5, || nodes.iter().all(|n| n.cluster.status().voting)).await);
+    for n in &nodes {
+        stop_node(n).await;
+    }
+}
+
+/// A good node that hears only from a misconfigured peer at first (the
+/// other good one not up yet) must not take itself for the odd one out:
+/// it would sit out for good. Node 3's config swaps nodes 2 and 3, so it
+/// answers node 1 as node 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_good_node_hearing_only_a_bad_peer_doesnt_sit_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let mut odd = pool.clone();
+    odd.swap(1, 2);
+    let bad = start_node("n3", &odd, ports[2], dir.path()).await;
+    let n1 = start_node("n1", &pool, ports[0], dir.path()).await;
+    assert!(
+        n1.cluster.check_peer(2).await.unwrap().is_some(),
+        "node 1 sees node 3 at another id"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!n1.cluster.misconfigured());
+    // Node 2 comes up: node 1 still takes part.
+    let n2 = start_node("n2", &pool, ports[1], dir.path()).await;
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert!(!n1.cluster.misconfigured() && !n2.cluster.misconfigured());
+    for n in [&n1, &n2, &bad] {
+        stop_node(n).await;
+    }
 }

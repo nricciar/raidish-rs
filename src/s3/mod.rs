@@ -362,8 +362,14 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             .await
     }
 
-    /// Hold `meta`'s bodies against deletion while reading them.
-    pub fn reading(self: &Arc<Self>, meta: &ObjectMeta) -> Reading<D> {
+    /// Hold `meta`'s bodies against deletion while reading them. Under the
+    /// operations lock, so the collector (which looks under the write lock)
+    /// sees it before it could delete them.
+    pub(crate) fn reading(
+        self: &Arc<Self>,
+        _held: &crate::service_tree::OpsHeld<'_>,
+        meta: &ObjectMeta,
+    ) -> Reading<D> {
         let bodies: Vec<u64> = meta.segments.iter().map(|s| s.body).collect();
         let mut r = self.readers.lock().unwrap();
         for b in &bodies {
@@ -375,16 +381,24 @@ impl<D: BlockDevice + 'static> Bucket<D> {
         }
     }
 
+    /// The bodies being read now. With the write lock held, no new reader
+    /// can register until it's dropped (audit X1).
+    fn readers(&self, _held: &crate::service_tree::OpsWriteHeld<'_>) -> Vec<u64> {
+        self.readers.lock().unwrap().keys().copied().collect()
+    }
+
     /// Delete some unused bodies; again until there are none.
     async fn collect(&self) -> Result<()> {
         loop {
             if self.is_stopped() {
                 return Ok(());
             }
-            let readers: Vec<u64> = self.readers.lock().unwrap().keys().copied().collect();
             let ds = self.tree.ds::<S3Error>().await?;
             let more = {
-                let _w = ds.ops.write().await;
+                let w = ds.ops.write().await;
+                // Under the write lock: a reader registers under a read
+                // (`reading`), so every body read now is in this list.
+                let readers = self.readers(&crate::service_tree::OpsWriteHeld::of(&w));
                 let mut t = Txn::begin(&self.tree.fs, &ds.obj).await?;
                 let dead = scan(&t, Bound::Included(b"D"), b"E", 64).await?;
                 let mut deleted = 0;
@@ -428,17 +442,29 @@ impl<D: BlockDevice + 'static> Bucket<D> {
 
     // ---- objects -------------------------------------------------------
 
-    pub async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
+    /// The object at `key`, with its bodies held against deletion from the
+    /// same read that found it: a delete and collection in between can't
+    /// take them from under the caller (see `collect`).
+    pub async fn head_held(
+        self: &Arc<Self>,
+        key: &str,
+    ) -> Result<Option<(ObjectMeta, Reading<D>)>> {
         let k = o_key(key);
-        self.read(|t| {
-            Box::pin(async move {
-                match t.get(&k).await? {
-                    Some(b) => Ok(Some(dec(&b, "object")?)),
-                    None => Ok(None),
-                }
+        let me = self.clone();
+        self.tree
+            .read_held(|t, held| {
+                Box::pin(async move {
+                    match t.get(&k).await? {
+                        Some(b) => {
+                            let meta: ObjectMeta = dec(&b, "object")?;
+                            let hold = me.reading(held, &meta);
+                            Ok(Some((meta, hold)))
+                        }
+                        None => Ok(None),
+                    }
+                })
             })
-        })
-        .await
+            .await
     }
 
     /// Drop a body written with `new_body` that won't be used after all.
@@ -528,8 +554,11 @@ impl<D: BlockDevice + 'static> Bucket<D> {
                     // After a rolled-up prefix: after everything under it.
                     (Some(a), Some(d))
                         if a.ends_with(d.as_str())
-                            && a[prefix.len()..].find(d.as_str())
-                                == Some(a.len() - prefix.len() - d.len()) =>
+                            && a.strip_prefix(prefix.as_str()).is_some_and(|rest| {
+                                // The delimiter ends it and isn't in it before.
+                                rest.strip_suffix(d.as_str())
+                                    .is_some_and(|before| !before.contains(d.as_str()))
+                            }) =>
                     {
                         (crate::kv::prefix_end(&o_key(a)).unwrap(), true)
                     }

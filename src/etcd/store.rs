@@ -895,14 +895,41 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            match self.lease_revoke(id).await {
-                Ok(_) | Err(EtcdError::LeaseNotFound) => {
-                    self.leases.lock().unwrap().remove(&id);
-                }
+            match self.expire_lease(id).await {
+                Ok(_) | Err(EtcdError::LeaseNotFound) => {}
                 Err(e) => return Err(e),
             }
         }
         Ok(())
+    }
+
+    /// Revoke lease `id` if it is still past its deadline, judged under
+    /// the write lock: a keep-alive (which renews under the read lock)
+    /// between the scan and now has saved it. Whether it was revoked.
+    async fn expire_lease(&self, id: i64) -> Result<bool> {
+        let leases = &self.leases;
+        self.write(move |w| {
+            let due = leases
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_none_or(|(_, d)| *d <= Instant::now());
+            Box::pin(async move {
+                if !due {
+                    return Ok(false);
+                }
+                match w.lease_revoke(id).await {
+                    Ok(()) => Ok(true),
+                    // Gone from the store already: forget it here too.
+                    Err(EtcdError::LeaseNotFound) => {
+                        w.leases_removed.push(id);
+                        Ok(true)
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+        })
+        .await
     }
 
     // ---- watch --------------------------------------------------------
@@ -980,7 +1007,7 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
         let t = Txn::begin(&self.fs, &ds.obj).await?;
         let b = ds.blksz as i64;
         let all = t.header.next_id as i64 * b;
-        Ok((all, all - t.header.free.len() as i64 * b))
+        Ok((all, all - t.header.free_total as i64 * b))
     }
 }
 
@@ -1849,12 +1876,21 @@ impl<D: BlockDevice> Writer<'_, D> {
                     )
                     .await?;
                 if let Some(((lk, lv), rest)) = old.split_last() {
-                    for (k, _) in rest {
+                    // A change at the target itself is an event a watch
+                    // from the compacted revision still gets, with the one
+                    // before it as `prev_kv` (a delete's is the object
+                    // deleted, which kube-apiserver needs): that one stays
+                    // too, and so does the change (a tombstone gone would
+                    // bring the value before it back). The next compaction
+                    // past it takes both (audit E2).
+                    let at_target = parse_h(lk).is_some_and(|(_, main, _)| main == target);
+                    let keep = if at_target { 1 } else { 0 };
+                    for (k, _) in &rest[..rest.len() - keep.min(rest.len())] {
                         self.t.delete(k).await?;
                         deletes += 1;
                     }
                     let last: Hist = dec(&self.t.read_val(lv).await?, "history")?;
-                    if last == Hist::Tombstone {
+                    if last == Hist::Tombstone && !at_target {
                         let lk = lk.clone();
                         self.t.delete(&lk).await?;
                         deletes += 1;

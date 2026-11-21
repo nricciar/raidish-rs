@@ -50,10 +50,20 @@ pub struct LentMetaslab {
 #[derive(Clone, Debug)]
 pub(crate) struct InDoubt {
     commit: DatasetCommit,
+    /// The misses it reports, counted as reported once it's accepted.
+    misses: NewMisses,
     new_root: TreeRoot,
     allocated: Vec<BlockPtr>,
     new_log: Option<crate::inode::DatasetLog>,
     new_region: Option<crate::inode::LogRegion>,
+}
+
+/// Disk misses a commit reports: the disks, and every disk's miss count
+/// when they were taken.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NewMisses {
+    disks: Vec<usize>,
+    counts: Vec<u64>,
 }
 
 /// While a commit's answer is awaited: dropped then (the caller gave up),
@@ -495,15 +505,21 @@ impl<D: BlockDevice> FileSystem<D> {
         {
             r = self.retire_log(&w, name).await;
         }
-        if let Some(w) = &self.writer {
-            if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
-                self.set_dataset_log(w, &vol, None);
-                self.set_cursor(&vol, None);
+        if r.is_err() {
+            // Not all of it is committed: it stays attached, writes and
+            // intent log included, so the caller can serve it on (a handoff
+            // called off) or drop it knowingly (`abandon_dataset`: its log
+            // is replayed once the lease goes). Closing it here lost the
+            // unsynced writes and its log state (audit A5).
+            if let Some(w) = &self.writer
+                && let Some(a) = w.datasets.lock().unwrap().get_mut(name)
+            {
+                a.detaching = false;
             }
-            w.datasets.lock().unwrap().remove(name);
+            return r;
         }
-        self.close_dataset(name);
-        r
+        self.abandon_dataset(name);
+        Ok(())
     }
 
     /// Commit `name` unchanged but without its intent log (a detach).
@@ -518,7 +534,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(());
         };
         // No flush may log into it meanwhile.
-        let _io = self.log_io.lock().await;
+        let _io = self.lock_log_io().await;
         let _tx = self.begin_tx().await;
         // Its commit is built on the root: settle one in doubt first.
         self.resolve_in_doubt(w, &vol).await?;
@@ -530,6 +546,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let writer = w.sink.writer();
         let root = vol.obj.root_ptr();
+        let misses = self.new_misses();
         let commit = DatasetCommit {
             dataset: name.to_string(),
             writer,
@@ -539,12 +556,13 @@ impl<D: BlockDevice> FileSystem<D> {
             allocs: Vec::new(),
             frees: Vec::new(),
             free_births: Vec::new(),
-            missed: self.take_new_misses(),
+            missed: misses.disks.clone(),
             birth_txg: self.open_txg().await?,
             log: None,
             min_birth: None,
         };
         let c = w.sink.commit(commit).await?;
+        self.misses_reported(&misses);
         self.note_open_txg(c.txg.next()).await;
         self.set_dataset_log(w, &vol, None);
         self.set_cursor(&vol, None);
@@ -720,9 +738,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 ms.free_extents = lent.free.iter().map(|e| (e.start, e.len)).collect();
             }
             if let Some(pool) = self.dev.pool() {
-                pool.disks()
-                    .fence()
-                    .set_metaslab_epoch(lent.idx, lent.epoch);
+                pool.disks().fence().set_lent(lent.idx, lent.epoch);
             }
             self.note_open_txg(lent.open_txg).await;
             w.lent.lock().unwrap().push(lent.idx);
@@ -739,8 +755,16 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             let free = self.metaslabs[idx.index()].read().await.free_blocks();
             if free < threshold {
+                // Pins are taken under the lent list's lock (see
+                // `RepairHold::pin_lent`): check and leave under it too.
+                {
+                    let mut l = w.lent.lock().unwrap();
+                    if w.is_pinned(idx) {
+                        continue;
+                    }
+                    l.retain(|&i| i != idx);
+                }
                 self.drop_lent(idx).await;
-                w.lent.lock().unwrap().retain(|&i| i != idx);
                 if let Err(e) = w.sink.return_metaslab(idx).await {
                     eprintln!("writer: returning metaslab {}: {}", idx, e);
                 }
@@ -748,18 +772,25 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    /// Pool disks with failed writes since the last call.
-    fn take_new_misses(&self) -> Vec<usize> {
+    /// Pool disks with failed writes no accepted commit has reported yet.
+    /// They count as reported only once a commit carrying them is accepted
+    /// (`misses_reported`): one refused, or lost, reports them again next
+    /// time (audit D4). Twice is harmless: a mark keeps the oldest TXG.
+    fn new_misses(&self) -> NewMisses {
         let counts = self.miss_counts();
+        let seen = self.miss_seen.lock().unwrap();
+        let disks = (0..counts.len())
+            .filter(|&d| counts[d] != seen[d])
+            .collect();
+        NewMisses { disks, counts }
+    }
+
+    /// An accepted commit carried `m`.
+    fn misses_reported(&self, m: &NewMisses) {
         let mut seen = self.miss_seen.lock().unwrap();
-        let mut out = Vec::new();
-        for (d, (now, s)) in counts.iter().zip(seen.iter_mut()).enumerate() {
-            if now != s {
-                *s = *now;
-                out.push(d);
-            }
+        for &d in &m.disks {
+            seen[d] = seen[d].max(m.counts[d]);
         }
-        out
     }
 
     /// The writer's commit: sync every volume (each one a `DatasetCommit`),
@@ -767,6 +798,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Also returns the datasets it left clean (see `sync_datasets_noting`).
     pub(crate) async fn writer_commit(
         &self,
+        tx: &mut crate::tx::Tx,
         w: &WriterState,
     ) -> (Result<Txg, FileSystemError>, Vec<String>) {
         // A sync stamped below the birth floor is rebuilt (with the TXG
@@ -774,7 +806,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut attempts = 0;
         let mut clean = Vec::new();
         let result = loop {
-            let (now_clean, volumes) = self.sync_datasets_noting().await;
+            let (now_clean, volumes) = self.sync_datasets_noting(tx).await;
             // Clean in any pass stays clean: a later pass only finds it
             // with nothing dirty from before this commit began, or syncs it.
             for n in now_clean {
@@ -782,7 +814,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     clean.push(n);
                 }
             }
-            let result = volumes.and(self.sync_files().await);
+            let result = volumes.and(self.sync_files(tx).await);
             attempts += 1;
             match result {
                 Err(FileSystemError::Restamp(_)) if attempts < 3 => continue,
@@ -805,6 +837,7 @@ impl<D: BlockDevice> FileSystem<D> {
         vol: &crate::dataset::Dataset,
         records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
+        fold: bool,
     ) -> Result<(), FileSystemError> {
         let (ds, detaching) = w
             .datasets
@@ -817,7 +850,7 @@ impl<D: BlockDevice> FileSystem<D> {
             })?;
         let mut span = crate::trace::Span::new("writer.sync_dataset");
         span.note("records", records.len());
-        let log_blocks = if detaching {
+        let log_blocks = if detaching || !fold {
             0
         } else {
             self.log_region_blocks()
@@ -829,8 +862,14 @@ impl<D: BlockDevice> FileSystem<D> {
         // go to once it's committed. Without one (no contiguous space, or
         // detaching), flushes keep to the current region.
         let writer = w.sink.writer();
-        let from = vol.fold_from.lock().unwrap().take();
-        let new_region = match detaching {
+        // Not folding (a holes-only retry, see `sync_datasets_noting`): the
+        // log stays as registered, whole, and `fold_from` stays for the
+        // next full sync.
+        let from = match fold {
+            true => vol.fold_from.lock().unwrap().take(),
+            false => None,
+        };
+        let new_region = match detaching || !fold {
             true => None,
             false => self.new_log_region().await.ok(),
         };
@@ -842,12 +881,15 @@ impl<D: BlockDevice> FileSystem<D> {
             from_seq = k;
         }
         regions.extend(new_region.clone());
-        let new_log = (!regions.is_empty()).then(|| crate::inode::DatasetLog {
-            regions,
-            from_seq,
-            writer: writer.clone(),
-            ds: ds.clone(),
-        });
+        let new_log = match fold {
+            true => (!regions.is_empty()).then(|| crate::inode::DatasetLog {
+                regions,
+                from_seq,
+                writer: writer.clone(),
+                ds: ds.clone(),
+            }),
+            false => vol.log.lock().unwrap().clone(),
+        };
         let release_log = async |r: &Option<crate::inode::LogRegion>| {
             if let Some(r) = r {
                 self.unallocate(r.start, r.len).await;
@@ -879,6 +921,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(e.into());
         }
         let ext = |p: &BlockPtr| p.extent();
+        let misses = self.new_misses();
         let mut allocs: Vec<Extent> = allocated.iter().map(ext).collect();
         allocs.extend(new_region.iter().map(crate::zil::region_alloc));
         let commit = DatasetCommit {
@@ -890,7 +933,7 @@ impl<D: BlockDevice> FileSystem<D> {
             allocs,
             frees: replaced.iter().map(ext).collect(),
             free_births: replaced.iter().map(|p| p.birth_txg).collect(),
-            missed: self.take_new_misses(),
+            missed: misses.disks.clone(),
             birth_txg,
             log: new_log.clone(),
             min_birth: allocated.iter().map(|p| p.birth_txg).min(),
@@ -900,6 +943,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // up), the next sync resends it before building anything new.
         let sent = InDoubt {
             commit,
+            misses,
             new_root: new_root.clone(),
             allocated,
             new_log,
@@ -951,6 +995,7 @@ impl<D: BlockDevice> FileSystem<D> {
         outcome: Result<Committed, CommitError>,
     ) -> Result<(), FileSystemError> {
         let InDoubt {
+            misses,
             new_root,
             allocated,
             new_log,
@@ -960,6 +1005,7 @@ impl<D: BlockDevice> FileSystem<D> {
         match outcome {
             Ok(c) => {
                 *vol.in_doubt.lock().unwrap() = None;
+                self.misses_reported(&misses);
                 vol.obj.set_root(new_root);
                 self.set_dataset_log(w, vol, new_log);
                 if new_region.is_some() {
@@ -1041,15 +1087,17 @@ impl<D: BlockDevice> FileSystem<D> {
         lease: Option<ObjLease>,
     ) -> Result<FsCommitted, CommitError> {
         let writer = w.sink.writer();
+        let misses = self.new_misses();
         let commit = FsCommit {
             writer,
             op,
             lease,
-            missed: self.take_new_misses(),
+            missed: misses.disks.clone(),
             birth_txg: self.open_txg().await.unwrap_or(Txg::ZERO),
         };
         let r = w.sink.commit_fs(commit).await;
         if let Ok(c) = &r {
+            self.misses_reported(&misses);
             self.note_open_txg(c.txg.next()).await;
             if let Err(e) = self.reload_root_index().await {
                 eprintln!("writer: reloading the root index: {}", e);
@@ -1176,15 +1224,22 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Check that every extent is free space in a metaslab lent to `writer`,
-    /// then mark them allocated.
+    /// and that no two overlap, then mark them allocated: all of them or
+    /// none. The metaslabs involved stay write-locked (in index order) from
+    /// the check through the marking, and `lent_to_writer` is asked under
+    /// those locks, so a metaslab can't be taken back and lent to another
+    /// writer in between (audit S6a: that writer would be handed the same
+    /// space as free).
     async fn claim_writer_allocs(
         &self,
+        tx: &mut crate::tx::Tx,
         allocs: &[Extent],
         writer: &LeaseResource,
         lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
     ) -> Result<(), CommitError> {
         let refuse = |m: String| CommitError::refused(ErrorKind::Invalid, m);
-        for &Extent { start, len } in allocs {
+        let mut placed: Vec<(MetaslabIdx, Extent)> = Vec::with_capacity(allocs.len());
+        for &e @ Extent { start, len } in allocs {
             let last = (len > 0).then(|| start.checked_add(len - 1)).flatten();
             let idx = self
                 .layout
@@ -1193,13 +1248,41 @@ impl<D: BlockDevice> FileSystem<D> {
                 .ok_or_else(|| {
                     refuse(format!("allocation {}+{} outside a metaslab", start, len))
                 })?;
+            placed.push((idx, e));
+        }
+        // Overlapping extents would each pass `is_free` and claim the same
+        // blocks twice (audit S6c-2).
+        let mut sorted: Vec<Extent> = allocs.to_vec();
+        sorted.sort_unstable_by_key(|e| e.start);
+        if let Some(w) = sorted
+            .windows(2)
+            .find(|w| w[0].start + w[0].len > w[1].start)
+        {
+            return Err(refuse(format!(
+                "allocations {}+{} and {}+{} overlap",
+                w[0].start, w[0].len, w[1].start, w[1].len
+            )));
+        }
+
+        let mut idxs: Vec<MetaslabIdx> = placed.iter().map(|(i, _)| *i).collect();
+        idxs.sort_unstable_by_key(|i| i.index());
+        idxs.dedup();
+        let mut locked = Vec::with_capacity(idxs.len());
+        for &idx in &idxs {
+            locked.push(self.metaslabs[idx.index()].write().await);
+        }
+        let guard = |idx: MetaslabIdx| idxs.iter().position(|i| *i == idx).unwrap();
+        for &idx in &idxs {
             if !lent_to_writer(idx) {
+                let e = placed.iter().find(|(i, _)| *i == idx).unwrap().1;
                 return Err(refuse(format!(
                     "allocation {}+{} in metaslab {}, not lent to {}",
-                    start, len, idx, writer
+                    e.start, e.len, idx, writer
                 )));
             }
-            let ms = self.metaslabs[idx.index()].read().await;
+        }
+        for &(idx, Extent { start, len }) in &placed {
+            let ms = &locked[guard(idx)];
             if !ms.lent || !ms.is_free(start, len) {
                 return Err(refuse(format!(
                     "allocation {}+{} isn't free space",
@@ -1207,13 +1290,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 )));
             }
         }
-        for &Extent { start, len } in allocs {
-            let idx = self.layout.metaslab_for_block(start).unwrap();
-            self.metaslabs[idx.index()]
-                .write()
-                .await
-                .mark_allocated(start, len);
+        for &(idx, Extent { start, len }) in &placed {
+            locked[guard(idx)].mark_allocated(start, len);
         }
+        // An op refused after this gives them back (see `crate::tx`).
+        tx.allocated(allocs.iter().map(|e| (e.start, e.len)));
         Ok(())
     }
 
@@ -1223,15 +1304,24 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// `object_ok(id)` says whether `c` may change object `id` (the caller
     /// checks it against the `obj/<id>` leases).
-    pub async fn apply_fs_commit(
+    pub(crate) async fn apply_fs_commit(
         &self,
         c: &FsCommit,
+        leases_ok: impl Fn(&crate::tx::Tx) -> Result<(), CommitError>,
         lent_to_writer: impl Fn(MetaslabIdx) -> bool,
         object_ok: impl Fn(crate::disk::FileId) -> Result<(), CommitError>,
     ) -> Result<FsCommitted, CommitError> {
         let file_id = {
-            let _tx = self.begin_tx().await;
-            self.stage_fs_commit(c, &lent_to_writer, &object_ok).await?
+            let mut tx = self.begin_tx().await;
+            let tx = &mut tx;
+            // As for a dataset commit: asked again under the tx.
+            leases_ok(tx)?;
+            // Applied, it stands for the group commit; refused partway,
+            // none of it does (audit S5a).
+            let r = self
+                .stage_fs_commit(tx, c, &lent_to_writer, &object_ok)
+                .await;
+            tx.check(r).await?
         };
         let txg = self.group_commit().await?;
         Ok(FsCommitted { txg, file_id })
@@ -1241,6 +1331,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Returns the file id at the path.
     async fn stage_fs_commit(
         &self,
+        tx: &mut crate::tx::Tx,
         c: &FsCommit,
         lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
         object_ok: &impl Fn(crate::disk::FileId) -> Result<(), CommitError>,
@@ -1304,23 +1395,14 @@ impl<D: BlockDevice> FileSystem<D> {
                     None => {}
                 }
                 self.check_births(*min_birth, c.birth_txg).await?;
-                self.claim_writer_allocs(allocs, &c.writer.resource, lent_to_writer)
+                self.claim_writer_allocs(tx, allocs, &c.writer.resource, lent_to_writer)
                     .await?;
-                match self
-                    .set_file_contents(l, current, *blksz, *size_bytes, tree.clone())
+                self.set_file_contents(tx, l, current, *blksz, *size_bytes, tree.clone())
                     .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        for &Extent { start, len } in allocs {
-                            self.unallocate(start, len).await;
-                        }
-                        return Err(retry(e));
-                    }
-                }
+                    .map_err(retry)?
             }
             FsOp::Mkdir { path } => self
-                .mkdir_locked(std::path::Path::new(path))
+                .mkdir_locked(tx, std::path::Path::new(path))
                 .await
                 .map_err(|e| CommitError::failed(format!("mkdir {}", path), &e))?,
             FsOp::Delete { path, base } => {
@@ -1341,7 +1423,7 @@ impl<D: BlockDevice> FileSystem<D> {
                             )));
                         }
                         object_ok(e.id)?;
-                        self.delete_locked(p)
+                        self.delete_locked(tx, p)
                             .await
                             .map_err(|e| CommitError::failed(format!("delete {}", path), &e))?;
                         crate::disk::FileId::NONE
@@ -1362,7 +1444,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 if let Some(t) = self.id_at(tp).await {
                     object_ok(t)?;
                 }
-                self.rename_locked(fp, tp)
+                self.rename_locked(tx, fp, tp)
                     .await
                     .map_err(|e| CommitError::failed(format!("rename {} to {}", from, to), &e))?
                     .0
@@ -1393,19 +1475,16 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 object_ok(*id)?;
                 self.check_births(*min_birth, c.birth_txg).await?;
-                self.claim_writer_allocs(allocs, &c.writer.resource, lent_to_writer)
+                self.claim_writer_allocs(tx, allocs, &c.writer.resource, lent_to_writer)
                     .await?;
                 dnode.tree = tree.clone();
                 dnode.size = *size;
                 dnode.attrs.touch();
-                if let Err(e) = self.write_dnode(*id, Some(dnode)).await {
-                    for &Extent { start, len } in allocs {
-                        self.unallocate(start, len).await;
-                    }
-                    return Err(retry(e));
-                }
+                self.write_dnode(tx, *id, Some(dnode))
+                    .await
+                    .map_err(retry)?;
                 for &Extent { start, len } in frees {
-                    let _ = self.free(start, len).await;
+                    let _ = self.free(tx, start, len).await;
                 }
                 *id
             }
@@ -1416,7 +1495,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 attrs,
                 exclusive,
             } => {
-                self.create_at_locked(*dir, name, *kind, attrs, *exclusive)
+                self.create_at_locked(tx, *dir, name, *kind, attrs, *exclusive)
                     .await
                     .map_err(|e| CommitError::failed(format!("create {}", name), &e))?
                     .0
@@ -1434,7 +1513,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     Some(_) => {
                         object_ok(*id)?;
-                        self.remove_at_locked(*dir, name)
+                        self.remove_at_locked(tx, *dir, name)
                             .await
                             .map_err(|e| CommitError::failed(format!("remove {}", name), &e))?;
                         crate::disk::FileId::NONE
@@ -1470,7 +1549,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 if let Some(t) = at(&dst) {
                     object_ok(t)?;
                 }
-                self.rename_at_locked(src, dst)
+                self.rename_at_locked(tx, src, dst)
                     .await
                     .map_err(|e| {
                         CommitError::failed(format!("rename {} to {}", from_name, to_name), &e)
@@ -1479,14 +1558,14 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             FsOp::SetAttrId { id, attrs } => {
                 // Attributes aren't contents: no lease needed.
-                self.set_attrs_id_locked(*id, attrs)
+                self.set_attrs_id_locked(tx, *id, attrs)
                     .await
                     .map_err(|e| CommitError::failed(format!("object {}", id), &e))?;
                 *id
             }
             FsOp::SetAttr { path, attrs } => {
                 let p = std::path::Path::new(path);
-                self.set_attrs_locked(p, attrs)
+                self.set_attrs_locked(tx, p, attrs)
                     .await
                     .map_err(|e| CommitError::failed(path, &e))?
             }
@@ -1553,7 +1632,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `epoch`: the committer writes there with it from now on).
     pub async fn unlend(&self, idx: MetaslabIdx, epoch: Epoch) {
         if let Some(pool) = self.dev.pool() {
-            pool.disks().fence().set_metaslab_epoch(idx, epoch);
+            pool.disks().fence().set_returned(idx, epoch);
         }
         if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.lent = false;
@@ -1573,16 +1652,23 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Apply a writer's commit. `lent_to_writer(idx)` says whether metaslab
     /// `idx` is lent to the committing writer (the caller checked the
     /// leases). Returns the durable TXG.
-    pub async fn apply_dataset_commit(
+    pub(crate) async fn apply_dataset_commit(
         &self,
         c: &DatasetCommit,
+        leases_ok: impl Fn(&crate::tx::Tx) -> Result<(), CommitError>,
         lent_to_writer: impl Fn(MetaslabIdx) -> bool,
     ) -> Result<Txg, CommitError> {
         let mut span = crate::trace::Span::new("committer.apply");
         {
-            let _tx = self.begin_tx().await;
+            let mut tx = self.begin_tx().await;
+            let tx = &mut tx;
             span.mark("begin_tx");
-            self.stage_dataset_commit(c, &lent_to_writer).await?;
+            // Asked again now that nothing else is applied: the wait for
+            // the tx can be long, and a lease checked before it may be gone
+            // (another writer's commit for the dataset applied first).
+            leases_ok(tx)?;
+            let r = self.stage_dataset_commit(tx, c, &lent_to_writer).await;
+            tx.check(r).await?;
             span.mark("stage");
         }
         // A resend after a failure here is acknowledged by the root check.
@@ -1594,6 +1680,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Apply `c` in memory, in the open TXG (the caller holds `begin_tx`).
     async fn stage_dataset_commit(
         &self,
+        tx: &mut crate::tx::Tx,
         c: &DatasetCommit,
         lent_to_writer: &impl Fn(MetaslabIdx) -> bool,
     ) -> Result<(), CommitError> {
@@ -1603,8 +1690,27 @@ impl<D: BlockDevice> FileSystem<D> {
             .await
             .map_err(|e| CommitError::failed(format!("dataset '{}'", c.dataset), &e))?;
         let current = vol.obj.root_ptr();
-        if current == c.new_root && c.new_root != c.base_root {
-            // A resend of a commit already applied: just make sure it's durable.
+        // A resend of a commit already applied: just make sure it's durable.
+        // A commit that leaves the tree as it was (`new_root == base_root`:
+        // only the intent log moves on) is recognized by its log being the
+        // dataset's already; otherwise it would be applied again, its new
+        // region refused as no longer free, and the writer told to reuse
+        // space the committed log points into (audit S6b). If it's a no-op
+        // that was never applied, acknowledging it is all applying would do.
+        let log_only_applied = || {
+            // Such a commit allocates nothing but its log's region(s).
+            let in_log = |a: &Extent| {
+                c.log
+                    .as_ref()
+                    .is_some_and(|l| l.regions.iter().any(|r| crate::zil::region_alloc(r) == *a))
+            };
+            c.allocs.iter().all(in_log) && c.frees.is_empty() && *vol.log.lock().unwrap() == c.log
+        };
+        let applied = current == c.new_root && (c.new_root != c.base_root || log_only_applied());
+        if applied {
+            for &d in &c.missed {
+                self.mark_degraded(d, c.birth_txg.prev());
+            }
             return Ok(());
         }
         if current != c.base_root {
@@ -1647,24 +1753,27 @@ impl<D: BlockDevice> FileSystem<D> {
 
         self.check_births(c.min_birth, c.birth_txg).await?;
         // Every allocation must be free space in a metaslab lent to this writer.
-        self.claim_writer_allocs(&c.allocs, &c.writer.resource, lent_to_writer)
+        self.claim_writer_allocs(tx, &c.allocs, &c.writer.resource, lent_to_writer)
             .await?;
         let old_log = std::mem::replace(&mut *vol.log.lock().unwrap(), c.log.clone());
-
-        if let Err(e) = self.update_dataset_dnode(&vol, c.new_root.clone()).await {
-            for &Extent { start, len } in &c.allocs {
-                self.unallocate(start, len).await;
-            }
-            *vol.log.lock().unwrap() = old_log;
-            return Err(CommitError::Retry(e.to_string()));
+        {
+            let (vol, old_log) = (vol.clone(), old_log.clone());
+            tx.on_rollback(move || *vol.log.lock().unwrap() = old_log);
         }
+        self.update_dataset_dnode(tx, &vol, c.new_root.clone())
+            .await
+            .map_err(|e| CommitError::Retry(e.to_string()))?;
         // Regions the new log no longer has are done with.
         for r in old_log.iter().flat_map(|l| &l.regions) {
             if !c.log.as_ref().is_some_and(|l| l.regions.contains(r)) {
-                let _ = self.free(r.start, r.len).await;
+                let _ = self.free(tx, r.start, r.len).await;
             }
         }
         vol.obj.set_root_ptr(c.new_root.clone());
+        {
+            let vol = vol.clone();
+            tx.on_rollback(move || vol.obj.set_root_ptr(current));
+        }
         // What a snapshot still has stays (see `crate::snapshot`).
         let held = self.held_txg_of(vol.id).await.unwrap_or(Txg::MAX);
         let births = c
@@ -1678,7 +1787,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .zip(births)
             .map(|(&extent, birth)| crate::types::Born { extent, birth })
             .collect();
-        let _ = self.free_unheld(frees, held).await;
+        let _ = self.free_unheld(tx, frees, held).await;
         for &d in &c.missed {
             self.mark_degraded(d, c.birth_txg.prev());
         }

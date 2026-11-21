@@ -14,6 +14,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Proof that a dataset's operations lock (`Dataset::ops`) is held, for
+/// reading or writing. Only a guard makes one, so a function taking it
+/// can't be called outside the lock (audit X1).
+pub(crate) struct OpsHeld<'a>(std::marker::PhantomData<&'a ()>);
+
+impl<'a> OpsHeld<'a> {
+    pub(crate) fn read(_g: &'a tokio::sync::RwLockReadGuard<'_, ()>) -> Self {
+        OpsHeld(std::marker::PhantomData)
+    }
+}
+
+/// Proof that a dataset's operations lock is held for writing: nothing
+/// reads or writes the dataset meanwhile.
+pub(crate) struct OpsWriteHeld<'a>(std::marker::PhantomData<&'a ()>);
+
+impl<'a> OpsWriteHeld<'a> {
+    pub(crate) fn of(_g: &'a tokio::sync::RwLockWriteGuard<'_, ()>) -> Self {
+        OpsWriteHeld(std::marker::PhantomData)
+    }
+}
+
 /// A service's errors: the pool's, and "not served here (any more)".
 pub trait ServiceError: From<FileSystemError> {
     fn stopped() -> Self;
@@ -93,11 +114,24 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
             &'a Txn<'a, D>,
         ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
     {
+        self.read_held(|t, _| f(t)).await
+    }
+
+    /// `read`, with proof the operations lock is held for the read.
+    pub(crate) async fn read_held<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: ServiceError,
+        F: for<'a> FnOnce(
+            &'a Txn<'a, D>,
+            &'a OpsHeld<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
+    {
         let ds = self.ds::<E>().await?;
-        let _r = ds.ops.read().await;
+        let r = ds.ops.read().await;
         self.settler.settle(&self.fs, &self.name).await?;
         let t = Txn::begin(&self.fs, &ds.obj).await?;
-        f(&t).await
+        let held = OpsHeld::read(&r);
+        f(&t, &held).await
     }
 }
 

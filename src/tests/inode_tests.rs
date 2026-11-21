@@ -107,12 +107,12 @@ async fn fsck_reports_namespace_damage() {
     let fs = pool.format().await;
     fs.write_file(Path::new("/f"), b"x").await.unwrap();
     {
-        let _tx = fs.begin_tx().await;
+        let mut tx = fs.begin_tx().await;
         let stray = fs.alloc_object();
-        fs.write_dnode(stray, Some(Dnode::file(fs.file_blksz())))
+        fs.write_dnode(&mut tx, stray, Some(Dnode::file(fs.file_blksz())))
             .await
             .unwrap();
-        fs.commit_locked().await.unwrap();
+        fs.commit_locked(&mut tx).await.unwrap();
     }
     let report = fs.fsck(false).await.unwrap();
     assert!(!report.is_clean());
@@ -126,10 +126,10 @@ async fn fsck_reports_namespace_damage() {
     let fs = pool.format().await;
     fs.write_file(Path::new("/f"), b"x").await.unwrap();
     {
-        let _tx = fs.begin_tx().await;
+        let mut tx = fs.begin_tx().await;
         let (id, _) = fs.stat(Path::new("/f")).await.unwrap();
-        fs.write_dnode(id, None).await.unwrap();
-        fs.commit_locked().await.unwrap();
+        fs.write_dnode(&mut tx, id, None).await.unwrap();
+        fs.commit_locked(&mut tx).await.unwrap();
     }
     let report = fs.fsck(false).await.unwrap();
     assert!(

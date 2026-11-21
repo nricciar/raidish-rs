@@ -45,6 +45,8 @@ pub(crate) mod events;
 #[cfg(not(target_arch = "wasm32"))]
 mod export;
 pub(crate) mod fence;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod fenced_disks;
 pub(crate) mod file_writer;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod files_api;
@@ -97,6 +99,7 @@ mod stripe;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod tls;
 mod trace;
+pub(crate) mod tx;
 pub mod types;
 #[cfg(not(target_arch = "wasm32"))]
 mod ui;
@@ -121,6 +124,9 @@ pub(crate) mod writer;
 mod xml;
 pub(crate) mod zil;
 
+#[cfg(test)]
+#[path = "tests/fault_tests.rs"]
+mod fault_tests;
 #[cfg(test)]
 #[path = "tests/util.rs"]
 mod test_util;

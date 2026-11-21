@@ -176,7 +176,8 @@ impl RemoteDisk {
             block,
             count,
             id,
-            crate::types::Epoch::NONE,
+            crate::fence::Stamp::Pool(crate::types::Epoch::NONE),
+            self.opts.request_timeout,
             data,
         );
         let (tx, rx) = oneshot::channel();

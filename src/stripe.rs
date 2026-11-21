@@ -160,11 +160,12 @@ impl Vdev for Stripe {
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<LabelScan, RaidZError> {
         let mut scan = LabelScan::default();
         for s in self.segments(lba, blocks) {
             let mut part = self.children[s.child]
-                .verify_labels(s.local, s.len, repair, score)
+                .verify_labels(s.local, s.len, repair, score, stale)
                 .await?;
             for b in part.unrecoverable.iter_mut() {
                 *b = self.global(s.child, *b);

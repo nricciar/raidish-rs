@@ -6,6 +6,7 @@
 
 pub use crate::api_types::{CreateVolume, NewName};
 use crate::cluster::lease::{HeldLease, LeaseClient};
+use crate::cluster::state::MetaslabGrant;
 use crate::cluster::state::{ClusterState, POOL, Response};
 use crate::cluster::{Cluster, LeaseOp, now_ms};
 use crate::dataset::{DatasetFormat, DatasetInfo};
@@ -257,10 +258,14 @@ pub struct Committer<D: BlockDevice> {
     pool: Holding,
     /// The node it runs on (for status).
     node: String,
-    /// Metaslab → the writer lease it's lent to. The committer's own record
-    /// is authoritative: this node's view of the cluster may not show a lend
-    /// it just made yet.
-    lends: std::sync::Mutex<std::collections::HashMap<MetaslabIdx, LeaseRef>>,
+    /// Metaslab → its lend. The committer's own record is authoritative:
+    /// this node's view of the cluster may not show a lend it just made yet.
+    lends: std::sync::Mutex<std::collections::HashMap<MetaslabIdx, Lend>>,
+    /// Per metaslab, the epoch of the newest grant (lend or return) the
+    /// cluster answered this committer with: what its next `Lend` or
+    /// `Return` of it names (see `LeaseOp::Lend`). This node's applied
+    /// state may lag its own ops; epochs only grow, so the newer one wins.
+    grants: std::sync::Mutex<std::collections::HashMap<MetaslabIdx, Epoch>>,
     /// The activity log (opened, or made, on first use).
     events: tokio::sync::OnceCell<Arc<EventLog<D>>>,
     /// The VM definitions (opened, or made, on first use).
@@ -270,6 +275,33 @@ pub struct Committer<D: BlockDevice> {
     /// Which pool disks were online at the last `observe` (in memory: a
     /// new committer reports the ones offline once).
     disks_online: std::sync::Mutex<Option<Vec<bool>>>,
+}
+
+/// A metaslab lent (or maybe lent) to a writer. A `Return` always names
+/// the lend's own epoch, however often it's sent: a resend after a lost
+/// answer is answered as the first time (audit R4d). Only `Active` and
+/// `Returning` have one, so nothing else can be named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Lend {
+    /// The `Lend` (naming `after`) got no answer, so it may have gone
+    /// through. The writer was never told: `reclaim` sends it again to
+    /// find out (`settle_lend`), then takes it back.
+    InDoubt { writer: LeaseRef, after: Epoch },
+    /// Lent at `epoch`, and the writer knows.
+    Active { writer: LeaseRef, epoch: Epoch },
+    /// Its `Return` was sent, maybe without an answer: `reclaim` sends it
+    /// again, live writer or not.
+    Returning { writer: LeaseRef, epoch: Epoch },
+}
+
+impl Lend {
+    fn writer(&self) -> &LeaseRef {
+        match self {
+            Lend::InDoubt { writer, .. }
+            | Lend::Active { writer, .. }
+            | Lend::Returning { writer, .. } => writer,
+        }
+    }
 }
 
 /// A writer's lease must have lapsed this long before its metaslabs are
@@ -296,10 +328,24 @@ impl<D: BlockDevice> Committer<D> {
             pool.disks().fence().set_pool_epoch(epoch);
         }
         let state = auth.state();
-        let lends: std::collections::HashMap<MetaslabIdx, LeaseRef> = state
+        let lends: std::collections::HashMap<MetaslabIdx, Lend> = state
             .metaslabs
             .iter()
-            .filter_map(|(&i, g)| g.writer().map(|w| (i, w.clone())))
+            .filter_map(|(&i, g)| match g {
+                MetaslabGrant::Lent { writer, epoch, .. } => Some((
+                    i,
+                    Lend::Active {
+                        writer: writer.clone(),
+                        epoch: *epoch,
+                    },
+                )),
+                MetaslabGrant::Returned { .. } => None,
+            })
+            .collect();
+        let grants = state
+            .metaslabs
+            .iter()
+            .map(|(&i, g)| (i, g.epoch()))
             .collect();
         fs.mark_lent(lends.keys().copied()).await;
         // Writers' views of the TXG may lag a previous committer's: from
@@ -313,6 +359,7 @@ impl<D: BlockDevice> Committer<D> {
             pool: Holding::new(owner, epoch),
             node,
             lends: std::sync::Mutex::new(lends),
+            grants: std::sync::Mutex::new(grants),
             events: Default::default(),
             vms: Default::default(),
             seen: Default::default(),
@@ -488,14 +535,23 @@ impl<D: BlockDevice> Committer<D> {
                 "no metaslab with free space to lend",
             ));
         };
+        let after = self.grant_epoch(idx);
         let op = LeaseOp::Lend {
             idx,
             writer: writer.clone(),
             pool: self.pool.clone(),
+            after,
         };
         match self.auth.propose(op).await {
             Ok(Response::Fenced { epoch }) => {
-                self.lends.lock().unwrap().insert(idx, writer.clone());
+                self.grants.lock().unwrap().insert(idx, epoch);
+                self.lends.lock().unwrap().insert(
+                    idx,
+                    Lend::Active {
+                        writer: writer.clone(),
+                        epoch,
+                    },
+                );
                 Ok(LentMetaslab {
                     idx,
                     epoch,
@@ -512,19 +568,121 @@ impl<D: BlockDevice> Committer<D> {
                 Err(CommitError::refused(ErrorKind::Conflict, m))
             }
             other => {
-                self.fs.lend_abort(idx).await;
+                // It may have gone through: the metaslab stays out of use
+                // here (it may be the writer's on the disk servers), and
+                // `reclaim` finds out and takes it back (audit R4d).
+                self.lends.lock().unwrap().insert(
+                    idx,
+                    Lend::InDoubt {
+                        writer: writer.clone(),
+                        after,
+                    },
+                );
                 Err(CommitError::Retry(format!("lend: {:?}", other)))
             }
         }
     }
 
-    async fn take_back(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
-        let op = LeaseOp::Return {
+    /// Settle a lend in doubt: the same `Lend` again is answered as the
+    /// first time if it went through. It's then `Active` (recorded here:
+    /// settled once is settled, or a later lost answer, say to the return,
+    /// would send it again, now refused, and abort a lend that happened);
+    /// otherwise it's dropped and the metaslab is back in use here. The
+    /// lend's epoch, or None.
+    async fn settle_lend(
+        &self,
+        idx: MetaslabIdx,
+        writer: &LeaseRef,
+        after: Epoch,
+    ) -> Result<Option<Epoch>, CommitError> {
+        let settled = self.settle_lend_once(idx, writer, after).await?;
+        let mut lends = self.lends.lock().unwrap();
+        let ours = |l: &Lend| matches!(l, Lend::InDoubt { writer: w, after: a } if w == writer && *a == after);
+        if lends.get(&idx).is_some_and(ours) {
+            match settled {
+                Some(epoch) => {
+                    lends.insert(
+                        idx,
+                        Lend::Active {
+                            writer: writer.clone(),
+                            epoch,
+                        },
+                    );
+                }
+                None => {
+                    lends.remove(&idx);
+                }
+            }
+        }
+        Ok(settled)
+    }
+
+    async fn settle_lend_once(
+        &self,
+        idx: MetaslabIdx,
+        writer: &LeaseRef,
+        after: Epoch,
+    ) -> Result<Option<Epoch>, CommitError> {
+        let op = LeaseOp::Lend {
             idx,
+            writer: writer.clone(),
             pool: self.pool.clone(),
+            after,
         };
         match self.auth.propose(op).await {
             Ok(Response::Fenced { epoch }) => {
+                self.grants.lock().unwrap().insert(idx, epoch);
+                Ok(Some(epoch))
+            }
+            Ok(Response::Refused(m)) => {
+                // A resend of a lend that went through is answered as the
+                // first time, so this one didn't, unless the state says
+                // otherwise (this node's view may be all there is to ask).
+                let applied = self.auth.state().metaslabs.get(&idx).and_then(|g| match g {
+                    MetaslabGrant::Lent {
+                        writer: w,
+                        epoch,
+                        from,
+                    } if w == writer && *from == after => Some(*epoch),
+                    _ => None,
+                });
+                if let Some(epoch) = applied {
+                    return Ok(Some(epoch));
+                }
+                eprintln!("committer: metaslab {} wasn't lent after all: {}", idx, m);
+                self.fs.lend_abort(idx).await;
+                Ok(None)
+            }
+            other => Err(CommitError::Retry(format!("lend in doubt: {:?}", other))),
+        }
+    }
+
+    async fn take_back(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        let Some(l) = self.lends.lock().unwrap().get(&idx).cloned() else {
+            return Ok(());
+        };
+        let (writer, lend) = match l {
+            Lend::Active { writer, epoch } | Lend::Returning { writer, epoch } => (writer, epoch),
+            Lend::InDoubt { writer, after } => match self.settle_lend(idx, &writer, after).await? {
+                Some(epoch) => (writer, epoch),
+                None => return Ok(()),
+            },
+        };
+        self.lends.lock().unwrap().insert(
+            idx,
+            Lend::Returning {
+                writer,
+                epoch: lend,
+            },
+        );
+        let op = LeaseOp::Return {
+            idx,
+            pool: self.pool.clone(),
+            lend,
+        };
+        match self.auth.propose(op).await {
+            Ok(Response::Fenced { epoch }) => {
+                self.grants.lock().unwrap().insert(idx, epoch);
                 self.lends.lock().unwrap().remove(&idx);
                 self.fs.unlend(idx, epoch).await;
                 Ok(())
@@ -534,11 +692,41 @@ impl<D: BlockDevice> Committer<D> {
         }
     }
 
+    /// The epoch of metaslab `idx`'s current grant, as far as this
+    /// committer knows: the newer of its own last answer and the applied
+    /// state.
+    fn grant_epoch(&self, idx: MetaslabIdx) -> Epoch {
+        let seen = self
+            .auth
+            .state()
+            .metaslabs
+            .get(&idx)
+            .map_or(Epoch::NONE, |g| g.epoch());
+        let ours = self
+            .grants
+            .lock()
+            .unwrap()
+            .get(&idx)
+            .copied()
+            .unwrap_or(Epoch::NONE);
+        seen.max(ours)
+    }
+
+    /// Whether metaslab `idx` is lent to `writer` right now.
+    fn lent_to(&self, idx: MetaslabIdx, writer: &LeaseRef) -> bool {
+        // A lend in doubt was never told to the writer, and one being
+        // returned is going: neither is its.
+        matches!(
+            self.lends.lock().unwrap().get(&idx),
+            Some(Lend::Active { writer: w, .. }) if w == writer
+        )
+    }
+
     /// A writer gives metaslab `idx` back.
     pub async fn give_back(&self, writer: &LeaseRef, idx: MetaslabIdx) -> Result<(), CommitError> {
         let lent = self.lends.lock().unwrap().get(&idx).cloned();
-        match lent {
-            Some(w) if w == *writer => self.take_back(idx).await,
+        match lent.as_ref().map(Lend::writer) {
+            Some(w) if w == writer => self.take_back(idx).await,
             // Already back (a resend): fine.
             None => Ok(()),
             Some(_) => Err(CommitError::refused(
@@ -549,34 +737,49 @@ impl<D: BlockDevice> Committer<D> {
     }
 
     pub async fn commit(&self, c: &DatasetCommit) -> Result<Committed, CommitError> {
-        let state = self.auth.state();
-        check_live(&state, &c.writer)?;
-        check_held(&state, &dataset_resource(&c.dataset), &c.ds)?;
-        let lends = self.lends.lock().unwrap().clone();
+        let leases_ok = || {
+            let state = self.auth.state();
+            check_live(&state, &c.writer)?;
+            check_held(&state, &dataset_resource(&c.dataset), &c.ds)
+        };
+        // Early, to refuse before waiting; again under the tx, which is
+        // the check that counts (it takes the tx: audit S6a).
+        leases_ok()?;
+        let leases_ok = |_: &crate::tx::Tx| leases_ok();
+        // Asked live, while the allocations are claimed (under the metaslab
+        // locks): a snapshot taken here could still say a metaslab is this
+        // writer's after it was taken back and lent to another (audit S6a).
         let txg = self
             .fs
-            .apply_dataset_commit(c, |idx| lends.get(&idx) == Some(&c.writer))
+            .apply_dataset_commit(c, leases_ok, |idx| self.lent_to(idx, &c.writer))
             .await?;
         Ok(Committed { txg })
     }
 
     /// Apply a writer's file or directory change.
     pub async fn commit_fs(&self, c: &FsCommit) -> Result<FsCommitted, CommitError> {
-        let state = self.auth.state();
-        check_live(&state, &c.writer)?;
-        let lends = self.lends.lock().unwrap().clone();
+        let leases_ok = || check_live(&self.auth.state(), &c.writer);
+        leases_ok()?;
+        // The `obj/<id>` leases, as of under the tx (a state taken then).
+        let state = std::sync::Mutex::new(None::<ClusterState>);
         self.fs
             .apply_fs_commit(
                 c,
-                |idx| lends.get(&idx) == Some(&c.writer),
-                |id| object_lease_ok(&state, c, id),
+                |_: &crate::tx::Tx| {
+                    let s = self.auth.state();
+                    check_live(&s, &c.writer)?;
+                    *state.lock().unwrap() = Some(s);
+                    Ok(())
+                },
+                |idx| self.lent_to(idx, &c.writer),
+                |id| match state.lock().unwrap().as_ref() {
+                    Some(s) => object_lease_ok(s, c, id),
+                    None => object_lease_ok(&self.auth.state(), c, id),
+                },
             )
             .await
     }
 
-    /// Get `volume` ready for the holder of its `ds/<name>` lease: replay
-    /// whatever intent log an earlier holder left (it can't add to it any
-    /// more: its lease is gone).
     pub async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
         check_held(&self.auth.state(), &dataset_resource(volume), ds)?;
         let vol = self
@@ -672,13 +875,20 @@ impl<D: BlockDevice> Committer<D> {
         let state = self.auth.state();
         let now = now_ms();
         let lends = self.lends.lock().unwrap().clone();
-        for (idx, writer) in lends {
-            let gone = match state.leases.get(&writer.resource) {
-                Some(l) => {
-                    l.epoch != writer.epoch || l.released || l.expires_ms + RECLAIM_GRACE_MS < now
-                }
-                // Not visible here yet: a lend this node's view hasn't caught up with.
-                None => false,
+        for (idx, l) in lends {
+            // A lend in doubt goes back at once (its writer wasn't told), and
+            // a return that got no answer is sent again.
+            let gone = match &l {
+                Lend::InDoubt { .. } | Lend::Returning { .. } => true,
+                Lend::Active { writer, .. } => match state.leases.get(&writer.resource) {
+                    Some(l) => {
+                        l.epoch != writer.epoch
+                            || l.released
+                            || l.expires_ms + RECLAIM_GRACE_MS < now
+                    }
+                    // Not visible here yet: a lend this node's view hasn't caught up with.
+                    None => false,
+                },
             };
             if gone && let Err(e) = self.take_back(idx).await {
                 eprintln!("committer: taking back metaslab {}: {}", idx, e);
@@ -1020,6 +1230,15 @@ pub async fn run(
                 continue;
             }
         };
+        // Renewing from the start: loading can take longer than a TTL, and
+        // a lease that lapsed meanwhile could be granted to another
+        // committer while this one goes on to commit (audit R3b).
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = lost.clone();
+        held.hold(move |msg| {
+            eprintln!("committer: {}; stepping down", msg);
+            flag.store(true, Ordering::SeqCst);
+        });
         let pool = access.open().await;
         pool.disks().fence().set_pool_epoch(held.epoch);
         let fs = match FileSystem::load(pool).await {
@@ -1032,12 +1251,25 @@ pub async fn run(
                 continue;
             }
         };
-        let lost = Arc::new(AtomicBool::new(false));
-        let flag = lost.clone();
-        held.hold(move |msg| {
-            eprintln!("committer: {}; stepping down", msg);
-            flag.store(true, Ordering::SeqCst);
-        });
+        if lost.load(Ordering::SeqCst) {
+            continue;
+        }
+        // The lends and grants it starts from, as of now: the lease may
+        // have been granted through the leader, ahead of what this node
+        // has applied (audit R2b).
+        if let Err(e) = cluster.linearizable_state(Duration::from_secs(10)).await {
+            eprintln!(
+                "committer: no linearizable read of the cluster ({}); retrying",
+                e
+            );
+            held.release().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        // The read can take its whole timeout: the lease may have lapsed.
+        if lost.load(Ordering::SeqCst) {
+            continue;
+        }
         let committer = Arc::new(
             Committer::new(
                 fs.clone(),
@@ -1048,6 +1280,9 @@ pub async fn run(
             )
             .await,
         );
+        if lost.load(Ordering::SeqCst) {
+            continue;
+        }
         println!(
             "committer: this node commits the pool (epoch {})",
             held.epoch
@@ -1059,7 +1294,15 @@ pub async fn run(
         );
         *slot.write().await = Some(committer.clone());
         let mut observe_failing = false;
+        let fenced_out = || fs.dev.pool().is_some_and(|p| p.disks().fence().is_stale());
         while !lost.load(Ordering::SeqCst) {
+            if fenced_out() {
+                // A disk server refused our pool epoch: a newer committer
+                // has the pool, whatever our lease renewals say (audit R2a).
+                eprintln!("committer: a disk refused our pool epoch; stepping down");
+                held.release().await;
+                break;
+            }
             match committer.observe().await {
                 Ok(()) => observe_failing = false,
                 Err(e) if !observe_failing => {

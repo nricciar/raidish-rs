@@ -329,10 +329,11 @@ async fn no_incremental_over_a_pending_intent_log() {
             writer: LeaseRef::new(crate::types::res("writer/1"), ep(1)),
             ds: Holding::new("gone", ep(1)),
         });
-        let _tx = dst.begin_tx().await;
-        dst.update_dataset_dnode(&vol, vol.obj.root_ptr())
+        let mut tx = dst.begin_tx().await;
+        dst.update_dataset_dnode(&mut tx, &vol, vol.obj.root_ptr())
             .await
             .unwrap();
+        tx.applied();
     }
     dst.sync().await.unwrap();
     for force in [false, true] {

@@ -1413,7 +1413,13 @@ impl VolumeWriter {
         let fs = FileSystem::load_writer(spec.open(opts).await, Arc::new(sink))
             .await
             .map_err(|e| format!("opening the pool: {}", e))?;
-        fs.attach_dataset(volume, vol.holding())
+        // Flushes are acknowledged only while the lease is provably held
+        // (audit R3b; as the agent's writers do).
+        let fresh = {
+            let vol = vol.clone();
+            Arc::new(move || vol.fresh()) as crate::writer::LeaseCheck
+        };
+        fs.attach_dataset_leased(volume, vol.holding(), None, Some(fresh))
             .await
             .map_err(|e| format!("volume '{}': {}", volume, e))?;
         Ok(VolumeWriter {

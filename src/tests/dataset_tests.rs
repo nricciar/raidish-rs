@@ -57,8 +57,11 @@ async fn fsck_reports_a_missing_default_dataset() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     {
-        let _tx = fs.begin_tx().await;
-        fs.write_datasets(&DatasetIndex::default()).await.unwrap();
+        let mut tx = fs.begin_tx().await;
+        fs.write_datasets(&mut tx, &DatasetIndex::default())
+            .await
+            .unwrap();
+        tx.applied();
     }
     let report = fs.fsck(false).await.unwrap();
     assert!(!report.is_clean());
@@ -152,4 +155,47 @@ fn the_lease_is_per_dataset() {
         crate::committer::dataset_resource("vol").to_string(),
         "ds/vol"
     );
+}
+
+/// S4b: a sync that doesn't fold the intent log (the holes-only retry
+/// after `NoSpace`) leaves the dnode's log as it is, even while `vol.log`
+/// says none (a replay clears it before its commit): the log still holds
+/// writes that sync didn't commit.
+#[tokio::test]
+async fn a_sync_without_folding_keeps_the_dnodes_log() {
+    use crate::inode::{DatasetLog, LogRegion};
+    use crate::types::{Holding, LeaseRef, ep, res};
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.create_block("v", 1 << 20, fs.default_volblocksize())
+        .await
+        .unwrap();
+    let vol = fs.open_dataset("v").await.unwrap();
+    let log = DatasetLog {
+        regions: vec![LogRegion {
+            start: 1 << 30,
+            len: 8,
+            guid: 1,
+        }],
+        from_seq: 0,
+        writer: LeaseRef::new(res("writer/1"), ep(1)),
+        ds: Holding::new("o", ep(1)),
+    };
+    *vol.log.lock().unwrap() = Some(log.clone());
+    let mut tx = fs.begin_tx().await;
+    fs.update_dataset_dnode(&mut tx, &vol, vol.obj.root_ptr())
+        .await
+        .unwrap();
+
+    // As a replay leaves it: the log cleared in memory, records dirty.
+    *vol.log.lock().unwrap() = None;
+    let holes: std::collections::BTreeMap<u64, crate::object::Dirty> =
+        [(0, crate::object::Dirty::Hole)].into_iter().collect();
+    fs.sync_dataset(&mut tx, &vol, &holes, false).await.unwrap();
+    let head_log = |d: crate::inode::Dnode| d.head().and_then(|h| h.log.clone());
+    assert_eq!(head_log(fs.read_dnode(vol.id).await.unwrap()), Some(log));
+    // Folding (everything synced): the log goes.
+    fs.sync_dataset(&mut tx, &vol, &holes, true).await.unwrap();
+    tx.applied();
+    assert_eq!(head_log(fs.read_dnode(vol.id).await.unwrap()), None);
 }

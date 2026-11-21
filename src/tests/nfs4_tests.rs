@@ -562,6 +562,53 @@ async fn files_from_open_to_close() {
     assert!(report.is_clean(), "{}", report);
 }
 
+/// OPEN, creating `name` UNCHECKED with size 0 (an existing file is
+/// truncated), for reading and writing.
+fn open_truncating(o: Ops, clientid: u64, owner: &str, name: &str) -> Ops {
+    let owner = owner.to_string();
+    let name = name.to_string();
+    o.op(op::OPEN, move |w| {
+        w.u32(0)
+            .u32(3)
+            .u32(0)
+            .u64(clientid)
+            .opaque(owner.as_bytes());
+        w.u32(1).u32(0);
+        let mut vals = Writer::new();
+        vals.u64(0);
+        write_bitmap(w, &bitmap_of(&[attrs::SIZE]));
+        w.opaque(&vals.buf);
+        w.u32(0).string(&name);
+    })
+}
+
+/// N3: an OPEN its share reservation is denied changes nothing: the file
+/// isn't truncated first.
+#[tokio::test]
+async fn a_denied_open_doesnt_truncate() {
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    fs.write_file(Path::new("f"), b"0123456789").await.unwrap();
+    let addr = serve(fs.clone()).await;
+    let mut a = V4::connect(addr, "client-a").await;
+    let mut b = V4::connect(addr, "client-b").await;
+    let res = a
+        .call(open(putroot(Ops::new()), a.clientid, "oa", "f", false, 2))
+        .await;
+    assert_eq!(res.status, 0);
+    let res = b
+        .call(open_truncating(putroot(Ops::new()), b.clientid, "ob", "f"))
+        .await;
+    assert_eq!(res.status, err::SHARE_DENIED);
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"0123456789");
+    // Allowed, it truncates.
+    let res = a
+        .call(open_truncating(putroot(Ops::new()), a.clientid, "oa", "f"))
+        .await;
+    assert_eq!(res.status, 0);
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"");
+}
+
 /// Share reservations and byte-range locks between two clients.
 #[tokio::test]
 async fn opens_and_locks_between_clients() {
@@ -862,6 +909,75 @@ async fn state_lives_on_the_owner() {
     assert_eq!(x.call(putroot(Ops::new())).await.status, 0);
 }
 
+/// N2: a write that runs on a follower is checked against what the owner
+/// says of its stateid: another client's, one for another file, a read-only
+/// open's, or a made-up one, is refused there as it would be on the owner.
+#[tokio::test]
+async fn a_followers_io_is_checked_against_the_owners_state() {
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    fs.write_file(Path::new("f"), b"0123456789").await.unwrap();
+    fs.write_file(Path::new("g"), b"0123456789").await.unwrap();
+    let (_cluster, on_a, on_b) = two_nodes(fs.clone()).await;
+    let mut x = V4::connect(on_b, "client-x").await;
+    let mut y = V4::connect(on_a, "client-y").await;
+
+    // Opens: x has f read-only and g read-write; y has f read-write.
+    let xid = x.clientid;
+    let res = x
+        .call(
+            putroot(Ops::new())
+                .op(op::OPEN, move |w| {
+                    w.u32(0).u32(1).u32(0).u64(xid).opaque(b"ox");
+                    w.u32(0).u32(0).string("f");
+                })
+                .op(op::GETFH, |_| {}),
+        )
+        .await;
+    let mut r = res.reader();
+    skip_sequence(&mut r);
+    next(&mut r, op::PUTROOTFH);
+    let x_ro = opened(&mut r);
+    next(&mut r, op::GETFH);
+    let fh = r.opaque(128).unwrap().to_vec();
+    let res = x
+        .call(open(putroot(Ops::new()), x.clientid, "ox", "g", false, 0))
+        .await;
+    let mut r = res.reader();
+    skip_sequence(&mut r);
+    next(&mut r, op::PUTROOTFH);
+    let x_g = opened(&mut r);
+    let res = y
+        .call(open(putroot(Ops::new()), y.clientid, "oy", "f", false, 0))
+        .await;
+    let mut r = res.reader();
+    skip_sequence(&mut r);
+    next(&mut r, op::PUTROOTFH);
+    let y_rw = opened(&mut r);
+
+    let write = async |x: &mut V4, sid: (u32, [u8; 12])| {
+        x.seq += 1;
+        let seq = x.seq;
+        x.call_seq(
+            seq,
+            false,
+            put_file(&fh).op(op::WRITE, move |w| {
+                put_stateid(w, sid);
+                w.u64(0).u32(2).opaque(b"AB");
+            }),
+        )
+        .await
+        .status
+    };
+    assert_eq!(write(&mut x, y_rw).await, err::BAD_STATEID, "y's stateid");
+    assert_eq!(write(&mut x, x_g).await, err::BAD_STATEID, "g's stateid");
+    assert_eq!(write(&mut x, x_ro).await, err::OPENMODE, "read-only open");
+    let mut made_up = x_g;
+    made_up.1[11] ^= 0x5a;
+    assert_eq!(write(&mut x, made_up).await, err::BAD_STATEID, "made up");
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"0123456789");
+}
+
 /// The owner changes: sessions are gone, recorded clients reclaim their
 /// opens and locks in the grace period, new ones wait (GRACE) until they
 /// have, and the reclaimed locks hold after.
@@ -922,6 +1038,17 @@ async fn a_new_owner_lets_clients_reclaim() {
         .call(open(putroot(Ops::new()), y.clientid, "oy", "f", false, 0))
         .await;
     assert_eq!(res.status, err::GRACE);
+    // ... nor create (N3: the create waits for grace too) ...
+    let res = y
+        .call(open_truncating(
+            putroot(Ops::new()),
+            y.clientid,
+            "oy",
+            "new",
+        ))
+        .await;
+    assert_eq!(res.status, err::GRACE);
+    assert!(fs.read_file(Path::new("new")).await.is_err(), "not created");
     // ... and a client the old owner never knew may not reclaim.
     let mut z = V4::session(on_a, "client-z").await;
     let zid = z.clientid;

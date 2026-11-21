@@ -17,6 +17,8 @@ struct Writer {
     fs: Arc<FileSystem<Pool>>,
     nbd: Arc<NbdServer<Pool>>,
     epoch: AtomicU64,
+    /// The epoch it took the volume over from cleanly (0: none).
+    from: AtomicU64,
 }
 
 #[async_trait]
@@ -28,6 +30,10 @@ impl PeerVolumes for Writer {
         }
         self.nbd
             .peer_export(volume)
+            .map(|e| PeerExport {
+                from: Epoch::from_raw(self.from.load(Ordering::SeqCst)),
+                ..e
+            })
             .ok_or_else(|| format!("{} isn't exported here", volume))
     }
 }
@@ -51,6 +57,7 @@ async fn setup() -> Setup {
         fs,
         nbd,
         epoch: AtomicU64::new(7),
+        from: AtomicU64::new(0),
     });
     let fixture = crate::frontend::testing::Fixture::new(vec![]);
     let acceptor = TlsAcceptor::from(Arc::new(fixture.tls.server_config(true, &[]).unwrap()));
@@ -292,4 +299,61 @@ async fn another_protocol_version_is_refused_by_name() {
             answer
         );
     }
+}
+
+/// A2: writes the writer acknowledged but nobody flushed are lost if it
+/// goes and the next writer didn't take over from it cleanly: the proxy's
+/// next flush fails rather than vouch for them. After a clean handoff
+/// (the new writer took over from that one) it doesn't.
+#[tokio::test]
+async fn a_flush_after_an_unclean_writer_change_fails() {
+    let s = setup().await;
+    let e = epoch(7);
+    let p = Arc::new(s.proxy(e.clone()));
+    // The writer changes with this write unflushed.
+    let change = |s: &Setup, to: u64, from: u64| {
+        s.writer.epoch.store(to, Ordering::SeqCst);
+        s.writer.from.store(from, Ordering::SeqCst);
+        e.store(to, Ordering::SeqCst);
+    };
+    let reconnect = async |s: &Setup| {
+        tokio::time::timeout(Duration::from_secs(5), s.writer.nbd.remove_export("vol"))
+            .await
+            .unwrap()
+            .unwrap();
+        s.writer.nbd.add_export("vol").await.unwrap();
+    };
+
+    p.write(0, &[1u8; 4096]).await.unwrap();
+    assert!(p.unflushed());
+    reconnect(&s).await;
+    change(&s, 8, 0); // a crash: the new writer started afresh
+    let r = p.flush().await;
+    assert!(matches!(r, Err(FileSystemError::Unavailable(_))), "{:?}", r);
+    // Reported once; from here on, flushes cover what's written.
+    p.flush().await.unwrap();
+    assert!(!p.unflushed());
+
+    p.write(0, &[2u8; 4096]).await.unwrap();
+    reconnect(&s).await;
+    change(&s, 9, 8); // a clean handoff from the writer at 8
+    p.flush().await.unwrap();
+
+    // The same writer reconnected: nothing is lost.
+    p.write(0, &[3u8; 4096]).await.unwrap();
+    reconnect(&s).await;
+    p.flush().await.unwrap();
+
+    // Found lost by a read (no flush since): still owed, though nothing is
+    // unflushed by count any more. A takeover asking `unflushed` (crash)
+    // or `lost` (clean) must still see it (audit A2).
+    p.write(0, &[4u8; 4096]).await.unwrap();
+    reconnect(&s).await;
+    change(&s, 10, 0);
+    let mut buf = [0u8; 4096];
+    p.read(0, &mut buf).await.unwrap();
+    assert!(p.lost());
+    assert!(p.unflushed(), "lost counts as unflushed");
+    assert!(p.flush().await.is_err());
+    assert!(!p.lost() && !p.unflushed());
 }

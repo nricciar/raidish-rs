@@ -238,8 +238,15 @@ pub struct Backend<D: BlockDevice> {
     source: FsSource<D>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: String,
-    verifier: [u8; 8],
+    /// This node's write verifier: changed whenever unstable writes
+    /// acknowledged here may have been lost, so clients resend them.
+    verifier: std::sync::Mutex<[u8; 8]>,
     held: tokio::sync::Mutex<HashMap<FileId, Held>>,
+    /// Held for writing while `tidy` closes a file (from leaving `held` to
+    /// a failed close's new verifier), for reading by `commit_local`: a
+    /// COMMIT never finds the file gone and the verifier not yet changed,
+    /// and answers with the old one for writes that were lost (audit N1).
+    closing: tokio::sync::RwLock<()>,
     last_refresh: std::sync::Mutex<Option<Instant>>,
     close_after: Duration,
     peers: Option<Arc<dyn Peers>>,
@@ -252,9 +259,12 @@ impl<D: BlockDevice + 'static> Backend<D> {
         Backend {
             source,
             leases,
-            verifier: crate::fs::new_guid(std::process::id() as u64).to_be_bytes(),
+            verifier: std::sync::Mutex::new(
+                crate::fs::new_guid(std::process::id() as u64).to_be_bytes(),
+            ),
             node,
             held: Default::default(),
+            closing: Default::default(),
             last_refresh: Default::default(),
             close_after: CLOSE_AFTER,
             peers: None,
@@ -347,10 +357,26 @@ impl<D: BlockDevice + 'static> Backend<D> {
         &self.node
     }
 
-    /// This process's write verifier.
-    #[cfg(test)]
+    /// This node's current write verifier.
     pub fn verifier(&self) -> [u8; 8] {
-        self.verifier
+        *self.verifier.lock().unwrap()
+    }
+
+    /// Unstable writes acknowledged with the current verifier may be gone
+    /// (dropped on a conflict, a failed close, written to a file closed
+    /// meanwhile): a new verifier makes every client resend what it hasn't
+    /// seen committed.
+    fn lost_writes(&self, id: FileId, why: &str) {
+        let mut v = self.verifier.lock().unwrap();
+        let old = u64::from_be_bytes(*v);
+        *v = crate::fs::new_guid(old ^ id.get()).to_be_bytes();
+        eprintln!("nfs: object {}: {}; new write verifier", id, why);
+    }
+
+    /// Whether `f` is still the file the pool has open as `id` (writes to
+    /// it can still be committed).
+    fn still_open(fs: &FileSystem<D>, id: FileId, f: &Arc<OpenFile>) -> bool {
+        !f.dropped() && fs.opened(id).is_some_and(|o| Arc::ptr_eq(&o, f))
     }
 
     /// The pool, caught up with what's committed.
@@ -590,8 +616,17 @@ impl<D: BlockDevice + 'static> Backend<D> {
     async fn writable(&self, fs: &FileSystem<D>, id: FileId) -> NfsResult<Arc<OpenFile>> {
         let mut held = self.held.lock().await;
         if let Some(h) = held.get_mut(&id) {
-            h.last_write = Instant::now();
-            return Ok(h.file.clone());
+            if Self::still_open(fs, id, &h.file) {
+                h.last_write = Instant::now();
+                return Ok(h.file.clone());
+            }
+            // The pool dropped it (a conflict): open it afresh.
+            if let Some(h) = held.remove(&id) {
+                self.lost_writes(id, "the file was dropped");
+                if let Some(g) = h.guard {
+                    g.release().await;
+                }
+            }
         }
         let d = self.dnode(fs, id).await?;
         if !d.is_file() {
@@ -663,6 +698,9 @@ impl<D: BlockDevice + 'static> Backend<D> {
     ) -> NfsResult<(Attr, [u8; 8])> {
         let fs = self.fs().await?;
         offset.checked_add(data.len() as u64).ok_or(status::FBIG)?;
+        // Taken before writing: if the write is lost, the verifier has
+        // changed by the time a COMMIT could answer.
+        let verifier = self.verifier();
         let f = self.writable(&fs, id).await?;
         fs.file_write(&f, offset, data).await.map_err(err)?;
         if stable {
@@ -670,7 +708,12 @@ impl<D: BlockDevice + 'static> Backend<D> {
         } else if let Some(h) = self.held.lock().await.get_mut(&id) {
             h.dirty_since.get_or_insert_with(Instant::now);
         }
-        Ok((self.getattr_local(id).await?, self.verifier))
+        if !Self::still_open(&fs, id, &f) {
+            // Closed (or dropped) while this wrote to it.
+            self.lost_writes(id, "a write raced with closing the file");
+            return Err(status::JUKEBOX);
+        }
+        Ok((self.getattr_local(id).await?, verifier))
     }
 
     /// Make every write to `id` so far durable. Returns the write verifier
@@ -687,13 +730,26 @@ impl<D: BlockDevice + 'static> Backend<D> {
 
     async fn commit_local(&self, id: FileId) -> NfsResult<[u8; 8]> {
         let fs = self.fs().await?;
-        if let Some(f) = fs.opened(id) {
-            fs.file_sync(&f).await.map_err(err)?;
+        let _closing = self.closing.read().await;
+        // The file this node writes through, even if the pool already
+        // dropped it (a conflict): its sync then reports what was lost.
+        let held = self.held.lock().await.get(&id).map(|h| h.file.clone());
+        if let Some(f) = held.or_else(|| fs.opened(id)) {
+            match fs.file_sync(&f).await {
+                Ok(()) => {}
+                Err(FileSystemError::Conflict(m)) => {
+                    self.lost_writes(id, &format!("unsynced writes dropped: {}", m));
+                    return Ok(self.verifier());
+                }
+                Err(e) => return Err(err(e)),
+            }
             if let Some(h) = self.held.lock().await.get_mut(&id) {
                 h.dirty_since = None;
             }
         }
-        Ok(self.verifier)
+        // As of now, after the sync: a loss noted meanwhile has changed it,
+        // so writes acknowledged with the old one are resent.
+        Ok(self.verifier())
     }
 
     /// The first byte at `offset` or after that is data (`data`) or in a
@@ -912,6 +968,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
             }
         }
         for id in to_close {
+            let _closing = self.closing.write().await;
             let h = {
                 let mut held = self.held.lock().await;
                 // Written to since we looked: keep it.
@@ -924,7 +981,9 @@ impl<D: BlockDevice + 'static> Backend<D> {
             };
             let Some(h) = h else { continue };
             if let Err(e) = fs.close_file(&h.file).await {
+                // Closed anyway: whatever it didn't commit is gone.
                 eprintln!("nfs: closing object {}: {}", id, e);
+                self.lost_writes(id, "closing it failed");
             }
             if let Some(g) = h.guard {
                 g.release().await;

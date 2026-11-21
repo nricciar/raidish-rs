@@ -723,6 +723,15 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
 ) -> std::io::Result<()> {
     let queue = conn.queue.lock().unwrap().clone();
     let completion = if sqe.opcode() == OPC_FABRICS {
+        if let Some(q) = queue.as_ref().filter(|q| q.qid == 0)
+            && shutdown_requested(&sqe)
+        {
+            // Normal or abrupt shutdown (CC.SHN): what was written must be
+            // durable before shutdown is reported complete.
+            if let Err(e) = q.ctrl.export.io.flush().await {
+                eprintln!("nvme: {}: flush on shutdown failed: {}", conn.peer, e);
+            }
+        }
         fabrics(conn, &queue, &sqe, &data)
     } else {
         match &queue {
@@ -751,6 +760,13 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
         c.status
     );
     send_completion(conn, sqe.cid(), c).await
+}
+
+/// A Property Set of CC asking for shutdown (CC.SHN != 0).
+fn shutdown_requested(sqe: &Sqe) -> bool {
+    sqe.fctype() == FCT_PROP_SET
+        && le32(&sqe.0, 44) == PROP_CC
+        && (le32(&sqe.0, 48) >> 14) & 0x3 != 0
 }
 
 fn fabrics<D: BlockDevice>(
@@ -873,8 +889,8 @@ fn fabrics<D: BlockDevice>(
                     regs.csts &= !1;
                 }
                 if (cc >> 14) & 0x3 != 0 {
-                    // Shutdown requested: nothing to drain beyond a commit,
-                    // which the host follows with FLUSH anyway. Report complete.
+                    // Shutdown requested: flushed already (see `execute`).
+                    // Report complete.
                     regs.csts = (regs.csts & !0xc) | (0x2 << 2);
                 }
                 regs.cc = cc;
@@ -965,6 +981,23 @@ fn admin<D: BlockDevice>(
     })
 }
 
+/// Force Unit Access (CDW12 bit 30) on a write or write zeroes: with the
+/// volatile write cache advertised, the write completes only once durable
+/// (filesystem journals rely on it in place of a separate FLUSH).
+async fn fua(
+    io: &SwitchableIo,
+    sqe: &Sqe,
+    fail: &impl Fn(&str, crate::fs::FileSystemError) -> Completion,
+) -> Completion {
+    if sqe.cdw(12) & (1 << 30) == 0 {
+        return Completion::ok();
+    }
+    match io.flush().await {
+        Ok(()) => Completion::ok(),
+        Err(e) => fail("FUA flush", e),
+    }
+}
+
 async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
     if sqe.nsid() != 1 {
         return Completion::generic(SC_INVALID_NS);
@@ -1005,12 +1038,12 @@ async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
                         return Completion::generic(SC_DATA_XFER_ERROR);
                     }
                     match io.write(offset, data).await {
-                        Ok(_) => Completion::ok(),
+                        Ok(_) => fua(io, sqe, &fail).await,
                         Err(e) => fail("write", e),
                     }
                 }
                 _ => match io.zero(offset, len).await {
-                    Ok(_) => Completion::ok(),
+                    Ok(_) => fua(io, sqe, &fail).await,
                     Err(e) => fail("write zeroes", e),
                 },
             }

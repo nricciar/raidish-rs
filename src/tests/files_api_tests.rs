@@ -33,8 +33,11 @@ async fn lease(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &
     }
 }
 
+/// Run (once) just before the next object lease is taken.
+type BeforeTake = Arc<std::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>>;
+
 /// `ObjectLeases` over the in-memory cluster state.
-struct TestLeases(Arc<LocalAuthority>);
+struct TestLeases(Arc<LocalAuthority>, BeforeTake);
 
 struct TestGuard {
     auth: Arc<LocalAuthority>,
@@ -63,6 +66,10 @@ impl ObjectLeases for TestLeases {
         resource: crate::types::LeaseResource,
         desc: crate::types::Holder,
     ) -> Result<Box<dyn ObjectGuard>, String> {
+        let before = self.1.lock().unwrap().take();
+        if let Some(before) = before {
+            before.await;
+        }
         let owner = format!("upload-{}", desc);
         let op = LeaseOp::Acquire {
             resource: resource.clone(),
@@ -85,6 +92,7 @@ struct Setup {
     pool: TestPool,
     auth: Arc<LocalAuthority>,
     committer: Arc<Committer<Pool>>,
+    before_take: BeforeTake,
 }
 
 async fn setup() -> Setup {
@@ -99,11 +107,22 @@ async fn setup() -> Setup {
         pool,
         auth,
         committer,
+        before_take: Default::default(),
     }
 }
 
 /// A node's file API, with its own writer (None: no writer yet).
 async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<FileSystem<Pool>>>) {
+    let (rocket, writer) = node_rocket(s, id, with_writer).await;
+    (Client::untracked(rocket).await.unwrap(), writer)
+}
+
+/// `node`'s server, not yet launched.
+async fn node_rocket(
+    s: &Setup,
+    id: &str,
+    with_writer: bool,
+) -> (rocket::Rocket<rocket::Build>, Option<Arc<FileSystem<Pool>>>) {
     let writer = if with_writer {
         let resource = format!("writer/{}", id);
         let epoch = lease(&s.auth, &resource, id).await;
@@ -123,7 +142,7 @@ async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<Fil
         node: id.into(),
         writer: Arc::new(std::sync::RwLock::new(writer.clone())),
         read_only: None,
-        leases: Arc::new(TestLeases(s.auth.clone())),
+        leases: Arc::new(TestLeases(s.auth.clone(), s.before_take.clone())),
     };
     let rocket = rocket::custom(
         rocket::Config::figment()
@@ -132,7 +151,7 @@ async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<Fil
     )
     .manage(state)
     .mount("/", routes());
-    (Client::untracked(rocket).await.unwrap(), writer)
+    (rocket, writer)
 }
 
 async fn get(c: &Client, uri: &str) -> (Status, Vec<u8>) {
@@ -246,6 +265,35 @@ async fn uploads_are_refused_cleanly() {
     );
 
     wa.unwrap().return_metaslabs().await;
+    drop(a);
+    let fs = s.pool.load().await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Two uploads of a new file: the first to get the lease writes it, and
+/// the second, failing, mustn't then remove it as "the empty file it made"
+/// (audit N3).
+#[tokio::test]
+async fn a_failed_upload_leaves_a_file_another_wrote() {
+    let s = setup().await;
+    let (a, wa) = node(&s, "a", true).await;
+    let wa = wa.unwrap();
+    let other = wa.clone();
+    *s.before_take.lock().unwrap() = Some(Box::pin(async move {
+        let mut f = other.file_writer(Path::new("f"), None).await.unwrap();
+        f.write(b"theirs").await.unwrap();
+        f.finish().await.unwrap();
+    }));
+    let huge = pattern(9 * MB, 3);
+    assert_eq!(put(&a, "/api/v1/files/f", &huge).await, Status::BadRequest);
+    assert!(s.before_take.lock().unwrap().is_none());
+    assert_eq!(
+        get(&a, "/api/v1/files/f").await,
+        (Status::Ok, b"theirs".to_vec())
+    );
+
+    wa.return_metaslabs().await;
     drop(a);
     let fs = s.pool.load().await;
     let report = fs.fsck(false).await.unwrap();
@@ -427,4 +475,121 @@ async fn partial_writes_respect_object_leases() {
     lease(&s.auth, &crate::committer::object_resource(id), "someone").await;
     assert_eq!(patch(&a, "f?offset=2", b"xx").await.0, Status::Conflict);
     assert_eq!(get(&a, "/api/v1/files/f").await.1, b"0123456789");
+}
+
+/// N3: a PATCH whose body is refused partway (too big) commits none of it,
+/// nor its new size.
+#[tokio::test]
+async fn a_refused_patch_changes_nothing() {
+    let s = setup().await;
+    let (a, wa) = node(&s, "a", true).await;
+    let orig = pattern(MB, 3);
+    assert_eq!(put(&a, "/api/v1/files/f", &orig).await, Status::Ok);
+    let huge = pattern(9 * MB, 4);
+    assert_eq!(
+        patch(&a, "f?offset=0&size=5", &huge).await.0,
+        Status::BadRequest
+    );
+    assert_eq!(get(&a, "/api/v1/files/f").await, (Status::Ok, orig.clone()));
+    // Later writes go on from the committed file.
+    let (st, w) = patch(&a, "f?offset=0", b"AB").await;
+    assert_eq!(st, Status::Ok);
+    assert_eq!(w.unwrap().size, orig.len() as u64);
+    let mut want = orig.clone();
+    want[..2].copy_from_slice(b"AB");
+    assert_eq!(get(&a, "/api/v1/files/f").await, (Status::Ok, want));
+
+    wa.unwrap().return_metaslabs().await;
+    drop(a);
+    let fs = s.pool.load().await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Make record `idx` of file `name` unreadable: every block of it flipped
+/// on every disk, past what parity rebuilds.
+async fn ruin_record(s: &Setup, name: &str, idx: u64) {
+    let fs = s.pool.load().await;
+    let (_, d) = fs.stat_file(Path::new(name)).await.unwrap();
+    let obj = ObjTree::new(d.blksz as usize, Sizing::Fixed, d.size, d.tree.clone());
+    let leaf = fs
+        .tree_lookup(&obj, &obj.root(), 0, idx)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(fs);
+    let mut spots = std::collections::BTreeSet::new();
+    for lba in leaf.lba..leaf.lba + leaf.asize as u64 {
+        for disk in 0..s.pool.paths.len() {
+            spots.insert((disk, TestPool::stripe_offset(lba)));
+        }
+    }
+    for (disk, off) in spots {
+        s.pool.corrupt(disk, off);
+    }
+}
+
+/// N3: a GET whose file can't be read fails: with an error status if it
+/// can't start, and with the body cut off (not ended short as if complete)
+/// if it fails partway.
+#[tokio::test]
+async fn an_unreadable_file_fails_rather_than_ends_short() {
+    let s = setup().await;
+    let (a, wa) = node(&s, "a", true).await;
+    let data = pattern(3 * MB, 5);
+    assert_eq!(put(&a, "/api/v1/files/late", &data).await, Status::Ok);
+    assert_eq!(put(&a, "/api/v1/files/early", &data).await, Status::Ok);
+    wa.unwrap().return_metaslabs().await;
+    drop(a);
+    let blksz = s.pool.load().await.file_blksz() as u64;
+    // Past the first piece the GET reads before answering.
+    let late = (2 * MB as u64) / blksz;
+    assert!(late >= crate::files_api::STREAM_RECORDS as u64);
+    ruin_record(&s, "late", late).await;
+    ruin_record(&s, "early", 0).await;
+
+    // Over a real connection, as a client sees it: Rocket's local client
+    // reads the body directly, and would see the failure where a socket
+    // sees a body that just ends.
+    let (rocket, _) = node_rocket(&s, "b", true).await;
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let rocket = rocket.configure(
+        rocket::Config::figment()
+            .merge(("log_level", "off"))
+            .merge(("port", port))
+            .merge(("limits", map!["upload" => "8 MiB"])),
+    );
+    let ignited = rocket.ignite().await.unwrap();
+    let shutdown = ignited.shutdown();
+    tokio::spawn(ignited.launch());
+    let base = format!("http://127.0.0.1:{}/api/v1/files", port);
+    let http = reqwest::Client::new();
+    let mut up = false;
+    for _ in 0..100 {
+        if http.get(format!("{}/early", base)).send().await.is_ok() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(up, "server up");
+    let r = http.get(format!("{}/early", base)).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 500);
+    let r = http.get(format!("{}/late", base)).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200, "it starts");
+    assert_eq!(
+        r.content_length(),
+        Some(data.len() as u64),
+        "declared in full"
+    );
+    let body = r.bytes().await;
+    assert!(
+        body.is_err(),
+        "and is cut off, not ended short: {:?}",
+        body.map(|b| b.len())
+    );
+    shutdown.notify();
 }

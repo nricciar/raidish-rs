@@ -131,12 +131,13 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Free the blocks of `ptrs` a head may free itself (born after `held`).
     pub(crate) async fn free_unheld(
         &self,
+        tx: &mut crate::tx::Tx,
         ptrs: Vec<crate::types::Born>,
         held: Txg,
     ) -> Result<(), FileSystemError> {
         for b in ptrs {
             if b.birth > held {
-                self.free(b.extent.start, b.extent.len).await?;
+                self.free(tx, b.extent.start, b.extent.len).await?;
             }
         }
         Ok(())
@@ -206,11 +207,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 "snapshots are taken by the committer".into(),
             ));
         }
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         // Nothing of the open TXG is in the tree after this, so the
         // snapshot is exactly TXG `txg`, and every block committed from
         // now on (stamped with the open TXG or later) is born after it.
-        let txg = self.commit_locked().await?;
+        let txg = self.commit_locked(tx).await?;
         self.raise_birth_floor(txg.next());
         let (id, mut head) = self.head(name).await?;
         let (origin, mut snapshots) = head_lineage(&head);
@@ -231,7 +233,7 @@ impl<D: BlockDevice> FileSystem<D> {
             s.attrs.ctime_ns = t;
             s.attrs.mtime_ns = t;
         }
-        self.write_dnode(sid, Some(s)).await?;
+        self.write_dnode(tx, sid, Some(s)).await?;
         snapshots.push(SnapRef {
             name: format!("{}@{}", name, snap),
             id: sid,
@@ -239,8 +241,10 @@ impl<D: BlockDevice> FileSystem<D> {
             guid,
         });
         set_head_lineage(&mut head, origin, snapshots);
-        self.write_dnode(id, Some(head)).await?;
-        self.commit_locked().await?;
+        let r = self.write_dnode(tx, id, Some(head)).await;
+        // The raised birth floor stays: higher than needed only restamps.
+        tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(txg)
     }
 
@@ -288,53 +292,60 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Destroy snapshot `name@snap`, freeing what only it referenced.
     /// Refused while clones of it exist.
     pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
-        let _tx = self.begin_tx().await;
-        let (id, mut head) = self.head(name).await?;
-        let (origin, mut snapshots) = head_lineage(&head);
-        let i = snapshots
-            .iter()
-            .position(|s| short(s) == snap)
-            .ok_or(FileSystemError::FileNotFound)?;
-        let r = snapshots[i].clone();
-        let d = self.read_dnode(r.id).await?;
-        if let Some(Snap { clones, .. }) = d.snap()
-            && !clones.is_empty()
-        {
-            let names = self.dataset_names().await?;
-            let list: Vec<String> = clones
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r: Result<_, FileSystemError> = async {
+            let (id, mut head) = self.head(name).await?;
+            let (origin, mut snapshots) = head_lineage(&head);
+            let i = snapshots
                 .iter()
-                .map(|c| names.get(c).cloned().unwrap_or_else(|| format!("#{}", c)))
-                .collect();
-            return Err(FileSystemError::InvalidArgument(format!(
-                "{} has clones ({}); delete them first",
-                r.name,
-                list.join(", ")
-            )));
+                .position(|s| short(s) == snap)
+                .ok_or(FileSystemError::FileNotFound)?;
+            let r = snapshots[i].clone();
+            let d = self.read_dnode(r.id).await?;
+            if let Some(Snap { clones, .. }) = d.snap()
+                && !clones.is_empty()
+            {
+                let names = self.dataset_names().await?;
+                let list: Vec<String> = clones
+                    .iter()
+                    .map(|c| names.get(c).cloned().unwrap_or_else(|| format!("#{}", c)))
+                    .collect();
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "{} has clones ({}); delete them first",
+                    r.name,
+                    list.join(", ")
+                )));
+            }
+            let prev = if i == 0 {
+                origin.as_ref().map_or(Txg::ZERO, |o| o.txg)
+            } else {
+                snapshots[i - 1].txg
+            };
+            // The head's tree as the table has it: what the volume has
+            // committed (a writer's commit is applied under the same lock, so
+            // what it replaces is either still here or already kept for us).
+            let next = match snapshots.get(i + 1) {
+                Some(n) => self.read_dnode(n.id).await?.tree,
+                None => head.tree.clone(),
+            };
+            let unique = self
+                .unique_blocks(&d.tree, d.blksz as usize, prev, Some(&next))
+                .await?;
+            snapshots.remove(i);
+            set_head_lineage(&mut head, origin, snapshots);
+            self.write_dnode(tx, id, Some(head)).await?;
+            self.write_dnode(tx, r.id, None).await?;
+            for p in &unique {
+                self.free(tx, p.lba, p.asize as u64).await?;
+            }
+            Ok(r.id)
         }
-        let prev = if i == 0 {
-            origin.as_ref().map_or(Txg::ZERO, |o| o.txg)
-        } else {
-            snapshots[i - 1].txg
-        };
-        // The head's tree as the table has it: what the volume has
-        // committed (a writer's commit is applied under the same lock, so
-        // what it replaces is either still here or already kept for us).
-        let next = match snapshots.get(i + 1) {
-            Some(n) => self.read_dnode(n.id).await?.tree,
-            None => head.tree.clone(),
-        };
-        let unique = self
-            .unique_blocks(&d.tree, d.blksz as usize, prev, Some(&next))
-            .await?;
-        snapshots.remove(i);
-        set_head_lineage(&mut head, origin, snapshots);
-        self.write_dnode(id, Some(head)).await?;
-        self.write_dnode(r.id, None).await?;
-        self.snap_trees.lock().unwrap().remove(&r.id);
-        for p in &unique {
-            self.free(p.lba, p.asize as u64).await?;
-        }
-        self.commit_locked().await?;
+        .await;
+        let sid = tx.check(r).await?;
+        // A cache: dropped once nothing can fail.
+        self.snap_trees.lock().unwrap().remove(&sid);
+        self.commit_locked(tx).await?;
         Ok(())
     }
 
@@ -346,76 +357,89 @@ impl<D: BlockDevice> FileSystem<D> {
         snap: &str,
         new: &str,
     ) -> Result<FileId, FileSystemError> {
-        let _tx = self.begin_tx().await;
-        let (_, head) = self.head(name).await?;
-        let (_, snapshots) = head_lineage(&head);
-        let r = snapshots
-            .iter()
-            .find(|s| short(s) == snap)
-            .cloned()
-            .ok_or(FileSystemError::FileNotFound)?;
-        let mut s = self.read_dnode(r.id).await?;
-        let format = self.dataset_entry(name).await?.format;
-        let mut c = head.clone();
-        c.body = Body::tree_root(
-            format.root_kind(),
-            Head {
-                props: crate::inode::DatasetProps {
-                    // A new volume: placed and started only when asked to.
-                    enabled: false,
-                    move_to: None,
-                    ..head.props().cloned().unwrap_or_default()
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r: Result<_, FileSystemError> = async {
+            let (_, head) = self.head(name).await?;
+            let (_, snapshots) = head_lineage(&head);
+            let r = snapshots
+                .iter()
+                .find(|s| short(s) == snap)
+                .cloned()
+                .ok_or(FileSystemError::FileNotFound)?;
+            let mut s = self.read_dnode(r.id).await?;
+            let format = self.dataset_entry(name).await?.format;
+            let mut c = head.clone();
+            c.body = Body::tree_root(
+                format.root_kind(),
+                Head {
+                    props: crate::inode::DatasetProps {
+                        // A new volume: placed and started only when asked to.
+                        enabled: false,
+                        move_to: None,
+                        ..head.props().cloned().unwrap_or_default()
+                    },
+                    log: None,
+                    origin: Some(r.clone()),
+                    snapshots: Vec::new(),
                 },
-                log: None,
-                origin: Some(r.clone()),
-                snapshots: Vec::new(),
-            },
-        );
-        c.blksz = s.blksz;
-        c.size = s.size;
-        c.tree = s.tree.clone();
-        c.attrs = crate::inode::Attrs::new(head.attrs.mode);
-        let cid = self.create_dataset_locked(new, format, c).await?;
-        if let Some(s) = s.snap_mut() {
-            s.clones.push(cid);
+            );
+            c.blksz = s.blksz;
+            c.size = s.size;
+            c.tree = s.tree.clone();
+            c.attrs = crate::inode::Attrs::new(head.attrs.mode);
+            let cid = self.create_dataset_locked(tx, new, format, c).await?;
+            if let Some(s) = s.snap_mut() {
+                s.clones.push(cid);
+            }
+            self.write_dnode(tx, r.id, Some(s)).await?;
+            Ok(cid)
         }
-        self.write_dnode(r.id, Some(s)).await?;
-        self.commit_locked().await?;
+        .await;
+        let cid = tx.check(r).await?;
+        self.commit_locked(tx).await?;
         Ok(cid)
     }
 
     /// Roll volume `name` back to its newest snapshot, discarding every
     /// write since (unsynced ones too). The volume must not be running.
     pub async fn rollback_volume(&self, name: &str) -> Result<(), FileSystemError> {
-        let _tx = self.begin_tx().await;
-        let (id, mut head) = self.head(name).await?;
-        let (_, snapshots) = head_lineage(&head);
-        let Some(r) = snapshots.last().cloned() else {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' has no snapshots",
-                name
-            )));
-        };
-        if head.log().is_some() {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' has an intent log (it's running, or its writer's log \
-                 is yet to be replayed)",
-                name
-            )));
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        let r: Result<_, FileSystemError> = async {
+            let (id, mut head) = self.head(name).await?;
+            let (_, snapshots) = head_lineage(&head);
+            let Some(r) = snapshots.last().cloned() else {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "volume '{}' has no snapshots",
+                    name
+                )));
+            };
+            if head.log().is_some() {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "volume '{}' has an intent log (it's running, or its writer's log \
+                     is yet to be replayed)",
+                    name
+                )));
+            }
+            let s = self.read_dnode(r.id).await?;
+            let gone = self
+                .unique_blocks(&head.tree, head.blksz as usize, r.txg, None)
+                .await?;
+            head.tree = s.tree.clone();
+            head.attrs.touch();
+            self.write_dnode(tx, id, Some(head)).await?;
+            for p in &gone {
+                self.free(tx, p.lba, p.asize as u64).await?;
+            }
+            Ok(())
         }
-        let s = self.read_dnode(r.id).await?;
-        let gone = self
-            .unique_blocks(&head.tree, head.blksz as usize, r.txg, None)
-            .await?;
-        head.tree = s.tree.clone();
-        head.attrs.touch();
-        self.write_dnode(id, Some(head)).await?;
-        // Its dirty records go with the cached volume.
+        .await;
+        tx.check(r).await?;
+        // Its dirty records go with the cached volume: only once nothing
+        // can fail, as that can't be undone.
         self.close_dataset(name);
-        for p in &gone {
-            self.free(p.lba, p.asize as u64).await?;
-        }
-        self.commit_locked().await?;
+        self.commit_locked(tx).await?;
         Ok(())
     }
 
@@ -462,6 +486,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// TXG at or before which its blocks aren't its own to free.
     pub(crate) async fn unlink_dataset_lineage(
         &self,
+        tx: &mut crate::tx::Tx,
         id: FileId,
         d: &Dnode,
     ) -> Result<Txg, FileSystemError> {
@@ -483,7 +508,7 @@ impl<D: BlockDevice> FileSystem<D> {
             if let Some(s) = s.snap_mut() {
                 s.clones.retain(|&c| c != id);
             }
-            self.write_dnode(o.id, Some(s)).await?;
+            self.write_dnode(tx, o.id, Some(s)).await?;
         }
         Ok(o.txg)
     }

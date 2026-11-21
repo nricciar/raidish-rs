@@ -12,7 +12,9 @@
 //!   record 0: header (root id, height, next id, free ids, entry count)
 //!   record r: branch [k1 k2 ...] → children [c0 c1 c2 ...]   (c_i < k_{i+1} <= c_{i+1})
 //!   record l: leaf   [(key, value) ...], keys ascending
-//!   records o..o+n: a large value, raw, in n contiguous overflow pages
+//!   record i: id list [ids ...] → next id list (a large value's pages, or
+//!             spilled free ids)
+//!   record o: a page of a large value, raw
 //! ```
 //!
 //! **Atomic operations.** An operation reads what it needs, builds every
@@ -32,11 +34,16 @@
 //! (except the root) is merged with a sibling, or shares its entries with
 //! one.
 //!
-//! **Node ids.** New ones come from `next_id`; freed ones (their records
-//! become holes, so they take no space) are kept in the header for reuse,
-//! up to a bound, past which they're simply left unused. The object has a
-//! fixed capacity of node ids (its size); a hole costs nothing, so it is
-//! set large.
+//! **Node ids.** Every id (a node, a large value's page or id list) comes
+//! from [`Txn::alloc`]: a freed one if there is any, else `next_id`. A
+//! freed id's record becomes a hole (no space) and the id goes on the
+//! header's free list; once that is full, the next freed id instead
+//! becomes an id list page holding the whole list, chained from the header
+//! (`free_chain`), and the header's list starts over. No freed id is ever
+//! dropped, so `next_id` stays at the most ids the tree has used at once,
+//! however long values churn (audit S6c-1). The object has a fixed
+//! capacity of node ids (its size); a hole costs nothing, so it is set
+//! large.
 
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
@@ -51,7 +58,9 @@ use std::sync::Arc;
 
 const MAGIC: u64 = 0x5241_4944_4b56_5431; // "RAIDKVT1"
 /// 2: `Header.root` is an `Option<NonZeroU64>`.
-const VERSION: u32 = 2;
+/// 3: large values' pages are listed in id lists (`Val::Overflow::index`),
+/// and free ids spill into a chain of them (`Header::free_chain`).
+const VERSION: u32 = 3;
 /// The largest value.
 pub const MAX_VALUE: usize = 64 << 20;
 
@@ -65,8 +74,12 @@ pub(crate) struct Header {
     pub height: u32,
     /// The lowest node id never handed out.
     pub next_id: u64,
-    /// Freed node ids, for reuse.
+    /// Freed node ids, for reuse (at most `Limits::max_free`).
     pub free: Vec<u64>,
+    /// More freed ids: a chain of id lists (see the module docs).
+    pub free_chain: Option<u64>,
+    /// Freed ids in all: `free` and those in the chain.
+    pub free_total: u64,
     /// Keys in the tree.
     pub entries: u64,
 }
@@ -80,6 +93,8 @@ impl Default for Header {
             height: 0,
             next_id: 1,
             free: Vec::new(),
+            free_chain: None,
+            free_total: 0,
             entries: 0,
         }
     }
@@ -88,11 +103,19 @@ impl Default for Header {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Val {
     Inline(Vec<u8>),
-    /// `len` bytes in pages `first..first + ceil(len / blksz)`.
+    /// `len` bytes in `ceil(len / blksz)` pages, listed in order in the
+    /// chain of id lists from `index`.
     Overflow {
-        first: u64,
+        index: u64,
         len: u64,
     },
+}
+
+/// A page of ids: a large value's pages, or spilled free ids.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdList {
+    pub next: Option<u64>,
+    pub ids: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -147,8 +170,10 @@ pub(crate) struct Limits {
     pub max_key: usize,
     /// Values larger than this go to overflow pages.
     pub max_inline: usize,
-    /// Free node ids kept for reuse.
+    /// Free node ids kept in the header (a spilled list holds as many).
     pub max_free: usize,
+    /// Ids an `IdList` page holds.
+    pub ids_per_list: usize,
     /// Node ids the object can hold.
     pub capacity: u64,
 }
@@ -163,6 +188,8 @@ impl Limits {
             max_key: cap / 16,
             max_inline: cap / 16,
             max_free: cap / 2 / 9,
+            // Its `next` (9 bytes) and length (8), then 8 bytes an id.
+            ids_per_list: (cap - 17) / 8,
             capacity: obj.size() / blksz as u64,
         }
     }
@@ -272,57 +299,132 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         Ok(())
     }
 
-    fn alloc(&mut self) -> Result<u64, FileSystemError> {
+    /// A node id: a freed one if there is any (the header's list, then
+    /// the spilled chain, whose page is itself handed out), else a new one.
+    async fn alloc(&mut self) -> Result<u64, FileSystemError> {
         self.header_dirty = true;
         if let Some(id) = self.header.free.pop() {
+            self.header.free_total -= 1;
             return Ok(id);
         }
-        self.alloc_run(1)
-    }
-
-    /// `n` contiguous new ids.
-    fn alloc_run(&mut self, n: u64) -> Result<u64, FileSystemError> {
-        let first = self.header.next_id;
-        if first + n > self.lim.capacity {
-            return Err(FileSystemError::NoSpace(format!("{} blocks", n)));
+        if let Some(id) = self.header.free_chain {
+            let list = self.id_list(id).await?;
+            if list.ids.len() > self.lim.max_free {
+                return Err(corrupt(format!("free id list {} is too long", id)));
+            }
+            self.header.free = list.ids;
+            self.header.free_chain = list.next;
+            return Ok(id);
         }
-        self.header.next_id += n;
-        self.header_dirty = true;
-        Ok(first)
+        let id = self.header.next_id;
+        if id >= self.lim.capacity {
+            return Err(FileSystemError::NoSpace(format!(
+                "the tree's {} node ids are all in use",
+                self.lim.capacity
+            )));
+        }
+        self.header.next_id += 1;
+        Ok(id)
     }
 
-    fn release(&mut self, id: u64) {
-        self.writes.insert(id, None);
+    /// Free `id`: a hole on the header's free list or, that being full, a
+    /// page holding the list (see the module docs).
+    fn release(&mut self, id: u64) -> Result<(), FileSystemError> {
+        self.header_dirty = true;
         if self.header.free.len() < self.lim.max_free {
+            self.writes.insert(id, None);
             self.header.free.push(id);
+            self.header.free_total += 1;
+            return Ok(());
         }
-        self.header_dirty = true;
+        let list = IdList {
+            next: self.header.free_chain,
+            ids: std::mem::take(&mut self.header.free),
+        };
+        self.writes.insert(id, Some(encode(&list)?));
+        self.header.free_chain = Some(id);
+        Ok(())
+    }
+
+    async fn id_list(&self, id: u64) -> Result<IdList, FileSystemError> {
+        let buf = self
+            .page(id)
+            .await?
+            .ok_or_else(|| corrupt(format!("id list {} is missing", id)))?;
+        decode(&buf, &format!("id list {}", id))
     }
 
     fn pages(&self, len: u64) -> u64 {
         len.div_ceil(self.lim.blksz as u64)
     }
 
-    fn release_val(&mut self, v: &Val) {
-        if let Val::Overflow { first, len } = v {
-            for id in *first..first + self.pages(*len) {
-                self.release(id);
+    /// A large value's (id lists, pages), checked against its length.
+    async fn overflow_ids(
+        &self,
+        index: u64,
+        len: u64,
+    ) -> Result<(Vec<u64>, Vec<u64>), FileSystemError> {
+        let want = self.pages(len) as usize;
+        let (mut lists, mut pages) = (Vec::new(), Vec::new());
+        let mut next = Some(index);
+        while let Some(id) = next {
+            // A chain longer than the value needs: corrupt (or a cycle).
+            if lists.len() > want.div_ceil(self.lim.ids_per_list) {
+                return Err(corrupt(format!(
+                    "value at {}: id list chain too long",
+                    index
+                )));
             }
+            let list = self.id_list(id).await?;
+            lists.push(id);
+            pages.extend(list.ids);
+            next = list.next;
         }
+        if pages.len() != want {
+            return Err(corrupt(format!(
+                "value at {}: {} pages listed, {} bytes need {}",
+                index,
+                pages.len(),
+                len,
+                want
+            )));
+        }
+        Ok((lists, pages))
     }
 
-    /// Store `value`: inline, or in new overflow pages.
-    fn make_val(&mut self, value: &[u8]) -> Result<Val, FileSystemError> {
+    async fn release_val(&mut self, v: &Val) -> Result<(), FileSystemError> {
+        if let Val::Overflow { index, len } = v {
+            let (lists, pages) = self.overflow_ids(*index, *len).await?;
+            for id in lists.into_iter().chain(pages) {
+                self.release(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Store `value`: inline, or in pages listed from a chain of id lists.
+    async fn make_val(&mut self, value: &[u8]) -> Result<Val, FileSystemError> {
         if value.len() <= self.lim.max_inline {
             return Ok(Val::Inline(value.to_vec()));
         }
-        let n = self.pages(value.len() as u64);
-        let first = self.alloc_run(n)?;
-        for (i, chunk) in value.chunks(self.lim.blksz).enumerate() {
-            self.writes.insert(first + i as u64, Some(chunk.to_vec()));
+        let mut pages = Vec::with_capacity(self.pages(value.len() as u64) as usize);
+        for chunk in value.chunks(self.lim.blksz) {
+            let id = self.alloc().await?;
+            self.writes.insert(id, Some(chunk.to_vec()));
+            pages.push(id);
+        }
+        let mut next = None;
+        for ids in pages.chunks(self.lim.ids_per_list).rev() {
+            let id = self.alloc().await?;
+            let list = IdList {
+                next,
+                ids: ids.to_vec(),
+            };
+            self.writes.insert(id, Some(encode(&list)?));
+            next = Some(id);
         }
         Ok(Val::Overflow {
-            first,
+            index: next.expect("a large value has pages"),
             len: value.len() as u64,
         })
     }
@@ -331,15 +433,18 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     pub(crate) async fn read_val(&self, v: &Val) -> Result<Vec<u8>, FileSystemError> {
         match v {
             Val::Inline(b) => Ok(b.clone()),
-            Val::Overflow { first, len } => {
+            Val::Overflow { index, len } => {
+                let (_, pages) = self.overflow_ids(*index, *len).await?;
                 let mut out = Vec::with_capacity(*len as usize);
-                for id in *first..first + self.pages(*len) {
-                    let page = self
-                        .page(id)
-                        .await?
-                        .ok_or_else(|| corrupt(format!("overflow page {} is missing", id)))?;
-                    let n = (*len as usize - out.len()).min(page.len());
-                    out.extend_from_slice(&page[..n]);
+                for id in pages {
+                    // An all-zero page is stored as a hole (see
+                    // `FileSystem::build_tree`): it reads as zeros.
+                    let n = (*len as usize - out.len()).min(self.lim.blksz);
+                    let end = out.len() + n;
+                    if let Some(page) = self.page(id).await? {
+                        out.extend_from_slice(&page[..n.min(page.len())]);
+                    }
+                    out.resize(end, 0);
                 }
                 Ok(out)
             }
@@ -417,9 +522,9 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     /// Set `key` to `value`. Returns whether it replaced a value.
     pub(crate) async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
         self.check_sizes(key, value)?;
-        let val = self.make_val(value)?;
+        let val = self.make_val(value).await?;
         let Some(root) = self.header.root else {
-            let id = self.alloc()?;
+            let id = self.alloc().await?;
             self.put_node(id, &Node::Leaf(vec![(key.to_vec(), val)]))?;
             self.header.root = NonZeroU64::new(id);
             self.header.height = 0;
@@ -443,7 +548,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         };
         let was = replaced.is_some();
         match replaced {
-            Some(old) => self.release_val(&old),
+            Some(old) => self.release_val(&old).await?,
             None => self.header.entries += 1,
         }
         self.header_dirty = true;
@@ -471,7 +576,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
         let Some(old) = removed else {
             return Ok(false);
         };
-        self.release_val(&old);
+        self.release_val(&old).await?;
         self.header.entries -= 1;
         self.header_dirty = true;
         self.fixup(path, idxs).await?;
@@ -495,10 +600,10 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
                 // The root.
                 if size > cap {
                     let (left, sep, right) = split(node);
-                    let rid = self.alloc()?;
+                    let rid = self.alloc().await?;
                     self.put_node(id, &left)?;
                     self.put_node(rid, &right)?;
-                    let root = self.alloc()?;
+                    let root = self.alloc().await?;
                     self.put_node(
                         root,
                         &Node::Branch {
@@ -511,12 +616,12 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
                 } else {
                     match node {
                         Node::Leaf(e) if e.is_empty() => {
-                            self.release(id);
+                            self.release(id)?;
                             self.header.root = None;
                             self.header.height = 0;
                         }
                         Node::Branch { keys, children } if keys.is_empty() => {
-                            self.release(id);
+                            self.release(id)?;
                             self.header.root = NonZeroU64::new(children[0]);
                             self.header.height -= 1;
                         }
@@ -529,7 +634,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
             let ci = idxs[level - 1];
             if size > cap {
                 let (left, sep, right) = split(node);
-                let rid = self.alloc()?;
+                let rid = self.alloc().await?;
                 self.put_node(id, &left)?;
                 self.put_node(rid, &right)?;
                 let Node::Branch { keys, children } = &mut path[level - 1].1 else {
@@ -559,7 +664,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
                     };
                     if size_of(&merged) <= cap {
                         self.put_node(lid, &merged)?;
-                        self.release(rid);
+                        self.release(rid)?;
                         keys.remove(li);
                         children.remove(ri);
                     } else {
@@ -789,13 +894,16 @@ pub struct CheckReport {
     pub entries: u64,
     pub nodes: u64,
     pub overflow_pages: u64,
+    /// Freed ids, ready for reuse.
+    pub free_ids: u64,
     pub errors: Vec<String>,
 }
 
 /// Verify the committed tree in `obj` (a fresh `ObjTree` of a dnode's
 /// tree): structure, key order, depths, the entry count, that each node
-/// and overflow page is used once, and that every record of the object is
-/// the header or reachable.
+/// and overflow page is used once, that every id below `next_id` is used
+/// or free (none lost), and that every record of the object is the header
+/// or reachable.
 pub(crate) async fn check<D: BlockDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> CheckReport {
     let mut r = CheckReport::default();
     let t = match Txn::begin(fs, obj).await {
@@ -856,23 +964,27 @@ pub(crate) async fn check<D: BlockDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> 
                             r.errors
                                 .push(format!("leaf {}: key outside its parent's range", id));
                         }
-                        if let Val::Overflow { first, len } = v {
-                            let n = t.pages(*len);
-                            for p in *first..first + n {
-                                if p == 0 || p >= h.next_id || !used.insert(p) {
+                        if let Val::Overflow { index, len } = v {
+                            let (lists, pages) = match t.overflow_ids(*index, *len).await {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    r.errors.push(format!("leaf {}: {}", id, e));
+                                    continue;
+                                }
+                            };
+                            for p in lists.iter().chain(&pages) {
+                                if *p == 0 || *p >= h.next_id || !used.insert(*p) {
                                     r.errors.push(format!(
                                         "leaf {}: overflow page {} out of range or reused",
                                         id, p
                                     ));
-                                    continue;
                                 }
+                            }
+                            for p in pages {
                                 r.overflow_pages += 1;
-                                match t.page(p).await {
-                                    Ok(Some(_)) => {}
-                                    Ok(None) => {
-                                        r.errors.push(format!("overflow page {} is missing", p))
-                                    }
-                                    Err(e) => r.errors.push(format!("overflow page {}: {}", p, e)),
+                                // A hole is an all-zero page, not a missing one.
+                                if let Err(e) = t.page(p).await {
+                                    r.errors.push(format!("overflow page {}: {}", p, e));
                                 }
                             }
                         }
@@ -930,10 +1042,53 @@ pub(crate) async fn check<D: BlockDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> 
             h.entries, count
         ));
     }
-    for f in &h.free {
-        if used.contains(f) {
-            r.errors.push(format!("free node id {} is in use", f));
+    // Free ids: the header's and the spilled chain's, each once, none in
+    // use; the chain's pages are records of their own.
+    let mut free: Vec<u64> = h.free.clone();
+    let mut next = h.free_chain;
+    while let Some(id) = next {
+        if id == 0 || id >= h.next_id || !used.insert(id) {
+            r.errors
+                .push(format!("free id list {} out of range or reused", id));
+            break;
         }
+        match t.id_list(id).await {
+            Ok(list) => {
+                free.extend(list.ids);
+                next = list.next;
+            }
+            Err(e) => {
+                r.errors.push(format!("free id list {}: {}", id, e));
+                break;
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for f in &free {
+        if *f == 0 || *f >= h.next_id || used.contains(f) || !seen.insert(*f) {
+            r.errors.push(format!(
+                "free node id {} is in use, out of range or listed twice",
+                f
+            ));
+        }
+    }
+    if free.len() as u64 != h.free_total {
+        r.errors.push(format!(
+            "header counts {} free ids, the lists have {}",
+            h.free_total,
+            free.len()
+        ));
+    }
+    r.free_ids = free.len() as u64;
+    // Every id below `next_id` is used or free: none is lost.
+    let lost = h
+        .next_id
+        .saturating_sub(used.len() as u64 + seen.len() as u64);
+    if lost != 0 && r.errors.is_empty() {
+        r.errors.push(format!(
+            "{} node ids are neither in use nor free (leaked)",
+            lost
+        ));
     }
     // Every record must be the header, a node or an overflow page.
     match fs.tree_leaves(&obj.root()).await {

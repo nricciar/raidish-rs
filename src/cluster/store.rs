@@ -95,7 +95,7 @@ fn check_version(dir: &Path) -> Result<(), String> {
                     ours
                 ));
             }
-            std::fs::write(&path, format!("{}\n", ours))
+            write_atomic(&path, format!("{}\n", ours).as_bytes())
                 .map_err(|e| format!("{}: {}", path.display(), e))
         }
         Err(e) => Err(format!("{}: {}", path.display(), e)),
@@ -113,18 +113,26 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SErr> {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    write_atomic(path, &bytes)
+}
+
+/// Replace `path` with `bytes` all at once and durably: a temp file,
+/// fsynced, renamed over it, and the directory fsynced (else the rename
+/// itself may not survive a crash). Any failure is an error: Raft must not
+/// act on state it hasn't stored (audit R4a).
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&bytes)?;
+    f.write_all(bytes)?;
     f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
 }
 
 impl Inner {
@@ -132,17 +140,28 @@ impl Inner {
         self.dir.join(name)
     }
 
-    fn save_log(&self) -> Result<(), SErr> {
+    /// Store `log` (and `last_purged`) as the log, then adopt it.
+    fn save_log(
+        &mut self,
+        log: BTreeMap<u64, Entry<TypeConfig>>,
+        last_purged: Option<LogId<NodeId>>,
+    ) -> Result<(), SErr> {
         let file = LogFile {
-            last_purged: self.last_purged,
-            entries: self.log.values().cloned().collect(),
+            last_purged,
+            entries: log.values().cloned().collect(),
         };
-        write_json(&self.path("log.json"), &file).map_err(|e| StorageIOError::write_logs(&e).into())
+        write_json(&self.path("log.json"), &file).map_err(|e| StorageIOError::write_logs(&e))?;
+        self.log = log;
+        self.last_purged = last_purged;
+        Ok(())
     }
 
-    fn save_sm(&self) -> Result<(), SErr> {
-        write_json(&self.path("state.json"), &self.sm)
-            .map_err(|e| StorageIOError::write_state_machine(&e).into())
+    /// Store `sm` as the state machine, then adopt it.
+    fn save_sm(&mut self, sm: StateMachine) -> Result<(), SErr> {
+        write_json(&self.path("state.json"), &sm)
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        self.sm = sm;
+        Ok(())
     }
 }
 
@@ -164,6 +183,17 @@ impl Store {
             .unwrap_or_default();
         let snapshot: Option<StoredSnapshot> =
             read_json(&dir.join("snapshot.json")).map_err(err)?;
+        // A snapshot installed is stored before the state it carries: a
+        // crash in between leaves the snapshot newer, and it wins.
+        let sm = match &snapshot {
+            Some(snap) if snap.meta.last_log_id > sm.last_applied => StateMachine {
+                last_applied: snap.meta.last_log_id,
+                membership: snap.meta.last_membership.clone(),
+                state: serde_json::from_slice(&snap.data)
+                    .map_err(|e| format!("{}: snapshot: {}", dir.display(), e))?,
+            },
+            _ => sm,
+        };
         observe(&fence, &sm.state);
         Ok(Store {
             view: Arc::new(RwLock::new(sm.state.clone())),
@@ -212,7 +242,7 @@ impl Store {
     }
 }
 
-fn observe(fence: &crate::fence::ServerFence, state: &ClusterState) {
+pub(crate) fn observe(fence: &crate::fence::ServerFence, state: &ClusterState) {
     fence.observe(
         state.pool_epoch(),
         state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
@@ -303,23 +333,26 @@ impl RaftStorage<TypeConfig> for Store {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
         let mut inner = self.inner.lock().unwrap();
+        let mut log = inner.log.clone();
         for e in entries {
-            inner.log.insert(e.log_id.index, e);
+            log.insert(e.log_id.index, e);
         }
-        inner.save_log()
+        let purged = inner.last_purged;
+        inner.save_log(log, purged)
     }
 
     async fn delete_conflict_logs_since(&mut self, log_id: LogId<NodeId>) -> Result<(), SErr> {
         let mut inner = self.inner.lock().unwrap();
-        inner.log.split_off(&log_id.index);
-        inner.save_log()
+        let mut log = inner.log.clone();
+        log.split_off(&log_id.index);
+        let purged = inner.last_purged;
+        inner.save_log(log, purged)
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), SErr> {
         let mut inner = self.inner.lock().unwrap();
-        inner.log = inner.log.split_off(&(log_id.index + 1));
-        inner.last_purged = Some(log_id);
-        inner.save_log()
+        let log = inner.log.clone().split_off(&(log_id.index + 1));
+        inner.save_log(log, Some(log_id))
     }
 
     async fn last_applied_state(
@@ -334,20 +367,21 @@ impl RaftStorage<TypeConfig> for Store {
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<Response>, SErr> {
         let mut inner = self.inner.lock().unwrap();
+        let mut sm = inner.sm.clone();
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
-            inner.sm.last_applied = Some(e.log_id);
+            sm.last_applied = Some(e.log_id);
             out.push(match &e.payload {
                 EntryPayload::Blank => Response::None,
-                EntryPayload::Normal(req) => inner.sm.state.apply(req),
+                EntryPayload::Normal(req) => sm.state.apply(req),
                 EntryPayload::Membership(m) => {
-                    inner.sm.membership = StoredMembership::new(Some(e.log_id), m.clone());
+                    sm.membership = StoredMembership::new(Some(e.log_id), m.clone());
                     Response::None
                 }
             });
         }
         // Persist before anyone (a disk server's fence) acts on the result.
-        inner.save_sm()?;
+        inner.save_sm(sm)?;
         self.publish(&inner.sm.state);
         Ok(out)
     }
@@ -369,12 +403,8 @@ impl RaftStorage<TypeConfig> for Store {
         let state: ClusterState = serde_json::from_slice(&data)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let mut inner = self.inner.lock().unwrap();
-        inner.sm = StateMachine {
-            last_applied: meta.last_log_id,
-            membership: meta.last_membership.clone(),
-            state,
-        };
-        inner.save_sm()?;
+        // The snapshot first: if the state after it doesn't make it, `open`
+        // takes the state from the snapshot.
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data,
@@ -382,6 +412,11 @@ impl RaftStorage<TypeConfig> for Store {
         write_json(&inner.path("snapshot.json"), &stored)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         inner.snapshot = Some(stored);
+        inner.save_sm(StateMachine {
+            last_applied: meta.last_log_id,
+            membership: meta.last_membership.clone(),
+            state,
+        })?;
         self.publish(&inner.sm.state);
         Ok(())
     }

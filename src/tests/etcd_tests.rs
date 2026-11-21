@@ -375,7 +375,9 @@ async fn compaction() {
     s.compact(81, true).await.unwrap();
     // Kept: each key's value as of 81 (one each), and everything after.
     // The deleted keys keep only their tombstone's past at 81 and newer.
-    assert_eq!(history_len(&fs).await, 20 + 20 + 11);
+    // The key changed at 81 itself keeps the change before it too (its
+    // event's `prev_kv`, audit E2).
+    assert_eq!(history_len(&fs).await, 20 + 20 + 11 + 1);
     let at = |rev| pb::RangeRequest {
         revision: rev,
         ..prefix("k")
@@ -392,9 +394,10 @@ async fn compaction() {
         s.compact(500, false).await,
         Err(EtcdError::FutureRev)
     ));
-    // Compacting past the delete drops the deleted keys entirely.
+    // Compacting at the delete keeps the deleted keys' tombstones and what
+    // they deleted (the delete events' `prev_kv`)...
     s.compact(102, true).await.unwrap();
-    assert_eq!(history_len(&fs).await, 9);
+    assert_eq!(history_len(&fs).await, 9 + 2 * 11);
     assert_eq!(s.range(prefix("k")).await.unwrap().count, 9);
     let r = s.range(at(102)).await.unwrap();
     assert_eq!(r.count, 9);
@@ -404,8 +407,14 @@ async fn compaction() {
         s.events(&all, 101, 102, false, 100).await,
         Err(EtcdError::Compacted)
     ));
-    let (ev, upto) = s.events(&all, 102, 102, false, 100).await.unwrap();
+    let (ev, upto) = s.events(&all, 102, 102, true, 100).await.unwrap();
     assert_eq!((ev.len(), upto), (11, 102));
+    assert!(ev.iter().all(|e| e.prev_kv.is_some()));
+    // ...and compacting past it drops them entirely.
+    s.put(put("z", "1")).await.unwrap(); // 103
+    s.compact(103, true).await.unwrap();
+    assert_eq!(history_len(&fs).await, 9 + 1);
+    assert_eq!(s.range(prefix("k")).await.unwrap().count, 9);
 }
 
 #[tokio::test]
@@ -681,4 +690,36 @@ async fn over_grpc_kv_watch_and_leases() {
     // Stopping ends the streams.
     s.stop();
     assert!(events.message().await.is_err());
+}
+
+/// E2: compacted at the revision of a delete, a watch from that revision
+/// still gets the delete with the object deleted as `prev_kv`, and the key
+/// stays deleted (the history kept for it doesn't bring it back). The next
+/// compaction past it drops both.
+#[tokio::test]
+async fn compacting_at_a_change_keeps_its_prev_kv() {
+    let pool = TestPool::new().await;
+    let (_fs, s) = store(&pool).await;
+    s.put(put("w/a", "1")).await.unwrap(); // 2
+    s.put(put("w/a", "2")).await.unwrap(); // 3
+    s.delete_range(pb::DeleteRangeRequest {
+        key: "w/a".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap(); // 4
+    s.put(put("w/b", "1")).await.unwrap(); // 5
+    s.compact(4, true).await.unwrap();
+    let kr = KeyRange::new(b"w/", b"w0");
+    let (ev, _) = s.events(&kr, 4, 5, true, 100).await.unwrap();
+    assert_eq!(ev.len(), 2);
+    assert_eq!(ev[0].r#type, 1, "a delete");
+    assert_eq!(
+        ev[0].prev_kv.as_ref().map(|kv| kv.value.as_slice()),
+        Some(&b"2"[..])
+    );
+    assert_eq!(s.range(get("w/a")).await.unwrap().count, 0);
+    s.compact(5, true).await.unwrap();
+    assert_eq!(s.range(get("w/a")).await.unwrap().count, 0);
+    assert_eq!(s.range(get("w/b")).await.unwrap().count, 1);
 }

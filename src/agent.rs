@@ -583,10 +583,16 @@ impl Agent {
                     }
                 };
             }
-            if node_lease.is_some()
-                && let Err(e) = self.tick().await
-            {
-                eprintln!("agent: {}", e);
+            if node_lease.is_some() {
+                if let Err(e) = self.tick().await {
+                    eprintln!("agent: {}", e);
+                }
+            } else {
+                // Cut off from the cluster (no node lease): place nothing,
+                // but still let go of every volume, service and VM whose
+                // lease lapsed. The rest of the cluster starts them
+                // elsewhere once it does.
+                self.drop_lost().await;
             }
             self.publish();
             match self.vm.clone() {
@@ -1335,8 +1341,16 @@ impl Agent {
                     // Its writer is gone (that's why this node starts it):
                     // requests stuck retrying it let go now and wait for
                     // the local backend, or the pause would wait them out.
+                    // Whatever it acknowledged and nobody flushed went with
+                    // it (only its intent log is replayed): say so at the
+                    // next flush (audit A2).
                     p.peer.retire();
                     let mut paused = p.io.pause_owned().await;
+                    // Asked once paused: a write acknowledged while the
+                    // pause drained requests counts too.
+                    if p.peer.unflushed() {
+                        p.io.poison();
+                    }
                     paused.set(Arc::new(crate::volume_io::LocalIo::new(
                         w.fs.clone(),
                         &v.name,
@@ -1625,7 +1639,9 @@ impl Agent {
         if let Some(w) = &self.writer {
             if clean {
                 if let Err(e) = w.fs.detach_dataset(name).await {
+                    // Its intent log is replayed once the lease is released.
                     eprintln!("agent: last sync of '{}': {}", name, e);
+                    w.fs.abandon_dataset(name);
                 }
             } else {
                 w.fs.abandon_dataset(name);
@@ -1655,7 +1671,9 @@ impl Agent {
                     eprintln!("agent: unexporting '{}': {}", name, e);
                 }
                 if let Err(e) = w.fs.detach_dataset(name).await {
+                    // Its intent log is replayed once the lease is released.
                     eprintln!("agent: last sync of '{}': {}", name, e);
+                    w.fs.abandon_dataset(name);
                 }
             } else {
                 w.fs.abandon_dataset(name);

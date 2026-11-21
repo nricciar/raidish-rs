@@ -86,13 +86,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 capacity
             )));
         }
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         let mut root = Dnode::kv(blksz, capacity);
         if let Some(h) = root.head_mut() {
             h.props = props;
         }
-        let id = self.create_dataset_locked(name, format, root).await?;
-        self.commit_locked().await?;
+        let id = self.create_dataset_locked(tx, name, format, root).await?;
+        self.commit_locked(tx).await?;
         Ok(id)
     }
 

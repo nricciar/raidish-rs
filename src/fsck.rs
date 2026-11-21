@@ -184,6 +184,11 @@ fn join(path: &str, name: &str) -> String {
 /// Insert a range, merging with neighbours. Returns the part of it that
 /// overlapped what was already there (empty when disjoint).
 fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<Extent> {
+    // Nothing to add (and the merging below would drop an extent that
+    // merely touches `start`).
+    if len == 0 {
+        return Vec::new();
+    }
     let end = start + len;
     let mut overlap = Vec::new();
     let mut new_start = start;
@@ -208,9 +213,7 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<Exten
         new_end = new_end.max(ns + nl);
         map.remove(&ns);
     }
-    if len > 0 {
-        map.insert(new_start, new_end - new_start);
-    }
+    map.insert(new_start, new_end - new_start);
     overlap
 }
 
@@ -831,9 +834,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// the commit lock throughout (writers wait), so the comparison is exact.
     pub async fn fsck(&self, repair: bool) -> Result<FsckReport, FileSystemError> {
         let repair = repair && !self.read_only;
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         if !self.read_only {
-            self.commit_locked().await?;
+            self.commit_locked(tx).await?;
         }
         let (live, walk) = self.live_set().await;
         let (leaks, referenced_free, out_of_range) = self.diff_spacemaps(&live.live).await;
@@ -869,13 +873,13 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         if !report.leaks.is_empty() && !report.incomplete {
             for &Extent { start: s, len: l } in &report.leaks {
-                self.free(s, l).await?;
+                self.free(tx, s, l).await?;
             }
             report.leaks_repaired = true;
             changed = true;
         }
         if changed {
-            report.txg = self.commit_locked().await?;
+            report.txg = self.commit_locked(tx).await?;
         }
         Ok(report)
     }
@@ -891,11 +895,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 "pool opened read-only".into(),
             ));
         }
-        let _tx = self.begin_tx().await;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        self.commit_locked(tx).await?;
         let older = self.older_roots().await;
         let report = self.rebuild_spacemaps_locked(&older, force).await?;
-        self.commit_locked().await?;
+        self.commit_locked(tx).await?;
         Ok(report)
     }
 

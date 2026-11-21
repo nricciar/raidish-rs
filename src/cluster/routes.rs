@@ -50,6 +50,13 @@ impl<'r> FromRequest<'r> for SameLayout {
             .headers()
             .get_one(super::TO_HEADER)
             .and_then(|v| v.parse().ok());
+        if cluster.misconfigured() {
+            // Sitting out: see `Cluster::misconfigured`.
+            return Outcome::Error((
+                Status::Conflict,
+                "this node's pool config is the odd one out".into(),
+            ));
+        }
         if theirs == cluster.members.fingerprint && to == Some(cluster.members.me) {
             return Outcome::Success(SameLayout);
         }
@@ -82,8 +89,23 @@ pub async fn vote(
     rpc: Json<VoteRequest<NodeId>>,
     _layout: SameLayout,
     cluster: &State<Shared>,
-) -> Json<Result<VoteResponse<NodeId>, RaftError<NodeId>>> {
-    Json(cluster.raft.vote(rpc.into_inner()).await)
+) -> Result<Json<Result<VoteResponse<NodeId>, RaftError<NodeId>>>, (Status, &'static str)> {
+    // Not even seen by Raft: a node catching up after losing its state
+    // must not vote (audit R4b), and refusing outright leaves no trace.
+    match cluster.vote_refusal(rpc.vote.leader_id().term) {
+        None => Ok(Json(cluster.raft.vote(rpc.into_inner()).await)),
+        Some(super::Refusal::CatchingUp) => {
+            Err((Status::ServiceUnavailable, "not voting: catching up"))
+        }
+        // A term this node may have voted in before it lost its state:
+        // refused as Raft refuses a stale term, with a newer vote, so the
+        // candidate moves past it at once instead of a term per election.
+        Some(super::Refusal::Below(floor)) => Ok(Json(Ok(VoteResponse {
+            vote: openraft::Vote::new(floor + 1, cluster.members.me),
+            vote_granted: false,
+            last_log_id: None,
+        }))),
+    }
 }
 
 #[post("/api/v1/raft/snapshot", data = "<rpc>")]
@@ -111,8 +133,20 @@ pub async fn status(_auth: crate::auth::CanRead, cluster: &State<Shared>) -> Jso
     Json(cluster.status())
 }
 
+/// A follower's read index (see `Cluster::linearizable_state`): the leader's
+/// commit index once it has confirmed it leads. Never forwarded further.
+#[get("/api/v1/cluster/read_index")]
+pub async fn read_index(
+    _auth: crate::auth::IsNode,
+    _layout: SameLayout,
+    cluster: &State<Shared>,
+) -> Json<Result<Option<u64>, String>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    Json(cluster.read_index(true, deadline).await)
+}
+
 pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![append, vote, snapshot, lease, status]
+    rocket::routes![append, vote, snapshot, lease, status, read_index]
 }
 
 /// Stops this node's Raft member as soon as the server is asked to shut

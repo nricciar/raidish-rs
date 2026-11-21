@@ -72,12 +72,27 @@ pub const GRACE: std::time::Duration = std::time::Duration::from_secs(state::LEA
 pub enum V4Forward {
     /// A whole COMPOUND (its arguments), with the caller's credentials.
     Compound { args: Vec<u8>, cred: Option<Cred> },
-    /// Just a SEQUENCE check, for a request that runs where it arrived.
+    /// Just a SEQUENCE check, for a request that runs where it arrived,
+    /// and what each stateid its I/O names allows.
     Sequence {
         session: [u8; 16],
         slot: u32,
         seqid: u32,
+        stateids: Vec<Stateid>,
     },
+}
+
+/// The owner's word on a forwarded request's stateids: each one's file and
+/// whether it may write, or why it may not be used.
+pub type Grants = Vec<(Stateid, Result<(FileId, bool), NfsStat>)>;
+
+/// A SEQUENCE the state owner checked: the client, the session's slot
+/// count, and the grants of the request's stateids.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Presequenced {
+    pub client: u64,
+    pub slots: u32,
+    pub grants: Grants,
 }
 
 /// The state owner's answer.
@@ -85,9 +100,8 @@ pub enum V4Forward {
 pub enum V4Forwarded {
     /// The COMPOUND's reply, as is.
     Reply(Vec<u8>),
-    /// The SEQUENCE went through (the client, the session's slot count),
-    /// or its status.
-    Sequenced(Result<(u64, u32), NfsStat>),
+    /// The SEQUENCE went through, or its status.
+    Sequenced(Result<Presequenced, NfsStat>),
     /// Not the owner (any more): try again.
     NotOwner,
 }
@@ -157,6 +171,7 @@ pub mod err {
     pub const NO_GRACE: NfsStat = NfsStat::from_code(10033);
     pub const BADXDR: NfsStat = NfsStat::from_code(10036);
     pub const LOCKS_HELD: NfsStat = NfsStat::from_code(10037);
+    pub const OPENMODE: NfsStat = NfsStat::from_code(10038);
     pub const BADOWNER: NfsStat = NfsStat::from_code(10039);
     pub const BADNAME: NfsStat = NfsStat::from_code(10041);
     pub const OP_ILLEGAL: NfsStat = NfsStat::from_code(10044);
@@ -244,8 +259,8 @@ struct Ctx {
     /// The COMPOUND's minor version (1 or 2).
     minor: u32,
     /// The SEQUENCE was checked by the state owner, which has the state:
-    /// stateids can't be checked here.
-    trusted: bool,
+    /// stateids are checked against what it said of them.
+    grants: Option<Grants>,
     cfh: Option<FileId>,
     sfh: Option<FileId>,
     cur: Option<Stateid>,
@@ -492,13 +507,21 @@ impl<D: BlockDevice + 'static> Server<D> {
                 session,
                 slot,
                 seqid,
+                stateids,
             } => {
                 let st = self.st();
                 V4Forwarded::Sequenced(match st.sequence(&session, slot, seqid) {
                     Ok(Sequenced::New { client }) => {
                         // It runs elsewhere and isn't cached: done here.
                         st.finish(&session, slot, None);
-                        Ok((client, st.slots(&session).unwrap_or(1)))
+                        Ok(Presequenced {
+                            client,
+                            slots: st.slots(&session).unwrap_or(1),
+                            grants: stateids
+                                .into_iter()
+                                .map(|sid| (sid, st.io_grant(client, &sid)))
+                                .collect(),
+                        })
                     }
                     Ok(Sequenced::Replay(_)) => Err(err::RETRY_UNCACHED_REP),
                     Err(e) => Err(e),
@@ -518,11 +541,12 @@ impl<D: BlockDevice + 'static> Server<D> {
             // Ours by the lease, not taken over yet.
             return delay_reply(&args);
         }
-        if let Some((session, seqid, slot)) = pure_data(&args) {
+        if let Some((session, seqid, slot, stateids)) = pure_data(&args) {
             let req = V4Forward::Sequence {
                 session,
                 slot,
                 seqid,
+                stateids,
             };
             return match cl.forward(&owner, &req).await {
                 Ok(V4Forwarded::Sequenced(Ok(pre))) => {
@@ -579,7 +603,7 @@ impl<D: BlockDevice + 'static> Server<D> {
         &self,
         call: &Call,
         r: &mut Reader<'_>,
-        pre: Option<(u64, u32)>,
+        mut pre: Option<Presequenced>,
     ) -> XdrResult<Writer> {
         let tag = r.opaque(1024)?.to_vec();
         let minor = r.u32()?;
@@ -613,7 +637,10 @@ impl<D: BlockDevice + 'static> Server<D> {
             };
             let mut w = Writer::new();
             let status = if i == 0 && opnum == op::SEQUENCE {
-                match self.sequence(&mut ctx, r, &mut w, count, pre).await? {
+                match self
+                    .sequence(&mut ctx, r, &mut w, count, pre.take())
+                    .await?
+                {
                     Seq::Run(st, s) => {
                         slot = s;
                         st
@@ -857,9 +884,23 @@ impl<D: BlockDevice + 'static> Server<D> {
         }
     }
 
-    /// Check an I/O stateid (unless the owner checked the request).
+    /// Check an I/O stateid: here, or against what the state owner said
+    /// of it when it sequenced the request.
     fn check_io(&self, ctx: &Ctx, sid: &Stateid, id: FileId, write: bool) -> Result<(), NfsStat> {
-        if ctx.trusted {
+        if let Some(grants) = &ctx.grants {
+            // Not one the owner was asked about (a special stateid isn't
+            // sent here at all: its share checks need the owner's opens).
+            let (_, grant) = grants
+                .iter()
+                .find(|(s, _)| s == sid)
+                .ok_or(err::BAD_STATEID)?;
+            let (file, may_write) = (*grant)?;
+            if file != id {
+                return Err(err::BAD_STATEID);
+            }
+            if write && !may_write {
+                return Err(err::OPENMODE);
+            }
             return Ok(());
         }
         self.st().check_io(ctx.client()?, sid, id, write)
@@ -885,8 +926,10 @@ fn delay_reply(args: &[u8]) -> Reply {
 
 /// If the COMPOUND in `args` only reads or writes data (no state, no
 /// namespace change) and doesn't ask for its reply to be cached: its
-/// SEQUENCE's session, seqid and slot.
-fn pure_data(args: &[u8]) -> Option<([u8; 16], u32, u32)> {
+/// SEQUENCE's session, seqid and slot, and the stateids its I/O names
+/// (none special: anonymous I/O is checked against the owner's opens, so
+/// such a request goes to the owner whole).
+fn pure_data(args: &[u8]) -> Option<([u8; 16], u32, u32, Vec<Stateid>)> {
     let mut r = Reader::new(args);
     r.opaque(1024).ok()?;
     if !matches!(r.u32().ok()?, 1 | 2) {
@@ -903,7 +946,17 @@ fn pure_data(args: &[u8]) -> Option<([u8; 16], u32, u32)> {
     if r.bool().ok()? {
         return None;
     }
-    let skip_stateid = |r: &mut Reader<'_>| r.fixed(16).map(|_| ());
+    let mut stateids = Vec::new();
+    let mut skip_stateid = |r: &mut Reader<'_>| {
+        let sid = read_stateid(r)?;
+        if sid.is_special() {
+            return Err(XdrError("special stateid"));
+        }
+        if !stateids.contains(&sid) {
+            stateids.push(sid);
+        }
+        Ok(())
+    };
     for _ in 1..count {
         let ok = match r.u32().ok()? {
             op::PUTFH => r.opaque(128).map(|_| ()),
@@ -949,7 +1002,7 @@ fn pure_data(args: &[u8]) -> Option<([u8; 16], u32, u32)> {
         };
         ok.ok()?;
     }
-    Some((session, seqid, slot))
+    Some((session, seqid, slot, stateids))
 }
 
 fn empty_settable() -> attrs::Settable {

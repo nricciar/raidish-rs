@@ -33,7 +33,6 @@ use crate::types::Txg;
 use crate::vdev::StripeCheck;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
@@ -46,6 +45,8 @@ pub struct ScanReport {
     pub bytes: u64,
     /// Records skipped (older than `since`, with their subtrees).
     pub pruned: u64,
+    /// Intent log records checked (they're outside the tree).
+    pub log_records: u64,
     pub shards: StripeCheck,
     pub label_stripes: u64,
     /// Label units (first block of each) for which no valid contents could be found.
@@ -102,12 +103,14 @@ impl std::fmt::Display for ScanReport {
         };
         writeln!(
             f,
-            "{}: {} records ({:.1} MiB) checked, {} skipped as unchanged, {} label stripes",
+            "{}: {} records ({:.1} MiB) checked, {} skipped as unchanged, {} label stripes, \
+             {} intent log records",
             what,
             self.records,
             self.bytes as f64 / (1u64 << 20) as f64,
             self.pruned,
-            self.label_stripes
+            self.label_stripes,
+            self.log_records
         )?;
         for d in 0..self.shards.disks() {
             let (m, r) = (self.shards.mismatched[d], self.shards.repaired[d]);
@@ -199,12 +202,14 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Snapshot: commit first so everything written so far is in the tree
         // being walked (and missed writes are folded into `degraded`).
-        let (root, misses_at_start, since) = {
-            let _tx = self.begin_tx().await;
+        let (root, misses_at_start, marks_at_start, since, hold) = {
+            let mut tx = self.begin_tx().await;
+            let tx = &mut tx;
             if !self.read_only {
-                self.commit_locked().await?;
+                self.commit_locked(tx).await?;
             }
             let misses = self.miss_counts();
+            let marks: Vec<u64> = (0..misses.len()).map(|d| self.degraded_mark(d)).collect();
             let degraded = self.degraded_disks();
             let since = match since {
                 Some(s) => s,
@@ -225,8 +230,9 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                 }
             };
-            self.scan_hold.fetch_add(1, Ordering::SeqCst);
-            (self.objects.root(), misses, since)
+            // Dropped with the scan, even a cancelled one.
+            let hold = crate::fs::FreeHold::new(&self.scan_hold);
+            (self.objects.root(), misses, marks, since, hold)
         };
 
         let mut report = ScanReport {
@@ -234,24 +240,60 @@ impl<D: BlockDevice> FileSystem<D> {
             repair,
             ..Default::default()
         };
-        let walked = self.scan_tree(root, since, &|_| repair, &mut report).await;
-        {
-            let _tx = self.begin_tx().await;
-            self.scan_labels(repair, &mut report).await;
+        let mut walked = self.scan_tree(root, since, &|_| repair, &mut report).await;
+        // Intent logs are outside the tree: a record a disk missed is on
+        // fewer copies than the pool says until it's rewritten (audit D4).
+        // Their space is held like the tree's (`scan_hold`), so a log
+        // dropped meanwhile isn't reused under a repair.
+        if walked.is_ok() {
+            walked = match self.dataset_logs().await {
+                Ok(logs) => {
+                    self.scan_logs(&logs, &|_| repair, &mut report).await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
         }
-        self.scan_hold.fetch_sub(1, Ordering::SeqCst);
+        {
+            let tx = self.begin_tx().await;
+            self.scan_labels(&tx, repair, &mut report).await;
+        }
+        drop(hold);
         self.release_held_frees().await;
         walked?;
 
+        // A disk is cleared only once what was repaired on it is durable:
+        // flushed, and no repair lost to a flush that failed (audit D1).
+        if repair
+            && report.is_clean()
+            && let Some(pool) = pool
+            && report.repaired() > 0
+        {
+            let flushed = self.dev.flush().await;
+            if pool.disks().take_repairs_lost() || flushed.is_err() {
+                report.errors.push(format!(
+                    "repairs not made durable (a disk's flush failed): {}",
+                    flushed
+                        .err()
+                        .map_or_else(|| "lost".to_string(), |e| e.to_string())
+                ));
+            }
+        }
         if repair
             && report.is_clean()
             && let Some(pool) = pool
         {
+            // Under the tx: no commit can write a label or fold a miss in
+            // between the label write and the clear (audit D4).
+            let mut tx = self.begin_tx().await;
             let degraded = self.degraded_disks();
             for d in 0..pool.disks().len() {
                 let covered = degraded[d].is_some_and(|t| t >= since);
+                // Marked since the snapshot (a writer's report of a miss):
+                // something the walk didn't see is missing.
                 let in_sync = pool.disks().is_online(d)
                     && pool.disks().miss_count(d) == misses_at_start[d]
+                    && self.degraded_mark(d) == marks_at_start[d]
                     && !report.shards.is_unreadable(d)
                     && !report.shards.has_write_failed(d);
                 if !(covered && in_sync) {
@@ -264,11 +306,12 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     pool.disks().set_fenced(d, false);
                 }
-                self.degraded.lock().unwrap()[d] = None;
-                report.cleared.push(d);
+                if self.clear_degraded(&tx, d, marks_at_start[d]) {
+                    report.cleared.push(d);
+                }
             }
             if !report.cleared.is_empty() {
-                self.commit_txg().await?;
+                self.commit_locked(&mut tx).await?;
             }
         }
         Ok(report)
@@ -293,7 +336,10 @@ impl<D: BlockDevice> FileSystem<D> {
             if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
                 continue;
             }
+            // Only a committer's scan holds freed space (a writer's frees
+            // are the committer's to release).
             if !self.read_only
+                && self.writer.is_none()
                 && report.records % 256 == 255
                 && self.allocatable_blocks().await < total / MIN_FREE_FRACTION
             {
@@ -320,6 +366,44 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         Ok(())
+    }
+
+    /// Check every record of the intent logs `logs` that replay would read,
+    /// as `scan_record` checks a tree record: read verified (rebuilt from
+    /// parity if a copy is bad), then every shard against it, rewriting
+    /// those `repair(lba)` allows. A record that can't be read verified is
+    /// the end of its log, as for replay: not an error.
+    async fn scan_logs(
+        &self,
+        logs: &[(String, crate::inode::DatasetLog)],
+        repair: &(dyn Fn(u64) -> bool + Send + Sync),
+        report: &mut ScanReport,
+    ) {
+        let Some(pool) = self.dev.pool() else {
+            return;
+        };
+        for (name, log) in logs {
+            for (i, region) in log.regions.iter().enumerate() {
+                let from = if i == 0 { log.from_seq } else { 0 };
+                for rec in self.region_records(region, from).await {
+                    let blocks = self.align_blocks(rec.bytes.len().div_ceil(BLOCK_SIZE) as u64);
+                    let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
+                    padded[..rec.bytes.len()].copy_from_slice(&rec.bytes);
+                    report.log_records += 1;
+                    match pool
+                        .root()
+                        .verify_blocks(rec.lba, &padded, repair(rec.lba))
+                        .await
+                    {
+                        Ok(check) => report.shards.add(&check),
+                        Err(e) => report.errors.push(format!(
+                            "volume '{}': intent log record at {}: {}",
+                            name, rec.lba, e
+                        )),
+                    }
+                }
+            }
+        }
     }
 
     /// Read one record (checksum verified, rebuilt from parity if needed),
@@ -379,35 +463,89 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let _one = self.scan_lock.lock().await;
         let layout = self.layout;
-        let in_lent = move |p: &BlockPtr| {
-            layout
-                .metaslab_for_block(p.lba)
-                .is_some_and(|i| lent.contains(&i))
-        };
         let mut report = ScanReport {
             since,
             repair: true,
             ..Default::default()
         };
-        self.scan_tree(newest.objects.clone(), since, &in_lent, &mut report)
+        {
+            // As in a scrub: nothing walked may be freed and reused under a
+            // repair. Here that means the lent metaslabs stay lent until the
+            // walk ends (audit D5a): only those still lent now are repaired.
+            let hold = crate::fs::RepairHold::pin_lent(&w, lent, false);
+            let pinned: std::collections::HashSet<_> = hold
+                .as_ref()
+                .map_or(&[][..], |h| h.pinned())
+                .iter()
+                .copied()
+                .collect();
+            let in_lent = move |lba: u64| {
+                layout
+                    .metaslab_for_block(lba)
+                    .is_some_and(|i| pinned.contains(&i))
+            };
+            self.scan_tree(
+                newest.objects.clone(),
+                since,
+                &|p: &BlockPtr| in_lent(p.lba),
+                &mut report,
+            )
             .await?;
+            // And the logs of the volumes it runs: they're in its lent
+            // space too, where only it can rewrite them (audit D4).
+            let names: Vec<String> = w.datasets.lock().unwrap().keys().cloned().collect();
+            let mut logs = Vec::new();
+            for name in names {
+                if let Ok(vol) = self.open_dataset(&name).await
+                    && let Some(log) = vol.log.lock().unwrap().clone()
+                {
+                    logs.push((name, log));
+                }
+            }
+            self.scan_logs(&logs, &in_lent, &mut report).await;
+        }
+        // The repairs are what lets the committer's resilver clear the disk;
+        // make them durable before it can look.
+        if report.repaired() > 0 {
+            self.dev.flush().await?;
+            if pool.disks().take_repairs_lost() {
+                return Err(FileSystemError::Unavailable(
+                    "repairs in lent space not made durable (a disk's flush failed)".into(),
+                ));
+            }
+        }
         Ok(Some(report))
     }
 
     /// Verify the fixed label regions: superblock, uberblock ring and space
     /// map slots. Must run under the commit lock (commits rewrite them).
-    async fn scan_labels(&self, repair: bool, report: &mut ScanReport) {
+    async fn scan_labels(&self, _tx: &crate::tx::Tx, repair: bool, report: &mut ScanReport) {
         let Some(pool) = self.dev.pool() else {
             return;
         };
-        let score = |b: &[u8]| parse_label(b).ok().map(|(txg, _)| txg.get());
+        // A label from past the last commit is a torn, uncommitted write:
+        // never the truth, however many copies hold it.
+        let committed = self.uberblock().await.map_or(0, |u| u.txg.get());
+        let score = move |b: &[u8]| {
+            parse_label(b)
+                .ok()
+                .map(|(txg, _)| txg.get())
+                .filter(|&t| t <= committed)
+        };
+        // Degraded members missed label writes: their copies don't vote
+        // (audit D3), they're what gets repaired.
+        let stale: Vec<bool> = self.degraded_disks().iter().map(|d| d.is_some()).collect();
         let header = (0, self.header.spacemap_start);
         let spacemaps = (
             self.layout.spacemap_start,
             self.layout.data_start - self.layout.spacemap_start,
         );
         for (lba, blocks) in [header, spacemaps] {
-            match pool.root().verify_labels(lba, blocks, repair, &score).await {
+            match pool
+                .root()
+                .verify_labels(lba, blocks, repair, &score, &stale)
+                .await
+            {
                 Ok(scan) => {
                     report.label_stripes += scan.units;
                     report.shards.add(&scan.check);

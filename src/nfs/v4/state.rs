@@ -30,7 +30,9 @@ pub const SHARE_READ: u32 = 1;
 pub const SHARE_WRITE: u32 = 2;
 
 /// A stateid: `seqid` and 12 opaque bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct Stateid {
     pub seqid: u32,
     pub other: [u8; 12],
@@ -121,6 +123,19 @@ enum Kind {
     },
     /// A pNFS layout of the whole file (read, or read-write).
     Layout { rw: bool },
+}
+
+/// How to take back an open (see [`StateTable::unopen`]).
+#[derive(Debug, Clone, Copy)]
+pub enum OpenUndo {
+    /// It made this state.
+    New(Stateid),
+    /// It upgraded the owner's open to `sid`, from `access` / `deny`.
+    Upgraded {
+        sid: Stateid,
+        access: u32,
+        deny: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -609,9 +624,39 @@ impl StateTable {
             });
             return if denied { Err(err::LOCKED) } else { Ok(()) };
         }
-        self.check(&inner, client, sid, Some(file))?;
-        // A lock owner's write may not cross another owner's lock.
+        let (f, may_write) = self.grant(&inner, client, sid)?;
+        if f != file {
+            return Err(err::BAD_STATEID);
+        }
+        if write && !may_write {
+            return Err(err::OPENMODE);
+        }
         Ok(())
+    }
+
+    /// What `sid` (not a special one) lets `client` do: its file, and
+    /// whether it may write there. For a follower that runs I/O on a
+    /// request the owner of the state sequenced (it checks with this).
+    pub fn io_grant(&self, client: u64, sid: &Stateid) -> Result<(FileId, bool), NfsStat> {
+        if sid.is_special() {
+            return Err(err::BAD_STATEID);
+        }
+        let inner = self.inner.lock().unwrap();
+        self.grant(&inner, client, sid)
+    }
+
+    fn grant(&self, inner: &Inner, client: u64, sid: &Stateid) -> Result<(FileId, bool), NfsStat> {
+        self.check(inner, client, sid, None)?;
+        let s = &inner.states[&sid.other];
+        let write = match &s.kind {
+            Kind::Open { access, .. } => access & SHARE_WRITE != 0,
+            Kind::Lock { open, .. } => match inner.states.get(open).map(|o| &o.kind) {
+                Some(Kind::Open { access, .. }) => access & SHARE_WRITE != 0,
+                _ => return Err(err::BAD_STATEID),
+            },
+            Kind::Layout { rw } => *rw,
+        };
+        Ok((s.file, write))
     }
 
     /// TEST_STATEID for one stateid.
@@ -640,6 +685,7 @@ impl StateTable {
 
     /// OPEN `file` for `owner` with `access` / `deny`: the open stateid
     /// (a second open by the same owner upgrades the first).
+    #[cfg(test)]
     pub fn open(
         &self,
         client: u64,
@@ -649,6 +695,33 @@ impl StateTable {
         deny: u32,
         reclaim: bool,
     ) -> Result<Stateid, NfsStat> {
+        self.open_undoable(client, owner, file, access, deny, reclaim)
+            .map(|(sid, _)| sid)
+    }
+
+    /// May `client` open anything now (a reclaim if `reclaim`)? What
+    /// [`open`](Self::open) checks before shares, for an OPEN to ask
+    /// before it changes the file system (a create).
+    pub fn may_open(&self, client: u64, reclaim: bool) -> Result<(), NfsStat> {
+        let inner = self.inner.lock().unwrap();
+        if !inner.clients.get(&client).is_some_and(|c| c.confirmed) {
+            return Err(err::STALE_CLIENTID);
+        }
+        inner.grace_check(client, reclaim)
+    }
+
+    /// [`open`](Self::open), and how to take it back ([`unopen`](Self::unopen))
+    /// if what the OPEN does after it (a truncate) fails: the share
+    /// reservation is taken first, so nothing it denies happens.
+    pub fn open_undoable(
+        &self,
+        client: u64,
+        owner: &[u8],
+        file: FileId,
+        access: u32,
+        deny: u32,
+        reclaim: bool,
+    ) -> Result<(Stateid, OpenUndo), NfsStat> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.clients.get(&client).is_some_and(|c| c.confirmed) {
             return Err(err::STALE_CLIENTID);
@@ -673,18 +746,26 @@ impl StateTable {
         }
         if let Some(o) = mine {
             let s = inner.states.get_mut(&o).unwrap();
+            let mut was = (0, 0);
             if let Kind::Open {
                 access: a, deny: d, ..
             } = &mut s.kind
             {
+                was = (*a, *d);
                 *a |= access;
                 *d |= deny;
             }
             s.seqid += 1;
-            return Ok(Stateid {
+            let sid = Stateid {
                 seqid: s.seqid,
                 other: o,
-            });
+            };
+            let undo = OpenUndo::Upgraded {
+                sid,
+                access: was.0,
+                deny: was.1,
+            };
+            return Ok((sid, undo));
         }
         let other = self.other(&mut inner);
         inner.states.insert(
@@ -701,7 +782,37 @@ impl StateTable {
             },
         );
         inner.files.entry(file).or_default().push(other);
-        Ok(Stateid { seqid: 1, other })
+        let sid = Stateid { seqid: 1, other };
+        Ok((sid, OpenUndo::New(sid)))
+    }
+
+    /// Take back an open that the OPEN making it couldn't finish: the
+    /// state it made goes, or the one it upgraded is as it was (unless
+    /// it's been changed since, by its owner, who then knows of it).
+    pub fn unopen(&self, undo: OpenUndo) {
+        let mut inner = self.inner.lock().unwrap();
+        match undo {
+            OpenUndo::New(sid) => {
+                if inner
+                    .states
+                    .get(&sid.other)
+                    .is_some_and(|s| s.seqid == sid.seqid)
+                {
+                    inner.remove_state(&sid.other);
+                }
+            }
+            OpenUndo::Upgraded { sid, access, deny } => {
+                if let Some(s) = inner.states.get_mut(&sid.other)
+                    && s.seqid == sid.seqid
+                    && let Kind::Open {
+                        access: a, deny: d, ..
+                    } = &mut s.kind
+                {
+                    (*a, *d) = (access, deny);
+                    s.seqid -= 1;
+                }
+            }
+        }
     }
 
     /// OPEN_DOWNGRADE to `access` / `deny` (a subset of what's open).

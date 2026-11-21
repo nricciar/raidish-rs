@@ -181,15 +181,18 @@ impl LeaseAuthority for HttpLeases {
     }
 }
 
-/// An owner id unique to this process.
+/// An owner id unique to this call: two leases taken in the same
+/// millisecond by one process must not look like one holder.
 pub fn owner_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let host = std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".into());
-    format!("{}:{}:{}", host, std::process::id(), super::now_ms())
+    format!("{}:{}:{}.{}", host, std::process::id(), super::now_ms(), n)
 }
 
 /// Where a [`HeldLease`] stands, from this holder's side.
@@ -203,6 +206,11 @@ enum HoldState {
     /// Let go (`release`, or a transfer went through): the renew loop
     /// stops quietly.
     Released = 2,
+    /// A transfer may have gone through (no answer), or the lease is gone:
+    /// not `fresh`. The next renewal settles it: granted, it's `Held`
+    /// again; refused, it's lost (`on_lost`). The same transfer may be
+    /// tried again meanwhile.
+    InDoubt = 3,
 }
 
 /// A [`HoldState`] shared with the renew loop.
@@ -214,6 +222,7 @@ impl AtomicHoldState {
         match self.0.load(std::sync::atomic::Ordering::SeqCst) {
             0 => HoldState::Held,
             1 => HoldState::HandingOff,
+            3 => HoldState::InDoubt,
             _ => HoldState::Released,
         }
     }
@@ -340,7 +349,11 @@ impl HeldLease {
         to_owner: &str,
         to_holder: Holder,
     ) -> Result<Epoch, TransferError> {
-        if !self.state.advance(HoldState::Held, HoldState::HandingOff) {
+        if !self.state.advance(HoldState::Held, HoldState::HandingOff)
+            && !self
+                .state
+                .advance(HoldState::InDoubt, HoldState::HandingOff)
+        {
             return Err(TransferError::Refused(match self.state.get() {
                 HoldState::HandingOff => format!("lease on {} is being handed off", self.resource),
                 _ => format!("lease on {} was released", self.resource),
@@ -360,8 +373,14 @@ impl HeldLease {
                 Ok(epoch)
             }
             other => {
-                // Back to held, unless `release` ran meanwhile.
-                self.state.advance(HoldState::HandingOff, HoldState::Held);
+                // Back to held only if it certainly didn't go through, and
+                // unless `release` ran meanwhile. Lost, or no answer (it may
+                // have): in doubt, so not `fresh`, until a renewal says.
+                let back = match &other {
+                    Ok(Response::Refused(_)) => HoldState::Held,
+                    _ => HoldState::InDoubt,
+                };
+                self.state.advance(HoldState::HandingOff, back);
                 Err(match other {
                     Ok(Response::Lost) => {
                         TransferError::Lost(format!("lease on {} was lost", self.resource))
@@ -391,9 +410,16 @@ impl HeldLease {
         );
         tokio::spawn(async move {
             let ttl = LEASE_TTL;
-            // Conservative: the lease counts from when the request was sent.
-            let mut valid_from = Instant::now();
-            let mut pause = ttl / 3;
+            // Conservative: the lease counts from when the request that
+            // granted it was sent (not from now: a holder that took a while
+            // between acquiring and holding has less left, audit R3a).
+            let mut valid_from = *weak
+                .upgrade()
+                .map(|me| *me.renewed.lock().unwrap())
+                .get_or_insert_with(Instant::now);
+            // The first renewal a third of a TTL after the grant was sent,
+            // not after now (audit R3a).
+            let mut pause = (ttl / 3).saturating_sub(valid_from.elapsed());
             loop {
                 tokio::time::sleep(pause).await;
                 let Some(me) = weak.upgrade() else {
@@ -433,6 +459,9 @@ impl HeldLease {
                         valid_from = sent;
                         *me.renewed.lock().unwrap() = sent;
                         pause = ttl / 3;
+                        // Renewed as this holder: a transfer in doubt didn't
+                        // go through.
+                        me.state.advance(HoldState::InDoubt, HoldState::Held);
                     }
                     Ok(_) => match me.state.get() {
                         HoldState::Released => return,
@@ -440,7 +469,7 @@ impl HeldLease {
                         // through (`transfer` then lets go), or it didn't
                         // and the next renewal finds out.
                         HoldState::HandingOff => pause = RETRY_PAUSE,
-                        HoldState::Held => {
+                        HoldState::Held | HoldState::InDoubt => {
                             on_lost(format!("lease on {} lost ({:?})", me.resource, result));
                             return;
                         }
@@ -468,8 +497,11 @@ impl HeldLease {
     /// well within a TTL old, leaving a third of it as margin for clock rate
     /// differences and in-flight writes: whatever this holder does while
     /// it's true happens before anyone else can be granted the lease.
+    /// Never while it's being handed off or once released: the new holder
+    /// may be acting already (audit R3b).
     pub fn fresh(&self) -> bool {
-        self.renewed.lock().unwrap().elapsed() < LEASE_TTL * 2 / 3
+        self.state.get() == HoldState::Held
+            && self.renewed.lock().unwrap().elapsed() < LEASE_TTL * 2 / 3
     }
 
     pub async fn release(&self) {

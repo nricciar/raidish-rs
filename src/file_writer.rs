@@ -122,6 +122,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// the compare-and-swap. Returns the file's object number.
     pub(crate) async fn set_file_contents(
         &self,
+        tx: &mut crate::tx::Tx,
         l: Lookup,
         current: Option<(FileId, Dnode)>,
         blksz: u32,
@@ -131,14 +132,15 @@ impl<D: BlockDevice> FileSystem<D> {
         match current {
             Some((id, mut dnode)) => {
                 dnode.blksz = blksz;
-                self.replace_file_contents(id, dnode, size, tree).await?;
+                self.replace_file_contents(tx, id, dnode, size, tree)
+                    .await?;
                 Ok(id)
             }
             None => {
                 let mut dnode = Dnode::file(blksz);
                 dnode.size = size;
                 dnode.tree = tree;
-                self.link_new(l, dnode).await
+                self.link_new(tx, l, dnode).await
             }
         }
     }
@@ -276,8 +278,9 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         if self.fs.writer.is_none() {
             // A commit since a record was written may have recorded it as
             // allocated: record it free again.
-            let _tx = self.fs.begin_tx().await;
-            if let Err(e) = self.fs.commit_locked().await {
+            let mut tx = self.fs.begin_tx().await;
+            let tx = &mut tx;
+            if let Err(e) = self.fs.commit_locked(tx).await {
                 eprintln!("file writer: committing released space: {}", e);
             }
         }
@@ -400,7 +403,8 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
 
     async fn finish_local(&mut self, tree: TreeRoot) -> Result<FileId, FileSystemError> {
         let fs = self.fs;
-        let _tx = fs.begin_tx().await;
+        let mut tx = fs.begin_tx().await;
+        let tx = &mut tx;
         // Records written before a snapshot raised the birth floor are
         // restamped (no commit can run now: the open TXG is final).
         let mut tree = tree;
@@ -414,23 +418,46 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
                 }
             };
         }
-        let l = fs.lookup(&self.path).await?;
-        let current = fs.current_file(&l).await?;
+        // Failing before anything is linked: the records are ours to free.
+        let looked = async {
+            let l = fs.lookup(&self.path).await?;
+            let current = fs.current_file(&l).await?;
+            Ok::<_, FileSystemError>((l, current))
+        }
+        .await;
+        let (l, current) = match looked {
+            Ok(v) => v,
+            Err(e) => {
+                self.release().await;
+                fs.commit_locked(tx).await?;
+                return Err(e);
+            }
+        };
         if current.as_ref().map(|(id, d)| (*id, d.tree.clone())) != self.base {
             // Released for good: a commit since a record was written may
             // have recorded it as allocated.
             self.release().await;
-            fs.commit_locked().await?;
+            fs.commit_locked(tx).await?;
             return Err(FileSystemError::Conflict(format!(
                 "{} changed since this write began",
                 self.path.display()
             )));
         }
-        let id = fs
-            .set_file_contents(l, current, self.blksz as u32, self.size, tree)
-            .await?;
-        fs.commit_locked().await?;
-        Ok(id)
+        let r = fs
+            .set_file_contents(tx, l, current, self.blksz as u32, self.size, tree)
+            .await;
+        match tx.check(r).await {
+            Ok(id) => {
+                fs.commit_locked(tx).await?;
+                Ok(id)
+            }
+            Err(e) => {
+                // Undone (nothing links the records): they're ours to free.
+                self.release().await;
+                fs.commit_locked(tx).await?;
+                Err(e)
+            }
+        }
     }
 }
 

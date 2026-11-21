@@ -61,16 +61,20 @@ impl<D: BlockDevice + 'static> Server<D> {
                 return Err(err::INVAL);
             }
             let here = ctx.fh()?;
-            let (file, cinfo, bitmap) = match claim {
+            // Nothing changes before the grace and share checks: a create
+            // waits for grace, and the share reservation is taken before a
+            // truncate (and given back if it fails).
+            self.st().may_open(client, claim == 1)?;
+            let (file, cinfo, bitmap, truncate) = match claim {
                 // CLAIM_NULL: by name in the current directory.
                 0 => {
                     let name = name.unwrap();
                     name_ok(&name)?;
                     let before = self.dir_change(here).await;
-                    let (id, bm) = match how {
+                    let (id, bm, truncate) = match how {
                         None => {
                             let a = self.backend.lookup(here, &name).await.map_err(v4)?;
-                            (a.id, Vec::new())
+                            (a.id, Vec::new(), None)
                         }
                         Some((guarded, exclusive, attrs)) => {
                             let s = attrs?;
@@ -82,32 +86,30 @@ impl<D: BlockDevice + 'static> Server<D> {
                                 .await
                                 .map_err(v4)?;
                             // UNCHECKED on an existing file with a size: truncate.
-                            if let Some(size) = s.size
-                                && a.size != size
-                            {
-                                self.backend
-                                    .setattr(a.id, &SetAttrs::default(), Some(size))
-                                    .await
-                                    .map_err(v4)?;
-                            }
-                            (a.id, s.bitmap)
+                            let truncate = s.size.filter(|&size| a.size != size);
+                            (a.id, s.bitmap, truncate)
                         }
                     };
-                    (id, Some((before, self.dir_change(here).await)), bm)
+                    (
+                        id,
+                        Some((before, self.dir_change(here).await)),
+                        bm,
+                        truncate,
+                    )
                 }
                 // CLAIM_FH: the current filehandle itself.
                 4 => {
                     if how.is_some() {
                         return Err(err::INVAL);
                     }
-                    (here, None, Vec::new())
+                    (here, None, Vec::new(), None)
                 }
                 // CLAIM_PREVIOUS: a reclaim of the current filehandle.
                 1 => {
                     if how.is_some() {
                         return Err(err::INVAL);
                     }
-                    (here, None, Vec::new())
+                    (here, None, Vec::new(), None)
                 }
                 // There are no delegations to claim.
                 _ => return Err(err::NOTSUPP),
@@ -116,7 +118,18 @@ impl<D: BlockDevice + 'static> Server<D> {
             if a.kind == ObjType::Directory {
                 return Err(err::ISDIR);
             }
-            let sid = self.st().open(client, &owner, file, acc, den, claim == 1)?;
+            let (sid, undo) =
+                self.st()
+                    .open_undoable(client, &owner, file, acc, den, claim == 1)?;
+            if let Some(size) = truncate
+                && let Err(e) = self
+                    .backend
+                    .setattr(file, &SetAttrs::default(), Some(size))
+                    .await
+            {
+                self.st().unopen(undo);
+                return Err(v4(e));
+            }
             Ok((file, sid, cinfo, bitmap))
         };
         let res = go.await;
