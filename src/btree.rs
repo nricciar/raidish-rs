@@ -102,7 +102,7 @@ impl Default for Header {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Val {
-    Inline(Vec<u8>),
+    Inline(#[serde(with = "bytes")] Vec<u8>),
     /// `len` bytes in `ceil(len / blksz)` pages, listed in order in the
     /// chain of id lists from `index`.
     Overflow {
@@ -120,13 +120,104 @@ pub(crate) struct IdList {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Node {
-    Leaf(Vec<(Vec<u8>, Val)>),
+    Leaf(#[serde(with = "bytes::entries")] Vec<(Vec<u8>, Val)>),
     /// `children.len() == keys.len() + 1`; child `i` holds keys in
     /// `[keys[i - 1], keys[i])`.
     Branch {
+        #[serde(with = "bytes::list")]
         keys: Vec<Vec<u8>>,
         children: Vec<u64>,
     },
+}
+
+/// Keys and values as serde byte strings rather than sequences of `u8`.
+/// bincode encodes both the same way (a u64 length, then the bytes), so
+/// the on-disk format is unchanged; but a byte string decodes with one
+/// copy, where a `Vec<u8>` decodes a byte at a time through serde's
+/// sequence visitor. Nodes are decoded on every read, so this was most of
+/// an etcd dataset's CPU.
+mod bytes {
+    use super::Val;
+    use serde::de::{Deserializer, SeqAccess, Visitor};
+    use serde::ser::Serializer;
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+
+    struct Ref<'a>(&'a [u8]);
+
+    impl Serialize for Ref<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(self.0)
+        }
+    }
+
+    #[repr(transparent)]
+    struct Buf(Vec<u8>);
+
+    impl<'de> Deserialize<'de> for Buf {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Buf;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a byte string")
+                }
+                fn visit_bytes<E>(self, v: &[u8]) -> Result<Buf, E> {
+                    Ok(Buf(v.to_vec()))
+                }
+                fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Buf, E> {
+                    Ok(Buf(v))
+                }
+                // Formats without byte strings (JSON) write a sequence.
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Buf, A::Error> {
+                    let mut v = Vec::with_capacity(a.size_hint().unwrap_or(0).min(4096));
+                    while let Some(b) = a.next_element()? {
+                        v.push(b);
+                    }
+                    Ok(Buf(v))
+                }
+            }
+            d.deserialize_byte_buf(V)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Buf::deserialize(d).map(|b| b.0)
+    }
+
+    /// `Vec<Vec<u8>>` (a branch's keys).
+    pub mod list {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(v.iter().map(|k| Ref(k)))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+            let v = Vec::<Buf>::deserialize(d)?;
+            Ok(v.into_iter().map(|b| b.0).collect())
+        }
+    }
+
+    /// `Vec<(Vec<u8>, Val)>` (a leaf's entries).
+    pub mod entries {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(v: &[(Vec<u8>, Val)], s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(v.iter().map(|(k, val)| (Ref(k), val)))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> Result<Vec<(Vec<u8>, Val)>, D::Error> {
+            let v = Vec::<(Buf, Val)>::deserialize(d)?;
+            Ok(v.into_iter().map(|(k, val)| (k.0, val)).collect())
+        }
+    }
 }
 
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, FileSystemError> {

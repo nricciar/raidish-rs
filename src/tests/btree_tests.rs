@@ -366,3 +366,67 @@ async fn ids_freed_in_bulk_are_all_kept_for_reuse() {
         verify(&fs, "t", &BTreeMap::new()).await;
     }
 }
+
+/// Nodes' keys and values are serde byte strings: the encoding must stay
+/// exactly what the derived `Vec<u8>` encoding wrote (existing pools).
+#[test]
+fn node_encoding_matches_the_vec_u8_encoding() {
+    use super::{Node, Val, decode, encode, size_of};
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    enum OldVal {
+        Inline(Vec<u8>),
+        Overflow { index: u64, len: u64 },
+    }
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    enum OldNode {
+        Leaf(Vec<(Vec<u8>, OldVal)>),
+        Branch {
+            keys: Vec<Vec<u8>>,
+            children: Vec<u64>,
+        },
+    }
+    let leaf = Node::Leaf(vec![
+        (
+            b"/registry/pods/default/a".to_vec(),
+            Val::Inline(vec![0, 1, 2, 255]),
+        ),
+        (vec![], Val::Inline(vec![])),
+        (
+            b"k".to_vec(),
+            Val::Overflow {
+                index: 7,
+                len: 1 << 20,
+            },
+        ),
+    ]);
+    let old_leaf = OldNode::Leaf(vec![
+        (
+            b"/registry/pods/default/a".to_vec(),
+            OldVal::Inline(vec![0, 1, 2, 255]),
+        ),
+        (vec![], OldVal::Inline(vec![])),
+        (
+            b"k".to_vec(),
+            OldVal::Overflow {
+                index: 7,
+                len: 1 << 20,
+            },
+        ),
+    ]);
+    let branch = Node::Branch {
+        keys: vec![b"m".to_vec(), vec![9; 300]],
+        children: vec![1, 2, 3],
+    };
+    let old_branch = OldNode::Branch {
+        keys: vec![b"m".to_vec(), vec![9; 300]],
+        children: vec![1, 2, 3],
+    };
+    for (new, old) in [(leaf, old_leaf), (branch, old_branch)] {
+        let a = encode(&new).unwrap();
+        let b = encode(&old).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(size_of(&new), a.len());
+        assert_eq!(decode::<Node>(&b, "n").unwrap(), new);
+        assert_eq!(decode::<OldNode>(&a, "n").unwrap(), old);
+    }
+}
