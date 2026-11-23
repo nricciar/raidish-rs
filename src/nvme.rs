@@ -18,9 +18,14 @@
 //! Set `RAIDISH_NVME_TRACE=1` to log every command.
 
 use crate::disk::BlockDevice;
+use crate::export::{
+    BlockExporter, ExportLife, ExportSession, ExportTable, Exported, export_closed,
+};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::nbd::{DEFAULT_BIND, ExportLife, ExportSession, ensure_sync_loop, export_closed};
-use std::collections::{BTreeMap, HashMap};
+use crate::nbd::DEFAULT_BIND;
+use crate::volume_io::ensure_sync_loop;
+use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -236,26 +241,48 @@ struct Export {
     nsze: u64,
     uuid: [u8; 16],
     life: ExportLife,
+    /// Where its I/O goes (this node's file system, for now).
+    io: Arc<SwitchableIo>,
+}
+
+impl Exported for Export {
+    fn volume(&self) -> &str {
+        &self.volume
+    }
+    fn size(&self) -> u64 {
+        self.nsze * LBA_SIZE
+    }
+    fn life(&self) -> &ExportLife {
+        &self.life
+    }
+    fn io(&self) -> &Arc<SwitchableIo> {
+        &self.io
+    }
 }
 
 impl Export {
-    fn new(volume: &str, size: u64) -> Self {
+    fn new(volume: &str, size: u64, io: Arc<dyn VolumeIo>) -> Self {
         let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
-        // SN is 20 bytes and must differ between subsystems: names too long
-        // to fit after the prefix are replaced by a hash.
-        let serial = if volume.len() <= 12 && volume.is_ascii() {
-            format!("RAIDISH-{}", volume)
-        } else {
-            format!("RAIDISH-{}", &hash.to_hex()[..12])
-        };
         Export {
             volume: volume.to_string(),
             nqn: subsystem_nqn(volume),
-            serial,
+            serial: serial_of(volume),
             nsze: size / LBA_SIZE,
             uuid: hash.as_bytes()[..16].try_into().unwrap(),
             life: ExportLife::new(),
+            io: Arc::new(SwitchableIo::new(io)),
         }
+    }
+}
+
+/// The namespace's serial number. SN is 20 bytes and must differ between
+/// subsystems: names too long to fit after the prefix are replaced by a hash.
+fn serial_of(volume: &str) -> String {
+    if volume.len() <= 12 && volume.is_ascii() {
+        format!("RAIDISH-{}", volume)
+    } else {
+        let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
+        format!("RAIDISH-{}", &hash.to_hex()[..12])
     }
 }
 
@@ -270,7 +297,7 @@ struct QueueInfo {
 struct Target<D: BlockDevice> {
     fs: Arc<FileSystem<D>>,
     /// By subsystem NQN.
-    exports: Mutex<BTreeMap<String, Arc<Export>>>,
+    exports: ExportTable<Export>,
     ctrls: Mutex<HashMap<u16, Arc<Controller>>>,
     next_cntlid: AtomicU16,
 }
@@ -297,12 +324,10 @@ pub struct NvmeTcpServer<D: BlockDevice> {
 }
 
 /// The NVMe/TCP port.
-#[allow(dead_code)]
 pub const NVME_PORT: u16 = 4420;
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-#[allow(dead_code)]
 impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
@@ -320,7 +345,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         NvmeTcpServer {
             target: Arc::new(Target {
                 fs,
-                exports: Mutex::new(BTreeMap::new()),
+                exports: ExportTable::new("nvme", subsystem_nqn),
                 ctrls: Mutex::new(HashMap::new()),
                 next_cntlid: AtomicU16::new(1),
             }),
@@ -329,41 +354,14 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         }
     }
 
-    /// Export volume `volume` as subsystem `subsystem_nqn(volume)`.
-    pub async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
-        let nqn = subsystem_nqn(volume);
-        if volume.is_empty() || nqn.len() > MAX_NQN || volume.contains('\0') {
+    fn check_name(volume: &str) -> Result<(), FileSystemError> {
+        if volume.is_empty() || subsystem_nqn(volume).len() > MAX_NQN || volume.contains('\0') {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume name '{}' does not fit in an NQN",
                 volume
             )));
         }
-        let size = self.target.fs.open_volume(volume).await?.size_bytes;
-        let mut exports = self.target.exports.lock().unwrap();
-        if exports.contains_key(&nqn) {
-            return Err(FileSystemError::AlreadyExists);
-        }
-        exports.insert(nqn, Arc::new(Export::new(volume, size)));
         Ok(())
-    }
-
-    /// Stop exporting `volume`: new connects are refused, its queues are
-    /// closed once their in-flight commands finish, then everything is
-    /// committed. Returns false if it wasn't exported.
-    pub async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
-        let nqn = subsystem_nqn(volume);
-        let Some(export) = self.target.exports.lock().unwrap().remove(&nqn) else {
-            return Ok(false);
-        };
-        export.life.close(&format!("nvme: {}", nqn)).await;
-        self.target.fs.sync().await?;
-        Ok(true)
-    }
-
-    /// Names of the exported volumes, sorted by NQN.
-    pub fn exports(&self) -> Vec<String> {
-        let exports = self.target.exports.lock().unwrap();
-        exports.values().map(|e| e.volume.clone()).collect()
     }
 
     /// Bind `bind:port` and serve until the listener fails.
@@ -375,7 +373,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Serve connections from an already-bound listener.
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         ensure_sync_loop(&self.target.fs, "nvme");
-        for e in self.target.exports.lock().unwrap().values() {
+        for e in self.target.exports.all() {
             println!(
                 "NVMe/TCP target {} (volume '{}', {} x {} byte LBAs)",
                 e.nqn, e.volume, e.nsze, LBA_SIZE
@@ -383,15 +381,56 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         }
         println!("NVMe/TCP listening on {}", listener.local_addr()?);
 
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            let target = self.target.clone();
-            tokio::spawn(async move {
+        let target = self.target.clone();
+        crate::net::accept_loop(listener, "nvme", move |stream, addr| {
+            let target = target.clone();
+            async move {
                 if let Err(e) = handle_connection(target, stream, addr.to_string()).await {
                     eprintln!("nvme: {}: {}", addr, e);
                 }
-            });
-        }
+            }
+        })
+        .await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
+    /// Exported as subsystem `subsystem_nqn(volume)`.
+    async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
+        Self::check_name(volume)?;
+        let size = self.target.fs.open_dataset(volume).await?.size_bytes;
+        let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
+        self.add_export_io(volume, size, io)
+    }
+
+    fn add_export_io(
+        &self,
+        volume: &str,
+        size: u64,
+        io: Arc<dyn VolumeIo>,
+    ) -> Result<(), FileSystemError> {
+        Self::check_name(volume)?;
+        self.target.exports.insert(Export::new(volume, size, io))
+    }
+
+    fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
+        self.target.exports.export_io(volume)
+    }
+
+    fn peer_export(&self, volume: &str) -> Option<crate::peer_io::PeerExport> {
+        self.target.exports.peer_export(volume)
+    }
+
+    async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
+        self.target.exports.remove(volume).await
+    }
+
+    /// Sorted by NQN.
+    #[cfg(test)]
+    fn exports(&self) -> Vec<String> {
+        self.target.exports.volumes()
     }
 }
 
@@ -684,12 +723,21 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
 ) -> std::io::Result<()> {
     let queue = conn.queue.lock().unwrap().clone();
     let completion = if sqe.opcode() == OPC_FABRICS {
+        if let Some(q) = queue.as_ref().filter(|q| q.qid == 0)
+            && shutdown_requested(&sqe)
+        {
+            // Normal or abrupt shutdown (CC.SHN): what was written must be
+            // durable before shutdown is reported complete.
+            if let Err(e) = q.ctrl.export.io.flush().await {
+                eprintln!("nvme: {}: flush on shutdown failed: {}", conn.peer, e);
+            }
+        }
         fabrics(conn, &queue, &sqe, &data)
     } else {
         match &queue {
             None => Some(Completion::generic(SC_CMD_SEQ_ERROR)),
             Some(q) if q.qid == 0 => admin(conn, q, &sqe, &data),
-            Some(q) => Some(io(conn, q, &sqe, &data).await),
+            Some(q) => Some(io(q, &sqe, &data).await),
         }
     };
 
@@ -712,6 +760,13 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
         c.status
     );
     send_completion(conn, sqe.cid(), c).await
+}
+
+/// A Property Set of CC asking for shutdown (CC.SHN != 0).
+fn shutdown_requested(sqe: &Sqe) -> bool {
+    sqe.fctype() == FCT_PROP_SET
+        && le32(&sqe.0, 44) == PROP_CC
+        && (le32(&sqe.0, 48) >> 14) & 0x3 != 0
 }
 
 fn fabrics<D: BlockDevice>(
@@ -745,7 +800,7 @@ fn fabrics<D: BlockDevice>(
                 dw0: ((in_data as u32) << 16) | offset,
                 ..Completion::err(SCT_FABRICS, SC_CONNECT_INVALID_PARAM)
             };
-            let Some(export) = target.exports.lock().unwrap().get(&subnqn).cloned() else {
+            let Some(export) = target.exports.by_key(&subnqn) else {
                 return Some(bad(true, 256));
             };
             if sqsize == 0 || sqsize >= QUEUE_ENTRIES {
@@ -834,8 +889,8 @@ fn fabrics<D: BlockDevice>(
                     regs.csts &= !1;
                 }
                 if (cc >> 14) & 0x3 != 0 {
-                    // Shutdown requested: nothing to drain beyond a commit,
-                    // which the host follows with FLUSH anyway. Report complete.
+                    // Shutdown requested: flushed already (see `execute`).
+                    // Report complete.
                     regs.csts = (regs.csts & !0xc) | (0x2 << 2);
                 }
                 regs.cc = cc;
@@ -926,18 +981,29 @@ fn admin<D: BlockDevice>(
     })
 }
 
-async fn io<D: BlockDevice + Send + Sync + 'static>(
-    conn: &Conn<D>,
-    q: &QueueInfo,
+/// Force Unit Access (CDW12 bit 30) on a write or write zeroes: with the
+/// volatile write cache advertised, the write completes only once durable
+/// (filesystem journals rely on it in place of a separate FLUSH).
+async fn fua(
+    io: &SwitchableIo,
     sqe: &Sqe,
-    data: &[u8],
+    fail: &impl Fn(&str, crate::fs::FileSystemError) -> Completion,
 ) -> Completion {
+    if sqe.cdw(12) & (1 << 30) == 0 {
+        return Completion::ok();
+    }
+    match io.flush().await {
+        Ok(()) => Completion::ok(),
+        Err(e) => fail("FUA flush", e),
+    }
+}
+
+async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
     if sqe.nsid() != 1 {
         return Completion::generic(SC_INVALID_NS);
     }
     let export = &q.ctrl.export;
-    let fs = &conn.target.fs;
-    let name = &export.volume;
+    let io = &export.io;
 
     let range = |slba: u64, nlb: u64| -> Option<(u64, usize)> {
         let end = slba.checked_add(nlb)?;
@@ -945,10 +1011,8 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
     };
     let fail = |what: &str, e: crate::fs::FileSystemError| {
         eprintln!("nvme: {} {} failed: {}", what, sqe.cid(), e);
-        match e {
-            crate::fs::FileSystemError::UnableToAllocateBlocks(_) => {
-                Completion::generic(SC_CAPACITY_EXCEEDED)
-            }
+        match e.kind() {
+            crate::types::ErrorKind::NoSpace => Completion::generic(SC_CAPACITY_EXCEEDED),
             _ => Completion::generic(SC_INTERNAL),
         }
     };
@@ -964,7 +1028,7 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                         return Completion::generic(SC_INVALID_FIELD);
                     }
                     let mut buf = vec![0u8; len];
-                    match fs.block_read(name, offset, &mut buf).await {
+                    match io.read(offset, &mut buf).await {
                         Ok(_) => Completion::with_data(buf),
                         Err(e) => fail("read", e),
                     }
@@ -973,18 +1037,18 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                     if data.len() != len {
                         return Completion::generic(SC_DATA_XFER_ERROR);
                     }
-                    match fs.block_write(name, offset, data).await {
-                        Ok(_) => Completion::ok(),
+                    match io.write(offset, data).await {
+                        Ok(_) => fua(io, sqe, &fail).await,
                         Err(e) => fail("write", e),
                     }
                 }
-                _ => match fs.block_zero(name, offset, len).await {
-                    Ok(_) => Completion::ok(),
+                _ => match io.zero(offset, len).await {
+                    Ok(_) => fua(io, sqe, &fail).await,
                     Err(e) => fail("write zeroes", e),
                 },
             }
         }
-        IO_FLUSH => match fs.sync().await {
+        IO_FLUSH => match io.flush().await {
             Ok(()) => Completion::ok(),
             Err(e) => fail("flush", e),
         },
@@ -1003,7 +1067,7 @@ async fn io<D: BlockDevice + Send + Sync + 'static>(
                     let Some((offset, len)) = range(le64(r, 8), nlb) else {
                         return Completion::generic(SC_LBA_RANGE);
                     };
-                    if let Err(e) = fs.block_zero(name, offset, len).await {
+                    if let Err(e) = io.zero(offset, len).await {
                         return fail("deallocate", e);
                     }
                 }

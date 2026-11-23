@@ -70,6 +70,7 @@ impl Conn {
             .timeout(option.hard_ttl())
             .header(super::FINGERPRINT_HEADER, &self.fingerprint)
             .header(super::TO_HEADER, self.target.to_string())
+            .header(super::PROTOCOL_HEADER, super::RAFT_PROTOCOL.to_string())
             .json(req)
             .send()
             .await
@@ -80,11 +81,25 @@ impl Conn {
                     RPCError::Network(NetworkError::new(&e))
                 }
             })?;
+        if resp.status() == reqwest::StatusCode::UPGRADE_REQUIRED {
+            let e = std::io::Error::other(format!(
+                "{} refused us: it speaks another Raft protocol than our {} (every node \
+                 must run the same raidish)",
+                addr,
+                super::RAFT_PROTOCOL
+            ));
+            return Err(RPCError::Unreachable(Unreachable::new(&e)));
+        }
         if resp.status() == reqwest::StatusCode::CONFLICT {
             let e = std::io::Error::other(format!(
                 "{} refused us: its pool config disagrees with ours (disk order?)",
                 addr
             ));
+            return Err(RPCError::Unreachable(Unreachable::new(&e)));
+        }
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            // A node catching up after losing its Raft state: no vote.
+            let e = std::io::Error::other(format!("{} isn't voting yet (catching up)", addr));
             return Err(RPCError::Unreachable(Unreachable::new(&e)));
         }
         let result: Result<Resp, RaftError<NodeId, E>> = resp

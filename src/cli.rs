@@ -1,11 +1,18 @@
 //! The `raidish` command line (native only).
 
+use crate::committer::PoolAdmin;
 use crate::config::Config;
 use crate::disk::BlockDevice;
-use crate::disks::DiskSet;
 use crate::fs::FileSystem;
+use crate::inode::DatasetProps;
+use crate::send::StreamReport;
+use crate::snapshot::SnapshotInfo;
+use crate::types::Txg;
+use crate::types::{DatasetName, SnapshotRef};
 use crate::vdev::Topology;
-use crate::{api, cluster, disk, fs, nbd, nvme, scan};
+use crate::volume::VolumeInfo;
+use crate::writer::CommitError;
+use crate::{cluster, fs, nbd, nvme, scan};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::{path::Path, path::PathBuf};
@@ -26,7 +33,7 @@ struct Cli {
 
     /// Open the committed state of exactly this TXG (see `status`).
     #[arg(long, global = true)]
-    txg: Option<u64>,
+    txg: Option<Txg>,
 
     #[command(subcommand)]
     command: Commands,
@@ -53,7 +60,7 @@ enum Commands {
         name: String,
     },
     Block {
-        name: String,
+        name: DatasetName,
         size: u64,
     },
     Delete {
@@ -117,12 +124,30 @@ enum Commands {
     Status,
     Listen {
         #[arg(short, long)]
-        port: Option<u32>,
+        port: Option<u16>,
 
         /// Never become the pool's committer (leaves the `pool` lease free
         /// for maintenance: fsck --repair, format, defrag).
         #[arg(long)]
         no_committer: bool,
+    },
+    /// Serve the Kubernetes CSI driver (`csi.raidish.io`) on a unix socket:
+    /// pods get raidish volumes as persistent volumes. Runs as root on every
+    /// node, next to `listen`.
+    Csi {
+        /// The socket (`unix:///path` or a path).
+        #[arg(
+            long,
+            default_value = "/var/lib/kubelet/plugins/csi.raidish.io/csi.sock"
+        )]
+        endpoint: String,
+        /// This node's name in the cluster (`node-0`), the CSI node id.
+        #[arg(long)]
+        node: String,
+        /// This node's `listen` API, for its agent's status (default:
+        /// https://127.0.0.1:8881).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// The control plane: members, leader, leases.
     Cluster {
@@ -134,14 +159,71 @@ enum Commands {
         #[command(subcommand)]
         command: VolumeCommands,
     },
+    /// Service datasets (etcd keyspaces, S3 buckets, SQS queues) and where
+    /// they run (through the committer).
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommands,
+    },
+    /// VMs whose disks are volumes, run through libvirt.
+    Vm {
+        #[command(subcommand)]
+        command: crate::cli_vm::VmCommands,
+    },
+    /// The nodes themselves: host, libvirt, what live migration needs.
+    Node {
+        #[command(subcommand)]
+        command: crate::cli_vm::NodeCommands,
+    },
+    /// The cluster's certificate authority: issue node and client certs.
+    Cert {
+        #[command(subcommand)]
+        command: crate::cli_pki::CertCommands,
+    },
+    /// Tokens for the dashboard and scripts (signed by your admin cert).
+    Token {
+        #[command(subcommand)]
+        command: crate::cli_pki::TokenCommands,
+    },
 }
 
 #[derive(Subcommand)]
 enum VolumeCommands {
     /// Create a volume of `size` bytes.
-    Create { name: String, size: u64 },
-    /// Delete a volume (it must not be running).
+    Create { name: DatasetName, size: u64 },
+    /// Delete a volume (it must not be running), or a snapshot
+    /// (`volume@snapshot`).
     Delete { name: String },
+    /// Snapshot a volume as last committed: `volume@snapshot`.
+    Snapshot { name: SnapshotRef },
+    /// List a volume's snapshots.
+    Snapshots { name: String },
+    /// Make volume `name` from snapshot `snapshot` (`volume@snapshot`).
+    Clone {
+        snapshot: SnapshotRef,
+        name: DatasetName,
+    },
+    /// Roll a volume back to its newest snapshot, discarding every write
+    /// since (it must not be running).
+    Rollback { name: String },
+    /// Write snapshot `volume@snapshot` to stdout as a stream: all of it,
+    /// or (`--from`) what changed since an older snapshot of it.
+    Send {
+        snapshot: SnapshotRef,
+
+        /// The older snapshot (its short name) the receiver already has.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Receive a stream from stdin into volume `name`: a full stream makes
+    /// the volume, an incremental one goes onto its newest snapshot.
+    Recv {
+        name: String,
+        /// Roll the volume back to its newest snapshot first if it was
+        /// written since.
+        #[arg(long)]
+        force: bool,
+    },
     /// List volumes with their placement settings.
     List,
     /// Change where and how a volume runs.
@@ -164,9 +246,51 @@ enum VolumeCommands {
 }
 
 #[derive(Subcommand)]
+enum DatasetCommands {
+    /// List the pool's datasets (all formats) and where services run.
+    List,
+    /// Create a service dataset: `--format etcd --port 2379`, `--format
+    /// s3` (a bucket) or `--format queue`.
+    Create {
+        name: String,
+        #[arg(long)]
+        format: String,
+        /// An etcd dataset's client port (every node listens on it).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Nodes that may run it, most preferred first (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        nodes: Option<Vec<String>>,
+    },
+    /// Delete a service dataset and everything in it (stopped first).
+    Delete { name: String },
+    /// Change where and how a dataset runs.
+    Set {
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        nodes: Option<Vec<String>>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ClusterCommands {
     /// Show members, the leader and who holds which lease.
     Status,
+    /// Attach volume `volume` to these nodes at once (comma separated,
+    /// preferred writer first): each exports it, one writes it, the others
+    /// proxy to it; a writer taken off the list hands it to the next. No
+    /// nodes: back to its own placement.
+    Attach {
+        volume: String,
+        #[arg(long, value_delimiter = ',', default_value = "")]
+        nodes: Vec<String>,
+    },
 }
 
 impl Commands {
@@ -188,13 +312,23 @@ impl Commands {
                 ..
             } => *repair || *rebuild_spacemaps,
             Commands::Defrag { check, .. } => !check,
-            Commands::Volume { command } => !matches!(command, VolumeCommands::List),
+            Commands::Volume { command } => !matches!(
+                command,
+                VolumeCommands::List
+                    | VolumeCommands::Snapshots { .. }
+                    | VolumeCommands::Send { .. }
+            ),
             _ => false,
         }
     }
 
     /// What the lease says this writer is doing.
-    fn describe(&self) -> String {
+    fn describe(&self) -> crate::types::Holder {
+        crate::types::Holder::new(crate::types::HolderRole::Tool, None)
+            .with_detail(self.describe_text())
+    }
+
+    fn describe_text(&self) -> String {
         match self {
             Commands::Nbd { name, .. } => format!("nbd {}", name),
             Commands::Nvme { name } => format!("nvme {}", name),
@@ -264,15 +398,15 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
     let Some(pool) = fs.dev.pool() else {
         return;
     };
-    let tolerance = pool.topology.fault_tolerance();
+    let tolerance = pool.topology().fault_tolerance();
     println!(
         "layout: {} (survives any {} failed disk{})",
-        pool.topology.summary(),
+        pool.topology().summary(),
         tolerance,
         if tolerance == 1 { "" } else { "s" }
     );
     let mut lines = Vec::new();
-    for d in 0..pool.disks.len() {
+    for d in 0..pool.disks().len() {
         let label = match fs.check_disk_label(d).await {
             fs::LabelState::Ok => "label ok",
             fs::LabelState::Offline => "OFFLINE",
@@ -285,12 +419,12 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
         lines.push(format!(
             "disk {} {:<40} {:<24} {}",
             d,
-            pool.disks.disks[d].path(),
+            pool.disks().disk(d).path(),
             label,
             state
         ));
     }
-    print_tree(&pool.topology, &lines, 1);
+    print_tree(pool.topology(), &lines, 1);
 }
 
 fn print_tree(t: &Topology, disk_lines: &[String], depth: usize) {
@@ -329,107 +463,91 @@ async fn open_fs<D: BlockDevice>(dev: D, read_only: bool, rewind: fs::Rewind) ->
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
+    // A one-shot command piped into `head` should end quietly once the
+    // reader is gone, as other command line tools do (Rust ignores SIGPIPE,
+    // so `println!` would panic instead). Servers keep ignoring it: a peer
+    // hanging up must not kill them.
+    if !matches!(
+        cli.command,
+        Commands::Listen { .. }
+            | Commands::Csi { .. }
+            | Commands::Nbd { .. }
+            | Commands::Nvme { .. }
+    ) {
+        // SAFETY: setting a signal disposition before any other thread
+        // could depend on it; SIG_DFL has no handler to be unsafe in.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+    // Certificates are managed without (or before there is) a config.
+    if let Commands::Cert { command } = &cli.command {
+        let config_path = cli.config.clone();
+        crate::cli_pki::run(command, &move || {
+            let config = load_config(&config_path).unwrap_or_else(|e| fail(e));
+            config
+                .pool_spec()
+                .unwrap_or_else(|e| fail(e))
+                .map(|s| s.paths)
+                .unwrap_or_default()
+        });
+        return Ok(());
+    }
     let config = load_config(&cli.config)?;
+    crate::tls::init(config.tls.as_ref()).unwrap_or_else(|e| fail(e));
+    if let Ok(Some(spec)) = config.pool_spec() {
+        crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
+    }
+    if let Commands::Token { command } = &cli.command {
+        if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
+            crate::cli_pki::s3_key(command, &config).await;
+        } else {
+            crate::cli_pki::run_token(command, &config);
+        }
+        return Ok(());
+    }
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
     if let Commands::Listen { port, no_committer } = &cli.command {
-        let serve = config.serve_disks().unwrap_or_else(|e| fail(e));
-        let paths: Vec<&str> = serve.iter().map(|s| s.as_str()).collect();
-        let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
-        let pool = match &spec {
-            // Serving the pool's own disks: share them.
-            Some(spec) if spec.paths == serve => Some(spec.on(disks.clone())),
-            Some(spec) => Some(spec.open(opts).await),
-            None => None,
-        };
-        let port = port.unwrap_or(8881);
-        let members = config
-            .cluster_members(port as u16)
-            .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
-        // The node's name comes from its id: the pool position of its first disk.
-        let name = format!("node-{}", members.me);
-        let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
-            Some(d) => expand_tilde(d).join(&name),
-            None => cluster::default_data_dir(&name),
-        };
-        println!(
-            "cluster: node {} ({}), {} member{}",
-            members.me,
-            name,
-            members.disks.len(),
-            if members.disks.len() == 1 { "" } else { "s" }
-        );
-        let pool_map = config
-            .pool_map(port as u16)
-            .unwrap_or_else(|e| fail(format!("dashboard: {}", e)));
-        let floor = Arc::new(crate::fence::ServerFence::default());
-        if let Some(map) = &pool_map {
-            // Requests name the served disk; fencing works in pool disks.
-            floor.set_served(
-                map.disks
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pool_idx, d)| match d {
-                        crate::inspect::DiskAddr::This(i) => Some((*i as usize, pool_idx)),
-                        _ => None,
-                    })
-                    .collect(),
-            );
-        }
-        let node = cluster::Cluster::start(&name, members, data_dir, floor.clone())
+        crate::server::listen(&config, spec, opts, *port, *no_committer)
             .await
-            .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
-        let slot: crate::committer::CommitterSlot = Default::default();
-        let agent_state: crate::agent::AgentState = Default::default();
-        let me = format!("http://127.0.0.1:{}", port);
-        if let (Some(spec), Some(map)) = (&spec, &pool_map) {
-            // This node's own disks through its own disk server, so the
-            // committer's writes are fenced like everyone else's.
-            let access = crate::committer::PoolAccess {
-                spec: crate::config::PoolSpec {
-                    paths: map
-                        .disks
-                        .iter()
-                        .map(|d| match d {
-                            crate::inspect::DiskAddr::This(i) => {
-                                format!("{}/api/v1/disks/{}", me, i)
-                            }
-                            crate::inspect::DiskAddr::Url(u) => u.clone(),
-                        })
-                        .collect(),
-                    topology: spec.topology.clone(),
-                },
-                opts,
-            };
-            if !*no_committer {
-                tokio::spawn(crate::committer::run(
-                    slot.clone(),
-                    node.clone(),
-                    access.clone(),
-                    cluster::lease::LeaseClient::new(vec![me.clone()]),
-                    name.clone(),
-                ));
-            }
-            // The committer is wherever the `pool` lease is: ask every node.
-            let mut endpoints = vec![me.clone()];
-            for e in config.lease_endpoints().unwrap_or_default() {
-                if !endpoints.contains(&e) && !cluster::members::is_local_base(&e, port as u16) {
-                    endpoints.push(e);
-                }
-            }
-            let agent = crate::agent::Agent::new(
-                name.clone(),
-                node.clone(),
-                endpoints,
-                access,
-                config.automount.clone(),
-                agent_state.clone(),
-            );
-            tokio::spawn(agent.run());
+            .unwrap_or_else(|e| fail(e));
+        return Ok(());
+    }
+
+    if let Commands::Node { command } = &cli.command {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            fail("no cluster to ask: the pool has no remote disks");
         }
-        println!("dashboard: http://localhost:{}/", port);
-        api::listen(disks, pool, port, node, floor, pool_map, slot, agent_state).await;
+        crate::cli_vm::run_node(command, endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
+        return Ok(());
+    }
+
+    if let Commands::Vm { command } = &cli.command {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        if endpoints.is_empty() {
+            fail("no cluster to ask: the pool has no remote disks");
+        }
+        crate::cli_vm::run(command, endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
+        return Ok(());
+    }
+
+    if let Commands::Csi {
+        endpoint,
+        node,
+        agent,
+    } = &cli.command
+    {
+        let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+        crate::csi::serve(endpoint, node.clone(), agent.clone(), endpoints)
+            .await
+            .unwrap_or_else(|e| fail(e));
         return Ok(());
     }
 
@@ -446,6 +564,21 @@ pub async fn main() -> std::io::Result<()> {
                     .unwrap_or_else(|e| fail(e));
                 print_cluster_status(&status);
             }
+            ClusterCommands::Attach { volume, nodes } => {
+                let nodes: Vec<String> = nodes.iter().filter(|n| !n.is_empty()).cloned().collect();
+                let op = cluster::LeaseOp::SetAttached {
+                    volume: volume.clone(),
+                    nodes: nodes.clone(),
+                };
+                cluster::lease::LeaseClient::new(endpoints)
+                    .call(&op)
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                match nodes.is_empty() {
+                    true => println!("{}: placed as usual", volume),
+                    false => println!("{}: attached to {}", volume, nodes.join(", ")),
+                }
+            }
         }
         return Ok(());
     }
@@ -453,6 +586,17 @@ pub async fn main() -> std::io::Result<()> {
     // A committer runs the pool (see `crate::writer`): volumes are managed
     // through it, and `nbd` / `nvme` run as volume writers.
     let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+    if let Commands::Dataset { command } = &cli.command {
+        if endpoints.is_empty() {
+            fail("datasets are managed through the cluster: no lease endpoints configured");
+        }
+        let client = crate::committer::CommitClient::new(endpoints.clone());
+        if client.committer().await.is_none() {
+            fail("no committer is running (start `raidish listen` on a node)");
+        }
+        dataset_command(command, client, &endpoints).await;
+        return Ok(());
+    }
     if !endpoints.is_empty()
         && matches!(
             cli.command,
@@ -461,6 +605,14 @@ pub async fn main() -> std::io::Result<()> {
                 | Commands::Delete { .. }
                 | Commands::Nbd { .. }
                 | Commands::Nvme { .. }
+        )
+        // Sending only reads (committed snapshots never change): any node
+        // can, straight from the disks.
+        && !matches!(
+            cli.command,
+            Commands::Volume {
+                command: VolumeCommands::Send { .. }
+            }
         )
     {
         let client = crate::committer::CommitClient::new(endpoints.clone());
@@ -476,6 +628,7 @@ pub async fn main() -> std::io::Result<()> {
     // The pool's one writer: take the lease before touching any disk, so
     // our first requests already carry the new epoch (that is what fences
     // out a previous writer).
+    let fence = Arc::new(crate::fence::ClientFence::default());
     let lease = if cli.command.writes() {
         let endpoints = config.lease_endpoints().unwrap_or_else(|e| fail(e));
         if endpoints.is_empty() {
@@ -485,12 +638,12 @@ pub async fn main() -> std::io::Result<()> {
             let held = cluster::lease::HeldLease::acquire(
                 client,
                 cluster::state::POOL,
-                &cli.command.describe(),
+                cli.command.describe(),
             )
             .await
             .unwrap_or_else(|e| fail(format!("cannot take the pool lease: {}", e)));
-            disk::set_lease_epoch(held.epoch);
-            disk::on_stale_epoch(|| {
+            fence.set_pool_epoch(held.epoch);
+            fence.on_stale(|| {
                 eprintln!("Error: another writer has taken over the pool; stopping");
                 std::process::exit(3);
             });
@@ -513,18 +666,20 @@ pub async fn main() -> std::io::Result<()> {
         (true, None) => fs::Rewind::Auto,
         (false, None) => fs::Rewind::None,
     };
-    let raid = spec.open(opts).await;
+    let raid = spec.open_fenced(opts, fence).await;
 
     match cli.command {
         Commands::Nbd { name, size: _ } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
-            nbd::serve_nbd(fs, name, 10809).await.unwrap();
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
+            nbd::serve_nbd(fs, name, nbd::NBD_PORT).await.unwrap();
         }
         Commands::Nvme { name } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL);
-            let server = nvme::NvmeTcpServer::new(fs, name, 4420).await.unwrap();
+            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
+            let server = nvme::NvmeTcpServer::new(fs, name, nvme::NVME_PORT)
+                .await
+                .unwrap();
             server.run().await.unwrap();
         }
         Commands::Scrub { dry_run } => {
@@ -607,8 +762,7 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Block { name, size } => {
             let fs = open_fs(raid, false, rewind).await;
-            let vbs = fs.default_volblocksize();
-            fs.create_block(&name, size, vbs).await.unwrap();
+            volume_command(&VolumeCommands::Create { name, size }, &fs).await;
         }
         Commands::Map => {
             let fs = open_fs(raid, true, rewind).await;
@@ -625,35 +779,34 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Read { path } => {
             let fs = open_fs(raid, true, rewind).await;
-            let data = fs.read_file(&Path::new(&path)).await.unwrap();
+            let data = fs.read_file(Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
         Commands::Inode { file } => {
             let fs = open_fs(raid, true, rewind).await;
-            let inode_ref = fs.file_index.read().await.files.get(&file).unwrap().clone();
-            let inode = fs.read_inode(&inode_ref).await.unwrap();
-            println!("inode: {:?}", inode);
+            let (id, dnode) = fs.stat(Path::new(&file)).await.unwrap();
+            println!("object {}: {:?}", id, dnode);
         }
         Commands::Write { source, dest } => {
             let fs = open_fs(raid, false, rewind).await;
             let file = Path::new(&source);
             let data = std::fs::read(file).unwrap();
-            fs.write_file(&Path::new(&dest), &data).await.unwrap();
+            fs.write_file(Path::new(&dest), &data).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Mkdir { path } => {
             let fs = open_fs(raid, false, rewind).await;
-            fs.mkdir(&Path::new(&path)).await.unwrap();
+            fs.mkdir(Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Ls { path } => {
             let fs = open_fs(raid, true, rewind).await;
-            let ls = fs.ls(&Path::new(&path)).await.unwrap();
+            let ls = fs.ls(Path::new(&path)).await.unwrap();
             println!("ls: {:?}", &ls);
         }
         Commands::Delete { path } => {
             let fs = open_fs(raid, false, rewind).await;
-            fs.delete(&Path::new(&path)).await.unwrap();
+            fs.delete(Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Format { blocks } => {
@@ -676,37 +829,31 @@ pub async fn main() -> std::io::Result<()> {
         }
         Commands::Load => {
             let fs = open_fs(raid, true, rewind).await;
-            println!("index: {:?}", fs.file_index);
+            println!("root: {:?}", fs.ls(Path::new("")).await.unwrap());
         }
         Commands::Volume { command } => {
-            let read_only = matches!(command, VolumeCommands::List);
+            let read_only = matches!(
+                command,
+                VolumeCommands::List
+                    | VolumeCommands::Snapshots { .. }
+                    | VolumeCommands::Send { .. }
+            );
             let fs = open_fs(raid, read_only, rewind).await;
             match command {
-                VolumeCommands::Create { name, size } => {
-                    let vbs = fs.default_volblocksize();
-                    fs.create_block(&name, size, vbs)
-                        .await
-                        .unwrap_or_else(|e| fail(e));
+                VolumeCommands::Send { snapshot, from } => {
+                    send_to_stdout(&fs, &snapshot, from).await
                 }
-                VolumeCommands::Delete { name } => {
-                    fs.delete(Path::new(&name))
-                        .await
-                        .unwrap_or_else(|e| fail(e));
-                    fs.sync().await.unwrap_or_else(|e| fail(e));
-                }
-                VolumeCommands::List => {
-                    print_volumes(&fs.list_volumes().await.unwrap_or_else(|e| fail(e)), None)
-                }
-                cmd @ (VolumeCommands::Set { .. } | VolumeCommands::Move { .. }) => {
-                    let vols = fs.list_volumes().await.unwrap_or_else(|e| fail(e));
-                    let (name, props) = change_props(&cmd, &vols);
-                    fs.set_volume_props(&name, props)
-                        .await
-                        .unwrap_or_else(|e| fail(e));
-                }
+                cmd => volume_command(&cmd, &fs).await,
             }
         }
-        Commands::Listen { .. } | Commands::Cluster { .. } => unreachable!(),
+        Commands::Listen { .. }
+        | Commands::Vm { .. }
+        | Commands::Node { .. }
+        | Commands::Cluster { .. }
+        | Commands::Csi { .. }
+        | Commands::Cert { .. }
+        | Commands::Token { .. }
+        | Commands::Dataset { .. } => unreachable!(),
     }
     if let Some(lease) = lease {
         lease.release().await;
@@ -714,11 +861,174 @@ pub async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// What the volume commands need of a pool: the disks themselves (no
+/// cluster, so this process is the only writer) or the cluster's committer.
+#[async_trait::async_trait]
+trait VolumeAdmin: Sync {
+    async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError>;
+    async fn create_volume(&self, name: &DatasetName, size: u64) -> Result<(), CommitError>;
+    async fn delete_volume(&self, name: &str) -> Result<(), CommitError>;
+    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError>;
+    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError>;
+    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError>;
+    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError>;
+    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError>;
+    async fn rollback(&self, name: &str) -> Result<(), CommitError>;
+    /// Receive the stream on stdin into `name`.
+    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError>;
+    /// For `volume list`: who commits, and the cluster (where volumes run).
+    async fn cluster_view(&self) -> Option<(String, Option<cluster::Status>)> {
+        None
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: BlockDevice + 'static> VolumeAdmin for FileSystem<D> {
+    async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError> {
+        Ok(self.list_volumes().await?)
+    }
+    async fn create_volume(&self, name: &DatasetName, size: u64) -> Result<(), CommitError> {
+        let vbs = self.default_volblocksize();
+        self.create_block(name, size, vbs).await?;
+        Ok(())
+    }
+    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+        Ok(FileSystem::delete_volume(self, name).await?)
+    }
+    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+        Ok(self.set_dataset_props(name, props.clone()).await?)
+    }
+    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+        Ok(self.list_snapshots(name).await?)
+    }
+    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+        Ok(FileSystem::create_snapshot(self, name, snap).await?)
+    }
+    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+        Ok(FileSystem::destroy_snapshot(self, name, snap).await?)
+    }
+    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+        FileSystem::clone_snapshot(self, name, snap, new).await?;
+        Ok(())
+    }
+    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+        Ok(self.rollback_volume(name).await?)
+    }
+    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError> {
+        Ok(self
+            .recv_snapshot(name, &mut tokio::io::stdin(), force)
+            .await?)
+    }
+}
+
+/// The running committer, found through the cluster at `endpoints`.
+struct Remote<'a> {
+    client: crate::committer::CommitClient,
+    info: crate::committer::CommitterInfo,
+    endpoints: &'a [String],
+}
+
+#[async_trait::async_trait]
+impl VolumeAdmin for Remote<'_> {
+    async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError> {
+        self.client.volumes().await
+    }
+    async fn create_volume(&self, name: &DatasetName, size: u64) -> Result<(), CommitError> {
+        self.client.create_volume(name, size).await
+    }
+    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+        self.client.delete_volume(name).await
+    }
+    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+        self.client.set_props(name, props).await
+    }
+    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+        self.client.snapshots(name).await
+    }
+    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+        self.client.create_snapshot(name, snap).await
+    }
+    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+        self.client.destroy_snapshot(name, snap).await
+    }
+    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+        self.client.clone_snapshot(name, snap, new).await
+    }
+    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+        self.client.rollback(name).await
+    }
+    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError> {
+        self.client.recv(name, force, tokio::io::stdin()).await
+    }
+    async fn cluster_view(&self) -> Option<(String, Option<cluster::Status>)> {
+        let status = cluster::lease::LeaseClient::new(self.endpoints.to_vec())
+            .status()
+            .await
+            .ok();
+        let who = format!("committer: {} (epoch {})", self.info.node, self.info.epoch);
+        Some((who, status))
+    }
+}
+
+/// Run a volume command (all but `send`, which reads the disks directly)
+/// against `pool`.
+async fn volume_command(cmd: &VolumeCommands, pool: &impl VolumeAdmin) {
+    let ok = |r: Result<(), CommitError>| r.unwrap_or_else(|e| fail(e));
+    match cmd {
+        VolumeCommands::Create { name, size } => ok(pool.create_volume(name, *size).await),
+        VolumeCommands::Delete { name } if name.contains('@') => {
+            let r: SnapshotRef = name.parse().unwrap_or_else(|e| fail(e));
+            ok(pool
+                .destroy_snapshot(r.volume.as_str(), r.snap.as_str())
+                .await)
+        }
+        VolumeCommands::Delete { name } => ok(pool.delete_volume(name).await),
+        VolumeCommands::Snapshot { name } => {
+            let txg = pool
+                .create_snapshot(name.volume.as_str(), name.snap.as_str())
+                .await
+                .unwrap_or_else(|e| fail(e));
+            println!("{} at TXG {}", name, txg);
+        }
+        VolumeCommands::Snapshots { name } => {
+            print_snapshots(&pool.snapshots(name).await.unwrap_or_else(|e| fail(e)))
+        }
+        VolumeCommands::Clone { snapshot, name } => ok(pool
+            .clone_snapshot(snapshot.volume.as_str(), snapshot.snap.as_str(), name)
+            .await),
+        VolumeCommands::Rollback { name } => ok(pool.rollback(name).await),
+        VolumeCommands::Recv { name, force } => {
+            let r = pool
+                .recv_stdin(name, *force)
+                .await
+                .unwrap_or_else(|e| fail(e));
+            eprintln!("received {}", r);
+        }
+        VolumeCommands::List => {
+            let vols = pool.volumes().await.unwrap_or_else(|e| fail(e));
+            let status = match pool.cluster_view().await {
+                Some((who, status)) => {
+                    println!("{}", who);
+                    status
+                }
+                None => None,
+            };
+            print_volumes(&vols, status.as_ref());
+        }
+        VolumeCommands::Set { .. } | VolumeCommands::Move { .. } => {
+            let vols = pool.volumes().await.unwrap_or_else(|e| fail(e));
+            let (name, props) = change_props(cmd, &vols);
+            ok(pool.set_props(&name, &props).await)
+        }
+        VolumeCommands::Send { .. } => unreachable!("sent from the disks"),
+    }
+}
+
 /// The volume and its new settings for `volume set` / `volume move`.
 fn change_props(
     cmd: &VolumeCommands,
     vols: &[crate::volume::VolumeInfo],
-) -> (String, crate::inode::VolumeProps) {
+) -> (String, crate::inode::DatasetProps) {
     let name = match cmd {
         VolumeCommands::Set { name, .. } | VolumeCommands::Move { name, .. } => name,
         _ => unreachable!(),
@@ -764,6 +1074,91 @@ fn change_props(
     (name.clone(), props)
 }
 
+/// `volume send`: the stream to stdout (which mustn't be a terminal), the
+/// report to stderr.
+async fn send_to_stdout(
+    fs: &FileSystem<crate::vdev::Pool>,
+    snapshot: &SnapshotRef,
+    from: Option<String>,
+) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        fail("refusing to write a send stream to a terminal (redirect or pipe it)");
+    }
+    let (v, s) = (snapshot.volume.as_str(), snapshot.snap.as_str());
+
+    let from = from.map(|f| f.rsplit('@').next().unwrap_or_default().to_string());
+    let mut out = tokio::io::BufWriter::with_capacity(4 << 20, tokio::io::stdout());
+    let r = fs
+        .send_snapshot(v, s, from.as_deref(), &mut out)
+        .await
+        .unwrap_or_else(|e| fail(e));
+    eprintln!("sent {}", r);
+}
+
+fn print_snapshots(snaps: &[crate::snapshot::SnapshotInfo]) {
+    if snaps.is_empty() {
+        println!("no snapshots");
+        return;
+    }
+    println!(
+        "{:<32} {:>8} {:>10}  {:<20} CLONES",
+        "NAME", "TXG", "UNIQUE", "CREATED"
+    );
+    for s in snaps {
+        let created = chrono_like(s.created_ns);
+        println!(
+            "{:<32} {:>8} {:>10}  {:<20} {}",
+            s.name,
+            s.txg,
+            human_bytes(s.unique_bytes),
+            created,
+            if s.clones.is_empty() {
+                "-".into()
+            } else {
+                s.clones.join(",")
+            }
+        );
+    }
+}
+
+/// `bytes` as K/M/G.
+fn human_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= (1u64 << 30) as f64 {
+        format!("{:.1}G", b / (1u64 << 30) as f64)
+    } else if b >= (1u64 << 20) as f64 {
+        format!("{:.1}M", b / (1u64 << 20) as f64)
+    } else {
+        format!("{:.0}K", b / 1024.0)
+    }
+}
+
+/// ns since the epoch as `YYYY-MM-DD HH:MM:SS` (UTC).
+fn chrono_like(ns: u64) -> String {
+    let secs = ns / 1_000_000_000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::Status>) {
     if vols.is_empty() {
         println!("no volumes");
@@ -777,10 +1172,8 @@ fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::St
         let running = status
             .and_then(|s| {
                 s.state
-                    .leases
-                    .get(&crate::committer::volume_resource(&v.name))
-                    .filter(|l| !l.released && l.expires_ms > s.now_ms)
-                    .map(|l| l.desc.clone())
+                    .live_lease(&crate::committer::dataset_resource(&v.name), s.now_ms)
+                    .map(|l| l.holder.to_string())
             })
             .unwrap_or_else(|| "-".into());
         println!(
@@ -799,6 +1192,139 @@ fn print_volumes(vols: &[crate::volume::VolumeInfo], status: Option<&cluster::St
     }
 }
 
+fn parse_format(f: &str) -> crate::dataset::DatasetFormat {
+    use crate::dataset::DatasetFormat as F;
+    match f {
+        "etcd" => F::Etcd,
+        "s3" | "bucket" => F::S3,
+        "queue" | "sqs" => F::Queue,
+        f => fail(format!(
+            "unknown service format '{}' (etcd, s3 or queue)",
+            f
+        )),
+    }
+}
+
+/// Run a dataset command against the running committer.
+async fn dataset_command(
+    command: &DatasetCommands,
+    client: crate::committer::CommitClient,
+    endpoints: &[String],
+) {
+    let ok = |r: Result<(), crate::writer::CommitError>| r.unwrap_or_else(|e| fail(e));
+    match command {
+        DatasetCommands::List => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let status = cluster::lease::LeaseClient::new(endpoints.to_vec())
+                .status()
+                .await
+                .ok();
+            if ds.is_empty() {
+                println!("no datasets");
+                return;
+            }
+            println!(
+                "{:<20} {:<6} {:<6} {:<8} {:<20} RUNNING",
+                "NAME", "FORMAT", "PORT", "ENABLED", "NODES"
+            );
+            for d in ds {
+                let running = status
+                    .as_ref()
+                    .and_then(|s| s.state.dataset_node(&d.name, s.now_ms).map(str::to_string))
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<20} {:<6} {:<6} {:<8} {:<20} {}",
+                    d.name,
+                    d.format.name(),
+                    d.props.port.map_or("-".to_string(), |p| p.to_string()),
+                    if d.props.enabled { "yes" } else { "no" },
+                    if d.props.nodes.is_empty() {
+                        "(any)".to_string()
+                    } else {
+                        d.props.nodes.join(",")
+                    },
+                    running
+                );
+            }
+        }
+        DatasetCommands::Create {
+            name,
+            format,
+            port,
+            nodes,
+        } => {
+            let req = crate::committer::CreateDataset {
+                name: crate::types::DatasetName::user(name).unwrap_or_else(|e| fail(e)),
+
+                format: parse_format(format),
+                props: crate::inode::DatasetProps {
+                    port: *port,
+                    nodes: nodes.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+            };
+            ok(client.create_dataset(&req).await)
+        }
+        DatasetCommands::Delete { name } => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let Some(d) = ds.into_iter().find(|d| &d.name == name) else {
+                fail(format!("no dataset '{}'", name));
+            };
+            if !d.format.is_service() {
+                fail(format!(
+                    "'{}' is a {} dataset: delete it with `volume delete`",
+                    name,
+                    d.format.name()
+                ));
+            }
+            // Stopped everywhere first (the committer refuses a dataset in
+            // use).
+            if d.props.enabled {
+                let props = crate::inode::DatasetProps {
+                    enabled: false,
+                    ..d.props.clone()
+                };
+                ok(client.set_props(name, &props).await);
+            }
+            let mut last = None;
+            for _ in 0..60 {
+                match client.delete_dataset(name).await {
+                    Ok(()) => return,
+                    Err(e) => last = Some(e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            fail(last.unwrap())
+        }
+        DatasetCommands::Set {
+            name,
+            nodes,
+            port,
+            enable,
+            disable,
+        } => {
+            let ds = client.datasets().await.unwrap_or_else(|e| fail(e));
+            let Some(d) = ds.into_iter().find(|d| &d.name == name) else {
+                fail(format!("no dataset '{}'", name));
+            };
+            let mut props = d.props;
+            if let Some(n) = nodes {
+                props.nodes = n.iter().filter(|n| !n.is_empty()).cloned().collect();
+            }
+            if port.is_some() {
+                props.port = *port;
+            }
+            if *enable {
+                props.enabled = true;
+            }
+            if *disable {
+                props.enabled = false;
+            }
+            ok(client.set_props(name, &props).await)
+        }
+    }
+}
+
 /// Run a volume command against a running committer.
 async fn via_committer(
     command: &Commands,
@@ -808,45 +1334,38 @@ async fn via_committer(
     spec: crate::config::PoolSpec,
     opts: crate::disk::DiskOptions,
 ) {
-    let ok = |r: Result<(), crate::writer::CommitError>| r.unwrap_or_else(|e| fail(e));
+    let remote = Remote {
+        client,
+        info,
+        endpoints,
+    };
     match command {
-        Commands::Block { name, size }
-        | Commands::Volume {
-            command: VolumeCommands::Create { name, size },
-        } => ok(client.create_volume(name, *size).await),
-        Commands::Delete { path: name }
-        | Commands::Volume {
-            command: VolumeCommands::Delete { name },
-        } => ok(client.delete_volume(name).await),
-        Commands::Volume {
-            command: VolumeCommands::List,
-        } => {
-            let vols = client.volumes().await.unwrap_or_else(|e| fail(e));
-            let status = cluster::lease::LeaseClient::new(endpoints.to_vec())
-                .status()
-                .await
-                .ok();
-            println!("committer: {} (epoch {})", info.node, info.epoch);
-            print_volumes(&vols, status.as_ref());
+        Commands::Block { name, size } => {
+            let cmd = VolumeCommands::Create {
+                name: name.clone(),
+                size: *size,
+            };
+            volume_command(&cmd, &remote).await
         }
-        Commands::Volume { command: cmd } => {
-            let vols = client.volumes().await.unwrap_or_else(|e| fail(e));
-            let (name, props) = change_props(cmd, &vols);
-            ok(client.set_props(&name, &props).await)
+        Commands::Delete { path } => {
+            let cmd = VolumeCommands::Delete { name: path.clone() };
+            volume_command(&cmd, &remote).await
         }
+        Commands::Volume { command } => volume_command(command, &remote).await,
         Commands::Nbd { name, .. } | Commands::Nvme { name } => {
-            let writer = VolumeWriter::start(endpoints, spec, opts, name, &command.describe())
+            let writer = VolumeWriter::start(endpoints, spec, opts, name, command.describe())
                 .await
                 .unwrap_or_else(|e| fail(e));
-            scan::spawn_health_monitor(writer.fs.clone(), HEALTH_INTERVAL);
+            scan::spawn_health_monitor(writer.fs.clone(), HEALTH_INTERVAL, None);
             if let Commands::Nbd { .. } = command {
-                nbd::serve_nbd(writer.fs.clone(), name.clone(), 10809)
+                nbd::serve_nbd(writer.fs.clone(), name.clone(), nbd::NBD_PORT)
                     .await
                     .unwrap();
             } else {
-                let server = nvme::NvmeTcpServer::new(writer.fs.clone(), name.clone(), 4420)
-                    .await
-                    .unwrap();
+                let server =
+                    nvme::NvmeTcpServer::new(writer.fs.clone(), name.clone(), nvme::NVME_PORT)
+                        .await
+                        .unwrap();
                 server.run().await.unwrap();
             }
         }
@@ -855,9 +1374,11 @@ async fn via_committer(
 }
 
 /// A volume writer process (`nbd` / `nvme` with a committer running): its
-/// `writer/...` and `vol/<name>` leases and the pool opened in writer role.
+/// `writer/...` and `ds/<name>` leases and the pool opened in writer role.
 struct VolumeWriter {
     fs: Arc<FileSystem<crate::vdev::Pool>>,
+    /// Held (renewed) for as long as this writer runs.
+    _leases: [Arc<cluster::lease::HeldLease>; 2],
 }
 
 impl VolumeWriter {
@@ -866,16 +1387,17 @@ impl VolumeWriter {
         spec: crate::config::PoolSpec,
         opts: crate::disk::DiskOptions,
         volume: &str,
-        desc: &str,
+        desc: crate::types::Holder,
     ) -> Result<Self, String> {
         let leases = cluster::lease::LeaseClient::new(endpoints.to_vec());
-        let resource = format!("writer/{}", cluster::lease::owner_id());
-        let writer =
-            Arc::new(cluster::lease::HeldLease::acquire(leases.clone(), &resource, desc).await?);
+        let resource = crate::types::LeaseResource::writer(cluster::lease::owner_id());
+        let writer = Arc::new(
+            cluster::lease::HeldLease::acquire(leases.clone(), resource, desc.clone()).await?,
+        );
         let vol = Arc::new(
             cluster::lease::HeldLease::acquire(
                 leases,
-                &crate::committer::volume_resource(volume),
+                crate::committer::dataset_resource(volume),
                 desc,
             )
             .await?,
@@ -886,22 +1408,24 @@ impl VolumeWriter {
                 std::process::exit(3);
             });
         }
-        let sink = crate::committer::CommitClient::new(endpoints.to_vec())
-            .as_writer(&resource, writer.epoch);
+        let sink =
+            crate::committer::CommitClient::new(endpoints.to_vec()).as_writer(writer.lease_ref());
         let fs = FileSystem::load_writer(spec.open(opts).await, Arc::new(sink))
             .await
             .map_err(|e| format!("opening the pool: {}", e))?;
-        fs.attach_volume(volume, &vol.owner, vol.epoch)
+        // Flushes are acknowledged only while the lease is provably held
+        // (audit R3b; as the agent's writers do).
+        let fresh = {
+            let vol = vol.clone();
+            Arc::new(move || vol.fresh()) as crate::writer::LeaseCheck
+        };
+        fs.attach_dataset_leased(volume, vol.holding(), None, Some(fresh))
             .await
             .map_err(|e| format!("volume '{}': {}", volume, e))?;
-        Ok(VolumeWriter { fs: Arc::new(fs) })
-    }
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(path),
+        Ok(VolumeWriter {
+            fs: Arc::new(fs),
+            _leases: [writer, vol],
+        })
     }
 }
 
@@ -941,12 +1465,24 @@ fn print_cluster_status(s: &cluster::Status) {
         };
         println!(
             "lease {:<8} epoch {:<4} {} ({}) {}",
-            resource, l.epoch, l.desc, l.owner, state
+            resource.to_string(),
+            l.epoch,
+            l.holder,
+            l.owner,
+            state
         );
     }
     for (idx, g) in &s.state.metaslabs {
-        if let Some(w) = &g.writer {
-            println!("metaslab {:<5} lent to {} (epoch {})", idx, w, g.epoch);
+        if let Some(w) = g.writer() {
+            println!(
+                "metaslab {:<5} lent to {} (epoch {})",
+                idx,
+                w.resource,
+                g.epoch()
+            );
         }
+    }
+    for (volume, nodes) in &s.state.attached {
+        println!("attached {} to {}", volume, nodes.join(", "));
     }
 }

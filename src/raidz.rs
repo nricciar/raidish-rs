@@ -1,5 +1,5 @@
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
-use crate::disks::DiskSet;
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, zeroed_blocks};
+use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask, read_or_fenced};
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
 use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
@@ -57,6 +57,15 @@ fn io_err(e: impl fmt::Display) -> DiskError {
     DiskError::IoError(std::io::Error::other(format!("{}", e)))
 }
 
+/// A stripe write's error as the disk error it reports: a member's own
+/// error kept as is (a fencing refusal must stay one, see `fenced_any`).
+fn write_err(e: RaidZError) -> DiskError {
+    match e {
+        RaidZError::DiskError(e) => e,
+        e => io_err(e),
+    }
+}
+
 type Shard = [u8; BLOCK_SIZE];
 
 /// A raidz group: `data` data shards plus `parity` Reed-Solomon parity
@@ -73,6 +82,8 @@ pub struct RaidZ {
     parity: usize,
     writes: Arc<DashMap<u64, Arc<Mutex<StripeBuffer>>>>,
     stripe_pool: Arc<ArrayQueue<Box<[u8]>>>,
+    /// A stripe is durable once `data` of the disks that took it flush.
+    acks: WriteAcks,
 }
 
 #[async_trait]
@@ -88,8 +99,9 @@ impl BlockDevice for RaidZ {
 
             let mut stripe_buf = stripe_buf_arc.lock().await;
 
-            // Check if already flushed
-            if stripe_buf.flushed && !stripe_buf.dirty {
+            // Already written by a concurrent flush (or replaced by a full
+            // stripe write) while we waited for it.
+            if stripe_buf.retired || (stripe_buf.flushed && !stripe_buf.dirty) {
                 continue;
             }
 
@@ -105,7 +117,11 @@ impl BlockDevice for RaidZ {
                         let mut buf = [0u8; BLOCK_SIZE];
                         // A missing disk shouldn't block the write: rebuild
                         // the shard from the rest of the stripe instead.
-                        if self.read_shard(i, stripe_id, &mut buf).await.is_err() {
+                        if self
+                            .read_shard(i, stripe_id, std::slice::from_mut(&mut buf))
+                            .await
+                            .is_err()
+                        {
                             self.reconstruct_from_stripe(stripe_id, i, &mut buf)
                                 .await
                                 .map_err(io_err)?;
@@ -123,29 +139,59 @@ impl BlockDevice for RaidZ {
             // Now stripe is complete, write it. On failure the stripe stays
             // buffered, so a later flush retries it.
             let data = stripe_buf.data.as_ref().expect("stripe without data");
-            self.write_encoded(stripe_id, data).await.map_err(io_err)?;
+            self.write_encoded(stripe_id, data)
+                .await
+                .map_err(write_err)?;
 
+            // Retire it: a write that picked this buffer up before it
+            // leaves the map starts a new one instead of writing into this
+            // (whose contents are now on disk and never flushed again).
+            stripe_buf.retired = true;
             if let Some(buffer) = stripe_buf.take_buffer() {
                 let _ = self.stripe_pool.push(buffer);
             }
 
             drop(stripe_buf);
-            self.writes.remove(&stripe_id);
+            self.writes
+                .remove_if(&stripe_id, |_, v| Arc::ptr_eq(v, &stripe_buf_arc));
         }
 
-        // Like stripe writes, flushing tolerates up to `parity` failed
-        // disks: the data is still recoverable from the rest.
-        let flushes = self.members.iter().map(|&d| self.disks.flush_disk(d));
-        let results = futures::future::join_all(flushes).await;
-        let failures = results.iter().filter(|r| r.is_err()).count();
-        if failures > self.parity {
-            return results.into_iter().find(Result::is_err).unwrap();
-        }
-
-        Ok(())
+        // Then every stripe written since the last flush (here or by a
+        // full-stripe write) must be durable on `data` of its disks.
+        self.acks
+            .flush(|| async {
+                // Like stripe writes, flushing tolerates up to `parity` failed
+                // disks: the data is still recoverable from the rest.
+                let traced = crate::trace::enabled();
+                let flushes = self.members.iter().map(|&d| async move {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if traced {
+                        let t = std::time::Instant::now();
+                        let r = self.disks.flush_disk(d).await;
+                        eprintln!(
+                            "trace disk.flush d{} {:.2}ms",
+                            d,
+                            t.elapsed().as_secs_f64() * 1e3
+                        );
+                        return r;
+                    }
+                    let _ = traced;
+                    self.disks.flush_disk(d).await
+                });
+                let results = futures::future::join_all(flushes).await;
+                if let Some(e) = fenced_any(&results) {
+                    return Err(e);
+                }
+                let failures = results.iter().filter(|r| r.is_err()).count();
+                if failures > self.parity {
+                    return results.into_iter().find(Result::is_err).unwrap().map(|_| 0);
+                }
+                Ok(ok_mask(&self.members, &results))
+            })
+            .await
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         let stripe = lba / self.data as u64;
         let data_index = (lba % self.data as u64) as usize;
 
@@ -157,7 +203,7 @@ impl BlockDevice for RaidZ {
         }
 
         match self
-            .read_shard(data_index, stripe, &mut buf[..BLOCK_SIZE])
+            .read_shard(data_index, stripe, std::slice::from_mut(buf))
             .await
         {
             Ok(()) => Ok(()),
@@ -178,35 +224,46 @@ impl BlockDevice for RaidZ {
         let stripe_id = lba / self.data as u64;
         let shard_idx = (lba % self.data as u64) as usize;
 
-        // Get or create stripe buffer
-        let stripe = if let Some(stripe_ref) = self.writes.get(&stripe_id) {
-            stripe_ref.value().clone()
-        } else {
-            let new_stripe = Arc::new(Mutex::new(match self.stripe_pool.pop() {
-                Some(b) => StripeBuffer::with_buffer(b, self.data),
-                None => StripeBuffer::new(self.data),
-            }));
+        loop {
+            // Get or create stripe buffer
+            let stripe = if let Some(stripe_ref) = self.writes.get(&stripe_id) {
+                stripe_ref.value().clone()
+            } else {
+                let new_stripe = Arc::new(Mutex::new(match self.stripe_pool.pop() {
+                    Some(b) => StripeBuffer::with_buffer(b, self.data),
+                    None => StripeBuffer::new(self.data),
+                }));
 
-            // Insert into map using Entry API to handle races safely
-            match self.writes.entry(stripe_id) {
-                dashmap::mapref::entry::Entry::Occupied(o) => {
-                    // We lost the race; another thread inserted the stripe
-                    // while we were getting the buffer. Return ours to the pool.
-                    let mut guard = new_stripe.try_lock().expect("Exclusive ownership expected");
-                    if let Some(buf) = guard.take_buffer() {
-                        let _ = self.stripe_pool.push(buf);
+                // Insert into map using Entry API to handle races safely
+                match self.writes.entry(stripe_id) {
+                    dashmap::mapref::entry::Entry::Occupied(o) => {
+                        // We lost the race; another thread inserted the stripe
+                        // while we were getting the buffer. Return ours to the pool.
+                        let mut guard =
+                            new_stripe.try_lock().expect("Exclusive ownership expected");
+                        if let Some(buf) = guard.take_buffer() {
+                            let _ = self.stripe_pool.push(buf);
+                        }
+                        o.get().clone()
                     }
-                    o.get().clone()
+                    dashmap::mapref::entry::Entry::Vacant(v) => {
+                        v.insert(new_stripe.clone());
+                        new_stripe
+                    }
                 }
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(new_stripe.clone());
-                    new_stripe
-                }
-            }
-        };
+            };
 
-        stripe.lock().await.set_shard(shard_idx, buf);
-        Ok(())
+            let mut guard = stripe.lock().await;
+            if guard.retired {
+                // Flushed (or replaced) since we found it: start a new one.
+                drop(guard);
+                self.writes
+                    .remove_if(&stripe_id, |_, v| Arc::ptr_eq(v, &stripe));
+                continue;
+            }
+            guard.set_shard(shard_idx, buf);
+            return Ok(());
+        }
     }
 
     /// Logical capacity: every stripe holds `data` data blocks.
@@ -216,8 +273,8 @@ impl BlockDevice for RaidZ {
 
     /// Contiguous reads become one read per data disk. Stripes with
     /// unflushed writes (or a failed disk) fall back to per-block reads.
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        let n = (buf.len() / BLOCK_SIZE) as u64;
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let n = buf.len() as u64;
         if n == 0 {
             return Ok(());
         }
@@ -228,20 +285,19 @@ impl BlockDevice for RaidZ {
         if n > 1 && !buffered {
             let count = (s_last - s_first + 1) as usize;
             let runs = (0..self.data).map(|i| async move {
-                let mut run = vec![0u8; count * BLOCK_SIZE];
+                let mut run = zeroed_blocks(count);
                 self.read_shard(i, s_first, &mut run).await.map(|_| run)
             });
             if let Ok(runs) = futures::future::try_join_all(runs).await {
-                for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+                for (i, out) in buf.iter_mut().enumerate() {
                     let lba = start + i as u64;
-                    let at = (lba / d - s_first) as usize * BLOCK_SIZE;
-                    out.copy_from_slice(&runs[(lba % d) as usize][at..at + BLOCK_SIZE]);
+                    *out = runs[(lba % d) as usize][(lba / d - s_first) as usize];
                 }
                 return Ok(());
             }
         }
 
-        for (i, out) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+        for (i, out) in buf.iter_mut().enumerate() {
             self.read_block(start + i as u64, out).await?;
         }
         Ok(())
@@ -250,31 +306,31 @@ impl BlockDevice for RaidZ {
     /// Whole stripes are encoded and written straight to the disks (one
     /// write per disk, no read-modify-write); partial stripes at either end
     /// go through the stripe buffer.
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         let d = self.data as u64;
         let mut lba = start;
         let mut rest = buf;
 
-        while !lba.is_multiple_of(d) && !rest.is_empty() {
-            let (block, tail) = rest.split_at(BLOCK_SIZE);
-            self.write_block(lba, block.try_into().unwrap()).await?;
+        while !lba.is_multiple_of(d)
+            && let Some((block, tail)) = rest.split_first()
+        {
+            self.write_block(lba, block).await?;
             rest = tail;
             lba += 1;
         }
 
-        let full_blocks = (rest.len() / BLOCK_SIZE) as u64 / d * d;
+        let full_blocks = rest.len() as u64 / d * d;
         if full_blocks > 0 {
-            let (full, tail) = rest.split_at(full_blocks as usize * BLOCK_SIZE);
-            self.write_full_stripes(lba / d, full)
+            let (full, tail) = rest.split_at(full_blocks as usize);
+            self.write_full_stripes(lba / d, full.as_flattened())
                 .await
-                .map_err(io_err)?;
+                .map_err(write_err)?;
             lba += full_blocks;
             rest = tail;
         }
 
-        while !rest.is_empty() {
-            let (block, tail) = rest.split_at(BLOCK_SIZE);
-            self.write_block(lba, block.try_into().unwrap()).await?;
+        while let Some((block, tail)) = rest.split_first() {
+            self.write_block(lba, block).await?;
             rest = tail;
             lba += 1;
         }
@@ -287,7 +343,7 @@ impl BlockDevice for RaidZ {
         let target = (lba % self.data as u64) as usize;
         let reads = (0..n).filter(|&i| i != target).map(|i| async move {
             let mut buf = [0u8; BLOCK_SIZE];
-            self.read_shard(i, stripe_id, &mut buf)
+            self.read_shard(i, stripe_id, std::slice::from_mut(&mut buf))
                 .await
                 .map(|_| (i, buf))
         });
@@ -355,7 +411,11 @@ impl BlockDevice for RaidZ {
         }
         // Parity already encodes this data, so only the data shard needs rewriting.
         self.disks
-            .write_shards(self.members[data_index], stripe_id, buf)
+            .repair_shards(
+                self.members[data_index],
+                stripe_id,
+                std::slice::from_ref(buf),
+            )
             .await
     }
 }
@@ -363,33 +423,25 @@ impl BlockDevice for RaidZ {
 impl RaidZ {
     pub fn new(disks: Arc<DiskSet>, members: Vec<usize>, parity: usize) -> Self {
         assert!(parity >= 1 && members.len() > parity, "invalid raidz shape");
+        let data = members.len() - parity;
         RaidZ {
-            data: members.len() - parity,
+            data,
             parity,
             disks,
             members,
             writes: Arc::new(DashMap::new()),
             stripe_pool: Arc::new(ArrayQueue::new(100)),
+            acks: WriteAcks::new(data),
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_local_disk(&self, index: usize) -> bool {
         self.disks.is_local(self.members[index])
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn with_pool_size(mut self, pool_size: usize) -> Self {
-        let pool = Arc::new(ArrayQueue::new(pool_size));
-        for _ in 0..pool_size {
-            let _ = pool.push(vec![0u8; BLOCK_SIZE * self.data].into_boxed_slice());
-        }
-        self.stripe_pool = pool;
-        self
-    }
-
     /// Read shard position `i` of stripes starting at `stripe`.
-    async fn read_shard(&self, i: usize, stripe: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_shard(&self, i: usize, stripe: u64, buf: &mut [Block]) -> Result<(), DiskError> {
         self.disks.read_shards(self.members[i], stripe, buf).await
     }
 
@@ -409,7 +461,7 @@ impl RaidZ {
         for i in (0..n).filter(|&i| i != data_index) {
             futures.push(async move {
                 let mut temp_buf = [0u8; BLOCK_SIZE];
-                self.read_shard(i, stripe_id, &mut temp_buf)
+                self.read_shard(i, stripe_id, std::slice::from_mut(&mut temp_buf))
                     .await
                     .map(|_| (i, temp_buf))
             });
@@ -455,10 +507,12 @@ impl RaidZ {
         // These stripes are being replaced wholesale; drop any buffered
         // partial writes so a later flush can't resurrect stale data.
         for s in first_stripe..first_stripe + stripes as u64 {
-            if let Some((_, buffered)) = self.writes.remove(&s)
-                && let Some(b) = buffered.lock().await.take_buffer()
-            {
-                let _ = self.stripe_pool.push(b);
+            if let Some((_, buffered)) = self.writes.remove(&s) {
+                let mut buffered = buffered.lock().await;
+                buffered.retired = true;
+                if let Some(b) = buffered.take_buffer() {
+                    let _ = self.stripe_pool.push(b);
+                }
             }
         }
 
@@ -476,6 +530,9 @@ impl RaidZ {
             .enumerate()
             .map(|(i, buf)| self.disks.write_shards(self.members[i], first_stripe, buf));
         let results = futures::future::join_all(writes).await;
+        if let Some(e) = fenced_any(&results) {
+            return Err(RaidZError::DiskError(e));
+        }
         let failures = results.iter().filter(|r| r.is_err()).count();
         if failures > 0 {
             eprintln!(
@@ -486,6 +543,7 @@ impl RaidZ {
             );
         }
         if self.members.len() - failures >= self.data {
+            self.acks.record(ok_mask(&self.members, &results));
             Ok(())
         } else {
             Err(RaidZError::IncompleteStripe(first_stripe))
@@ -511,7 +569,7 @@ impl RaidZ {
     }
 
     /// Encode whole stripes of `data` into one buffer per shard position.
-    fn encode_stripes(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, RaidZError> {
+    fn encode_stripes(&self, data: &[u8]) -> Result<Vec<Vec<Block>>, RaidZError> {
         encode_stripes(self.data, self.parity, data)
     }
 
@@ -529,14 +587,13 @@ impl RaidZ {
         let n = data.len() / (self.data * BLOCK_SIZE);
         let expected = self.encode_stripes(data)?;
         let reads = self.members.iter().map(|&d| async move {
-            let mut run = vec![0u8; n * BLOCK_SIZE];
+            let mut run = zeroed_blocks(n);
             self.disks
                 .read_shards_raw(d, first_stripe, &mut run)
                 .await
-                .ok()
                 .map(|_| run)
         });
-        let actual = futures::future::join_all(reads).await;
+        let actual = read_or_fenced(futures::future::join_all(reads).await)?;
 
         let mut check = StripeCheck::new(self.disks.len(), n as u64);
         let buffered: Vec<bool> = (0..n as u64)
@@ -553,18 +610,18 @@ impl RaidZ {
                 if busy {
                     continue;
                 }
-                let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
-                if run[at.clone()] == expected[i][at.clone()] {
+                if run[j] == expected[i][j] {
                     continue;
                 }
                 check.mismatched[d] += 1;
                 if repair {
                     match self
                         .disks
-                        .write_shards(d, first_stripe + j as u64, &expected[i][at])
+                        .repair_shards(d, first_stripe + j as u64, &expected[i][j..j + 1])
                         .await
                     {
                         Ok(()) => check.repaired[d] += 1,
+                        Err(e) if e.is_fencing() => return Err(e.into()),
                         Err(_) => check.write_failed[d] = true,
                     }
                 }
@@ -586,6 +643,7 @@ impl RaidZ {
         stripe: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<Option<StripeCheck>, RaidZError> {
         let n = self.members.len();
         let mut shards = vec![[0u8; BLOCK_SIZE]; n];
@@ -593,19 +651,28 @@ impl RaidZ {
         let reads = self.members.iter().map(|&d| async move {
             let mut b = [0u8; BLOCK_SIZE];
             self.disks
-                .read_shards_raw(d, stripe, &mut b)
+                .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
                 .await
-                .ok()
                 .map(|_| b)
         });
-        for (i, r) in futures::future::join_all(reads)
-            .await
+        for (i, r) in read_or_fenced(futures::future::join_all(reads).await)?
             .into_iter()
             .enumerate()
         {
             if let Some(b) = r {
                 shards[i] = b;
                 present[i] = true;
+            }
+        }
+        // Stale members' shards don't vote while the rest can rebuild the
+        // stripe alone: they're rebuilt (and repaired) like missing ones.
+        let is_stale = |i: usize| stale.get(self.members[i]).copied().unwrap_or(false);
+        let current = (0..n).filter(|&i| present[i] && !is_stale(i)).count();
+        if current >= self.data {
+            for (i, p) in present.iter_mut().enumerate() {
+                if is_stale(i) {
+                    *p = false;
+                }
             }
         }
 
@@ -627,15 +694,17 @@ impl RaidZ {
         // labels sharing one TXG. Stale shards mixed with current ones can
         // decode into *valid* labels of other versions, or into rebuilds that
         // happen to re-encode consistently with several disks, so neither
-        // validity nor agreement alone decides. Then prefer the candidate the
-        // most disks already hold, then the newest.
-        // (valid labels, one TXG, agreeing disks, TXG sum)
-        type Rank = (usize, bool, usize, u64);
+        // validity nor agreement alone decides. Then prefer the newest (a
+        // label is only rewritten in a later TXG, so older ones come from
+        // disks that missed commits, however many agree: audit D3; `score`
+        // rejects labels past the last commit), then the one most disks hold.
+        // (valid labels, one TXG, TXG sum, agreeing disks)
+        type Rank = (usize, bool, u64, usize);
         let mut best: Option<(Rank, Vec<u8>)> = None;
         for (data, agree) in candidates {
             let txgs: Vec<u64> = data.chunks(BLOCK_SIZE).filter_map(score).collect();
             let uniform = txgs.len() == self.data && txgs.iter().all(|&t| t == txgs[0]);
-            let rank = (txgs.len(), uniform, agree, txgs.iter().sum());
+            let rank = (txgs.len(), uniform, txgs.iter().sum(), agree);
             if !txgs.is_empty() && best.as_ref().is_none_or(|(r, _)| rank > *r) {
                 best = Some((rank, data));
             }
@@ -646,20 +715,41 @@ impl RaidZ {
         }
     }
 
-    /// Never written: every readable shard is zeros, and enough are readable
-    /// to be sure.
-    async fn label_stripe_is_blank(&self, stripe: u64) -> bool {
+    /// Never written: every readable current shard is zeros, and enough
+    /// are readable to be sure. `ButStale`: a stale member's shard isn't.
+    async fn label_stripe_blankness(
+        &self,
+        stripe: u64,
+        stale: &[bool],
+    ) -> Result<Blank, RaidZError> {
         let mut readable = 0;
+        let mut stale_dirty = false;
         for &d in &self.members {
-            let mut b = vec![0u8; BLOCK_SIZE];
-            if self.disks.read_shards_raw(d, stripe, &mut b).await.is_ok() {
-                readable += 1;
-                if b.iter().any(|&x| x != 0) {
-                    return false;
-                }
+            let mut b = [0u8; BLOCK_SIZE];
+            match self
+                .disks
+                .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if e.is_fencing() => return Err(e.into()),
+                Err(_) => continue,
             }
+            let zero = b.iter().all(|&x| x == 0);
+            if stale.get(d).copied().unwrap_or(false) {
+                stale_dirty |= !zero;
+                continue;
+            }
+            if !zero {
+                return Ok(Blank::No);
+            }
+            readable += 1;
         }
-        readable >= self.data
+        Ok(match (readable >= self.data, stale_dirty) {
+            (false, _) => Blank::No,
+            (true, false) => Blank::Yes,
+            (true, true) => Blank::ButStale,
+        })
     }
 }
 
@@ -687,6 +777,7 @@ impl Vdev for RaidZ {
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<LabelScan, RaidZError> {
         let d = self.data as u64;
         let mut scan = LabelScan {
@@ -695,14 +786,23 @@ impl Vdev for RaidZ {
         };
         for stripe in lba / d..(lba + blocks).div_ceil(d) {
             scan.units += 1;
-            match self.verify_label_stripe(stripe, repair, score).await? {
+            match self
+                .verify_label_stripe(stripe, repair, score, stale)
+                .await?
+            {
                 Some(check) => scan.check.add(&check),
-                None => {
-                    // Never-written space map slots are all zeros and fine.
-                    if !self.label_stripe_is_blank(stripe).await {
-                        scan.unrecoverable.push(stripe * d);
+                // Never-written space map slots are all zeros and fine. A
+                // stale member's leftovers there don't count against that;
+                // they're zeroed like any other stale shard.
+                None => match self.label_stripe_blankness(stripe, stale).await? {
+                    Blank::No => scan.unrecoverable.push(stripe * d),
+                    Blank::Yes => scan.check.stripes += 1,
+                    Blank::ButStale => {
+                        let zeros = vec![0u8; self.data * BLOCK_SIZE];
+                        scan.check
+                            .add(&self.verify_stripes(stripe, &zeros, repair).await?);
                     }
-                }
+                },
             }
         }
         Ok(scan)
@@ -710,24 +810,24 @@ impl Vdev for RaidZ {
 }
 
 /// Encode whole stripes of `data` into one buffer per shard position.
-fn encode_stripes(data: usize, parity: usize, bytes: &[u8]) -> Result<Vec<Vec<u8>>, RaidZError> {
+/// Each disk's shards of whole stripes `bytes` (data disks, then parity).
+fn encode_stripes(data: usize, parity: usize, bytes: &[u8]) -> Result<Vec<Vec<Block>>, RaidZError> {
     let stripe_bytes = data * BLOCK_SIZE;
     debug_assert!(bytes.len().is_multiple_of(stripe_bytes));
     let stripes = bytes.len() / stripe_bytes;
-    let mut disk_bufs: Vec<Vec<u8>> = vec![vec![0u8; stripes * BLOCK_SIZE]; data + parity];
+    let mut disk_bufs: Vec<Vec<Block>> = vec![zeroed_blocks(stripes); data + parity];
     let mut encoder = ReedSolomonEncoder::new(data, parity, BLOCK_SIZE)?;
     for (j, stripe) in bytes.chunks(stripe_bytes).enumerate() {
-        let at = j * BLOCK_SIZE..(j + 1) * BLOCK_SIZE;
         if j > 0 {
             encoder.reset(data, parity, BLOCK_SIZE)?;
         }
         for (i, shard) in stripe.chunks(BLOCK_SIZE).enumerate() {
-            disk_bufs[i][at.clone()].copy_from_slice(shard);
+            disk_bufs[i][j].copy_from_slice(shard);
             encoder.add_original_shard(shard)?;
         }
         let encoded = encoder.encode()?;
         for (p, recovery) in encoded.recovery_iter().enumerate() {
-            disk_bufs[data + p][at.clone()].copy_from_slice(recovery);
+            disk_bufs[data + p][j].copy_from_slice(recovery);
         }
     }
     Ok(disk_bufs)
@@ -735,6 +835,14 @@ fn encode_stripes(data: usize, parity: usize, bytes: &[u8]) -> Result<Vec<Vec<u8
 
 /// A label stripe's data as rebuilt one way, and how many disks agree with it.
 type LabelCandidate = (Vec<u8>, usize);
+
+/// Whether a label stripe that decoded to nothing valid was never written.
+enum Blank {
+    No,
+    Yes,
+    /// Never written, but a stale member holds leftovers there.
+    ButStale,
+}
 
 /// Every way of rebuilding a label stripe's data from exactly `data` of its
 /// readable shards, each with how many disks already hold what it encodes
@@ -764,7 +872,7 @@ fn label_candidates(
         data_only[..data].fill(true);
         if let Some(d) = data_of(&data_only) {
             let enc = encode_stripes(data, parity, &d)?;
-            if (data..n).all(|i| enc[i][..] == shards[i][..]) {
+            if (data..n).all(|i| enc[i].as_flattened() == &shards[i][..]) {
                 return Ok(None);
             }
         }
@@ -772,7 +880,7 @@ fn label_candidates(
 
     let mut out = Vec::new();
     // Every way of picking exactly `data` of the shards.
-    for m in (0u64..1 << n).filter(|m| m.count_ones() as usize == data) {
+    for m in masks_of(n, data) {
         let use_: Vec<bool> = (0..n).map(|d| m & (1 << d) != 0).collect();
         if (0..n).any(|i| use_[i] && !present[i]) {
             continue;
@@ -780,11 +888,29 @@ fn label_candidates(
         let Some(d) = data_of(&use_) else { continue };
         let enc = encode_stripes(data, parity, &d)?;
         let agree = (0..n)
-            .filter(|&i| present[i] && enc[i][..] == shards[i][..])
+            .filter(|&i| present[i] && enc[i].as_flattened() == &shards[i][..])
             .count();
         out.push((d, agree));
     }
     Ok(Some(out))
+}
+
+/// Every `n`-bit mask with exactly `k` bits set, in ascending order (as
+/// filtering `0..1 << n` would give them, so ties rank as they always
+/// did), by Gosper's hack: C(n, k) steps rather than 2^n (audit D6b; a
+/// 33-disk raidz3 is a valid pool), with no shift overflow at any width.
+fn masks_of(n: usize, k: usize) -> impl Iterator<Item = u128> {
+    let end: u128 = 1 << n;
+    let first: u128 = (1 << k) - 1;
+    std::iter::successors(Some(first), move |&m| {
+        if m == 0 {
+            return None; // k == 0: the empty mask only
+        }
+        let c = m.isolate_lowest_one();
+        let r = m + c;
+        Some((((r ^ m) >> 2) / c) | r)
+    })
+    .take_while(move |&m| m < end)
 }
 
 /// Reconstruct data shard `target_shard` of a `data` + `parity` stripe from
@@ -836,6 +962,9 @@ pub struct StripeBuffer {
     shard_mask: u32,
     dirty: bool,
     flushed: bool, // For optimistic writes
+    /// Written out (or superseded) and out of the map, or about to be:
+    /// nothing may be added to it any more.
+    retired: bool,
 }
 
 impl StripeBuffer {
@@ -847,6 +976,7 @@ impl StripeBuffer {
             shard_mask: 0,
             dirty: false,
             flushed: false,
+            retired: false,
         }
     }
 

@@ -1,6 +1,7 @@
 //! Drives the NBD server over a real socket with a minimal client.
 
 use super::*;
+use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
 use std::time::Duration;
@@ -227,10 +228,10 @@ async fn remove_export_flushes_and_closes_its_connections() {
     let (mut b, _) = Client::connect_to(addr, "beta").await.unwrap();
     let data = vec![0x5Au8; 4096];
     assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
-    assert!(fs.has_dirty_volumes(), "write not yet committed");
+    assert!(fs.has_dirty_datasets(), "write not yet committed");
 
     assert!(server.remove_export("alpha").await.unwrap());
-    assert!(!fs.has_dirty_volumes(), "removal commits");
+    assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut a.s).await;
     assert_eq!(server.exports(), vec!["beta"]);
 
@@ -258,25 +259,6 @@ async fn remove_export_flushes_and_closes_its_connections() {
     server.add_export("alpha").await.unwrap();
     let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
     assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
-}
-
-#[tokio::test]
-async fn one_sync_loop_per_file_system() {
-    let pool = TestPool::new().await;
-    let fs = Arc::new(pool.format().await);
-    let count = |fs: &Fs| {
-        let ptr = Arc::as_ptr(fs) as *const ();
-        SYNC_LOOPS
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|w| w.as_ptr() as *const () == ptr)
-            .count()
-    };
-    ensure_sync_loop(&fs, "nbd");
-    ensure_sync_loop(&fs, "nvme");
-    ensure_sync_loop(&fs, "nbd");
-    assert_eq!(count(&fs), 1);
 }
 
 #[tokio::test]
@@ -337,9 +319,9 @@ async fn trim_and_write_zeroes_accept_huge_ranges() {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
-    let vol = fs.open_volume("vol").await.unwrap();
+    let vol = fs.open_dataset("vol").await.unwrap();
     let used: u64 = fs
-        .volume_tree_extents(&vol.root_for_test(), vol.levels)
+        .tree_extents(&vol.obj.root())
         .await
         .unwrap()
         .iter()
@@ -381,4 +363,78 @@ async fn out_of_space_is_reported_as_enospc() {
     let (err, got) = c.cmd(NBD_CMD_READ, 149 * MB, MB as u32, &[]).await;
     assert_eq!(err, 0);
     assert!(got == chunk);
+}
+
+/// Counts the requests that reach the backend it wraps.
+struct Counting {
+    inner: Arc<dyn VolumeIo>,
+    n: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl VolumeIo for Counting {
+    async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.read(offset, buf).await
+    }
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.write(offset, data).await
+    }
+    async fn zero(&self, offset: u64, len: usize) -> Result<(), FileSystemError> {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.zero(offset, len).await
+    }
+    async fn flush(&self) -> Result<(), FileSystemError> {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.flush().await
+    }
+    async fn sync(&self) -> Result<(), FileSystemError> {
+        self.inner.sync().await
+    }
+}
+
+/// An export's backend is switched (and paused) under a live connection:
+/// the client keeps its connection, a request sent while paused is held,
+/// not failed, and everything written before and after reads back.
+#[tokio::test]
+async fn an_exports_backend_switches_under_a_live_connection() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (mut c, _) = Client::connect(addr).await;
+    let before = vec![1u8; 8192];
+    assert_eq!(c.cmd(NBD_CMD_WRITE, 0, 8192, &before).await.0, 0);
+
+    let io = server.export_io("vol").unwrap();
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    io.switch(Arc::new(Counting {
+        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+        n: n.clone(),
+    }))
+    .await;
+
+    // Paused: a write sent now is held until the pause ends.
+    let paused = io.pause().await;
+    let after = vec![2u8; 8192];
+    let send = after.clone();
+    let mut pending = tokio::spawn(async move {
+        let r = c.cmd(NBD_CMD_WRITE, 8192, 8192, &send).await.0;
+        (c, r)
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut pending)
+            .await
+            .is_err(),
+        "a write completed while the export was paused"
+    );
+    drop(paused);
+    let (mut c, r) = pending.await.unwrap();
+    assert_eq!(r, 0);
+
+    assert_eq!(c.cmd(NBD_CMD_FLUSH, 0, 0, &[]).await.0, 0);
+    let (err, got) = c.cmd(NBD_CMD_READ, 0, 16384, &[]).await;
+    assert_eq!(err, 0);
+    assert!(got[..8192] == before[..] && got[8192..] == after[..]);
+    // The write, flush and read went through the new backend.
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
 }

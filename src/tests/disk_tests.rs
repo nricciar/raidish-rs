@@ -40,8 +40,8 @@ async fn test_read_write_single_block() {
 
     // Create test data
     let mut write_buf = [0u8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        write_buf[i] = (i % 256) as u8;
+    for (i, b) in write_buf.iter_mut().enumerate() {
+        *b = (i % 256) as u8;
     }
 
     // Write block
@@ -73,8 +73,8 @@ async fn test_write_read_multiple_blocks() {
     // Write different patterns to different blocks
     for block_id in 0..10 {
         let mut write_buf = [0u8; BLOCK_SIZE];
-        for i in 0..BLOCK_SIZE {
-            write_buf[i] = ((block_id + i) % 256) as u8;
+        for (i, b) in write_buf.iter_mut().enumerate() {
+            *b = ((block_id + i) % 256) as u8;
         }
 
         disk.write_block(block_id as u64, &write_buf)
@@ -92,13 +92,9 @@ async fn test_write_read_multiple_blocks() {
             .expect("Failed to read block");
 
         // Verify pattern
-        for i in 0..BLOCK_SIZE {
+        for (i, &got) in read_buf.iter().enumerate() {
             let expected = ((block_id + i as u64) % 256) as u8;
-            assert_eq!(
-                read_buf[i], expected,
-                "Mismatch at block {} offset {}",
-                block_id, i
-            );
+            assert_eq!(got, expected, "Mismatch at block {} offset {}", block_id, i);
         }
     }
 }
@@ -225,9 +221,13 @@ async fn remote_read_write_roundtrip() {
     assert!(disk.is_online());
 
     let data: Vec<u8> = (0..BLOCK_SIZE * 3).map(|i| (i % 251) as u8).collect();
-    disk.write_blocks(10, &data).await.unwrap();
+    disk.write_blocks(10, crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
     let mut back = vec![0u8; data.len()];
-    disk.read_blocks(10, &mut back).await.unwrap();
+    disk.read_blocks(10, crate::disk::as_blocks_mut(&mut back).unwrap())
+        .await
+        .unwrap();
     assert_eq!(back, data);
     assert_eq!(
         disk.capacity_blocks().await.unwrap(),
@@ -250,7 +250,14 @@ async fn remote_disk_fails_fast_and_reconnects() {
     );
     let mut buf = vec![0u8; BLOCK_SIZE];
     let t = Instant::now();
-    assert!(disk.read_block(0, &mut buf).await.is_err());
+    assert!(
+        disk.read_block(
+            0,
+            <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap()
+        )
+        .await
+        .is_err()
+    );
     assert!(
         t.elapsed() < Duration::from_millis(100),
         "offline disk should fail fast"
@@ -263,7 +270,12 @@ async fn remote_disk_fails_fast_and_reconnects() {
     );
     assert!(*reconnects.borrow_and_update() > gen0);
     disk.write_block(3, &[7u8; BLOCK_SIZE]).await.unwrap();
-    disk.read_block(3, &mut buf).await.unwrap();
+    disk.read_block(
+        3,
+        <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(buf, vec![7u8; BLOCK_SIZE]);
 }
 
@@ -276,13 +288,24 @@ async fn remote_disk_times_out_on_a_silent_server() {
     server.set_mode(ServerMode::Silent);
     let t = Instant::now();
     let mut buf = vec![0u8; BLOCK_SIZE];
-    let err = disk.read_block(0, &mut buf).await.unwrap_err();
+    let err = disk
+        .read_block(
+            0,
+            <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(err, DiskError::Timeout), "got {}", err);
     assert!(t.elapsed() < Duration::from_secs(2));
 
     server.set_mode(ServerMode::Normal);
     assert!(wait_until(5, || disk.is_online()).await);
-    disk.read_block(0, &mut buf).await.unwrap();
+    disk.read_block(
+        0,
+        <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -313,7 +336,12 @@ async fn remote_disk_opens_while_server_is_down() {
     server.restart().await;
     assert!(wait_until(5, || disk.is_online()).await);
     let mut buf = vec![0u8; BLOCK_SIZE];
-    disk.read_block(0, &mut buf).await.unwrap();
+    disk.read_block(
+        0,
+        <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -325,7 +353,9 @@ async fn raidz_survives_a_hung_disk_within_the_timeout() {
     server.set_mode(ServerMode::Silent);
     let data: Vec<u8> = (0..BLOCK_SIZE * 30).map(|i| (i % 249) as u8).collect();
     let t = Instant::now();
-    raid.write_blocks(300, &data).await.unwrap();
+    raid.write_blocks(300, crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
     raid.flush().await.unwrap();
     assert!(
         t.elapsed() < Duration::from_secs(3),
@@ -333,6 +363,86 @@ async fn raidz_survives_a_hung_disk_within_the_timeout() {
     );
 
     let mut back = vec![0u8; data.len()];
-    raid.read_blocks(300, &mut back).await.unwrap();
+    raid.read_blocks(300, crate::disk::as_blocks_mut(&mut back).unwrap())
+        .await
+        .unwrap();
     assert_eq!(back, data);
+}
+
+#[test]
+fn byte_buffers_are_blocks_only_when_whole() {
+    let mut bytes = vec![7u8; 2 * BLOCK_SIZE];
+    assert_eq!(as_blocks(&bytes).unwrap().len(), 2);
+    assert_eq!(as_blocks_mut(&mut bytes).unwrap().len(), 2);
+    assert!(as_blocks(&bytes[..BLOCK_SIZE + 1]).is_err());
+    assert!(as_blocks_mut(&mut bytes[1..]).is_err());
+    assert_eq!(zeroed_blocks(3).as_flattened().len(), 3 * BLOCK_SIZE);
+}
+
+#[test]
+fn block_pointers_refuse_what_they_cant_describe() {
+    use crate::blkptr::BlockPtr;
+    use crate::types::Txg;
+    let data = vec![1u8; BLOCK_SIZE + 1];
+    let p = BlockPtr::new(10, 2, &data, Txg::from_raw(5)).unwrap();
+    assert_eq!((p.lba, p.asize, p.lsize), (10, 2, BLOCK_SIZE as u32 + 1));
+    assert_eq!(p.checksum, *blake3::hash(&data).as_bytes());
+    // More data than its blocks hold, or sizes past u32.
+    assert!(BlockPtr::new(10, 1, &data, Txg::from_raw(5)).is_err());
+    assert!(BlockPtr::new(10, u32::MAX as u64 + 1, &data, Txg::from_raw(5)).is_err());
+}
+
+/// D6d: a missing local disk is an error, not a new empty disk.
+#[tokio::test]
+async fn a_missing_disk_file_isnt_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typo");
+    let r = Disk::open(path.to_str().unwrap()).await;
+    assert!(r.is_err(), "opened a disk that doesn't exist");
+    assert!(!path.exists(), "the open created the file");
+}
+
+fn locked() -> DiskOptions {
+    DiskOptions {
+        lock: true,
+        ..DiskOptions::default()
+    }
+}
+
+/// D6d: a locked disk file can't be opened (locked) again until its open
+/// is gone; the size is the file's.
+#[tokio::test]
+async fn a_locked_disk_file_is_held_exclusively() {
+    let (_f, path) = create_test_disk_file().await;
+    let path = path.to_str().unwrap();
+    let first = Disk::open_with(path, locked()).await.unwrap();
+    assert_eq!(
+        first.capacity_blocks().await.unwrap(),
+        100 * 1024 * 1024 / BLOCK_SIZE as u64
+    );
+    let second = Disk::open_with(path, locked()).await;
+    let e = second.expect_err("opened a locked disk twice");
+    assert!(e.to_string().contains("in use"), "{}", e);
+    // A clone shares the open, and its lock.
+    let clone = first.clone();
+    drop(first);
+    assert!(Disk::open_with(path, locked()).await.is_err());
+    drop(clone);
+    Disk::open_with(path, locked()).await.unwrap();
+}
+
+/// D6d: a pool spec over this node's served disks and others shares the
+/// served (locked) opens rather than failing to lock them again.
+#[tokio::test]
+async fn a_pool_shares_the_served_disks_opens() {
+    let (_a, a) = create_test_disk_file().await;
+    let (_b, b) = create_test_disk_file().await;
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let served = crate::disks::DiskSet::new_with(&[a], locked()).await;
+    assert!(served.disk(0).is_local());
+    let pool = crate::disks::DiskSet::new_sharing(&[a, b], locked(), &served).await;
+    assert!(pool.disk(0).is_local(), "the served disk wasn't shared");
+    assert!(pool.disk(1).is_local());
+    // The other one is locked by the pool's own open.
+    assert!(Disk::open_with(b, locked()).await.is_err());
 }

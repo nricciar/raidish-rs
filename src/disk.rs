@@ -11,25 +11,7 @@ use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
-pub type FileId = u64;
-
-/// Runs when a disk server says our epoch is stale: another writer has the
-/// pool now. `main` makes this exit; it must never be retried.
-static ON_STALE_EPOCH: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
-
-/// This process's pool lease epoch, sent with remote requests outside
-/// metaslabs lent to it (0: no lease). See `crate::fence`.
-pub fn set_lease_epoch(epoch: u64) {
-    crate::fence::client().set_pool_epoch(epoch);
-}
-
-pub fn lease_epoch() -> u64 {
-    crate::fence::client().pool_epoch()
-}
-
-pub fn on_stale_epoch(f: fn()) {
-    let _ = ON_STALE_EPOCH.set(f);
-}
+pub use crate::types::FileId;
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -44,6 +26,38 @@ pub enum DiskError {
     InvalidUri(ParseError),
     /// The disk server refused a write: our lease epoch is out of date.
     StaleEpoch,
+    /// The disk server refused a write into a metaslab lent to a writer,
+    /// stamped with something other than that lend's epoch (audit R2b).
+    /// Says nothing about our standing in the pool.
+    Fenced,
+    /// The disk server is starting: it refuses writes until its fence is
+    /// ready (`crate::fence::Ready`). The write missed the disk.
+    NotReady,
+}
+
+impl DiskError {
+    /// A fencing refusal: the write was refused for who sent it, not for
+    /// the disk. Never a reason to count the disk as having missed data,
+    /// and never tolerable on some members of a vdev (audit R2a).
+    pub fn is_fencing(&self) -> bool {
+        matches!(self, DiskError::StaleEpoch | DiskError::Fenced)
+    }
+
+    /// About reaching the disk (or our standing with it), not what's on
+    /// it: something a later try may not hit.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            DiskError::UnhealthyDisk
+            | DiskError::Disconnected
+            | DiskError::Timeout
+            | DiskError::StaleEpoch
+            | DiskError::Fenced
+            | DiskError::NotReady => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            DiskError::TungsteniteError(_) => true,
+            DiskError::IoError(_) | DiskError::InvalidUri(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for DiskError {
@@ -57,6 +71,8 @@ impl fmt::Display for DiskError {
             DiskError::Timeout => write!(f, "disk timed out"),
             DiskError::InvalidUri(err) => write!(f, "invalid URI: {}", err),
             DiskError::StaleEpoch => write!(f, "stale lease epoch (another writer holds the pool)"),
+            DiskError::Fenced => write!(f, "fenced out: the space is lent to another writer"),
+            DiskError::NotReady => write!(f, "disk server is starting (writes wait for its fence)"),
         }
     }
 }
@@ -87,10 +103,43 @@ impl From<tokio::task::JoinError> for DiskError {
     }
 }
 
+/// One block's bytes. Runs of blocks are `[Block]`: whole blocks by type
+/// (`as_flattened` for their bytes).
+pub type Block = [u8; BLOCK_SIZE];
+
+/// `n` zeroed blocks.
+pub fn zeroed_blocks(n: usize) -> Vec<Block> {
+    vec![[0u8; BLOCK_SIZE]; n]
+}
+
+/// `bytes` as whole blocks; refused if it isn't a whole number of them.
+pub fn as_blocks(bytes: &[u8]) -> Result<&[Block], DiskError> {
+    match bytes.as_chunks::<BLOCK_SIZE>() {
+        (blocks, []) => Ok(blocks),
+        _ => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} bytes isn't whole blocks", bytes.len()),
+        ))),
+    }
+}
+
+/// `bytes` as whole blocks, to read into; refused if it isn't a whole
+/// number of them.
+pub fn as_blocks_mut(bytes: &mut [u8]) -> Result<&mut [Block], DiskError> {
+    let len = bytes.len();
+    match bytes.as_chunks_mut::<BLOCK_SIZE>() {
+        (blocks, []) => Ok(blocks),
+        _ => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} bytes isn't whole blocks", len),
+        ))),
+    }
+}
+
 #[async_trait]
 pub trait BlockDevice: Send + Sync {
     async fn flush(&self) -> Result<(), DiskError>;
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError>;
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError>;
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
 
     /// Usable capacity in blocks.
@@ -98,21 +147,18 @@ pub trait BlockDevice: Send + Sync {
         Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
     }
 
-    /// Read `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
-        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
-            self.read_block(start + i as u64, chunk).await?;
+    /// Read `buf.len()` consecutive blocks starting at `start`.
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        for (i, b) in buf.iter_mut().enumerate() {
+            self.read_block(start + i as u64, b).await?;
         }
         Ok(())
     }
 
-    /// Write `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
-        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
-            self.write_block(start + i as u64, chunk.try_into().unwrap())
-                .await?;
+    /// Write `buf.len()` consecutive blocks starting at `start`.
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        for (i, b) in buf.iter().enumerate() {
+            self.write_block(start + i as u64, b).await?;
         }
         Ok(())
     }
@@ -147,7 +193,7 @@ impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
     async fn flush(&self) -> Result<(), DiskError> {
         (**self).flush().await
     }
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         (**self).read_block(block, buf).await
     }
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
@@ -156,10 +202,10 @@ impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         (**self).capacity_blocks().await
     }
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         (**self).read_blocks(start, buf).await
     }
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         (**self).write_blocks(start, buf).await
     }
     async fn reconstruct_candidates(&self, block: BlockId) -> Result<Candidates, DiskError> {
@@ -183,29 +229,22 @@ pub struct Candidates {
     pub rebuilt: Vec<Option<Vec<u8>>>,
 }
 
-/// Map a websocket reply status to a result. A stale epoch runs the
-/// `on_stale_epoch` hook (another writer has the pool).
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+/// Map a websocket reply status to a result.
 pub(crate) fn check_status(status: u8) -> Result<(), DiskError> {
-    check_status_in(status, false)
-}
-
-/// `check_status` for a request fenced by a lent metaslab's epoch
-/// (`lent`): a refusal there means this process's writer lost that
-/// metaslab, which the writer handles itself; the hook isn't run.
-pub(crate) fn check_status_in(status: u8, lent: bool) -> Result<(), DiskError> {
     match WsStatus::try_from(status) {
         Ok(WsStatus::Success) => Ok(()),
         Ok(WsStatus::ErrorNotFound) => Err(DiskError::IoError(std::io::ErrorKind::NotFound.into())),
         Ok(WsStatus::InvalidRequest) => {
             Err(DiskError::IoError(std::io::ErrorKind::InvalidInput.into()))
         }
-        Ok(WsStatus::StaleEpoch) => {
-            if !lent && let Some(f) = ON_STALE_EPOCH.get() {
-                f();
-            }
-            Err(DiskError::StaleEpoch)
-        }
+        Ok(WsStatus::Forbidden) => Err(DiskError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "this certificate or token may not write",
+        ))),
+        Ok(WsStatus::StaleEpoch) => Err(DiskError::StaleEpoch),
+        Ok(WsStatus::Fenced) => Err(DiskError::Fenced),
+        Ok(WsStatus::NotReady) => Err(DiskError::NotReady),
+        Ok(WsStatus::Expired) => Err(DiskError::Timeout),
         Err(_) => Err(DiskError::IoError(std::io::Error::other(format!(
             "websocket: unknown status {}",
             status
@@ -228,9 +267,15 @@ pub struct IoStats {
     pub rtt_us_last: u64,
 }
 
-/// Timeouts and reconnect pacing for remote (websocket) disks.
+/// How disks are opened: timeouts and reconnect pacing for remote
+/// (websocket) disks, and whether local files are locked.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskOptions {
+    /// Hold an exclusive `flock` on each local disk file for as long as
+    /// it's open, so a second process (another `listen`, a CLI tool) can't
+    /// write it beside this one (audit D6d). Off by default: tests open the
+    /// same files many times in one process, as several nodes.
+    pub lock: bool,
     /// A request (send + response) taking longer than this fails with
     /// `Timeout` and the connection is torn down and re-established.
     pub request_timeout: Duration,
@@ -248,6 +293,7 @@ pub struct DiskOptions {
 impl Default for DiskOptions {
     fn default() -> Self {
         DiskOptions {
+            lock: false,
             request_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(5),
@@ -267,6 +313,8 @@ mod remote;
 pub use remote::RemoteDisk;
 #[cfg(not(target_arch = "wasm32"))]
 pub use remote::WsConn;
+#[cfg(target_arch = "wasm32")]
+pub use remote::set_access_token;
 
 #[derive(Debug, Clone)]
 enum DiskBackend {
@@ -275,7 +323,14 @@ enum DiskBackend {
     #[cfg(not(target_arch = "wasm32"))]
     Local(Arc<std::fs::File>),
     WebSocket(Arc<RemoteDisk>),
+    /// A local file behind test-controlled faults (see `disk_fault`).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    Fault(Arc<fault::FaultDisk>),
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "disk_fault.rs"]
+pub mod fault;
 
 #[derive(Debug, Clone)]
 pub struct Disk {
@@ -287,7 +342,21 @@ impl Disk {
         #[cfg(target_arch = "wasm32")]
         return false;
         #[cfg(not(target_arch = "wasm32"))]
-        matches!(self.backend, DiskBackend::Local(_))
+        {
+            #[cfg(test)]
+            if matches!(self.backend, DiskBackend::Fault(_)) {
+                return true;
+            }
+            matches!(self.backend, DiskBackend::Local(_))
+        }
+    }
+
+    /// A disk whose I/O goes through `fault`'s switches (tests only).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub fn faulty(fault: fault::FaultHandle) -> Self {
+        Disk {
+            backend: DiskBackend::Fault(fault),
+        }
     }
 
     /// Can I/O be attempted right now? (Local disks always; remote disks
@@ -296,6 +365,8 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => true,
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(f) => f.is_online(),
             DiskBackend::WebSocket(r) => r.is_online(),
         }
     }
@@ -322,6 +393,8 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => {}
+            #[cfg(test)]
+            DiskBackend::Fault(_) => {}
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::WebSocket(r) => r.set_fence(index, fence),
         }
@@ -332,11 +405,12 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => None,
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(_) => None,
             DiskBackend::WebSocket(r) => Some(r.subscribe()),
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn open(path: &str) -> Result<Self, DiskError> {
         Self::open_with(path, DiskOptions::default()).await
     }
@@ -370,19 +444,43 @@ impl Disk {
                 backend: DiskBackend::WebSocket(RemoteDisk::open(ws_url, disk_id, opts).await),
             })
         } else {
-            Self::open_local(path).await
+            Self::open_local(path, opts.lock).await
         }
     }
+
+    /// Open an existing local disk file or block device (audit D6d): a
+    /// missing one is an error, not a new empty disk (a mistyped path
+    /// used to make one), and with `lock` it's held exclusively.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn open_local(path: &str) -> Result<Self, DiskError> {
+    async fn open_local(path: &str, lock: bool) -> Result<Self, DiskError> {
         let path = path.to_string();
         let file = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)
+                .open(&path)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("opening '{}': {}", path, e)))?;
+            if lock {
+                use std::os::fd::AsRawFd;
+                // Per open file description: held until the last clone of
+                // this file is dropped.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    let why = match e.kind() {
+                        std::io::ErrorKind::WouldBlock => {
+                            "in use by another process (a running `raidish listen` serves it: \
+                             reach it through its disk server URL)"
+                                .to_string()
+                        }
+                        _ => e.to_string(),
+                    };
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("locking '{}': {}", path, why),
+                    ));
+                }
+            }
+            Ok(file)
         })
         .await??;
         Ok(Disk {
@@ -391,7 +489,7 @@ impl Disk {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn open_local(path: &str) -> Result<Self, DiskError> {
+    async fn open_local(path: &str, _lock: bool) -> Result<Self, DiskError> {
         Err(DiskError::IoError(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("'{}': only remote disks can be opened in the browser", path),
@@ -424,8 +522,12 @@ impl BlockDevice for Disk {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
+                let span = crate::trace::Span::new("disk.fdatasync");
                 tokio::task::spawn_blocking(move || file.sync_data()).await??;
+                drop(span);
             }
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(f) => f.flush().await?,
             DiskBackend::WebSocket(r) => {
                 r.request(WsOp::Flush, 0, 0, None).await?;
             }
@@ -433,12 +535,12 @@ impl BlockDevice for Disk {
         Ok(())
     }
 
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        self.read_blocks(block, &mut buf[..BLOCK_SIZE]).await
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
+        self.read_blocks(block, std::slice::from_mut(buf)).await
     }
 
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        self.write_blocks(block, buf).await
+    async fn write_block(&self, block: BlockId, buf: &Block) -> Result<(), DiskError> {
+        self.write_blocks(block, std::slice::from_ref(buf)).await
     }
 
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
@@ -446,10 +548,17 @@ impl BlockDevice for Disk {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
-                let len =
-                    tokio::task::spawn_blocking(move || file.metadata().map(|m| m.len())).await??;
+                // Seeking to the end sizes block devices too (their
+                // metadata says 0). I/O is positional: the cursor is unused.
+                let len = tokio::task::spawn_blocking(move || {
+                    use std::io::Seek;
+                    (&*file).seek(std::io::SeekFrom::End(0))
+                })
+                .await??;
                 Ok(len / BLOCK_SIZE as u64)
             }
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(f) => f.capacity(),
             DiskBackend::WebSocket(r) => {
                 let data = r.request(WsOp::Info, 0, 0, None).await?;
                 let bytes: [u8; 8] = data[..]
@@ -460,8 +569,8 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let buf = buf.as_flattened_mut();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
@@ -475,6 +584,8 @@ impl BlockDevice for Disk {
                 buf.copy_from_slice(&data);
                 Ok(())
             }
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(f) => f.read(start, buf),
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
                 let reads = buf.chunks_mut(chunk).enumerate().map(|(i, out)| {
@@ -495,8 +606,8 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        debug_assert!(buf.len().is_multiple_of(BLOCK_SIZE));
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        let buf = buf.as_flattened();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
@@ -508,6 +619,8 @@ impl BlockDevice for Disk {
                 .await??;
                 Ok(())
             }
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            DiskBackend::Fault(f) => f.write(start, buf).await,
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
                 let writes = buf.chunks(chunk).enumerate().map(|(i, data)| {

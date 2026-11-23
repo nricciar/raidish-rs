@@ -2,12 +2,18 @@
 
 use crate::blockmap::BlockMap;
 use crate::cluster::{self, Status};
-use crate::panels::{ClusterPanel, Hero, Metaslabs, Objects, Timeline, TopologyPanel};
+use crate::files::FileManager;
+use crate::panels::{ClusterPanel, Hero, Metaslabs, Timeline, TopologyPanel};
 use crate::session::{LayoutData, Session, Shared, Snapshot, now_ms, tab_hidden};
+use crate::vm_page::VmPage;
+use crate::vms::Vms;
+use crate::volumes::Volumes;
 use gloo_timers::callback::Interval;
 use raidish::disk::IoStats;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use yew::prelude::*;
 
 /// Pool refresh period.
@@ -18,6 +24,77 @@ const LAYOUT_MIN_MS: f64 = 30_000.0;
 /// I/O samples kept per disk (one per refresh).
 const HISTORY: usize = 36;
 
+/// Who's signed in (None on a node without TLS: no sign-in).
+#[derive(Properties, PartialEq)]
+pub struct Props {
+    #[prop_or_default]
+    pub user: Option<String>,
+    #[prop_or_default]
+    pub on_sign_out: Callback<()>,
+    /// May change things (not a read-only token).
+    #[prop_or(true)]
+    pub can_write: bool,
+}
+
+/// Which page is shown, from the URL's fragment: `#files/<dir>` for the
+/// file manager, anything else for the overview.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Route {
+    Overview,
+    Files(String),
+    /// `#vms`: the list; `#vms/<name>`: one VM.
+    Vms(Option<String>),
+}
+
+impl Route {
+    fn current() -> Route {
+        let hash = web_sys::window()
+            .and_then(|w| w.location().hash().ok())
+            .unwrap_or_default();
+        let hash = hash.trim_start_matches('#');
+        if let Some(rest) = hash.strip_prefix("vms")
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            let name = rest.trim_matches('/');
+            return Route::Vms((!name.is_empty()).then(|| {
+                js_sys::decode_uri_component(name)
+                    .map(String::from)
+                    .unwrap_or_else(|_| name.to_string())
+            }));
+        }
+        match hash.strip_prefix("files") {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => Route::Files(
+                rest.split('/')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        js_sys::decode_uri_component(p)
+                            .map(String::from)
+                            .unwrap_or_else(|_| p.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ),
+            _ => Route::Overview,
+        }
+    }
+
+    pub fn href(&self) -> String {
+        match self {
+            Route::Overview => "#overview".into(),
+            Route::Vms(None) => "#vms".into(),
+            Route::Vms(Some(n)) => format!("#vms/{}", crate::api::encode_path(n)),
+            Route::Files(p) if p.is_empty() => "#files".into(),
+            Route::Files(p) => format!("#files/{}", crate::api::encode_path(p)),
+        }
+    }
+
+    pub fn go(&self) {
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().set_hash(&self.href());
+        }
+    }
+}
+
 pub enum Msg {
     Opened(Result<Rc<Session>, String>),
     Refresh,
@@ -26,8 +103,7 @@ pub enum Msg {
     ReloadLayout,
     Cluster(Result<Status, String>),
     Tick,
-    Frag(String),
-    FragDone(String, Result<(u64, u64), String>),
+    Route,
 }
 
 /// One I/O sample of a disk.
@@ -52,15 +128,18 @@ pub struct App {
     cluster: Option<Status>,
     cluster_error: Option<String>,
     history: Vec<VecDeque<Sample>>,
-    frag: HashMap<String, Result<(u64, u64), String>>,
     now: f64,
     ticks: u64,
+    route: Route,
+    /// The last directory the file manager showed (the tab goes back to it).
+    files_dir: String,
     _timers: Vec<Interval>,
+    _hash: Closure<dyn FnMut()>,
 }
 
 impl Component for App {
     type Message = Msg;
-    type Properties = ();
+    type Properties = Props;
 
     fn create(ctx: &Context<Self>) -> Self {
         ctx.link()
@@ -71,6 +150,16 @@ impl Component for App {
         let refresh = Interval::new(REFRESH_MS, move || link.send_message(Msg::Refresh));
         let link = ctx.link().clone();
         let tick = Interval::new(1_000, move || link.send_message(Msg::Tick));
+        let link = ctx.link().clone();
+        let hash = Closure::<dyn FnMut()>::new(move || link.send_message(Msg::Route));
+        if let Some(w) = web_sys::window() {
+            w.set_onhashchange(Some(hash.as_ref().unchecked_ref()));
+        }
+        let route = Route::current();
+        let files_dir = match &route {
+            Route::Files(d) => d.clone(),
+            Route::Overview | Route::Vms(_) => String::new(),
+        };
         App {
             session: None,
             error: None,
@@ -85,10 +174,12 @@ impl Component for App {
             cluster: None,
             cluster_error: None,
             history: Vec::new(),
-            frag: HashMap::new(),
             now: now_ms(),
             ticks: 0,
+            route,
+            files_dir,
             _timers: vec![refresh, tick],
+            _hash: hash,
         }
     }
 
@@ -112,7 +203,8 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return false;
                 };
-                if self.loading || tab_hidden() {
+                // The pool is only read for the overview.
+                if self.loading || tab_hidden() || self.route != Route::Overview {
                     return false;
                 }
                 self.loading = true;
@@ -191,44 +283,96 @@ impl Component for App {
                         .send_future(async { Msg::Cluster(cluster::fetch().await) });
                 }
             }
-            Msg::Frag(name) => {
-                let Some(snap) = self.snap.clone() else {
+            Msg::Route => {
+                let route = Route::current();
+                if route == self.route {
                     return false;
-                };
-                self.frag.insert(name.clone(), Err("checking…".into()));
-                ctx.link().send_future(async move {
-                    let r = snap.fs.volume_fragmentation(&name).await;
-                    Msg::FragDone(name, r)
-                });
-            }
-            Msg::FragDone(name, r) => {
-                self.frag.insert(name, r);
+                }
+                if let Route::Files(d) = &route {
+                    self.files_dir = d.clone();
+                }
+                let to_overview = route == Route::Overview;
+                self.route = route;
+                if to_overview {
+                    ctx.link().send_message(Msg::Refresh);
+                }
             }
         }
         true
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let on_files = matches!(self.route, Route::Files(_));
+        let on_vms = matches!(self.route, Route::Vms(_));
+        let on_overview = self.route == Route::Overview;
+        let files_href = Route::Files(self.files_dir.clone()).href();
         let header = html! {
             <header class="top">
                 <div class="brand">
                     <span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>
                     <span>{ "raidish" }</span>
                 </div>
+                <nav class="tabs">
+                    <a class={classes!("tab", on_overview.then_some("on"))} href="#overview">{ "Overview" }</a>
+                    <a class={classes!("tab", on_files.then_some("on"))} href={files_href}>{ "File Manager" }</a>
+                    <a class={classes!("tab", on_vms.then_some("on"))} href="#vms">{ "VMs" }</a>
+                </nav>
                 <div class="top-meta">
                     { self.cluster.as_ref().map(|c| html! {
-                        <span class="muted">{ format!("via node {} ({})", c.id, c.node) }</span>
+                        <span class="muted">{ format!("via {}", c.node) }</span>
                     }).unwrap_or_default() }
-                    { self.refresh_note() }
+                    if on_overview { { self.refresh_note() } }
+                    if let Some(user) = &ctx.props().user {
+                        <span class="user">
+                            <span class="muted">{ user }</span>
+                            <button class="btn small" onclick={ctx.props().on_sign_out.reform(|_| ())}>
+                                { "Sign out" }
+                            </button>
+                        </span>
+                    }
                 </div>
             </header>
         };
+        let path: AttrValue = match &self.route {
+            Route::Files(d) => d.clone().into(),
+            Route::Overview | Route::Vms(_) => self.files_dir.clone().into(),
+        };
+        let can_write = ctx.props().can_write;
+        let on_navigate = Callback::from(|dir: String| Route::Files(dir).go());
+        html! {
+            <>
+                { header }
+                <main>
+                    if on_overview { { self.overview(ctx) } }
+                    if let Route::Vms(None) = &self.route {
+                        <div class="wrap">
+                            <Vms active={true} {can_write} />
+                        </div>
+                    }
+                    if let Route::Vms(Some(name)) = &self.route {
+                        <div class="wrap">
+                            <VmPage key={name.clone()} name={name.clone()} {can_write} cluster={self.cluster.clone()} />
+                        </div>
+                    }
+                    // Kept mounted on the overview too, so uploads carry on.
+                    <div class="wrap" hidden={!on_files}>
+                        <FileManager {path} active={on_files} {can_write} {on_navigate} />
+                        <Volumes active={on_files} {can_write} cluster={self.cluster.clone()}
+                            session={self.session.clone().map(Shared)} />
+                    </div>
+                </main>
+                <crate::activity::Activity />
+            </>
+        }
+    }
+}
 
+impl App {
+    fn overview(&self, ctx: &Context<Self>) -> Html {
         let Some(_session) = &self.session else {
             return html! {
                 <>
-                    { header }
-                    <main class="wrap">
+                    <div class="wrap">
                         <div class="card empty">
                             if let Some(e) = &self.error {
                                 <h2>{ "Can't open the pool" }</h2>
@@ -239,7 +383,7 @@ impl Component for App {
                             }
                         </div>
                         { self.cluster_view() }
-                    </main>
+                    </div>
                 </>
             };
         };
@@ -247,8 +391,7 @@ impl Component for App {
         let Some(snap) = &self.snap else {
             return html! {
                 <>
-                    { header }
-                    <main class="wrap">
+                    <div class="wrap">
                         <div class="card empty">
                             if let Some(e) = &self.snap_error {
                                 <h2>{ "Can't read the pool" }</h2>
@@ -259,7 +402,7 @@ impl Component for App {
                             }
                         </div>
                         { self.cluster_view() }
-                    </main>
+                    </div>
                 </>
             };
         };
@@ -271,13 +414,11 @@ impl Component for App {
                 .map(|s| s.online())
                 .unwrap_or_default(),
         );
-        let on_frag = ctx.link().callback(Msg::Frag);
         let on_reload = ctx.link().callback(|_| Msg::ReloadLayout);
 
         html! {
             <>
-                { header }
-                <main class="wrap">
+                <div class="wrap">
                     if let Some(e) = &self.snap_error {
                         <div class="banner">{ format!("Last refresh failed: {} (showing the previous state)", e) }</div>
                     }
@@ -291,14 +432,12 @@ impl Component for App {
                     } else {
                         <section class="card"><h2>{ "Block map" }</h2><p class="muted">{ "Walking the tree…" }</p></section>
                     }
+                    <crate::hosts::VmHosts />
                     <div class="grid two">
                         <Metaslabs snap={snap.clone()} />
                         <Timeline snap={snap.clone()} now={self.now} />
                     </div>
-                    if let Some(layout) = &self.layout {
-                        <Objects layout={Shared(layout.clone())} frag={Rc::new(self.frag.clone())} on_frag={on_frag} />
-                    }
-                </main>
+                </div>
             </>
         }
     }

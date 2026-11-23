@@ -1,37 +1,76 @@
 //! Consistency checking and recovery.
 //!
-//! Everything here is built on one fault-tolerant walk of the tree
-//! (`walk_tree`): root index → directories → inodes → file data and volume
-//! trees. Unlike a normal read, the walk never stops at a damaged record; it
-//! notes the error and carries on with the rest of the tree.
+//! Everything here is built on one fault-tolerant walk of the pool
+//! (`walk_tree`): the object table → every object's tree, then the
+//! namespace from the root directory (for paths). Unlike a normal read, the
+//! walk never stops at a damaged record; it notes the error and carries on
+//! with the rest. Since the table lists every object, a damaged directory
+//! hides no space: only an unreadable table or indirect block does.
 //!
 //! * `fsck` compares the blocks the tree references with the space maps:
 //!   *leaks* (allocated, referenced by nothing) and *referenced-but-free*
 //!   blocks (live data the allocator could hand out again), plus
 //!   *cross-links* (two pointers to the same blocks). `--repair` frees leaks
-//!   and re-allocates live space.
+//!   and re-allocates live space. Objects no directory links to, and
+//!   entries for objects that don't exist, are reported as errors.
 //! * `rebuild_spacemaps` throws the space maps away and derives them from the
 //!   tree (used after a rewind, or when a space map is lost).
 //! * `salvage` copies out whatever is still readable, zero-filling the rest.
 
 use crate::blkptr::BlockPtr;
-use crate::disk::BlockDevice;
+use crate::dataset::{DEFAULT_FS, DatasetFormat};
+use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{Extent, FileIndex, FileInode, InodeType};
+use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Head, ObjType, Snap, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
-use crate::volume::INDIRECT_FANOUT;
-use std::collections::{BTreeMap, VecDeque};
+use crate::object::{INDIRECT_FANOUT, TreeRoot};
+use crate::types::Txg;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
-/// What a record of the tree holds.
+/// What a record holds: a node of some tree, at a level (0 = data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjKind {
-    RootIndex,
-    DirIndex,
-    Inode,
-    FileData,
-    /// A volume tree node; level 0 is a data record.
+    /// The object table; its level 0 records hold dnodes.
+    Table(u8),
+    /// A directory; its data is its entries.
+    Dir(u8),
+    File(u8),
     Volume(u8),
+}
+
+impl ObjKind {
+    fn of(t: ObjType, level: u8) -> Self {
+        match t {
+            ObjType::File => ObjKind::File(level),
+            ObjType::Directory | ObjType::Datasets => ObjKind::Dir(level),
+            // A B+tree's nodes are its object's data records.
+            ObjType::Volume | ObjType::Snapshot | ObjType::KvTree => ObjKind::Volume(level),
+        }
+    }
+
+    pub fn level(&self) -> u8 {
+        match *self {
+            ObjKind::Table(l) | ObjKind::Dir(l) | ObjKind::File(l) | ObjKind::Volume(l) => l,
+        }
+    }
+
+    fn child(&self) -> Self {
+        let l = self.level() - 1;
+        match self {
+            ObjKind::Table(_) => ObjKind::Table(l),
+            ObjKind::Dir(_) => ObjKind::Dir(l),
+            ObjKind::File(_) => ObjKind::File(l),
+            ObjKind::Volume(_) => ObjKind::Volume(l),
+        }
+    }
+
+    /// Whether a walk has to read this record to find the rest (indirect
+    /// blocks and object table records).
+    pub fn is_metadata(&self) -> bool {
+        self.level() > 0 || matches!(self, ObjKind::Table(_))
+    }
 }
 
 /// Callbacks of `walk_tree`. All have empty defaults.
@@ -39,8 +78,10 @@ pub trait Visitor {
     /// Every reachable record, whether or not it can be read.
     fn record(&mut self, _ptr: &BlockPtr, _kind: ObjKind) {}
     fn dir(&mut self, _path: &str) {}
-    fn file(&mut self, _path: &str, _size_bytes: u64, _blocks: &[BlockPtr]) {}
-    fn volume(&mut self, _path: &str, _inode: &InodeType) {}
+    fn file(&mut self, _path: &str, _id: FileId, _dnode: &Dnode) {}
+    fn volume(&mut self, _path: &str, _id: FileId, _dnode: &Dnode) {}
+    /// A volume's intent log region (in use, though no pointer reaches it).
+    fn log_region(&mut self, _start: u64, _len: u64) {}
 }
 
 /// A visitor that only wants the walk's own report.
@@ -51,99 +92,83 @@ impl Visitor for NoVisitor {}
 pub struct WalkReport {
     /// Records reached (read or not).
     pub records: u64,
-    /// Unreadable or undecodable records, with their location.
+    /// Unreadable or undecodable records, with their location, and
+    /// namespace inconsistencies.
     pub errors: Vec<String>,
-    /// Some metadata (a directory, inode or volume indirect block) could not
-    /// be read, so part of the tree was never reached: whatever it references
-    /// is unknown.
+    /// Some metadata (an object table record or an indirect block) could
+    /// not be read, so part of the pool was never reached: whatever it
+    /// references is unknown.
     pub incomplete: bool,
 }
 
-/// A pending node of a tree walk (shared with scrub, see `scan`).
-pub(crate) enum Node {
-    Object {
-        ptrs: Vec<BlockPtr>,
-        kind: ObjKind,
-        path: String,
-    },
-    Volume {
-        ptr: BlockPtr,
-        level: u8,
-        path: String,
-    },
+/// A pending node of a walk (shared with scrub, see `scan`): record
+/// `index` at its level of some tree.
+pub(crate) struct Node {
+    pub ptr: BlockPtr,
+    pub kind: ObjKind,
+    pub index: u64,
+    /// Whose tree, for messages.
+    pub owner: String,
 }
 
-/// The children of a decoded directory index or inode (none for file
-/// data), reporting directories, files and volumes to `v`. This is the one
-/// place that knows how objects reference each other.
-pub(crate) fn expand<V: Visitor>(
-    kind: ObjKind,
-    path: &str,
-    data: &[u8],
-    v: &mut V,
-) -> Result<Vec<Node>, String> {
-    match kind {
-        ObjKind::RootIndex | ObjKind::DirIndex => {
-            let index = bincode::deserialize::<FileIndex>(data)
-                .map_err(|e| format!("{}: directory: {}", path, e))?;
-            v.dir(path);
-            Ok(index
-                .files
-                .into_iter()
-                .rev()
-                .map(|(name, r)| Node::Object {
-                    ptrs: r.inode,
-                    kind: ObjKind::Inode,
-                    path: join(path, &name),
+/// The root node of `tree` (if it has one).
+pub(crate) fn tree_node(tree: &TreeRoot, kind: ObjKind, owner: String) -> Option<Node> {
+    tree.ptr.clone().map(|ptr| Node {
+        ptr,
+        kind,
+        index: 0,
+        owner,
+    })
+}
+
+/// The root node of the object table at `table`.
+pub(crate) fn table_node(table: &TreeRoot) -> Option<Node> {
+    tree_node(table, ObjKind::Table(table.levels), "object table".into())
+}
+
+/// What `expand` finds under a record: nodes to walk, and dnodes.
+pub(crate) type Expanded = (Vec<Node>, Vec<(FileId, Dnode)>);
+
+/// The children of a metadata record (see `ObjKind::is_metadata`), and
+/// for an object table record the dnodes it holds. This is the one place
+/// that knows how records reference each other.
+pub(crate) fn expand(node: &Node, data: &[u8]) -> Result<Expanded, String> {
+    if node.kind.level() > 0 {
+        let ind = bincode::deserialize::<Vec<Option<BlockPtr>>>(data)
+            .map_err(|e| format!("{} ({:?}): indirect block: {}", node.owner, node.kind, e))?;
+        let children = ind
+            .into_iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(slot, c)| {
+                c.map(|ptr| Node {
+                    ptr,
+                    kind: node.kind.child(),
+                    index: node.index * INDIRECT_FANOUT + slot as u64,
+                    owner: node.owner.clone(),
                 })
-                .collect())
-        }
-        ObjKind::Inode => {
-            let inode = bincode::deserialize::<FileInode>(data)
-                .map_err(|e| format!("{}: inode: {}", path, e))?;
-            Ok(match &inode.inode_type {
-                InodeType::File { size_bytes, blocks } => {
-                    v.file(path, *size_bytes, blocks);
-                    vec![Node::Object {
-                        ptrs: blocks.clone(),
-                        kind: ObjKind::FileData,
-                        path: path.to_string(),
-                    }]
-                }
-                InodeType::Directory { blocks } => vec![Node::Object {
-                    ptrs: blocks.clone(),
-                    kind: ObjKind::DirIndex,
-                    path: path.to_string(),
-                }],
-                InodeType::Volume { root, levels, .. } => {
-                    v.volume(path, &inode.inode_type);
-                    root.iter()
-                        .map(|ptr| Node::Volume {
-                            ptr: ptr.clone(),
-                            level: *levels,
-                            path: path.to_string(),
-                        })
-                        .collect()
-                }
             })
-        }
-        ObjKind::FileData | ObjKind::Volume(_) => Ok(Vec::new()),
+            .collect();
+        return Ok((children, Vec::new()));
     }
-}
-
-/// The children of a volume indirect block at `level` (> 0).
-pub(crate) fn expand_indirect(level: u8, path: &str, data: &[u8]) -> Result<Vec<Node>, String> {
-    let ind = bincode::deserialize::<Vec<Option<BlockPtr>>>(data)
-        .map_err(|e| format!("{} (volume L{}): {}", path, level, e))?;
-    Ok(ind
-        .into_iter()
-        .flatten()
-        .map(|c| Node::Volume {
-            ptr: c,
-            level: level - 1,
-            path: path.to_string(),
-        })
-        .collect())
+    if !matches!(node.kind, ObjKind::Table(_)) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let slots =
+        decode_leaf(data).map_err(|e| format!("object table record {}: {}", node.index, e))?;
+    let mut children = Vec::new();
+    let mut found = Vec::new();
+    for (slot, d) in slots.into_iter().enumerate() {
+        let Some(d) = d else { continue };
+        let id = FileId::from_raw(node.index * DNODES_PER_LEAF + slot as u64);
+        children.extend(tree_node(
+            &d.tree,
+            ObjKind::of(d.kind(), d.tree.levels),
+            format!("object {}", id),
+        ));
+        found.push((id, d));
+    }
+    Ok((children, found))
 }
 
 fn join(path: &str, name: &str) -> String {
@@ -158,7 +183,12 @@ fn join(path: &str, name: &str) -> String {
 
 /// Insert a range, merging with neighbours. Returns the part of it that
 /// overlapped what was already there (empty when disjoint).
-fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64, u64)> {
+fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<Extent> {
+    // Nothing to add (and the merging below would drop an extent that
+    // merely touches `start`).
+    if len == 0 {
+        return Vec::new();
+    }
     let end = start + len;
     let mut overlap = Vec::new();
     let mut new_start = start;
@@ -167,7 +197,7 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64,
         && ps + pl >= start
     {
         if ps + pl > start {
-            overlap.push((start, (ps + pl).min(end) - start));
+            overlap.push(Extent::new(start, (ps + pl).min(end) - start));
         }
         new_start = ps;
         new_end = new_end.max(ps + pl);
@@ -178,14 +208,12 @@ fn insert_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) -> Vec<(u64,
             break;
         }
         if ns < end {
-            overlap.push((ns, (ns + nl).min(end) - ns));
+            overlap.push(Extent::new(ns, (ns + nl).min(end) - ns));
         }
         new_end = new_end.max(ns + nl);
         map.remove(&ns);
     }
-    if len > 0 {
-        map.insert(new_start, new_end - new_start);
-    }
+    map.insert(new_start, new_end - new_start);
     overlap
 }
 
@@ -223,18 +251,18 @@ fn complement(map: &BTreeMap<u64, u64>, start: u64, end: u64) -> BTreeMap<u64, u
 }
 
 /// Ranges in both `a` and `b`.
-fn intersect(a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>) -> Vec<(u64, u64)> {
+fn intersect(a: &BTreeMap<u64, u64>, b: &BTreeMap<u64, u64>) -> Vec<Extent> {
     let mut out = Vec::new();
     for (&s, &l) in a {
         for (&bs, &bl) in &clip(b, s, s + l) {
-            out.push((bs, bl));
+            out.push(Extent::new(bs, bl));
         }
     }
     out
 }
 
-fn total(ranges: &[(u64, u64)]) -> u64 {
-    ranges.iter().map(|(_, l)| l).sum()
+fn total(ranges: &[Extent]) -> u64 {
+    ranges.iter().map(|e| e.len).sum()
 }
 
 /// Collects every extent the tree references.
@@ -242,7 +270,7 @@ fn total(ranges: &[(u64, u64)]) -> u64 {
 pub struct LiveSet {
     pub live: BTreeMap<u64, u64>,
     /// Blocks referenced more than once.
-    pub cross_links: Vec<(u64, u64)>,
+    pub cross_links: Vec<Extent>,
 }
 
 impl Visitor for LiveSet {
@@ -250,22 +278,26 @@ impl Visitor for LiveSet {
         let overlap = insert_range(&mut self.live, ptr.lba, ptr.asize as u64);
         self.cross_links.extend(overlap);
     }
+    fn log_region(&mut self, start: u64, len: u64) {
+        let overlap = insert_range(&mut self.live, start, len);
+        self.cross_links.extend(overlap);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct FsckReport {
-    pub txg: u64,
+    pub txg: Txg,
     pub repair: bool,
     pub records: u64,
     pub live_blocks: u64,
     /// Allocated but referenced by nothing.
-    pub leaks: Vec<(u64, u64)>,
+    pub leaks: Vec<Extent>,
     /// Referenced, but free (or pending free) in the space maps.
-    pub referenced_free: Vec<(u64, u64)>,
+    pub referenced_free: Vec<Extent>,
     /// Blocks referenced by more than one pointer.
-    pub cross_links: Vec<(u64, u64)>,
+    pub cross_links: Vec<Extent>,
     /// References outside the data area.
-    pub out_of_range: Vec<(u64, u64)>,
+    pub out_of_range: Vec<Extent>,
     pub errors: Vec<String>,
     pub incomplete: bool,
     pub leaks_repaired: bool,
@@ -289,11 +321,15 @@ impl std::fmt::Display for FsckReport {
             "fsck at TXG {}: {} records, {} blocks in use",
             self.txg, self.records, self.live_blocks
         )?;
-        let show = |f: &mut std::fmt::Formatter<'_>, what: &str, r: &[(u64, u64)], fixed: &str| {
+        let show = |f: &mut std::fmt::Formatter<'_>, what: &str, r: &[Extent], fixed: &str| {
             if r.is_empty() {
                 return Ok(());
             }
-            let sample: Vec<String> = r.iter().take(8).map(|(s, l)| format!("{s}+{l}")).collect();
+            let sample: Vec<String> = r
+                .iter()
+                .take(8)
+                .map(|e| format!("{}+{}", e.start, e.len))
+                .collect();
             writeln!(
                 f,
                 "  {}: {} blocks in {} extents{} [{}{}]",
@@ -361,34 +397,38 @@ impl std::fmt::Display for RebuildReport {
 
 /// One salvaged file or volume.
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Salvaged {
     pub path: String,
     pub bytes: u64,
-    /// (offset, length) ranges that could not be read and were zero-filled.
-    pub lost: Vec<(u64, u64)>,
+    /// Byte ranges that could not be read and were zero-filled.
+    pub lost: Vec<std::ops::Range<u64>>,
 }
 
 #[derive(Debug, Default, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SalvageReport {
     pub items: Vec<Salvaged>,
     /// Directories / inodes that could not be read (their contents are lost).
     pub errors: Vec<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SalvageReport {
     pub fn is_complete(&self) -> bool {
         self.errors.is_empty() && self.items.iter().all(|i| i.lost.is_empty())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for SalvageReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in &self.items {
             if i.lost.is_empty() {
                 writeln!(f, "  ok      {} ({} bytes)", i.path, i.bytes)?;
             } else {
-                let lost: u64 = i.lost.iter().map(|(_, l)| l).sum();
-                let at: Vec<String> = i.lost.iter().take(4).map(|(o, _)| o.to_string()).collect();
+                let lost: u64 = i.lost.iter().map(|r| r.end - r.start).sum();
+                let at: Vec<String> = i.lost.iter().take(4).map(|r| r.start.to_string()).collect();
                 writeln!(
                     f,
                     "  DAMAGED {} ({} bytes, {} lost at offsets {}{})",
@@ -414,126 +454,332 @@ impl std::fmt::Display for SalvageReport {
     }
 }
 
-#[derive(Default)]
-struct Collect {
-    dirs: Vec<String>,
-    files: Vec<(String, u64, Vec<BlockPtr>)>,
-    volumes: Vec<(String, InodeType)>,
+/// Check volume `id`'s snapshots and origin against the objects they
+/// name; returns its snapshots that check out (object number, short name).
+fn check_lineage(
+    id: FileId,
+    d: &Dnode,
+    dnodes: &BTreeMap<FileId, Dnode>,
+    errors: &mut Vec<String>,
+) -> Vec<(FileId, String)> {
+    let Some(Head {
+        origin, snapshots, ..
+    }) = d.head()
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut last = Txg::ZERO;
+    if let Some(o) = origin {
+        last = o.txg;
+        match dnodes.get(&o.id) {
+            Some(s) => match s.snap() {
+                Some(Snap { txg, clones, .. }) if *txg == o.txg => {
+                    if !clones.contains(&id) {
+                        errors.push(format!(
+                            "volume {}: its origin {} doesn't list it as a clone",
+                            id, o.name
+                        ));
+                    }
+                }
+                _ => errors.push(format!("volume {}: origin {} is inconsistent", id, o.name)),
+            },
+            _ => errors.push(format!("volume {}: origin {} doesn't exist", id, o.name)),
+        }
+    }
+    for r in snapshots {
+        let ok = match dnodes.get(&r.id) {
+            Some(s) if s.parent == Some(id) => {
+                matches!(s.snap(), Some(Snap { txg, guid, .. }) if *txg == r.txg && *guid == r.guid)
+            }
+            _ => false,
+        };
+        if !ok {
+            errors.push(format!(
+                "{}: snapshot object {} is missing or inconsistent",
+                r.name, r.id
+            ));
+            continue;
+        }
+        if r.txg < last {
+            errors.push(format!("{}: snapshots out of TXG order", r.name));
+        }
+        last = r.txg;
+        if let Some(Snap { clones, .. }) = dnodes[&r.id].snap() {
+            for c in clones {
+                let theirs = dnodes
+                    .get(c)
+                    .and_then(|cd| cd.head()?.origin.as_ref().map(|o| o.id));
+                if theirs != Some(r.id) {
+                    errors.push(format!("{}: clone {} doesn't name it as origin", r.name, c));
+                }
+            }
+        }
+        let short = r.name.split_once('@').map_or(r.name.as_str(), |(_, s)| s);
+        out.push((r.id, short.to_string()));
+    }
+    out
 }
 
+#[derive(Default)]
+#[cfg(not(target_arch = "wasm32"))]
+struct Collect {
+    dirs: Vec<String>,
+    /// Files and volumes.
+    objects: Vec<(String, Dnode)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Visitor for Collect {
     fn dir(&mut self, path: &str) {
         self.dirs.push(path.to_string());
     }
-    fn file(&mut self, path: &str, size_bytes: u64, blocks: &[BlockPtr]) {
-        self.files
-            .push((path.to_string(), size_bytes, blocks.to_vec()));
+    fn file(&mut self, path: &str, _id: FileId, d: &Dnode) {
+        self.objects.push((path.to_string(), d.clone()));
     }
-    fn volume(&mut self, path: &str, inode: &InodeType) {
-        self.volumes.push((path.to_string(), inode.clone()));
+    fn volume(&mut self, path: &str, _id: FileId, d: &Dnode) {
+        self.objects.push((format!("{}.img", path), d.clone()));
     }
 }
 
 impl<D: BlockDevice> FileSystem<D> {
-    /// Walk every record reachable from `root`, reporting each to `v`.
-    /// File data and volume data records are only read when `verify_data`.
+    /// Walk every record reachable from the object table at `table`,
+    /// reporting each to `v`, then the namespace from the root directory.
+    /// File and volume data records are only read when `verify_data`.
     pub(crate) async fn walk_tree<V: Visitor>(
         &self,
-        root: &[BlockPtr],
+        table: &TreeRoot,
         verify_data: bool,
         v: &mut V,
     ) -> WalkReport {
         let mut report = WalkReport::default();
-        let mut stack = vec![Node::Object {
-            ptrs: root.to_vec(),
-            kind: ObjKind::RootIndex,
-            path: "/".to_string(),
-        }];
+        let mut dnodes: BTreeMap<FileId, Dnode> = BTreeMap::new();
+        let mut stack: Vec<Node> = table_node(table).into_iter().collect();
+        // Snapshots, clones and their volumes share subtrees: each record
+        // once (a reused lba always has a newer birth).
+        let mut seen: HashSet<(u64, Txg)> = HashSet::new();
         while let Some(node) = stack.pop() {
-            match node {
-                Node::Object { ptrs, kind, path } => {
-                    for p in &ptrs {
-                        report.records += 1;
-                        v.record(p, kind);
+            if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
+                continue;
+            }
+            report.records += 1;
+            v.record(&node.ptr, node.kind);
+            // Directory data is read by the namespace walk below.
+            let needed =
+                node.kind.is_metadata() || (verify_data && !matches!(node.kind, ObjKind::Dir(0)));
+            if !needed {
+                continue;
+            }
+            let data = match self.read_record(&node.ptr).await {
+                Ok(d) => d,
+                Err(e) => {
+                    report.errors.push(format!(
+                        "{} ({:?}): record at {}: {}",
+                        node.owner, node.kind, node.ptr.lba, e
+                    ));
+                    report.incomplete |= node.kind.is_metadata();
+                    continue;
+                }
+            };
+            if !node.kind.is_metadata() {
+                continue;
+            }
+            match expand(&node, &data) {
+                Ok((children, found)) => {
+                    for (id, d) in found {
+                        for r in d.log().iter().flat_map(|l| &l.regions) {
+                            v.log_region(r.start, r.len);
+                        }
+                        dnodes.insert(id, d);
                     }
-                    if kind == ObjKind::FileData {
-                        if verify_data {
-                            for p in &ptrs {
-                                if let Err(e) = self.read_record(p).await {
-                                    report
-                                        .errors
-                                        .push(format!("{}: data record at {}: {}", path, p.lba, e));
+                    stack.extend(children);
+                }
+                Err(e) => {
+                    report.errors.push(e);
+                    report.incomplete = true;
+                }
+            }
+        }
+        self.walk_namespace(&dnodes, v, &mut report).await;
+        report
+    }
+
+    /// Check the B+tree of `d` (a `kv` dataset or a snapshot of one).
+    async fn check_kv(&self, path: &str, d: &Dnode, report: &mut WalkReport) {
+        for e in self.check_kv_tree(d).await.errors {
+            report.errors.push(format!("{}: {}", path, e));
+        }
+    }
+
+    /// Visit every object linked from the root directory, by path; report
+    /// entries for missing objects and objects nothing links to.
+    async fn walk_namespace<V: Visitor>(
+        &self,
+        dnodes: &BTreeMap<FileId, Dnode>,
+        v: &mut V,
+        report: &mut WalkReport,
+    ) {
+        let mut complete = !report.incomplete;
+        let mut reached: BTreeSet<FileId> = BTreeSet::new();
+        let mut stack: Vec<(FileId, String)> = Vec::new();
+        // Every dataset's namespace starts in the dataset directory.
+        let ds_id = self.datasets_object();
+        match dnodes.get(&ds_id) {
+            Some(ds) if ds.kind() == ObjType::Datasets => {
+                reached.insert(ds_id);
+                match self.read_datasets(ds).await {
+                    Ok(index) => {
+                        if !index.datasets.contains_key(DEFAULT_FS) {
+                            report.errors.push(format!("no '{}' dataset", DEFAULT_FS));
+                        }
+                        for (name, e) in index.datasets.iter().rev() {
+                            let path = match e.format {
+                                DatasetFormat::Posix if name == DEFAULT_FS => "/".to_string(),
+                                DatasetFormat::Posix => format!("{}:/", name),
+                                // Where salvage puts its image.
+                                _ => format!("/{}", name),
+                            };
+                            let want = e.format.root_kind();
+                            match dnodes.get(&e.root) {
+                                None => {
+                                    report.errors.push(format!(
+                                        "dataset '{}': root object {} doesn't exist",
+                                        name, e.root
+                                    ));
+                                    complete = false;
+                                }
+                                Some(r) if r.kind() != want => report.errors.push(format!(
+                                    "dataset '{}': root object {} is a {}, not a {}",
+                                    name,
+                                    e.root,
+                                    r.kind().name(),
+                                    want.name()
+                                )),
+                                Some(_) if reached.contains(&e.root) => {
+                                    report.errors.push(format!(
+                                        "dataset '{}': root object {} is linked more than once",
+                                        name, e.root
+                                    ))
+                                }
+                                Some(_) => {
+                                    reached.insert(e.root);
+                                    stack.push((e.root, path));
                                 }
                             }
                         }
-                        continue;
                     }
-                    if ptrs.is_empty() {
-                        continue;
+                    Err(e) => {
+                        report.errors.push(format!("dataset directory: {}", e));
+                        complete = false;
                     }
-                    let data = match self.read_object(&ptrs).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            report.errors.push(format!("{} ({:?}): {}", path, kind, e));
-                            report.incomplete = true;
-                            continue;
-                        }
-                    };
-                    match expand(kind, &path, &data, v) {
-                        Ok(children) => stack.extend(children),
-                        Err(e) => {
-                            report.errors.push(e);
-                            report.incomplete = true;
+                }
+            }
+            Some(ds) => {
+                report.errors.push(format!(
+                    "dataset directory (object {}) is a {}",
+                    ds_id,
+                    ds.kind().name()
+                ));
+                complete = false;
+            }
+            None => {
+                report
+                    .errors
+                    .push("the dataset directory is missing".into());
+                complete = false;
+            }
+        }
+        while let Some((id, path)) = stack.pop() {
+            reached.insert(id);
+            let d = &dnodes[&id];
+            match d.kind() {
+                ObjType::File => v.file(&path, id, d),
+                ObjType::Volume | ObjType::KvTree => {
+                    v.volume(&path, id, d);
+                    let snaps = check_lineage(id, d, dnodes, &mut report.errors);
+                    if d.kind() == ObjType::KvTree {
+                        self.check_kv(&path, d, report).await;
+                    }
+                    for (sid, name) in snaps {
+                        reached.insert(sid);
+                        let spath = format!("{}@{}", path, name);
+                        v.volume(&spath, sid, &dnodes[&sid]);
+                        if d.kind() == ObjType::KvTree {
+                            self.check_kv(&spath, &dnodes[&sid], report).await;
                         }
                     }
                 }
-                Node::Volume { ptr, level, path } => {
-                    report.records += 1;
-                    v.record(&ptr, ObjKind::Volume(level));
-                    if level == 0 && !verify_data {
-                        continue;
-                    }
-                    let data = match self.read_record(&ptr).await {
-                        Ok(d) => d,
+                // Reached from its volume / the uberblock.
+                ObjType::Snapshot | ObjType::Datasets => {}
+                ObjType::Directory => {
+                    v.dir(&path);
+                    let index = match self.read_dir(d).await {
+                        Ok(i) => i,
                         Err(e) => {
-                            report.errors.push(format!(
-                                "{} (volume L{}): record at {}: {}",
-                                path, level, ptr.lba, e
-                            ));
-                            report.incomplete |= level > 0;
+                            report.errors.push(format!("{}: directory: {}", path, e));
+                            complete = false;
                             continue;
                         }
                     };
-                    if level > 0 {
-                        match expand_indirect(level, &path, &data) {
-                            Ok(children) => stack.extend(children),
-                            Err(e) => {
-                                report.errors.push(e);
-                                report.incomplete = true;
+                    for (name, e) in index.files.into_iter().rev() {
+                        let child = join(&path, &name);
+                        match dnodes.get(&e.id) {
+                            None => report.errors.push(format!(
+                                "{}: entry for object {}, which doesn't exist",
+                                child, e.id
+                            )),
+                            Some(cd) if !matches!(cd.kind(), ObjType::File | ObjType::Directory) => {
+                                report.errors.push(format!(
+                                    "{}: entry for object {}, a {} (only the dataset directory links those)",
+                                    child,
+                                    e.id,
+                                    cd.kind().name()
+                                ))
+                            }
+                            Some(cd) if cd.kind() != e.kind => report.errors.push(format!(
+                                "{}: entry says {}, object {} is a {}",
+                                child,
+                                e.kind.name(),
+                                e.id,
+                                cd.kind().name()
+                            )),
+                            Some(_) if reached.contains(&e.id) => report.errors.push(format!(
+                                "{}: object {} is linked more than once",
+                                child, e.id
+                            )),
+                            Some(_) => {
+                                reached.insert(e.id);
+                                stack.push((e.id, child));
                             }
                         }
                     }
                 }
             }
         }
-        report
+        if complete {
+            for id in dnodes.keys().filter(|id| !reached.contains(id)) {
+                report
+                    .errors
+                    .push(format!("object {} isn't linked from any directory", id));
+            }
+        }
     }
 
     /// Read every record of the tree under `root`, data included.
-    pub(crate) async fn verify_tree(&self, root: &[BlockPtr]) -> WalkReport {
+    pub(crate) async fn verify_tree(&self, root: &TreeRoot) -> WalkReport {
         self.walk_tree(root, true, &mut NoVisitor).await
     }
 
     /// Blocks referenced from the committed root (and the walk's report).
     async fn live_set(&self) -> (LiveSet, WalkReport) {
-        let root = self.root_ptr.lock().await.clone();
+        let root = self.objects.root();
         let mut live = LiveSet::default();
         let walk = self.walk_tree(&root, false, &mut live).await;
         (live, walk)
     }
 
     /// Blocks referenced by `roots` (older trees), ignoring damage.
-    async fn protected_set(&self, roots: &[Vec<BlockPtr>]) -> BTreeMap<u64, u64> {
+    async fn protected_set(&self, roots: &[TreeRoot]) -> BTreeMap<u64, u64> {
         let mut set = LiveSet::default();
         for root in roots {
             self.walk_tree(root, false, &mut set).await;
@@ -542,13 +788,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Roots of the valid ring uberblocks older than the committed one.
-    async fn older_roots(&self) -> Vec<Vec<BlockPtr>> {
-        let txg = self.uberblock().await.map_or(0, |u| u.txg);
+    async fn older_roots(&self) -> Vec<TreeRoot> {
+        let txg = self.uberblock().await.map_or(Txg::ZERO, |u| u.txg);
         self.uberblock_ring()
             .await
             .into_iter()
-            .filter(|u| u.txg < txg && u.txg + TXG_DEFER_SIZE >= txg)
-            .map(|u| u.root)
+            .filter(|u| u.txg < txg && u.txg.after(TXG_DEFER_SIZE) >= txg)
+            .map(|u| u.objects)
             .collect()
     }
 
@@ -557,7 +803,7 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn diff_spacemaps(
         &self,
         live: &BTreeMap<u64, u64>,
-    ) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    ) -> (Vec<Extent>, Vec<Extent>, Vec<Extent>) {
         let (mut leaks, mut referenced_free) = (Vec::new(), Vec::new());
         for ms in self.metaslabs.iter() {
             let ms = ms.read().await;
@@ -567,14 +813,19 @@ impl<D: BlockDevice> FileSystem<D> {
             let live_here = clip(live, start, end);
             // Allocated minus live.
             for (&s, &l) in &allocated {
-                leaks.extend(complement(&live_here, s, s + l));
+                leaks.extend(
+                    complement(&live_here, s, s + l)
+                        .into_iter()
+                        .map(|(s, l)| Extent::new(s, l)),
+                );
             }
             referenced_free.extend(intersect(&live_here, &released));
         }
         let data_start = self.layout.data_start;
         let data_end = data_start + self.layout.metaslab_count * self.layout.metaslab_size_blocks;
-        let mut out_of_range: Vec<(u64, u64)> = clip(live, 0, data_start).into_iter().collect();
-        out_of_range.extend(clip(live, data_end, u64::MAX));
+        let extents = |m: BTreeMap<u64, u64>| m.into_iter().map(|(s, l)| Extent::new(s, l));
+        let mut out_of_range: Vec<Extent> = extents(clip(live, 0, data_start)).collect();
+        out_of_range.extend(extents(clip(live, data_end, u64::MAX)));
         (leaks, referenced_free, out_of_range)
     }
 
@@ -583,14 +834,15 @@ impl<D: BlockDevice> FileSystem<D> {
     /// the commit lock throughout (writers wait), so the comparison is exact.
     pub async fn fsck(&self, repair: bool) -> Result<FsckReport, FileSystemError> {
         let repair = repair && !self.read_only;
-        let _tx = self.begin_tx().await;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
         if !self.read_only {
-            self.commit_locked().await?;
+            self.commit_locked(tx).await?;
         }
         let (live, walk) = self.live_set().await;
         let (leaks, referenced_free, out_of_range) = self.diff_spacemaps(&live.live).await;
         let mut report = FsckReport {
-            txg: self.uberblock().await.map_or(0, |u| u.txg),
+            txg: self.uberblock().await.map_or(Txg::ZERO, |u| u.txg),
             repair,
             records: walk.records,
             live_blocks: live.live.values().sum(),
@@ -608,23 +860,26 @@ impl<D: BlockDevice> FileSystem<D> {
 
         let mut changed = false;
         if !report.referenced_free.is_empty() {
-            for &(s, l) in &report.referenced_free {
+            for &Extent { start: s, len: l } in &report.referenced_free {
                 if let Some(idx) = self.layout.metaslab_for_block(s) {
-                    self.metaslabs[idx].write().await.mark_allocated(s, l);
+                    self.metaslabs[idx.index()]
+                        .write()
+                        .await
+                        .mark_allocated(s, l);
                 }
             }
             report.referenced_free_repaired = true;
             changed = true;
         }
         if !report.leaks.is_empty() && !report.incomplete {
-            for &(s, l) in &report.leaks {
-                self.free(s, l).await?;
+            for &Extent { start: s, len: l } in &report.leaks {
+                self.free(tx, s, l).await?;
             }
             report.leaks_repaired = true;
             changed = true;
         }
         if changed {
-            report.txg = self.commit_locked().await?;
+            report.txg = self.commit_locked(tx).await?;
         }
         Ok(report)
     }
@@ -640,11 +895,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 "pool opened read-only".into(),
             ));
         }
-        let _tx = self.begin_tx().await;
-        self.commit_locked().await?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        self.commit_locked(tx).await?;
         let older = self.older_roots().await;
         let report = self.rebuild_spacemaps_locked(&older, force).await?;
-        self.commit_locked().await?;
+        self.commit_locked(tx).await?;
         Ok(report)
     }
 
@@ -652,7 +908,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `older` are the trees to hold freed space back for.
     pub(crate) async fn rebuild_spacemaps_locked(
         &self,
-        older: &[Vec<BlockPtr>],
+        older: &[TreeRoot],
         force: bool,
     ) -> Result<RebuildReport, FileSystemError> {
         let (live, walk) = self.live_set().await;
@@ -664,7 +920,11 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let protected = self.protected_set(older).await;
-        let release_txg = self.uberblock().await.map_or(0, |u| u.txg) + TXG_DEFER_SIZE;
+        let release_txg = self
+            .uberblock()
+            .await
+            .map_or(Txg::ZERO, |u| u.txg)
+            .after(TXG_DEFER_SIZE);
         let mut report = RebuildReport {
             live_blocks: live.live.values().sum(),
             errors: walk.errors,
@@ -711,7 +971,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Find all blocks that are allocated but not referenced by any live data
-    pub async fn find_orphaned_blocks(&self) -> Result<Vec<(u64, u64)>, FileSystemError> {
+    pub async fn find_orphaned_blocks(&self) -> Result<Vec<Extent>, FileSystemError> {
         let (live, walk) = self.live_set().await;
         if walk.incomplete {
             return Err(FileSystemError::ChecksumMismatch);
@@ -726,7 +986,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn salvage(&self, dest: &Path) -> Result<SalvageReport, FileSystemError> {
         use std::os::unix::fs::FileExt;
         let io = |e: std::io::Error| FileSystemError::DiskError(e.into());
-        let root = self.root_ptr.lock().await.clone();
+        let root = self.objects.root();
         let mut found = Collect::default();
         let walk = self.walk_tree(&root, false, &mut found).await;
         let mut report = SalvageReport {
@@ -740,59 +1000,39 @@ impl<D: BlockDevice> FileSystem<D> {
             std::fs::create_dir_all(local(d)).map_err(io)?;
         }
 
-        for (path, size, blocks) in found.files {
+        // Files and volumes alike: a tree of `blksz` records, holes sparse.
+        for (path, d) in found.objects {
+            let size = d.size;
+            let bs = d.blksz as u64;
             let out = std::fs::File::create(local(&path)).map_err(io)?;
+            out.set_len(size).map_err(io)?;
             let mut item = Salvaged {
                 path,
                 bytes: size,
                 lost: Vec::new(),
             };
-            let mut offset = 0u64;
-            for p in &blocks {
-                match self.read_record(p).await {
-                    Ok(data) => out.write_all_at(&data, offset).map_err(io)?,
-                    Err(_) => item.lost.push((offset, p.lsize as u64)),
-                }
-                offset += p.lsize as u64;
-            }
-            out.set_len(size).map_err(io)?;
-            report.items.push(item);
-        }
-
-        for (path, inode) in found.volumes {
-            let InodeType::Volume {
-                size_bytes,
-                volblocksize,
-                levels,
-                root,
-                ..
-            } = inode
-            else {
-                continue;
-            };
-            let vbs = volblocksize as u64;
-            let out = std::fs::File::create(local(&format!("{}.img", path))).map_err(io)?;
-            out.set_len(size_bytes).map_err(io)?;
-            let mut item = Salvaged {
-                path: format!("{}.img", path),
-                bytes: size_bytes,
-                lost: Vec::new(),
-            };
-            let mut stack: Vec<(BlockPtr, u8, u64)> =
-                root.into_iter().map(|r| (r, levels, 0)).collect();
+            let mut stack: Vec<(BlockPtr, u8, u64)> = d
+                .tree
+                .ptr
+                .into_iter()
+                .map(|r| (r, d.tree.levels, 0))
+                .collect();
             while let Some((ptr, level, base)) = stack.pop() {
                 let span = INDIRECT_FANOUT.pow(level as u32);
-                let offset = base * vbs;
+                let offset = base * bs;
+                if offset >= size {
+                    continue;
+                }
+                let lost = (span * bs).min(size - offset);
                 let data = match self.read_record(&ptr).await {
                     Ok(d) => d,
                     Err(_) => {
-                        let len = (span * vbs).min(size_bytes.saturating_sub(offset));
-                        item.lost.push((offset, len));
+                        item.lost.push(offset..offset + lost);
                         continue;
                     }
                 };
                 if level == 0 {
-                    let n = (data.len() as u64).min(size_bytes.saturating_sub(offset));
+                    let n = (data.len() as u64).min(size - offset);
                     out.write_all_at(&data[..n as usize], offset).map_err(io)?;
                     continue;
                 }
@@ -805,13 +1045,10 @@ impl<D: BlockDevice> FileSystem<D> {
                             }
                         }
                     }
-                    Err(_) => {
-                        let len = (span * vbs).min(size_bytes.saturating_sub(offset));
-                        item.lost.push((offset, len));
-                    }
+                    Err(_) => item.lost.push(offset..offset + lost),
                 }
             }
-            item.lost.sort_unstable();
+            item.lost.sort_unstable_by_key(|r| r.start);
             report.items.push(item);
         }
         Ok(report)

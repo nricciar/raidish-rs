@@ -3,11 +3,12 @@
 use crate::app::Sample;
 use crate::cluster::Status;
 use crate::fmt;
-use crate::session::{LayoutData, Shared, Snapshot, hostname};
+use crate::session::{Shared, Snapshot};
 use raidish::fs::LabelState;
-use raidish::inspect::{DiskReport, Health, ObjectKind};
+use raidish::inspect::{DiskReport, Health};
+use raidish::types::NodeId;
 use raidish::vdev::Topology;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use yew::prelude::*;
 
@@ -77,7 +78,7 @@ pub fn Hero(p: &HeroProps) -> Html {
                         if r.fault_tolerance == 1 { "" } else { "s" }) }
                 </p>
                 <div class="facts">
-                    <Fact label="TXG" value={fmt::count(r.txg)} sub={r.committed_ms.map(|t| format!("committed {}", fmt::ago(t as f64, p.now)))} />
+                    <Fact label="TXG" value={fmt::count(r.txg.get())} sub={r.committed_ms.map(|t| format!("committed {}", fmt::ago(t as f64, p.now)))} />
                     <Fact label="Disks" value={format!("{}/{}", r.disks.len() - offline, r.disks.len())}
                         sub={Some(if offline > 0 { format!("{} unavailable", offline) } else { String::from("all online") })} />
                     <Fact label="Resilver" value={if resilver > 0 { format!("{} disk{}", resilver, if resilver == 1 { "" } else { "s" }) } else { "none".into() }}
@@ -228,8 +229,13 @@ fn disk_card(d: &DiskReport, p: &TopologyProps) -> Html {
         .as_ref()
         .and_then(|c| c.owner_of(d.index))
         .map(|m| match &m.addr {
-            Some(a) => format!("node {} · {}", m.id, a.trim_start_matches("http://")),
-            None => format!("node {} · this node", m.id),
+            Some(a) => format!(
+                "{} · {}",
+                NodeId::from_raw(m.id),
+                a.trim_start_matches("https://")
+                    .trim_start_matches("http://")
+            ),
+            None => format!("{} · this node", NodeId::from_raw(m.id)),
         });
     let history = p.history.get(d.index);
     // Mean round trip over each refresh interval.
@@ -349,11 +355,11 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
             <div class="kv">
                 <span>{ "Leader" }</span>
                 <span>
-                    if let Some(l) = s.leader { { format!("node {}", l) } }
+                    if let Some(l) = s.leader { { NodeId::from_raw(l).name() } }
                     else { <span class="tag bad">{ "no quorum" }</span> }
                 </span>
                 <span>{ "Raft term" }</span><span>{ s.term }</span>
-                <span>{ "Lease epoch" }</span><span>{ s.state.epoch }</span>
+                <span>{ "Lease epoch" }</span><span>{ s.state.epoch.to_string() }</span>
                 <span>{ "Layout" }</span><span class="mono">{ s.fingerprint.clone() }</span>
             </div>
             <h3>{ "Members" }</h3>
@@ -363,9 +369,9 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     html! {
                         <li>
                             <span class={classes!("dot", if quorum { "ok" } else { "warn" })}></span>
-                            <span class="mono">{ format!("node {}", m.id) }</span>
+                            <span class="mono">{ NodeId::from_raw(m.id).name() }</span>
                             if leader { <span class="crown" title="leader">{ "♛" }</span> }
-                            <span class="muted">{ m.addr.clone().unwrap_or_else(|| format!("{} (this node)", s.node)) }</span>
+                            <span class="muted">{ m.addr.clone().unwrap_or_else(|| "this node".to_string()) }</span>
                             <span class="muted small">{ format!("disks {}", m.disks.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) }</span>
                         </li>
                     }
@@ -387,8 +393,8 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     };
                     html! {
                         <li class={cls}>
-                            <span class="mono">{ res.clone() }</span>
-                            <span>{ l.desc.clone() }</span>
+                            <span class="mono">{ res.to_string() }</span>
+                            <span>{ l.holder.to_string() }</span>
                             <span class="muted small">{ format!("{} · epoch {}", l.owner, l.epoch) }</span>
                             <span class={classes!("tag", cls)}>{ state }</span>
                         </li>
@@ -483,99 +489,3 @@ pub fn Timeline(p: &TimelineProps) -> Html {
 }
 
 // ------------------------------------------------------------- objects ----
-
-/// Volume name → (records, discontiguities), or why not (yet).
-pub type FragResults = HashMap<String, Result<(u64, u64), String>>;
-
-#[derive(Properties, PartialEq)]
-pub struct ObjectsProps {
-    pub layout: Shared<LayoutData>,
-    pub frag: Rc<FragResults>,
-    pub on_frag: Callback<String>,
-}
-
-#[function_component]
-pub fn Objects(p: &ObjectsProps) -> Html {
-    let sort_by_size = use_state(|| true);
-    let mut objects: Vec<_> = p.layout.objects.iter().collect();
-    if *sort_by_size {
-        objects.sort_by_key(|o| std::cmp::Reverse(o.allocated_blocks));
-    }
-    let host = hostname();
-    let toggle = {
-        let s = sort_by_size.clone();
-        Callback::from(move |_| s.set(!*s))
-    };
-    let volumes = objects
-        .iter()
-        .filter(|o| o.kind == ObjectKind::Volume)
-        .count();
-    html! {
-        <section class="card">
-            <div class="card-head">
-                <h2>{ "Files & volumes" }</h2>
-                <button class="btn ghost" onclick={toggle}>
-                    { if *sort_by_size { "sorted by size" } else { "sorted by path" } }
-                </button>
-            </div>
-            if objects.is_empty() {
-                <p class="muted">{ "The pool is empty. Create a volume with `raidish block <name> <bytes>`." }</p>
-            } else {
-                <div class="table-wrap">
-                <table class="objects">
-                    <thead><tr>
-                        <th>{ "Path" }</th><th>{ "Kind" }</th>
-                        <th class="num">{ "Size" }</th><th class="num">{ "On disk" }</th><th>{ "" }</th>
-                    </tr></thead>
-                    <tbody>
-                    { for objects.iter().map(|o| {
-                        let name = o.path.trim_start_matches('/').to_string();
-                        let kind = match o.kind {
-                            ObjectKind::File => "file",
-                            ObjectKind::Directory => "dir",
-                            ObjectKind::Volume => "volume",
-                        };
-                        let action = if o.kind == ObjectKind::Volume {
-                            let on_frag = p.on_frag.clone();
-                            let n = name.clone();
-                            match p.frag.get(&name) {
-                                Some(Ok((records, breaks))) => html! {
-                                    <span class="small">{ format!("{} records, {:.1}% fragmented", records,
-                                        if *records > 1 { *breaks as f64 * 100.0 / (*records - 1) as f64 } else { 0.0 }) }</span>
-                                },
-                                Some(Err(e)) => html! { <span class="small muted">{ e.clone() }</span> },
-                                None => html! {
-                                    <button class="btn ghost small" onclick={Callback::from(move |_| on_frag.emit(n.clone()))}>
-                                        { "check fragmentation" }
-                                    </button>
-                                },
-                            }
-                        } else {
-                            Html::default()
-                        };
-                        html! {
-                            <>
-                            <tr>
-                                <td class="mono">{ o.path.clone() }</td>
-                                <td><span class={classes!("kind", kind)}>{ kind }</span></td>
-                                <td class="num">{ if o.kind == ObjectKind::Directory { "—".to_string() } else { fmt::bytes(o.size_bytes) } }</td>
-                                <td class="num">{ fmt::blocks(o.allocated_blocks) }</td>
-                                <td>{ action }</td>
-                            </tr>
-                            if o.kind == ObjectKind::Volume {
-                                <tr class="cmds"><td colspan="5">
-                                    <code>{ format!("raidish nbd {}  →  sudo nbd-client {} 10809 /dev/nbd0", name, host) }</code>
-                                    <code>{ format!("raidish nvme {}  →  sudo nvme connect -t tcp -a {} -s 4420 -n nqn.2024-01.com.raidish:nvme:{}", name, host, name) }</code>
-                                </td></tr>
-                            }
-                            </>
-                        }
-                    }) }
-                    </tbody>
-                </table>
-                </div>
-                <p class="muted small">{ format!("{} objects, {} volumes. Commands assume the server runs on this host.", objects.len(), volumes) }</p>
-            }
-        </section>
-    }
-}

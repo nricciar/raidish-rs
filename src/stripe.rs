@@ -8,7 +8,7 @@
 //! Requests that cross a boundary are split. A stripe tolerates no more
 //! failures than its weakest child.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev, lcm, max_record_blocks};
 use async_trait::async_trait;
@@ -71,14 +71,24 @@ impl Stripe {
     }
 }
 
+/// The children's error, if any, a fencing refusal first (audit R2a): it
+/// must reach the caller as one, not hidden by another child's failure.
+/// Every child runs to the end (no child's write is cut off halfway).
+fn first_err(results: Vec<Result<(), DiskError>>) -> Result<(), DiskError> {
+    if let Some(e) = crate::disks::fenced_any(&results) {
+        return Err(e);
+    }
+    results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+}
+
 #[async_trait]
 impl BlockDevice for Stripe {
     async fn flush(&self) -> Result<(), DiskError> {
         let results = futures::future::join_all(self.children.iter().map(|c| c.flush())).await;
-        results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        first_err(results)
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].read_block(local, buf).await
     }
@@ -97,25 +107,25 @@ impl BlockDevice for Stripe {
         Ok(min / self.chunk * self.chunk * self.children.len() as u64)
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
-        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+        let segs = self.segments(start, buf.len() as u64);
         let mut rest = buf;
         let mut reads = Vec::new();
         for s in &segs {
-            let (part, tail) = rest.split_at_mut(s.len as usize * BLOCK_SIZE);
+            let (part, tail) = rest.split_at_mut(s.len as usize);
             rest = tail;
             reads.push(self.children[s.child].read_blocks(s.local, part));
         }
-        futures::future::try_join_all(reads).await.map(|_| ())
+        first_err(futures::future::join_all(reads).await)
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
-        let segs = self.segments(start, (buf.len() / BLOCK_SIZE) as u64);
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+        let segs = self.segments(start, buf.len() as u64);
         let writes = segs.iter().map(|s| {
-            let at = s.offset as usize * BLOCK_SIZE;
-            self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize * BLOCK_SIZE])
+            let at = s.offset as usize;
+            self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize])
         });
-        futures::future::try_join_all(writes).await.map(|_| ())
+        first_err(futures::future::join_all(writes).await)
     }
 
     async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {
@@ -160,11 +170,12 @@ impl Vdev for Stripe {
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<LabelScan, RaidZError> {
         let mut scan = LabelScan::default();
         for s in self.segments(lba, blocks) {
             let mut part = self.children[s.child]
-                .verify_labels(s.local, s.len, repair, score)
+                .verify_labels(s.local, s.len, repair, score, stale)
                 .await?;
             for b in part.unrecoverable.iter_mut() {
                 *b = self.global(s.child, *b);

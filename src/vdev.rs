@@ -11,7 +11,7 @@
 //! data shards for raidz, 1 for a mirror, the LCM of its children for a
 //! stripe). The pool's alignment is the root's width.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Candidates, DiskError};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError};
 use crate::disks::{DiskSet, MAX_DISKS};
 use crate::mirror::Mirror;
 use crate::raidz::{RaidZ, RaidZError};
@@ -23,6 +23,9 @@ use std::sync::Arc;
 /// Target record size in blocks; the largest record is the biggest multiple
 /// of the pool's alignment that fits (30 blocks, ~120 KiB, for most pools).
 pub const RECORD_TARGET_BLOCKS: u64 = 30;
+
+/// The most parity a raidz group may have (raidz3).
+pub const MAX_RAIDZ_PARITY: usize = 3;
 
 /// Largest record, in blocks, for a pool aligned to `align`.
 pub fn max_record_blocks(align: u64) -> u64 {
@@ -75,32 +78,32 @@ impl Topology {
         }
     }
 
-    /// The pool blocks `[start, end)` whose data or parity shard `shard`
+    /// The pool blocks whose data or parity shard `shard`
     /// (a block after the label area) of leaf `disk` holds, or None if
     /// `disk` isn't in this tree. The inverse of how each vdev places
     /// blocks: raidz stripe `s` holds blocks `s*data..(s+1)*data`, a
     /// mirror (or plain disk) block `s`, a stripe interleaves its
     /// children in chunks.
-    pub fn pool_range_of(&self, disk: usize, shard: u64) -> Option<(u64, u64)> {
+    pub fn pool_range_of(&self, disk: usize, shard: u64) -> Option<std::ops::Range<u64>> {
         match self {
-            Topology::Disk(d) => (*d == disk).then_some((shard, shard + 1)),
-            Topology::Mirror { disks } => disks.contains(&disk).then_some((shard, shard + 1)),
+            Topology::Disk(d) => (*d == disk).then_some(shard..shard + 1),
+            Topology::Mirror { disks } => disks.contains(&disk).then_some(shard..shard + 1),
             Topology::RaidZ { parity, disks } => {
                 let data = (disks.len() - parity) as u64;
                 disks
                     .contains(&disk)
-                    .then_some((shard * data, (shard + 1) * data))
+                    .then_some(shard * data..(shard + 1) * data)
             }
             Topology::Stripe { children } => {
                 let n = children.len() as u64;
                 let chunk = max_record_blocks(self.width());
                 children.iter().enumerate().find_map(|(i, c)| {
-                    let (s, e) = c.pool_range_of(disk, shard)?;
+                    let r = c.pool_range_of(disk, shard)?;
                     // A child's range never crosses a chunk (the chunk is
                     // a multiple of every child's width).
                     let global =
                         |local: u64| ((local / chunk) * n + i as u64) * chunk + local % chunk;
-                    Some((global(s), global(e - 1) + 1))
+                    Some(global(r.start)..global(r.end - 1) + 1)
                 })
             }
         }
@@ -151,6 +154,15 @@ impl Topology {
             Topology::RaidZ { parity, disks } => {
                 if *parity == 0 {
                     return Err("raidz parity must be at least 1".into());
+                }
+                // Label repair tries every way of leaving `parity` shards
+                // out (C(disks, parity) rebuilds), and raidz3 is as far as
+                // the rest is built and tested for (audit D6b).
+                if *parity > MAX_RAIDZ_PARITY {
+                    return Err(format!(
+                        "raidz parity is at most {} (raidz{} asked for)",
+                        MAX_RAIDZ_PARITY, parity
+                    ));
                 }
                 if disks.len() <= *parity {
                     return Err(format!(
@@ -303,13 +315,16 @@ pub trait Vdev: BlockDevice + std::fmt::Debug {
     /// Verify `blocks` self-describing label blocks (superblock, uberblocks,
     /// space map slots) starting at aligned `lba`. They have no parent
     /// checksum, so `score` decides which version is right. Never-written
-    /// (all zero) units are fine.
+    /// (all zero) units are fine. Members `stale` marks (by pool disk:
+    /// degraded ones) don't vote while the others can decide alone: their
+    /// copies are only repaired (audit D3).
     async fn verify_labels(
         &self,
         lba: BlockId,
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
+        stale: &[bool],
     ) -> Result<LabelScan, RaidZError>;
 }
 
@@ -334,14 +349,33 @@ fn build(disks: &Arc<DiskSet>, t: &Topology) -> Box<dyn Vdev> {
 /// `FileSystem` sits on.
 #[derive(Debug)]
 pub struct Pool {
-    pub disks: Arc<DiskSet>,
-    pub root: Box<dyn Vdev>,
-    pub topology: Topology,
+    disks: Arc<DiskSet>,
+    root: Box<dyn Vdev>,
+    topology: Topology,
     /// Record alignment in blocks (the root's width).
-    pub align: u64,
+    align: u64,
 }
 
 impl Pool {
+    /// Its leaf disks.
+    pub fn disks(&self) -> &Arc<DiskSet> {
+        &self.disks
+    }
+
+    /// The vdev tree over the disks.
+    pub fn root(&self) -> &dyn Vdev {
+        self.root.as_ref()
+    }
+
+    pub fn topology(&self) -> &Topology {
+        &self.topology
+    }
+
+    /// Record alignment in blocks (the root's width).
+    pub fn align(&self) -> u64 {
+        self.align
+    }
+
     pub fn new(disks: Arc<DiskSet>, topology: Topology) -> Result<Self, String> {
         topology.validate(disks.len())?;
         let root = build(&disks, &topology);
@@ -355,7 +389,6 @@ impl Pool {
     }
 
     /// The 5-disk raidz2 every pool used to be.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn raidz(disks: Arc<DiskSet>, parity: usize) -> Self {
         let n = disks.len();
         Self::new(
@@ -374,7 +407,7 @@ impl BlockDevice for Pool {
     async fn flush(&self) -> Result<(), DiskError> {
         self.root.flush().await
     }
-    async fn read_block(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         self.root.read_block(lba, buf).await
     }
     async fn write_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
@@ -383,10 +416,10 @@ impl BlockDevice for Pool {
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         self.root.capacity_blocks().await
     }
-    async fn read_blocks(&self, lba: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, lba: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         self.root.read_blocks(lba, buf).await
     }
-    async fn write_blocks(&self, lba: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, lba: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         self.root.write_blocks(lba, buf).await
     }
     async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {

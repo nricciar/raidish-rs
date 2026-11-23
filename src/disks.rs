@@ -1,4 +1,4 @@
-use crate::disk::{BLOCK_SIZE, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
@@ -22,14 +22,38 @@ pub const MAX_DISKS: usize = 64;
 /// per disk, so the pool knows which disks missed data.
 #[derive(Debug)]
 pub struct DiskSet {
-    pub disks: Arc<Vec<Caddy>>,
+    disks: Arc<Vec<Caddy>>,
     fenced: AtomicU64,
     misses: Vec<AtomicU64>,
+    /// Per disk: repair writes (`repair_shards`) made, ever.
+    repairs: Vec<AtomicU64>,
+    /// Per disk: how many of `repairs` a finished flush of that disk has
+    /// covered (or lost: see `repairs_lost`). Both only grow, so overlapping
+    /// flushes can't undercount.
+    repairs_flushed: Vec<AtomicU64>,
+    /// A disk failed the flush that would have made repairs on it durable
+    /// (see `take_repairs_lost`).
+    repairs_lost: std::sync::atomic::AtomicBool,
     /// The epochs this pool client's remote requests carry (see `crate::fence`).
-    pub fence: Arc<crate::fence::ClientFence>,
+    fence: Arc<crate::fence::ClientFence>,
 }
 
 impl DiskSet {
+    /// Disk `index`.
+    pub fn disk(&self, index: usize) -> &Caddy {
+        &self.disks[index]
+    }
+
+    /// Every disk, in pool order (shared with the disk server).
+    pub fn caddies(&self) -> &Arc<Vec<Caddy>> {
+        &self.disks
+    }
+
+    /// The epochs this pool client's remote requests carry.
+    pub fn fence(&self) -> &crate::fence::ClientFence {
+        &self.fence
+    }
+
     pub fn len(&self) -> usize {
         self.disks.len()
     }
@@ -42,16 +66,46 @@ impl DiskSet {
         self.disks[index].is_local()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn new(paths: &[&str]) -> Self {
         Self::new_with(paths, DiskOptions::default()).await
     }
 
     pub async fn new_with(paths: &[&str], opts: DiskOptions) -> Self {
-        assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
-        let results = join_all(paths.iter().map(|path| Disk::open_with(path, opts))).await;
-        let fence = Arc::new(crate::fence::ClientFence::default());
+        Self::new_fenced(paths, opts, Default::default()).await
+    }
 
+    /// Open `paths`, their requests carrying `fence`'s epochs.
+    pub async fn new_fenced(
+        paths: &[&str],
+        opts: DiskOptions,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Self {
+        let results = join_all(paths.iter().map(|path| Disk::open_with(path, opts))).await;
+        Self::from_opened(paths, results, fence)
+    }
+
+    /// `new_with`, but a path already open in `open` shares that disk (the
+    /// same file, and its lock) rather than opening it a second time.
+    pub async fn new_sharing(paths: &[&str], opts: DiskOptions, open: &DiskSet) -> Self {
+        let results = join_all(paths.iter().map(|&path| async move {
+            match open.disks.iter().find(|c| c.path() == path) {
+                Some(Caddy::Healthy(_, disk)) => Ok(disk.clone()),
+                Some(Caddy::Unhealthy(_, e)) => Err(DiskError::IoError(std::io::Error::other(
+                    format!("unavailable: {}", e),
+                ))),
+                None => Disk::open_with(path, opts).await,
+            }
+        }))
+        .await;
+        Self::from_opened(paths, results, Default::default())
+    }
+
+    fn from_opened(
+        paths: &[&str],
+        results: Vec<Result<Disk, DiskError>>,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Self {
+        assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
         let disks: Vec<Caddy> = results
             .into_iter()
             .zip(paths.iter())
@@ -77,6 +131,9 @@ impl DiskSet {
         DiskSet {
             fence: Default::default(),
             misses: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
+            repairs: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
+            repairs_flushed: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
+            repairs_lost: Default::default(),
             disks: Arc::new(disks),
             fenced: AtomicU64::new(0),
         }
@@ -109,8 +166,13 @@ impl DiskSet {
         self.is_online(disk) && !self.is_fenced(disk)
     }
 
+    /// Count a failed write or flush as a miss: the disk lacks data the
+    /// pool wrote. A fencing refusal isn't one (the disk is fine; we may not
+    /// write there): it fails the whole op instead (see `fenced_any`).
     fn miss<T>(&self, disk: usize, r: Result<T, DiskError>) -> Result<T, DiskError> {
-        if r.is_err() {
+        if let Err(e) = &r
+            && !e.is_fencing()
+        {
             self.misses[disk].fetch_add(1, Ordering::SeqCst);
         }
         r
@@ -126,12 +188,12 @@ impl DiskSet {
         Ok(min.saturating_sub(DISK_LABEL_BLOCKS))
     }
 
-    /// Read `buf.len() / BLOCK_SIZE` consecutive shards of `disk` starting at `shard`.
+    /// Read `buf.len()` consecutive shards of `disk` starting at `shard`.
     pub async fn read_shards(
         &self,
         disk: usize,
         shard: u64,
-        buf: &mut [u8],
+        buf: &mut [Block],
     ) -> Result<(), DiskError> {
         if self.is_fenced(disk) {
             return Err(DiskError::UnhealthyDisk);
@@ -144,23 +206,65 @@ impl DiskSet {
         &self,
         disk: usize,
         shard: u64,
-        buf: &mut [u8],
+        buf: &mut [Block],
     ) -> Result<(), DiskError> {
         self.disks[disk]
             .read_blocks(shard + DISK_LABEL_BLOCKS, buf)
             .await
     }
 
-    pub async fn write_shards(&self, disk: usize, shard: u64, buf: &[u8]) -> Result<(), DiskError> {
+    pub async fn write_shards(
+        &self,
+        disk: usize,
+        shard: u64,
+        buf: &[Block],
+    ) -> Result<(), DiskError> {
         let r = self.disks[disk]
             .write_blocks(shard + DISK_LABEL_BLOCKS, buf)
             .await;
         self.miss(disk, r)
     }
 
+    /// `write_shards` for a repair: a copy or shard rewritten on one disk
+    /// because it was wrong there. It's no write a vdev flush is owed for
+    /// (the data was already durable elsewhere), so a failed flush of that
+    /// disk doesn't fail the vdev's flush (and every commit with it, for as
+    /// long as the disk is bad). It's noted instead, for the scan that made
+    /// the repair to ask (`take_repairs_lost`) before counting it done.
+    pub async fn repair_shards(
+        &self,
+        disk: usize,
+        shard: u64,
+        buf: &[Block],
+    ) -> Result<(), DiskError> {
+        self.write_shards(disk, shard, buf).await?;
+        self.repairs[disk].fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub async fn flush_disk(&self, disk: usize) -> Result<(), DiskError> {
+        // Only repairs written before this flush began are covered by it.
+        let repaired = self.repairs[disk].load(Ordering::SeqCst);
         let r = self.disks[disk].flush().await;
+        if repaired > self.repairs_flushed[disk].load(Ordering::SeqCst) {
+            if r.is_err() {
+                self.repairs_lost.store(true, Ordering::SeqCst);
+            }
+            // Accounted for either way: lost repairs are reported once.
+            self.repairs_flushed[disk].fetch_max(repaired, Ordering::SeqCst);
+        }
         self.miss(disk, r)
+    }
+
+    /// Whether repairs (`repair_shards`) were lost to a failed flush since
+    /// this was last asked, or are on disks not flushed since.
+    pub fn take_repairs_lost(&self) -> bool {
+        let unflushed = self
+            .repairs
+            .iter()
+            .zip(&self.repairs_flushed)
+            .any(|(n, f)| n.load(Ordering::SeqCst) > f.load(Ordering::SeqCst));
+        self.repairs_lost.swap(false, Ordering::SeqCst) || unflushed
     }
 
     /// Raw access to label copy `copy` (< DISK_LABEL_BLOCKS) of `disk`.
@@ -168,7 +272,7 @@ impl DiskSet {
         &self,
         disk: usize,
         copy: u64,
-        buf: &mut [u8],
+        buf: &mut Block,
     ) -> Result<(), DiskError> {
         assert!(copy < DISK_LABEL_BLOCKS);
         self.disks[disk].read_block(copy, buf).await
@@ -193,7 +297,7 @@ pub enum Caddy {
 
 #[async_trait]
 impl BlockDevice for Caddy {
-    async fn read_block(&self, block: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.map_err(|e| {
@@ -220,7 +324,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [u8]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.map_err(|e| {
@@ -230,7 +334,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[u8]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.map_err(|e| {
@@ -294,4 +398,121 @@ impl Caddy {
             Caddy::Healthy(_, disk) => disk.is_local(),
         }
     }
+}
+
+/// Which members took each write a vdev acked since its last flush (audit
+/// D1). A write is durable once `need` of the members that took it have
+/// flushed after it; a flush that leaves any acked write short of that is a
+/// failure, even if some members flushed fine (an `Ok` flush must never
+/// cover a write no disk holds durably).
+///
+/// Flushes are serialized: a flush that started after a write completed
+/// must not return before that write is durable, which a concurrent flush
+/// that already took it off the set would otherwise allow.
+#[derive(Debug)]
+pub struct WriteAcks {
+    need: u32,
+    /// Distinct "members that acked" masks (usually just one: all of them).
+    pending: std::sync::Mutex<std::collections::HashSet<u64>>,
+    flushing: tokio::sync::Mutex<()>,
+}
+
+impl WriteAcks {
+    pub fn new(need: usize) -> Self {
+        WriteAcks {
+            need: need as u32,
+            pending: Default::default(),
+            flushing: Default::default(),
+        }
+    }
+
+    /// Record a write `acked` (a mask of disk indices) took.
+    pub fn record(&self, acked: u64) {
+        let mut p = self.pending.lock().unwrap();
+        if !p.contains(&acked) {
+            p.insert(acked);
+        }
+    }
+
+    /// Run `flush` (which flushes every member and returns the mask that
+    /// succeeded) and check every write recorded before it against that.
+    /// On failure the writes stay pending, so a later flush retries them.
+    pub async fn flush<F, Fut>(&self, flush: F) -> Result<(), DiskError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<u64, DiskError>>,
+    {
+        let _serial = self.flushing.lock().await;
+        // Given up on mid-flush (a dropped future), the writes taken go
+        // back: nothing says they're durable.
+        let mut taken = Restore {
+            acks: self,
+            taken: Some(std::mem::take(&mut *self.pending.lock().unwrap())),
+        };
+        let r = flush().await.and_then(|flushed| {
+            match taken
+                .taken
+                .iter()
+                .flatten()
+                .find(|&&m| (m & flushed).count_ones() < self.need)
+            {
+                None => Ok(()),
+                Some(&m) => Err(DiskError::IoError(std::io::Error::other(format!(
+                    "flush: writes acked by disks {:#x} are durable on only {} of them",
+                    m,
+                    (m & flushed).count_ones()
+                )))),
+            }
+        });
+        if r.is_ok() {
+            taken.taken = None;
+        }
+        r
+    }
+}
+
+/// Puts writes `WriteAcks::flush` took back as pending, unless the flush
+/// covered them.
+struct Restore<'a> {
+    acks: &'a WriteAcks,
+    taken: Option<std::collections::HashSet<u64>>,
+}
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.taken.take() {
+            self.acks.pending.lock().unwrap().extend(t);
+        }
+    }
+}
+
+/// The first fencing refusal among a vdev op's per-member `results`: a
+/// write some members refused for who sent it must fail as a whole, never
+/// "succeed" on the rest with the refusing members counted as degraded
+/// (audit R2a). The other members did take it; the caller stops writing.
+pub fn fenced_any<T>(results: &[Result<T, DiskError>]) -> Option<DiskError> {
+    results.iter().find_map(|r| match r {
+        Err(DiskError::StaleEpoch) => Some(DiskError::StaleEpoch),
+        Err(DiskError::Fenced) => Some(DiskError::Fenced),
+        _ => None,
+    })
+}
+
+/// Each member's verification read, `None` where it failed, unless one
+/// was a fencing refusal: that fails the whole scan, as it fails any vdev
+/// op (audit R2a), rather than counting the disk as unreadable.
+pub fn read_or_fenced<T>(results: Vec<Result<T, DiskError>>) -> Result<Vec<Option<T>>, DiskError> {
+    if let Some(e) = fenced_any(&results) {
+        return Err(e);
+    }
+    Ok(results.into_iter().map(Result::ok).collect())
+}
+
+/// The mask of `members` whose `results` are `Ok`.
+pub fn ok_mask<T, E>(members: &[usize], results: &[Result<T, E>]) -> u64 {
+    members
+        .iter()
+        .zip(results)
+        .filter(|(_, r)| r.is_ok())
+        .fold(0, |m, (&d, _)| m | 1 << d)
 }

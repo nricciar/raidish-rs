@@ -4,6 +4,8 @@ use super::*;
 use crate::cluster::state::Response;
 use crate::fence::FenceMap;
 use crate::test_util::{TestDiskServer, TestPool};
+use crate::types::Txg;
+use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep};
 use crate::vdev::Pool;
 
 const MB: usize = 1024 * 1024;
@@ -14,11 +16,12 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn lease(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
+async fn lease(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &str) -> Epoch {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Acquire {
-        resource: resource.into(),
+        resource: resource.clone(),
         owner: owner.into(),
-        desc: format!("test {}", owner),
+        holder: crate::types::Holder::default().with_detail(format!("test {}", owner)),
         ttl_ms: 600_000,
     };
     match auth.propose(op).await.unwrap() {
@@ -27,11 +30,16 @@ async fn lease(auth: &LocalAuthority, resource: &str, owner: &str) -> u64 {
     }
 }
 
-async fn release(auth: &LocalAuthority, resource: &str, owner: &str, epoch: u64) {
+async fn release(
+    auth: &LocalAuthority,
+    resource: impl std::fmt::Display,
+    owner: &str,
+    epoch: Epoch,
+) {
+    let resource = crate::types::res(resource);
     let op = LeaseOp::Release {
-        resource: resource.into(),
-        owner: owner.into(),
-        epoch,
+        resource: resource.clone(),
+        holder: Holding::new(owner, epoch),
     };
     assert_eq!(auth.propose(op).await.unwrap(), Response::Released);
 }
@@ -52,7 +60,7 @@ async fn setup(volumes: &[&str]) -> Setup {
     }
     drop(fs);
     let auth = Arc::new(LocalAuthority::default());
-    let epoch = lease(&auth, POOL, "c").await;
+    let epoch = lease(&auth, &POOL, "c").await;
     let fs = Arc::new(pool.load().await);
     let committer =
         Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
@@ -66,7 +74,7 @@ async fn setup(volumes: &[&str]) -> Setup {
 struct Writer {
     fs: FileSystem<Pool>,
     resource: String,
-    epoch: u64,
+    epoch: Epoch,
 }
 
 async fn writer(s: &Setup, dev: Pool, id: &str) -> Writer {
@@ -74,8 +82,7 @@ async fn writer(s: &Setup, dev: Pool, id: &str) -> Writer {
     let epoch = lease(&s.auth, &resource, id).await;
     let sink = Arc::new(DirectSink {
         committer: s.committer.clone(),
-        writer: resource.clone(),
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     });
     Writer {
         fs: FileSystem::load_writer(dev, sink).await.unwrap(),
@@ -84,10 +91,12 @@ async fn writer(s: &Setup, dev: Pool, id: &str) -> Writer {
     }
 }
 
-/// Take `vol/<name>` as `owner` and run it on `w`.
-async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> u64 {
-    let epoch = lease(&s.auth, &volume_resource(vol), owner).await;
-    w.fs.attach_volume(vol, owner, epoch).await.unwrap();
+/// Take `ds/<name>` as `owner` and run it on `w`.
+async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> Epoch {
+    let epoch = lease(&s.auth, &dataset_resource(vol), owner).await;
+    w.fs.attach_dataset(vol, Holding::new(owner, epoch))
+        .await
+        .unwrap();
     epoch
 }
 
@@ -146,6 +155,12 @@ async fn two_writers_two_volumes() {
     assert_eq!(read(&w2.fs, "b", 0, want_b.len()).await, want_b);
     assert!(!s.committer.fs.lent_metaslabs().await.is_empty());
 
+    // A running volume's intent log keeps its metaslab lent; once detached,
+    // everything goes back.
+    w1.fs.return_metaslabs().await;
+    assert!(!s.committer.fs.lent_metaslabs().await.is_empty());
+    w1.fs.detach_dataset("a").await.unwrap();
+    w2.fs.detach_dataset("b").await.unwrap();
     w1.fs.return_metaslabs().await;
     w2.fs.return_metaslabs().await;
     assert!(s.committer.fs.lent_metaslabs().await.is_empty());
@@ -162,23 +177,31 @@ async fn two_writers_two_volumes() {
 /// Wraps a sink and keeps the last commit, to resend it.
 struct Recording {
     inner: DirectSink<Pool>,
-    last: std::sync::Mutex<Option<VolumeCommit>>,
+    last: std::sync::Mutex<Option<DatasetCommit>>,
+    last_fs: std::sync::Mutex<Option<FsCommit>>,
 }
 
 #[async_trait]
 impl CommitSink for Recording {
-    fn writer(&self) -> (String, u64) {
+    fn writer(&self) -> LeaseRef {
         self.inner.writer()
     }
     async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
         self.inner.lease_metaslab(want).await
     }
-    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
         self.inner.return_metaslab(idx).await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         *self.last.lock().unwrap() = Some(c.clone());
         self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        *self.last_fs.lock().unwrap() = Some(c.clone());
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
     }
 }
 
@@ -190,16 +213,18 @@ async fn commits_are_compare_and_swap() {
     let sink = Arc::new(Recording {
         inner: DirectSink {
             committer: s.committer.clone(),
-            writer: resource,
-            epoch,
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
         },
         last: Default::default(),
+        last_fs: Default::default(),
     });
     let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
         .await
         .unwrap();
-    let vol_epoch = lease(&s.auth, &volume_resource("a"), "o").await;
-    fs.attach_volume("a", "o", vol_epoch).await.unwrap();
+    let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", Holding::new("o", ds_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(300_000, 3)).await.unwrap();
     fs.sync().await.unwrap();
     let first = sink.last.lock().unwrap().clone().unwrap();
@@ -213,15 +238,18 @@ async fn commits_are_compare_and_swap() {
     // The first commit again, now that the root has moved on: refused.
     assert!(matches!(
         s.committer.commit(&first).await,
-        Err(CommitError::Refused(_))
+        Err(CommitError::Refused { .. })
     ));
     // Space outside what was lent: refused.
     let mut wild = sink.last.lock().unwrap().clone().unwrap();
     wild.base_root = wild.new_root.clone();
-    wild.allocs = vec![(s.committer.fs.layout.data_start, 1)];
+    wild.allocs = vec![crate::types::Extent::new(
+        s.committer.fs.layout.data_start,
+        1,
+    )];
     assert!(matches!(
         s.committer.commit(&wild).await,
-        Err(CommitError::Refused(_))
+        Err(CommitError::Refused { .. })
     ));
     let mut want = pattern(300_000, 3);
     want[..1000].copy_from_slice(&pattern(1000, 4));
@@ -232,14 +260,14 @@ async fn commits_are_compare_and_swap() {
 async fn a_writer_without_its_leases_cannot_commit() {
     let s = setup(&["a"]).await;
     let w = writer(&s, s.pool.dev().await, "1").await;
-    let vol_epoch = attach(&s, &w, "a", "o").await;
+    let ds_epoch = attach(&s, &w, "a", "o").await;
     w.fs.block_write("a", 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w.fs.sync().await.unwrap();
 
     // The volume lease is released (moved elsewhere): the next sync is refused.
-    release(&s.auth, &volume_resource("a"), "o", vol_epoch).await;
+    release(&s.auth, &dataset_resource("a"), "o", ds_epoch).await;
     w.fs.block_write("a", 0, &pattern(100_000, 2))
         .await
         .unwrap();
@@ -262,10 +290,7 @@ fn sync_fence(server: &TestDiskServer, s: &Setup) {
     let state = s.auth.state();
     server.floor.observe(
         state.pool_epoch(),
-        state
-            .metaslabs
-            .iter()
-            .map(|(&i, g)| (i, g.writer.is_some(), g.epoch)),
+        state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
     );
 }
 
@@ -290,7 +315,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     // A stalls; the cluster decides it's gone: its leases lapse and the
     // committer takes its metaslabs back.
     release(&s.auth, &a.resource, "a", a.epoch).await;
-    release(&s.auth, &volume_resource("a"), "oa", a_vol).await;
+    release(&s.auth, &dataset_resource("a"), "oa", a_vol).await;
     s.committer.reclaim().await;
     assert!(s.committer.fs.lent_metaslabs().await.is_empty());
     sync_fence(&server, &s);
@@ -318,6 +343,95 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     assert!(fs.fsck(false).await.unwrap().is_clean());
 }
 
+/// R2b, over the wire: a committer write spanning a metaslab returned to it
+/// and a plain one goes out as two requests, each stamped for its own
+/// domain. With one stamp (the return's, newer than the pool epoch) the
+/// plain metaslab's floor rose to it, and the committer's next pool-stamped
+/// write there was refused: it fenced itself out.
+#[tokio::test]
+async fn a_write_across_a_returned_metaslab_doesnt_fence_the_committer() {
+    let s = setup(&["a"]).await;
+    let server = TestDiskServer::start(&s.pool.paths).await;
+    let map = FenceMap::new(s.pool.topology.clone(), s.committer.fs.layout);
+    server.floor.set_map(Some(map.clone()));
+    let all: Vec<usize> = (0..s.pool.paths.len()).collect();
+    let dev = s.pool.dev_remote(&server, &all).await;
+    let disks = dev.disks().clone();
+    let fence = disks.fence();
+    fence.set_map(map.clone());
+    let pool = s.auth.state().pool_epoch();
+    fence.set_pool_epoch(pool);
+    server.floor.observe(pool, []);
+
+    // The last raw block of metaslab 0 on disk 0, and metaslab 1's first.
+    let shard = (0..u64::MAX)
+        .map(|sh| sh + crate::disks::DISK_LABEL_BLOCKS)
+        .find(|&b| map.domain_of(0, b + 1) == crate::fence::Domain::Metaslab(crate::types::ms(1)))
+        .unwrap()
+        - crate::disks::DISK_LABEL_BLOCKS;
+    let returned = Epoch::from_raw(pool.get() + 5);
+    fence.set_returned(crate::types::ms(0), returned);
+    server.floor.observe(
+        pool,
+        [(crate::types::ms(0), crate::fence::Grant::Returned(returned))],
+    );
+
+    // Rewrite what's there (the pool's own blocks), across the boundary...
+    let mut two = crate::disk::zeroed_blocks(2);
+    disks.read_shards(0, shard, &mut two).await.unwrap();
+    disks.write_shards(0, shard, &two).await.unwrap();
+    // ...then metaslab 1 alone, with the pool epoch.
+    disks.write_shards(0, shard + 1, &two[1..]).await.unwrap();
+    assert!(!fence.is_stale());
+    assert_eq!(
+        server
+            .floor
+            .floor(crate::fence::Domain::Metaslab(crate::types::ms(1))),
+        pool
+    );
+}
+
+/// D5a: a writer repairs only in space lent to it, and what it repairs
+/// stays lent (it can't be given back and lent or reused) until the repair
+/// is done. Outside its lent space it doesn't repair at all: no hold of a
+/// writer's keeps the committer from freeing and reusing the block.
+#[tokio::test]
+async fn a_writers_repairs_pin_its_lent_space() {
+    let s = setup(&["a"]).await;
+    let a = writer(&s, s.pool.dev().await, "a").await;
+    attach(&s, &a, "a", "oa").await;
+    a.fs.block_write("a", 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    a.fs.sync().await.unwrap();
+    // Done with the volume: its intent log no longer pins its metaslab.
+    a.fs.detach_dataset("a").await.unwrap();
+    let w = a.fs.writer.clone().unwrap();
+    let lent = w.lent.lock().unwrap().clone();
+    assert!(w.pinned.lock().unwrap().is_empty());
+    let idx = lent[0];
+    let layout = a.fs.layout;
+    let start = |i: crate::types::MetaslabIdx| {
+        layout.data_start + i.index() as u64 * layout.metaslab_size_blocks
+    };
+    let other = (0..layout.metaslab_count as u32)
+        .map(crate::types::MetaslabIdx::from_raw)
+        .find(|i| !lent.contains(i))
+        .unwrap();
+    assert!(a.fs.repair_hold(start(other), 1).is_none(), "not lent");
+    assert!(a.fs.repair_hold(0, 1).is_none(), "not a metaslab");
+
+    let hold = a.fs.repair_hold(start(idx) + 3, 2).unwrap();
+    assert_eq!(hold.pinned(), &[idx]);
+    a.fs.return_metaslabs().await;
+    assert!(w.lent.lock().unwrap().contains(&idx), "pinned: kept");
+    drop(hold);
+    a.fs.return_metaslabs().await;
+    assert!(!w.lent.lock().unwrap().contains(&idx));
+    // Given back: no longer this writer's to repair.
+    assert!(a.fs.repair_hold(start(idx), 1).is_none());
+}
+
 /// An authority whose view of the cluster lags (a committer on a Raft
 /// follower): proposals go through, `state()` shows an older snapshot.
 struct Lagging {
@@ -340,7 +454,7 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     let s = setup(&["a"]).await;
     // The writer's and volume's leases are visible; the lends to come aren't.
     let w_epoch = lease(&s.auth, "writer/1", "1").await;
-    let v_epoch = lease(&s.auth, &volume_resource("a"), "o").await;
+    let v_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
     let lagging = Arc::new(Lagging {
         inner: s.auth.clone(),
         view: std::sync::Mutex::new(s.auth.state()),
@@ -358,13 +472,14 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     );
     let sink = Arc::new(DirectSink {
         committer: committer.clone(),
-        writer: "writer/1".into(),
-        epoch: w_epoch,
+        writer: LeaseRef::new(crate::types::res("writer/1"), w_epoch),
     });
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
-    fs.attach_volume("a", "o", v_epoch).await.unwrap();
+    fs.attach_dataset("a", Holding::new("o", v_epoch))
+        .await
+        .unwrap();
     fs.block_write("a", 0, &pattern(200_000, 5)).await.unwrap();
     fs.sync().await.unwrap();
     committer.reclaim().await;
@@ -382,16 +497,16 @@ struct Retrying(DirectSink<Pool>);
 
 #[async_trait]
 impl CommitSink for Retrying {
-    fn writer(&self) -> (String, u64) {
+    fn writer(&self) -> LeaseRef {
         self.0.writer()
     }
     async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
         self.0.lease_metaslab(want).await
     }
-    async fn return_metaslab(&self, idx: u32) -> Result<(), CommitError> {
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
         self.0.return_metaslab(idx).await
     }
-    async fn commit(&self, c: VolumeCommit) -> Result<Committed, CommitError> {
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
         loop {
             match self.0.commit(c.clone()).await {
                 Err(CommitError::Retry(_)) => {
@@ -400,6 +515,12 @@ impl CommitSink for Retrying {
                 other => return other,
             }
         }
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.0.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.0.claim_dataset(volume, ds).await
     }
 }
 
@@ -410,8 +531,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
     let epoch = lease(&s.auth, &resource, "1").await;
     let sink = Arc::new(Retrying(DirectSink {
         committer: s.committer.clone(),
-        writer: resource,
-        epoch,
+        writer: LeaseRef::new(crate::types::res(&resource), epoch),
     }));
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
@@ -419,16 +539,16 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
     // A short volume lease, which lapses without anyone taking it over: the
     // committer answers "retry" (it could still be renewed), forever.
     let op = LeaseOp::Acquire {
-        resource: volume_resource("a"),
+        resource: dataset_resource("a"),
         owner: "o".into(),
-        desc: "test o".into(),
+        holder: crate::types::Holder::default().with_detail("test o"),
         ttl_ms: 2_000,
     };
     let Response::Granted { epoch: v_epoch, .. } = s.auth.propose(op).await.unwrap() else {
         panic!("volume lease not granted");
     };
     let (lost, rx) = tokio::sync::watch::channel(false);
-    fs.attach_volume_until("a", "o", v_epoch, Some(rx))
+    fs.attach_dataset_until("a", Holding::new("o", v_epoch), Some(rx))
         .await
         .unwrap();
     fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
@@ -451,10 +571,1320 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
         .expect("sync still waiting after the lease was lost")
         .unwrap();
     assert!(r.is_err());
-    fs.abandon_volume("a");
+    fs.abandon_dataset("a");
 
     // Only what was committed is there.
     let fs = s.pool.load().await;
     assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
     assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+// ---- files and directories from writers ----
+
+use crate::writer::FsOp;
+use std::path::Path;
+
+#[tokio::test]
+async fn two_writers_write_files_concurrently() {
+    let s = setup(&[]).await;
+    let w1 = writer(&s, s.pool.dev().await, "1").await;
+    let w2 = writer(&s, s.pool.dev().await, "2").await;
+    w1.fs.mkdir(Path::new("shared")).await.unwrap();
+    w2.fs.mkdir(Path::new("two")).await.unwrap();
+
+    // Same directory and different ones, at the same time.
+    let (r1, r2) = tokio::join!(
+        async {
+            for i in 0..4u8 {
+                let p = format!("shared/a{}", i);
+                w1.fs
+                    .write_file(Path::new(&p), &pattern(300_000, i))
+                    .await?;
+            }
+            w1.fs.write_file(Path::new("one"), &pattern(MB, 40)).await
+        },
+        async {
+            for i in 0..4u8 {
+                let p = format!("shared/b{}", i);
+                w2.fs
+                    .write_file(Path::new(&p), &pattern(200_000, 10 + i))
+                    .await?;
+            }
+            w2.fs
+                .write_file(Path::new("two/x"), &pattern(MB + 7, 41))
+                .await
+        }
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    // Overwrite one of the other writer's files, and delete another.
+    w2.fs.reload_root_index().await.unwrap();
+    w2.fs
+        .write_file(Path::new("shared/a0"), &pattern(5000, 99))
+        .await
+        .unwrap();
+    w1.fs.delete(Path::new("shared/b3")).await.unwrap();
+
+    let check = async |fs: &FileSystem<Pool>| {
+        assert_eq!(
+            fs.read_file(Path::new("shared/a0")).await.unwrap(),
+            pattern(5000, 99)
+        );
+        for i in 1..4u8 {
+            let p = format!("shared/a{}", i);
+            assert_eq!(
+                fs.read_file(Path::new(&p)).await.unwrap(),
+                pattern(300_000, i)
+            );
+        }
+        for i in 0..3u8 {
+            let p = format!("shared/b{}", i);
+            assert_eq!(
+                fs.read_file(Path::new(&p)).await.unwrap(),
+                pattern(200_000, 10 + i)
+            );
+        }
+        assert!(fs.read_file(Path::new("shared/b3")).await.is_err());
+        assert_eq!(
+            fs.read_file(Path::new("one")).await.unwrap(),
+            pattern(MB, 40)
+        );
+        assert_eq!(
+            fs.read_file(Path::new("two/x")).await.unwrap(),
+            pattern(MB + 7, 41)
+        );
+    };
+    w1.fs.reload_root_index().await.unwrap();
+    w2.fs.reload_root_index().await.unwrap();
+    check(&w1.fs).await;
+    check(&w2.fs).await;
+
+    w1.fs.return_metaslabs().await;
+    w2.fs.return_metaslabs().await;
+    drop((w1, w2));
+    let fs = s.pool.load().await;
+    check(&fs).await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+#[tokio::test]
+async fn file_commits_are_compare_and_swap() {
+    let s = setup(&["vol"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Recording {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        last: Default::default(),
+        last_fs: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+        .await
+        .unwrap();
+    fs.write_file(Path::new("f"), &pattern(100_000, 1))
+        .await
+        .unwrap();
+    let first = sink.last_fs.lock().unwrap().clone().unwrap();
+
+    // Resent (the answer got lost): acknowledged, nothing changes.
+    s.committer.commit_fs(&first).await.unwrap();
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        pattern(100_000, 1)
+    );
+
+    // Someone else replaces it: the first write, prepared against "absent",
+    // is now refused rather than clobbering the newer file.
+    fs.write_file(Path::new("f"), &pattern(2000, 2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.committer.commit_fs(&first).await,
+        Err(CommitError::Refused { .. })
+    ));
+    // A delete prepared against the first version: refused too.
+    let stale_delete = FsCommit {
+        op: FsOp::Delete {
+            path: "f".into(),
+            base: Some((
+                crate::disk::FileId::NONE,
+                crate::object::TreeRoot {
+                    ptr: None,
+                    levels: 0,
+                },
+            )),
+        },
+        ..first.clone()
+    };
+    assert!(matches!(
+        s.committer.commit_fs(&stale_delete).await,
+        Err(CommitError::Refused { .. })
+    ));
+    // Space outside what was lent: refused.
+    let mut wild = first.clone();
+    if let FsOp::WriteFile {
+        path, allocs, base, ..
+    } = &mut wild.op
+    {
+        *path = "g".into();
+        *base = None;
+        allocs[0].start = s.committer.fs.layout.data_start;
+    }
+    assert!(matches!(
+        s.committer.commit_fs(&wild).await,
+        Err(CommitError::Refused { .. })
+    ));
+    // Volumes aren't deleted this way.
+    assert!(fs.delete(Path::new("vol")).await.is_err());
+
+    assert_eq!(
+        fs.read_file(Path::new("f")).await.unwrap(),
+        pattern(2000, 2)
+    );
+    fs.return_metaslabs().await;
+    drop(fs);
+    let fs = s.pool.load().await;
+    assert_eq!(
+        fs.read_file(Path::new("f")).await.unwrap(),
+        pattern(2000, 2)
+    );
+    assert!(fs.read_file(Path::new("g")).await.is_err());
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Writes at an offset from a writer: the committer applies them with a
+/// compare-and-swap on the tree they were made on; a resend is
+/// acknowledged, a stale one refused, and the writer's own sync of writes
+/// made on a file replaced meanwhile fails with a conflict.
+#[tokio::test]
+async fn offset_writes_are_compare_and_swap() {
+    let s = setup(&[]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Recording {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        last: Default::default(),
+        last_fs: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+        .await
+        .unwrap();
+    let mut expect = pattern(200_000, 1);
+    fs.write_file(Path::new("f"), &expect).await.unwrap();
+
+    let f = fs.open_file(Path::new("f"), None).await.unwrap();
+    fs.file_write(&f, 150_000, b"middle").await.unwrap();
+    fs.file_sync(&f).await.unwrap();
+    expect[150_000..150_006].copy_from_slice(b"middle");
+    let update = sink.last_fs.lock().unwrap().clone().unwrap();
+    assert!(matches!(update.op, FsOp::UpdateFile { .. }));
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        expect
+    );
+
+    // Resent: acknowledged, nothing changes.
+    s.committer.commit_fs(&update).await.unwrap();
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        expect
+    );
+
+    // Replaced by someone else: the old update is refused, and writes
+    // made on the old contents are dropped, not written over the new.
+    s.committer
+        .fs
+        .write_file(Path::new("f"), b"theirs")
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.committer.commit_fs(&update).await,
+        Err(CommitError::Refused { .. })
+    ));
+    fs.file_write(&f, 0, b"mine").await.unwrap();
+    assert!(matches!(
+        fs.file_sync(&f).await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("f")).await.unwrap(),
+        b"theirs"
+    );
+
+    fs.return_metaslabs().await;
+    drop(fs);
+    let fs = s.pool.load().await;
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"theirs");
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Lends like a real sink, but keeps namespace commits instead of sending
+/// them (the writer is told "retry", so it keeps the space out of use).
+struct HoldingSink {
+    inner: DirectSink<Pool>,
+    held: std::sync::Mutex<Vec<FsCommit>>,
+}
+
+#[async_trait]
+impl CommitSink for HoldingSink {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.held.lock().unwrap().push(c);
+        Err(CommitError::Retry("held".into()))
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_commits_share_a_txg() {
+    let s = setup(&[]).await;
+    let mut held = Vec::new();
+    let mut writers = Vec::new();
+    for id in 0..3u8 {
+        let resource = format!("writer/{}", id);
+        let epoch = lease(&s.auth, &resource, &id.to_string()).await;
+        let sink = Arc::new(HoldingSink {
+            inner: DirectSink {
+                committer: s.committer.clone(),
+                writer: LeaseRef::new(crate::types::res(&resource), epoch),
+            },
+            held: Default::default(),
+        });
+        let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+            .await
+            .unwrap();
+        for f in 0..2u8 {
+            let p = format!("w{}f{}", id, f);
+            assert!(
+                fs.write_file(Path::new(&p), &pattern(50_000, id * 10 + f))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(fs.mkdir(Path::new(&format!("d{}", id))).await.is_err());
+        held.extend(sink.held.lock().unwrap().drain(..));
+        writers.push(fs);
+    }
+    assert_eq!(held.len(), 9);
+
+    // All of them arrive while a commit is in progress: they apply one after
+    // another, then share a single TXG.
+    let before = s.committer.fs.uberblock().await.unwrap().txg;
+    let busy = s.committer.fs.begin_tx().await;
+    let commits = futures::future::join_all(held.iter().map(|c| s.committer.commit_fs(c)));
+    let (results, ()) = tokio::join!(commits, async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(busy);
+    });
+    let txgs: Vec<Txg> = results.into_iter().map(|r| r.unwrap().txg).collect();
+    let after = s.committer.fs.uberblock().await.unwrap().txg;
+    assert_eq!(
+        after.since(before),
+        1,
+        "9 commits took {} TXGs",
+        after.since(before)
+    );
+    assert!(txgs.iter().all(|&t| t == after));
+
+    for fs in &writers {
+        fs.return_metaslabs().await;
+    }
+    drop(writers);
+    let fs = s.pool.load().await;
+    for id in 0..3u8 {
+        for f in 0..2u8 {
+            let p = format!("w{}f{}", id, f);
+            assert_eq!(
+                fs.read_file(Path::new(&p)).await.unwrap(),
+                pattern(50_000, id * 10 + f)
+            );
+        }
+        fs.ls(Path::new(&format!("d{}", id))).await.unwrap();
+    }
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+// ---- streaming writes, object numbers, object leases ----
+
+use crate::writer::ObjLease;
+
+/// Write `data` through a `FileWriter` in uneven chunks.
+async fn stream(
+    fs: &FileSystem<Pool>,
+    path: &str,
+    data: &[u8],
+    lease: Option<ObjLease>,
+) -> Result<crate::disk::FileId, FileSystemError> {
+    let mut f = fs.file_writer(Path::new(path), lease).await?;
+    for chunk in data.chunks(100_003) {
+        f.write(chunk).await?;
+    }
+    assert_eq!(f.len(), data.len() as u64);
+    f.finish().await
+}
+
+#[tokio::test]
+async fn a_writer_streams_a_large_file() {
+    let s = setup(&[]).await;
+    let w1 = writer(&s, s.pool.dev().await, "1").await;
+    let w2 = writer(&s, s.pool.dev().await, "2").await;
+    let big = pattern(5 * MB + 17, 1);
+
+    let mut f = w1.fs.file_writer(Path::new("big"), None).await.unwrap();
+    let (first, rest) = big.split_at(3 * MB);
+    for chunk in first.chunks(65_536) {
+        f.write(chunk).await.unwrap();
+    }
+    // Mid-upload: giving metaslabs back keeps the ones this file uses (the
+    // committer would otherwise lend its records' space to someone else).
+    w1.fs.return_metaslabs().await;
+    assert!(!s.committer.fs.lent_metaslabs().await.is_empty());
+    // Another writer gets on with its own files meanwhile.
+    w2.fs
+        .write_file(Path::new("small"), &pattern(70_000, 2))
+        .await
+        .unwrap();
+    for chunk in rest.chunks(65_536) {
+        f.write(chunk).await.unwrap();
+    }
+    f.finish().await.unwrap();
+
+    assert_eq!(w1.fs.read_file(Path::new("big")).await.unwrap(), big);
+    w1.fs.return_metaslabs().await;
+    w2.fs.return_metaslabs().await;
+    assert!(s.committer.fs.lent_metaslabs().await.is_empty());
+    drop((w1, w2));
+    let fs = s.pool.load().await;
+    assert_eq!(fs.read_file(Path::new("big")).await.unwrap(), big);
+    assert_eq!(
+        fs.read_file(Path::new("small")).await.unwrap(),
+        pattern(70_000, 2)
+    );
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+#[tokio::test]
+async fn a_stale_upload_is_refused_and_its_space_released() {
+    let s = setup(&[]).await;
+    let w1 = writer(&s, s.pool.dev().await, "1").await;
+    let w2 = writer(&s, s.pool.dev().await, "2").await;
+
+    let mut f = w1.fs.file_writer(Path::new("g"), None).await.unwrap();
+    f.write(&pattern(MB, 1)).await.unwrap();
+    // Someone else creates it first.
+    w2.fs
+        .write_file(Path::new("g"), &pattern(1000, 2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.finish().await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    // An abandoned upload gives its space back too.
+    let mut f = w1.fs.file_writer(Path::new("h"), None).await.unwrap();
+    f.write(&pattern(MB, 3)).await.unwrap();
+    f.abort().await;
+
+    w1.fs.reload_root_index().await.unwrap();
+    assert_eq!(
+        w1.fs.read_file(Path::new("g")).await.unwrap(),
+        pattern(1000, 2)
+    );
+    assert!(w1.fs.read_file(Path::new("h")).await.is_err());
+    w1.fs.return_metaslabs().await;
+    w2.fs.return_metaslabs().await;
+    drop((w1, w2));
+    let fs = s.pool.load().await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+#[tokio::test]
+async fn object_numbers_are_pool_wide_and_never_reused() {
+    let s = setup(&["vol"]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    w.fs.mkdir(Path::new("a")).await.unwrap();
+    w.fs.mkdir(Path::new("b")).await.unwrap();
+    let mut ids = vec![
+        s.committer.fs.dataset_id("vol").await.ok(),
+        w.fs.create_file(Path::new("a/x")).await.ok(),
+        w.fs.create_file(Path::new("b/x")).await.ok(),
+        w.fs.create_file(Path::new("x")).await.ok(),
+    ]
+    .into_iter()
+    .map(Option::unwrap)
+    .collect::<Vec<_>>();
+    // Same name in different directories: different objects.
+    let n = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), n);
+
+    // Creating an existing file just returns it.
+    let ax = w.fs.file_id(Path::new("a/x")).await.unwrap();
+    assert_eq!(w.fs.create_file(Path::new("a/x")).await.unwrap(), ax);
+    // Replacing keeps the number; delete + create gets a new one.
+    w.fs.write_file(Path::new("a/x"), b"hello").await.unwrap();
+    assert_eq!(w.fs.file_id(Path::new("a/x")).await.unwrap(), ax);
+    w.fs.delete(Path::new("a/x")).await.unwrap();
+    let again = w.fs.create_file(Path::new("a/x")).await.unwrap();
+    assert!(again > *ids.iter().max().unwrap());
+
+    // The counter survives a reopen (it's in the uberblock).
+    w.fs.return_metaslabs().await;
+    drop(w);
+    drop(s.committer);
+    let fs = s.pool.load().await;
+    let next = fs.create_file(Path::new("after")).await.unwrap();
+    assert!(next > again);
+}
+
+#[tokio::test]
+async fn an_object_lease_keeps_others_out() {
+    let s = setup(&[]).await;
+    let w1 = writer(&s, s.pool.dev().await, "1").await;
+    let w2 = writer(&s, s.pool.dev().await, "2").await;
+
+    let id = w1.fs.create_file(Path::new("f")).await.unwrap();
+    let res = object_resource(id);
+    let epoch = lease(&s.auth, &res, "up1").await;
+    let held = ObjLease {
+        owner: "up1".into(),
+        epoch,
+    };
+    let data = pattern(2 * MB + 5, 7);
+    let mut f = w1
+        .fs
+        .file_writer(Path::new("f"), Some(held.clone()))
+        .await
+        .unwrap();
+    f.write(&data).await.unwrap();
+    // While it's open for writing, no one else may change it.
+    assert!(matches!(
+        w2.fs.write_file(Path::new("f"), b"mine").await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    assert!(w2.fs.delete(Path::new("f")).await.is_err());
+    // Others' files are fine.
+    w2.fs.write_file(Path::new("other"), b"ok").await.unwrap();
+    assert_eq!(f.finish().await.unwrap(), id);
+
+    // A write whose lease was lost meanwhile is refused.
+    let mut f = w1
+        .fs
+        .file_writer(Path::new("f"), Some(held.clone()))
+        .await
+        .unwrap();
+    f.write(&pattern(MB, 8)).await.unwrap();
+    release(&s.auth, &res, "up1", epoch).await;
+    assert!(matches!(
+        f.finish().await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    // Released: anyone may write it again.
+    w2.fs
+        .write_file(Path::new("f"), &pattern(3000, 9))
+        .await
+        .unwrap();
+
+    w1.fs.reload_root_index().await.unwrap();
+    assert_eq!(
+        w1.fs.read_file(Path::new("f")).await.unwrap(),
+        pattern(3000, 9)
+    );
+    w1.fs.return_metaslabs().await;
+    w2.fs.return_metaslabs().await;
+    drop((w1, w2));
+    let fs = s.pool.load().await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+#[tokio::test]
+async fn a_standalone_pool_streams_files_too() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    let big = pattern(4 * MB + 3, 5);
+    let id = stream(&fs, "big", &big, None).await.unwrap();
+    assert_eq!(fs.read_file(Path::new("big")).await.unwrap(), big);
+    // Replaced while a second upload was in progress: that one is refused.
+    let mut f = fs.file_writer(Path::new("big"), None).await.unwrap();
+    f.write(&pattern(MB, 6)).await.unwrap();
+    fs.write_file(Path::new("big"), b"tiny").await.unwrap();
+    assert!(matches!(
+        f.finish().await,
+        Err(FileSystemError::Conflict(_))
+    ));
+    assert_eq!(fs.file_id(Path::new("big")).await.unwrap(), id);
+    drop(fs);
+    let fs = pool.load().await;
+    assert_eq!(fs.read_file(Path::new("big")).await.unwrap(), b"tiny");
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+#[test]
+fn a_grant_this_view_hasnt_seen_yet_is_retried_not_refused() {
+    use crate::cluster::state::{ClusterState, Lease};
+    let mut state = ClusterState::default();
+    let lease = |owner: &str, epoch, released| Lease {
+        owner: owner.into(),
+        holder: crate::types::Holder::default().with_detail(String::new()),
+        epoch,
+        expires_ms: 0,
+        released,
+    };
+    // The previous holder's (expired) grant is all this node knows of yet.
+    state
+        .leases
+        .insert(crate::types::res("ds/a"), lease("old", ep(5), false));
+    assert!(matches!(
+        check_lease(&state, &crate::types::res("ds/a"), Some("new"), ep(7)),
+        Err(CommitError::Retry(_))
+    ));
+    state
+        .leases
+        .insert(crate::types::res("ds/a"), lease("old", ep(5), true));
+    assert!(matches!(
+        check_lease(&state, &crate::types::res("ds/a"), Some("new"), ep(7)),
+        Err(CommitError::Retry(_))
+    ));
+    // Taken over by a newer grant, or this grant released: lost for good.
+    state
+        .leases
+        .insert(crate::types::res("ds/a"), lease("newer", ep(9), false));
+    assert!(matches!(
+        check_lease(&state, &crate::types::res("ds/a"), Some("new"), ep(7)),
+        Err(CommitError::Refused { .. })
+    ));
+    state
+        .leases
+        .insert(crate::types::res("ds/a"), lease("new", ep(7), true));
+    assert!(matches!(
+        check_lease(&state, &crate::types::res("ds/a"), Some("new"), ep(7)),
+        Err(CommitError::Refused { .. })
+    ));
+}
+
+#[test]
+fn an_orphaned_log_is_replayed_only_once_its_lease_is_gone() {
+    use crate::cluster::state::Lease;
+    let log = crate::inode::DatasetLog {
+        regions: Vec::new(),
+        from_seq: 0,
+        writer: LeaseRef::new(crate::types::res("writer/1"), ep(3)),
+        ds: Holding::new("o", ep(7)),
+    };
+    let now = 1_000_000;
+    let lease = |owner: &str, epoch: Epoch, expires_ms: u64, released: bool| Lease {
+        owner: owner.into(),
+        holder: crate::types::Holder::default().with_detail(String::new()),
+        epoch,
+        expires_ms,
+        released,
+    };
+    let at = |l: Option<Lease>| orphan_state(l.as_ref(), &log, now);
+
+    // Not visible yet, or the view lags behind the log's grant (a follower,
+    // or a new committer): the holder may well be live.
+    assert_eq!(at(None), Orphan::Live);
+    assert_eq!(at(Some(lease("x", ep(5), 0, true))), Orphan::Live);
+    assert_eq!(at(Some(lease("o", ep(6), 0, false))), Orphan::Live);
+    // Held, or only just expired (still renewable).
+    assert_eq!(at(Some(lease("o", ep(7), now + 5000, false))), Orphan::Live);
+    assert_eq!(at(Some(lease("o", ep(7), now - 1000, false))), Orphan::Live);
+    // Taken over, or released by its holder.
+    assert_eq!(at(Some(lease("p", ep(8), now + 5000, false))), Orphan::Gone);
+    assert_eq!(at(Some(lease("o", ep(7), now + 5000, true))), Orphan::Gone);
+    // Lapsed past the grace period: renewable until someone takes it.
+    assert_eq!(
+        at(Some(lease("o", ep(7), now - 60_000, false))),
+        Orphan::Lapsed
+    );
+}
+
+// ---- birth TXGs ----
+
+/// Let the committer commit a few TXGs without the writers hearing of it
+/// (their view of the TXG lags), then raise the birth floor to its open
+/// TXG, as a snapshot will. Returns the floor.
+async fn lag_and_raise(s: &Setup) -> u64 {
+    for _ in 0..3 {
+        s.committer.fs.sync().await.unwrap();
+    }
+    let floor = s.committer.fs.open_txg().await.unwrap();
+    s.committer.fs.raise_birth_floor(floor);
+    floor.get()
+}
+
+/// The births of a tree's root and data records.
+async fn births(fs: &FileSystem<Pool>, tree: &crate::object::TreeRoot) -> Vec<Txg> {
+    let mut out: Vec<Txg> = tree.ptr.iter().map(|p| p.birth_txg).collect();
+    for (_, p) in fs.tree_leaves(tree).await.unwrap() {
+        out.push(p.birth_txg);
+    }
+    out
+}
+
+/// A volume sync stamped below the floor is rebuilt and sent again.
+#[tokio::test]
+async fn volume_syncs_are_restamped_above_the_birth_floor() {
+    let s = setup(&["vol"]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    attach(&s, &w, "vol", "o1").await;
+    w.fs.block_write("vol", 0, &pattern(200_000, 1))
+        .await
+        .unwrap();
+    w.fs.sync().await.unwrap();
+    let data = pattern(200_000, 2);
+    w.fs.block_write("vol", 0, &data).await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    assert!(
+        w.fs.open_txg().await.unwrap() < floor,
+        "the writer's view lags"
+    );
+
+    w.fs.sync().await.unwrap();
+    let vol = s.committer.fs.open_dataset("vol").await.unwrap();
+    let b = births(&s.committer.fs, &vol.obj.root()).await;
+    assert!(
+        !b.is_empty() && b.iter().all(|&t| t >= floor),
+        "{:?} vs floor {}",
+        b,
+        floor
+    );
+    assert_eq!(read(&s.committer.fs, "vol", 0, data.len()).await, data);
+    w.fs.detach_dataset("vol").await.unwrap();
+    w.fs.return_metaslabs().await;
+    drop(w);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// A streamed upload whose records were written before the floor rose:
+/// their pointers are restamped (the data isn't rewritten).
+#[tokio::test]
+async fn streamed_files_are_restamped_above_the_birth_floor() {
+    let s = setup(&[]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    let data = pattern(600_000, 3);
+    let mut f = w.fs.file_writer(Path::new("big"), None).await.unwrap();
+    f.write(&data).await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    f.finish().await.unwrap();
+
+    let (_, d) = s.committer.fs.stat_file(Path::new("big")).await.unwrap();
+    let b = births(&s.committer.fs, &d.tree).await;
+    assert!(
+        b.len() > 2 && b.iter().all(|&t| t >= floor),
+        "{:?} vs floor {}",
+        b,
+        floor
+    );
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("big")).await.unwrap(),
+        data
+    );
+    w.fs.return_metaslabs().await;
+    drop(w);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Writes at an offset (an open file's sync) too.
+#[tokio::test]
+async fn open_file_syncs_are_restamped_above_the_birth_floor() {
+    let s = setup(&[]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    w.fs.write_file(Path::new("of"), &pattern(300_000, 4))
+        .await
+        .unwrap();
+    let f = w.fs.open_file(Path::new("of"), None).await.unwrap();
+    w.fs.file_write(&f, 1000, b"changed").await.unwrap();
+    let floor = lag_and_raise(&s).await;
+    w.fs.close_file(&f).await.unwrap();
+
+    let (_, d) = s.committer.fs.stat_file(Path::new("of")).await.unwrap();
+    let leaves = s.committer.fs.tree_leaves(&d.tree).await.unwrap();
+    assert!(leaves[0].1.birth_txg >= floor, "the rewritten record");
+    assert!(d.tree.ptr.as_ref().unwrap().birth_txg >= floor, "the root");
+    let mut want = pattern(300_000, 4);
+    want[1000..1007].copy_from_slice(b"changed");
+    assert_eq!(
+        s.committer.fs.read_file(Path::new("of")).await.unwrap(),
+        want
+    );
+    w.fs.return_metaslabs().await;
+}
+
+/// The committer refuses births from the future, and asks for a restamp
+/// (with its open TXG) below the floor.
+#[tokio::test]
+async fn the_committer_checks_births() {
+    let s = setup(&[]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(Recording {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        last: Default::default(),
+        last_fs: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink.clone())
+        .await
+        .unwrap();
+    fs.write_file(Path::new("x"), &pattern(1000, 5))
+        .await
+        .unwrap();
+    let mut c = sink.last_fs.lock().unwrap().clone().unwrap();
+    let open = s.committer.fs.open_txg().await.unwrap();
+    if let FsOp::WriteFile {
+        path,
+        base,
+        min_birth,
+        ..
+    } = &mut c.op
+    {
+        *path = "y".into();
+        *base = None;
+        *min_birth = Some(open.after(5));
+    }
+    assert!(matches!(
+        s.committer.commit_fs(&c).await,
+        Err(CommitError::Refused { .. })
+    ));
+    s.committer.fs.raise_birth_floor(open);
+    if let FsOp::WriteFile { min_birth, .. } = &mut c.op {
+        *min_birth = Some(open.prev());
+    }
+    assert_eq!(
+        s.committer.commit_fs(&c).await,
+        Err(CommitError::Restamp(open))
+    );
+    fs.return_metaslabs().await;
+}
+
+/// A pool this process commits: an upload is restamped at finish too.
+#[tokio::test]
+async fn local_uploads_are_restamped_above_the_birth_floor() {
+    let pool = crate::test_util::TestPool::new().await;
+    let fs = pool.format().await;
+    let data = pattern(400_000, 6);
+    let mut f = fs.file_writer(Path::new("up"), None).await.unwrap();
+    f.write(&data).await.unwrap();
+    for _ in 0..3 {
+        fs.sync().await.unwrap();
+    }
+    let floor = fs.open_txg().await.unwrap();
+    fs.raise_birth_floor(floor);
+    f.finish().await.unwrap();
+    let (_, d) = fs.stat_file(Path::new("up")).await.unwrap();
+    let b = births(&fs, &d.tree).await;
+    assert!(b.iter().all(|&t| t >= floor), "{:?} vs floor {}", b, floor);
+    assert_eq!(fs.read_file(Path::new("up")).await.unwrap(), data);
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+// ---- snapshots of running volumes ----
+
+/// The committer snapshots a volume a writer runs: the snapshot is the
+/// volume as the writer last committed it, the writer's later commits
+/// (restamped above the snapshot) keep the snapshot's blocks, and
+/// destroying it frees what only it had.
+#[tokio::test]
+async fn snapshots_of_a_volume_a_writer_runs() {
+    let s = setup(&["vol"]).await;
+    let w = writer(&s, s.pool.dev().await, "1").await;
+    attach(&s, &w, "vol", "o1").await;
+    let a = pattern(200_000, 1);
+    w.fs.block_write("vol", 0, &a).await.unwrap();
+    w.fs.sync().await.unwrap();
+    // Not yet committed by the writer: not in the snapshot.
+    let b = pattern(100_000, 2);
+    w.fs.block_write("vol", 0, &b).await.unwrap();
+    s.committer.fs.create_snapshot("vol", "s").await.unwrap();
+    w.fs.sync().await.unwrap();
+
+    let mut want = a.clone();
+    want[..b.len()].copy_from_slice(&b);
+    assert_eq!(read(&s.committer.fs, "vol", 0, want.len()).await, want);
+    let mut snap = vec![0u8; a.len()];
+    s.committer
+        .fs
+        .snapshot_read("vol", "s", 0, &mut snap)
+        .await
+        .unwrap();
+    assert_eq!(snap, a);
+    let c = pattern(200_000, 3);
+    w.fs.block_write("vol", 0, &c).await.unwrap();
+    w.fs.sync().await.unwrap();
+    s.committer
+        .fs
+        .snapshot_read("vol", "s", 0, &mut snap)
+        .await
+        .unwrap();
+    assert_eq!(snap, a);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+
+    s.committer.fs.destroy_snapshot("vol", "s").await.unwrap();
+    w.fs.detach_dataset("vol").await.unwrap();
+    w.fs.return_metaslabs().await;
+    drop(w);
+    assert_eq!(read(&s.committer.fs, "vol", 0, c.len()).await, c);
+    let report = s.pool.load().await.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// A new committer starts its birth floor at its open TXG: a writer whose
+/// view lags a snapshot the old committer took can't slip under it.
+#[tokio::test]
+async fn a_new_committer_raises_the_birth_floor() {
+    let s = setup(&[]).await;
+    let open = s.committer.fs.open_txg().await.unwrap();
+    assert!(s.committer.fs.birth_floor() >= open);
+}
+
+/// Applies every commit at once, but holds its answer back while `hold` is
+/// set (a slow committer: the writer is still waiting when it carries on).
+struct SlowAnswers {
+    inner: DirectSink<Pool>,
+    hold: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CommitSink for SlowAnswers {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let r = self.inner.commit(c).await;
+        let mut hold = self.hold.clone();
+        let _ = hold.wait_for(|h| !*h).await;
+        r
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+#[tokio::test]
+async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(SlowAnswers {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", Holding::new("o", ds_epoch))
+        .await
+        .unwrap();
+
+    // A sync whose answer is slow to come back...
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    let first = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.sync().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!first.is_finished());
+    // ...and more writes, and another sync, meanwhile.
+    fs.block_write("a", 200_000, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.sync().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    hold.send_replace(false);
+    let r1 = first.await.unwrap();
+    let r2 = second.await.unwrap();
+    eprintln!("first sync: {:?}, second sync: {:?}", r1, r2);
+
+    // Whatever happened to those two, the volume carries on.
+    fs.block_write("a", 400_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.sync().await.expect("a later sync");
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 3));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// Refuses every commit of dataset `bad`.
+struct RefuseOne {
+    inner: DirectSink<Pool>,
+    bad: &'static str,
+}
+
+#[async_trait]
+impl CommitSink for RefuseOne {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        if c.dataset == self.bad {
+            return Err(CommitError::refused(
+                crate::types::ErrorKind::Invalid,
+                format!("'{}' is refused", c.dataset),
+            ));
+        }
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+#[tokio::test]
+async fn one_datasets_refused_sync_doesnt_fail_anothers_flush() {
+    let s = setup(&["a", "b"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(RefuseOne {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        bad: "b",
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    for name in ["a", "b"] {
+        let e = lease(&s.auth, &dataset_resource(name), "o").await;
+        fs.attach_dataset(name, Holding::new("o", e)).await.unwrap();
+    }
+
+    // Both written; only `b`'s commits are refused.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
+    fs.flush_for("a").await.expect("a's flush, b refused");
+    assert!(fs.flush_for("b").await.is_err());
+    assert!(
+        fs.flush().await.is_err(),
+        "a flush of everything includes b"
+    );
+
+    // Again, now that `a` has an intent log and `b` still has none.
+    fs.block_write("a", 200_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.block_write("b", 200_000, &pattern(100_000, 4))
+        .await
+        .unwrap();
+    fs.flush_for("a").await.expect("a's second flush");
+    fs.block_write("a", 400_000, &pattern(100_000, 5))
+        .await
+        .unwrap();
+    fs.sync_for("a").await.expect("a's sync");
+    assert!(fs.sync().await.is_err());
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 3));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 5));
+}
+
+/// The wedge seen with Kubernetes on raidish etcd: a sync whose caller gives
+/// up while it waits for the committer's answer (kube-apiserver's gRPC
+/// deadline drops the etcd request's future, and the flush inside it), after
+/// the committer applied it. The writer never learns its root moved, and
+/// every later sync, built on the old root, was refused as "moved on".
+#[tokio::test]
+async fn a_sync_given_up_on_after_the_committer_applied_it_doesnt_wedge_the_volume() {
+    let s = setup(&["a", "b"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(SlowAnswers {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    for name in ["a", "b"] {
+        let e = lease(&s.auth, &dataset_resource(name), "o").await;
+        fs.attach_dataset(name, Holding::new("o", e)).await.unwrap();
+    }
+
+    // Applied by the committer, answered too late: the caller is gone.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
+    let gave_up =
+        tokio::time::timeout(std::time::Duration::from_millis(300), fs.flush_for("a")).await;
+    assert!(gave_up.is_err(), "the flush should still be waiting");
+    hold.send_replace(false);
+
+    // Later writes and syncs carry on, on both datasets.
+    fs.block_write("a", 200_000, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.block_write("b", 200_000, &pattern(100_000, 4))
+        .await
+        .unwrap();
+    fs.sync().await.expect("the next sync");
+    fs.block_write("a", 400_000, &pattern(100_000, 5))
+        .await
+        .unwrap();
+    fs.flush_for("a").await.expect("a later flush");
+    fs.sync().await.expect("a later sync");
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "b", 0, 100_000).await, pattern(100_000, 2));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 3));
+    assert_eq!(read(&fs, "b", 200_000, 100_000).await, pattern(100_000, 4));
+    assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 5));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// Applies the first commit that drops a dataset's log (a detach's
+/// `retire_log`), then answers as if the reply was lost.
+struct LosesRetireAnswer {
+    inner: DirectSink<Pool>,
+    lost: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl CommitSink for LosesRetireAnswer {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let retire = c.log.is_none() && c.new_root == c.base_root;
+        let r = self.inner.commit(c).await;
+        if retire && r.is_ok() && !self.lost.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(CommitError::Retry("answer lost".into()));
+        }
+        r
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+/// Audit A5: a detach whose log-dropping commit was applied but not
+/// answered keeps the volume attached (a handoff called off serves it on).
+/// Its flushes must not be acked into the retired log, whose regions the
+/// committer freed and the dnode no longer names: a crash would lose them.
+#[tokio::test]
+async fn a_detach_whose_answer_was_lost_doesnt_ack_into_the_retired_log() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(LosesRetireAnswer {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        lost: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink)
+        .await
+        .unwrap();
+    let e = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", Holding::new("o", e)).await.unwrap();
+    // A log with a region flushes append to.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+    fs.block_write("a", 0, &pattern(100_000, 2)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+
+    assert!(
+        fs.detach_dataset("a").await.is_err(),
+        "the retire's outcome is unknown"
+    );
+    // Served on: an acked flush, then a crash (no sync).
+    fs.block_write("a", 0, &pattern(100_000, 3)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+    drop(fs);
+
+    let fs = s.pool.load().await;
+    assert_eq!(
+        read(&fs, "a", 0, 100_000).await,
+        pattern(100_000, 3),
+        "an acked flush was lost"
+    );
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// The same, where the committer never got the commit before the caller
+/// gave up (it's sent again, and applied, by the next sync), or refused it.
+#[tokio::test]
+async fn a_sync_given_up_on_before_it_reached_the_committer_is_sent_again() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let (hold, rx) = tokio::sync::watch::channel(true);
+    let sink = Arc::new(HeldBack {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        hold: rx,
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(s.pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let e = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", Holding::new("o", e)).await.unwrap();
+
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    let gave_up = tokio::time::timeout(std::time::Duration::from_millis(300), fs.sync()).await;
+    assert!(gave_up.is_err());
+    hold.send_replace(false);
+    fs.block_write("a", 200_000, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    fs.sync().await.expect("the next sync");
+
+    let fs = s.pool.load().await;
+    assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
+    assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
+/// Holds commits back before they reach the committer.
+struct HeldBack {
+    inner: DirectSink<Pool>,
+    hold: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl CommitSink for HeldBack {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let mut hold = self.hold.clone();
+        let _ = hold.wait_for(|h| !*h).await;
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+/// The client asks the node the committer last answered on first: other
+/// nodes aren't asked (to say "not the committer") on every call.
+#[tokio::test]
+async fn commit_client_remembers_where_the_committer_is() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::Ordering::SeqCst;
+    let quick = std::time::Duration::ZERO;
+    let not_here = serde_json::to_string(&Err::<CommitterInfo, CommitError>(CommitError::Retry(
+        "this node isn't the committer".into(),
+    )))
+    .unwrap();
+    let here = serde_json::to_string(&Ok::<CommitterInfo, CommitError>(CommitterInfo {
+        node: "node-2".into(),
+        epoch: ep(3),
+    }))
+    .unwrap();
+    let (a, a_hits) = fake_json_server(Some(not_here.clone()), quick).await;
+    let (b, b_hits) = fake_json_server(Some(not_here), quick).await;
+    let (c, c_hits) = fake_json_server(Some(here), quick).await;
+    let client = CommitClient::new(vec![a, b, c]);
+    assert_eq!(client.committer().await.unwrap().node, "node-2");
+    // Clones (as `on_behalf_of` makes) share what it learned.
+    let other = client.on_behalf_of("admin");
+    for _ in 0..4 {
+        assert_eq!(other.committer().await.unwrap().node, "node-2");
+    }
+    assert_eq!(
+        (
+            a_hits.load(SeqCst),
+            b_hits.load(SeqCst),
+            c_hits.load(SeqCst)
+        ),
+        (1, 1, 5)
+    );
 }

@@ -40,6 +40,20 @@ pub struct Config {
     /// How `listen` exports and attaches the volumes placed on it.
     #[serde(default)]
     pub automount: crate::agent::AutomountConfig,
+    /// Certificates (see `crate::tls`). Without it: plain HTTP, no auth.
+    pub tls: Option<crate::tls::TlsConfig>,
+    /// Who may do what once `tls` is on (see `crate::auth`).
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
+    /// Serve the pool over NFS from `listen` (see `crate::nfs`). Absent: no
+    /// NFS server.
+    pub nfs: Option<crate::nfs::NfsConfig>,
+    /// Serve etcd, S3 and SQS datasets (see `crate::frontend`). Absent:
+    /// this node serves none (it still forwards nothing either).
+    pub services: Option<crate::frontend::ServicesConfig>,
+    /// Run VMs whose disks are volumes, through libvirt (see `crate::vm`).
+    /// Absent: this node runs none.
+    pub vm: Option<crate::vm::VmConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -71,9 +85,25 @@ pub struct PoolSpec {
 impl PoolSpec {
     /// Open the disks and build the pool.
     pub async fn open(&self, opts: DiskOptions) -> Pool {
+        self.open_fenced(opts, Default::default()).await
+    }
+
+    /// `open`, its requests carrying `fence`'s epochs from the first.
+    pub async fn open_fenced(
+        &self,
+        opts: DiskOptions,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Pool {
         let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
-        let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
+        let disks = Arc::new(DiskSet::new_fenced(&paths, opts, fence).await);
         self.on(disks)
+    }
+
+    /// `open`, sharing the disks already open in `open` (by path) instead
+    /// of opening them again: a locked local file can't be opened twice.
+    pub async fn open_sharing(&self, opts: DiskOptions, open: &DiskSet) -> Pool {
+        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
+        self.on(Arc::new(DiskSet::new_sharing(&paths, opts, open).await))
     }
 
     /// Build the pool over already opened `disks` (in `paths` order).
@@ -238,7 +268,10 @@ impl Config {
     }
 
     pub fn disk_options(&self) -> DiskOptions {
-        let mut opts = DiskOptions::default();
+        let mut opts = DiskOptions {
+            lock: true,
+            ..DiskOptions::default()
+        };
         if let Some(ms) = self.disk_timeout_ms {
             opts.request_timeout = std::time::Duration::from_millis(ms);
         }

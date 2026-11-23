@@ -30,4 +30,6 @@ else
 fi
 raidish volume list
 raidish cluster status
-echo "init: done. Dashboard: http://node0:8881/ (or :8882 / :8883)"
+echo "init: done. Dashboard: https://node0:8881/ (or :8882 / :8883)"
+echo "init: trust docker/pki/ca.pem in your browser, and sign in with this read-only token:"
+raidish token create dashboard 2>/dev/null

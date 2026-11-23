@@ -2,6 +2,7 @@
 //! own `RemoteDisk` in `disk_wasm.rs` with the same interface.
 
 use super::*;
+use crate::fence::Stamp;
 use crate::websocket::{WsOp, decode_response, encode_request};
 use dashmap::DashMap;
 use futures_util::stream::SplitSink;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot, watch};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 pub use tungstenite::Bytes;
 use tungstenite::Message;
 
@@ -82,9 +83,24 @@ impl Drop for WsConn {
 
 impl WsConn {
     async fn connect(url: &str, opts: DiskOptions) -> Result<Arc<Self>, DiskError> {
-        let (ws, _) = tokio::time::timeout(opts.connect_timeout, connect_async(url))
-            .await
-            .map_err(|_| DiskError::Timeout)??;
+        let versioned = crate::websocket::versioned(url);
+        let (ws, _) = tokio::time::timeout(
+            opts.connect_timeout,
+            connect_async_tls_with_config(&versioned, None, false, crate::tls::ws_connector()),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)?
+        .map_err(|e| match e {
+            // Refused before the upgrade: say why (a version mismatch, a
+            // missing certificate...).
+            tungstenite::Error::Http(r) => DiskError::IoError(std::io::Error::other(format!(
+                "{}: {} {}",
+                url,
+                r.status(),
+                String::from_utf8_lossy(r.body().as_deref().unwrap_or_default())
+            ))),
+            e => e.into(),
+        })?;
         let (sink, mut stream) = ws.split();
         let state = Arc::new(ConnState {
             pending: DashMap::new(),
@@ -169,6 +185,9 @@ impl WsConn {
         self.state.closed_tx.subscribe()
     }
 
+    /// Send `op` for `count` blocks from `block`: as one request, or one
+    /// per run of blocks needing the same stamp (`ClientFence::stamps`),
+    /// in order, with read payloads joined.
     async fn request(
         &self,
         op: WsOp,
@@ -178,14 +197,45 @@ impl WsConn {
         count: u32,
         data: Option<&[u8]>,
     ) -> Result<Bytes, DiskError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (epoch, lent) = match op {
-            WsOp::Flush | WsOp::Info => (lease_epoch(), false),
-            _ => match fence {
-                Some((i, f)) => f.epoch_for(Some(*i), block, count),
-                None => (lease_epoch(), false),
-            },
+        let runs = match (op, fence) {
+            (_, None) => vec![(block, count, Stamp::Pool(crate::types::Epoch::NONE))],
+            (WsOp::Flush | WsOp::Info, Some((_, f))) => {
+                vec![(block, count, Stamp::Pool(f.pool_epoch()))]
+            }
+            (_, Some((i, f))) => f.stamps(Some(*i), block, count),
         };
+        if let [(block, count, stamp)] = runs[..] {
+            return self
+                .request_one(op, disk_id, fence, block, count, stamp, data)
+                .await;
+        }
+        let mut out = bytes::BytesMut::new();
+        for (b, n, stamp) in runs {
+            let piece = data.map(|d| {
+                let from = (b - block) as usize * crate::disk::BLOCK_SIZE;
+                &d[from..from + n as usize * crate::disk::BLOCK_SIZE]
+            });
+            let r = self
+                .request_one(op, disk_id, fence, b, n, stamp, piece)
+                .await?;
+            out.extend_from_slice(&r);
+        }
+        Ok(out.freeze())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_one(
+        &self,
+        op: WsOp,
+        disk_id: u16,
+        fence: Option<&(usize, Arc<crate::fence::ClientFence>)>,
+        block: u64,
+        count: u32,
+        stamp: Stamp,
+        data: Option<&[u8]>,
+    ) -> Result<Bytes, DiskError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
         let (tx, rx) = oneshot::channel();
         self.state.pending.insert(id, tx);
         if self.is_closed() {
@@ -194,7 +244,16 @@ impl WsConn {
         }
 
         // One deadline covers queueing for the sink, sending and the reply.
-        let msg = encode_request(op, disk_id, block, count, id, epoch, data);
+        let msg = encode_request(
+            op,
+            disk_id,
+            block,
+            count,
+            id,
+            stamp,
+            self.opts.request_timeout,
+            data,
+        );
         let exchange = async {
             self.sink
                 .lock()
@@ -222,8 +281,15 @@ impl WsConn {
                     return Err(DiskError::Timeout);
                 }
             };
-        check_status_in(status, lent)?;
-        Ok(payload)
+        let r = check_status(status);
+        // Our pool (or return) epoch refused: another committer or writer
+        // has the pool now (a lent metaslab's refusal is the writer's own
+        // business).
+        if let (Err(DiskError::StaleEpoch), true, Some((_, f))) = (&r, stamp.is_committers(), fence)
+        {
+            f.stale();
+        }
+        r.map(|_| payload)
     }
 }
 

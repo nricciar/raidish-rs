@@ -254,14 +254,23 @@ async fn range_io_round_trips_at_every_alignment() {
         for blocks in [1usize, 2, 3, 4, 5, 6, 7, 31] {
             let start = lba + start_off;
             let data = pattern(blocks, (start + blocks as u64) as u8);
-            raidz.write_blocks(start, &data).await.unwrap();
+            raidz
+                .write_blocks(start, crate::disk::as_blocks(&data).unwrap())
+                .await
+                .unwrap();
             let mut got = vec![0u8; data.len()];
-            raidz.read_blocks(start, &mut got).await.unwrap();
+            raidz
+                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .await
+                .unwrap();
             assert_eq!(got, data, "before flush: start {} blocks {}", start, blocks);
 
             raidz.flush().await.unwrap();
             let mut got = vec![0u8; data.len()];
-            raidz.read_blocks(start, &mut got).await.unwrap();
+            raidz
+                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .await
+                .unwrap();
             assert_eq!(got, data, "after flush: start {} blocks {}", start, blocks);
             lba += 60;
         }
@@ -278,11 +287,17 @@ async fn full_stripe_write_supersedes_buffered_partial() {
         .await
         .unwrap();
     let fresh = pattern(3, 2);
-    raidz.write_blocks(30, &fresh).await.unwrap();
+    raidz
+        .write_blocks(30, crate::disk::as_blocks(&fresh).unwrap())
+        .await
+        .unwrap();
     raidz.flush().await.unwrap();
 
     let mut got = vec![0u8; fresh.len()];
-    raidz.read_blocks(30, &mut got).await.unwrap();
+    raidz
+        .read_blocks(30, crate::disk::as_blocks_mut(&mut got).unwrap())
+        .await
+        .unwrap();
     assert_eq!(got, fresh);
 }
 
@@ -290,7 +305,10 @@ async fn full_stripe_write_supersedes_buffered_partial() {
 async fn full_stripe_writes_have_valid_parity() {
     let (raidz, _t) = create_test_raidz().await;
     let data = pattern(12, 5);
-    raidz.write_blocks(60, &data).await.unwrap();
+    raidz
+        .write_blocks(60, crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
     raidz.flush().await.unwrap();
 
     // Every way of rebuilding each data block from the other disks must
@@ -305,4 +323,75 @@ async fn full_stripe_writes_have_valid_parity() {
             assert_eq!(&r[..], &data[at..at + BLOCK_SIZE], "block {}", 60 + i);
         }
     }
+}
+
+/// Single-block writes racing concurrent flushes on the same stripes: no
+/// flush may trip over a stripe another one already wrote out, and no write
+/// may land in a buffer that was already written out (and be lost).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_flushes_and_block_writes_lose_nothing() {
+    let (raidz, _temp_files) = create_test_raidz().await;
+    let raidz = std::sync::Arc::new(raidz);
+    const BLOCKS: u64 = 12; // four stripes of three data shards
+    for round in 0..40u8 {
+        let mut tasks = Vec::new();
+        for lba in 0..BLOCKS {
+            let r = raidz.clone();
+            tasks.push(tokio::spawn(async move {
+                let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
+                r.write_block(lba, &[fill; BLOCK_SIZE]).await.unwrap();
+            }));
+            if lba % 3 == 0 {
+                let r = raidz.clone();
+                tasks.push(tokio::spawn(async move { r.flush().await.unwrap() }));
+            }
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        raidz.flush().await.unwrap();
+        for lba in 0..BLOCKS {
+            let mut buf = [0u8; BLOCK_SIZE];
+            raidz.read_block(lba, &mut buf).await.unwrap();
+            let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
+            assert!(buf.iter().all(|&b| b == fill), "round {round}, block {lba}");
+        }
+        // Everything reached the disks: nothing is left buffered.
+        assert!(
+            raidz.writes.is_empty(),
+            "round {round}: stripes left buffered"
+        );
+    }
+}
+
+/// `masks_of` gives what filtering every mask did, in the same order.
+#[test]
+fn masks_of_is_every_mask_with_k_bits_in_order() {
+    for n in 0..=12usize {
+        for k in 0..=n {
+            let old: Vec<u128> = (0u128..1 << n)
+                .filter(|m| m.count_ones() as usize == k)
+                .collect();
+            assert_eq!(masks_of(n, k).collect::<Vec<_>>(), old, "n={} k={}", n, k);
+        }
+    }
+    // No overflow at the widest pool.
+    assert_eq!(masks_of(64, 61).count(), 41664); // C(64, 3)
+}
+
+/// D6b: label repair on a wide (valid) raidz group tries each way of
+/// leaving `parity` shards out once: C(disks, parity) rebuilds.
+#[test]
+fn label_candidates_on_a_wide_raidz_are_each_rebuild_once() {
+    let (data, parity) = (30, 1);
+    let n = data + parity;
+    // Inconsistent shards (the parity matches no data), so every rebuild
+    // is tried.
+    let mut shards: Vec<Shard> = (0..n).map(|i| [i as u8 + 1; BLOCK_SIZE]).collect();
+    shards[n - 1] = [0xEE; BLOCK_SIZE];
+    let present = vec![true; n];
+    let candidates = label_candidates(data, parity, &shards, &present)
+        .unwrap()
+        .expect("inconsistent shards have candidates");
+    assert_eq!(candidates.len(), n);
 }
