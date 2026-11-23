@@ -267,9 +267,15 @@ pub struct IoStats {
     pub rtt_us_last: u64,
 }
 
-/// Timeouts and reconnect pacing for remote (websocket) disks.
+/// How disks are opened: timeouts and reconnect pacing for remote
+/// (websocket) disks, and whether local files are locked.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskOptions {
+    /// Hold an exclusive `flock` on each local disk file for as long as
+    /// it's open, so a second process (another `listen`, a CLI tool) can't
+    /// write it beside this one (audit D6d). Off by default: tests open the
+    /// same files many times in one process, as several nodes.
+    pub lock: bool,
     /// A request (send + response) taking longer than this fails with
     /// `Timeout` and the connection is torn down and re-established.
     pub request_timeout: Duration,
@@ -287,6 +293,7 @@ pub struct DiskOptions {
 impl Default for DiskOptions {
     fn default() -> Self {
         DiskOptions {
+            lock: false,
             request_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(5),
@@ -437,19 +444,43 @@ impl Disk {
                 backend: DiskBackend::WebSocket(RemoteDisk::open(ws_url, disk_id, opts).await),
             })
         } else {
-            Self::open_local(path).await
+            Self::open_local(path, opts.lock).await
         }
     }
+
+    /// Open an existing local disk file or block device (audit D6d): a
+    /// missing one is an error, not a new empty disk (a mistyped path
+    /// used to make one), and with `lock` it's held exclusively.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn open_local(path: &str) -> Result<Self, DiskError> {
+    async fn open_local(path: &str, lock: bool) -> Result<Self, DiskError> {
         let path = path.to_string();
         let file = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)
+                .open(&path)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("opening '{}': {}", path, e)))?;
+            if lock {
+                use std::os::fd::AsRawFd;
+                // Per open file description: held until the last clone of
+                // this file is dropped.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    let why = match e.kind() {
+                        std::io::ErrorKind::WouldBlock => {
+                            "in use by another process (a running `raidish listen` serves it: \
+                             reach it through its disk server URL)"
+                                .to_string()
+                        }
+                        _ => e.to_string(),
+                    };
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("locking '{}': {}", path, why),
+                    ));
+                }
+            }
+            Ok(file)
         })
         .await??;
         Ok(Disk {
@@ -458,7 +489,7 @@ impl Disk {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn open_local(path: &str) -> Result<Self, DiskError> {
+    async fn open_local(path: &str, _lock: bool) -> Result<Self, DiskError> {
         Err(DiskError::IoError(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("'{}': only remote disks can be opened in the browser", path),
@@ -517,8 +548,13 @@ impl BlockDevice for Disk {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
-                let len =
-                    tokio::task::spawn_blocking(move || file.metadata().map(|m| m.len())).await??;
+                // Seeking to the end sizes block devices too (their
+                // metadata says 0). I/O is positional: the cursor is unused.
+                let len = tokio::task::spawn_blocking(move || {
+                    use std::io::Seek;
+                    (&*file).seek(std::io::SeekFrom::End(0))
+                })
+                .await??;
                 Ok(len / BLOCK_SIZE as u64)
             }
             #[cfg(all(test, not(target_arch = "wasm32")))]

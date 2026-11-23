@@ -1209,6 +1209,16 @@ impl Virsh {
         self.run(&["dumpxml", "--migratable", name]).await
     }
 
+    /// Running domain `name` as its moves are judged
+    /// (`crate::vm_check::judged_domain`).
+    pub async fn dumpxml_judged(&self, name: &str) -> Result<String, VmError> {
+        let live = self.dumpxml_live(name).await?;
+        Ok(match self.dumpxml_migratable(name).await {
+            Ok(mig) => crate::vm_check::judged_domain(&live, &mig),
+            Err(_) => live,
+        })
+    }
+
     /// Replace raidish's metadata on running domain `name`.
     pub async fn set_meta(&self, name: &str, meta: &DomMeta) -> Result<(), VmError> {
         self.run(&[

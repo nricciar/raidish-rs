@@ -328,24 +328,51 @@ impl PeerVolumes for Shared {
         .await;
         match taken {
             Ok((lease, lost)) => {
-                self.writing
-                    .lock()
-                    .unwrap()
-                    .insert(volume.to_string(), new_epoch);
-                self.handed_from
-                    .lock()
-                    .unwrap()
-                    .insert(volume.to_string(), (new_epoch, epoch));
                 let device = proxy.as_ref().and_then(|p| p.device.clone());
-                self.slots.lock().unwrap().insert(
-                    volume.to_string(),
-                    Slot::Adopted {
-                        lease,
-                        lost,
-                        transport,
-                        device,
-                    },
-                );
+                // Published only while `w` is still this node's writer, under
+                // its lock: the agent clears it before it stops what ran on
+                // it, so a takeover finishing after that is undone here,
+                // where `w` is still at hand (audit A1).
+                let orphaned = {
+                    let cur = self.writer.lock().unwrap();
+                    if cur.as_ref().is_some_and(|c| Arc::ptr_eq(&c.fs, &w.fs)) {
+                        self.writing
+                            .lock()
+                            .unwrap()
+                            .insert(volume.to_string(), new_epoch);
+                        self.handed_from
+                            .lock()
+                            .unwrap()
+                            .insert(volume.to_string(), (new_epoch, epoch));
+                        self.slots.lock().unwrap().insert(
+                            volume.to_string(),
+                            Slot::Adopted {
+                                lease,
+                                lost,
+                                transport,
+                                device,
+                            },
+                        );
+                        None
+                    } else {
+                        Some(lease)
+                    }
+                };
+                if let Some(lease) = orphaned {
+                    // Writes acked on the proxy since the pause, and not
+                    // flushed, go with the dataset: owed a failed flush.
+                    if let Some(p) = &proxy {
+                        p.io.poison();
+                    }
+                    drop(paused);
+                    if let Err(e) = w.remove_export(volume, transport).await {
+                        eprintln!("agent: unexporting '{}': {}", volume, e);
+                    }
+                    w.fs.abandon_dataset(volume);
+                    lease.release().await;
+                    self.restore(volume, None);
+                    refuse!("this node's writer went away meanwhile")
+                }
                 drop(paused);
                 println!("agent: took volume '{}' over (epoch {})", volume, new_epoch);
                 let _ = wr.write_all(b"DONE\n").await;

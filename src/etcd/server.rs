@@ -26,7 +26,7 @@ type Out<T> = Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>
 const WATCH_BATCH: usize = 1000;
 /// Bytes of events per watch response, about (clients take 4 MiB by
 /// default; a single event may go over).
-const WATCH_BYTES: usize = 1 << 20;
+pub(super) const WATCH_BYTES: usize = 1 << 20;
 /// How often watchers that asked for it get a progress notification.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(600);
 
@@ -213,19 +213,24 @@ impl<D: BlockDevice + 'static> watch_server::Watch for EtcdServer<D> {
         }
         let (tx, rx) = mpsc::channel(64);
         let store = self.store.clone();
-        tokio::spawn(watch_session(store, r.into_inner(), tx));
+        let durable = store.durable_rev();
+        tokio::spawn(watch_session(store, r.into_inner(), tx, durable));
         Ok(Response::new(out(rx)))
     }
 }
 
 /// One watch stream: its watchers, each sent the events of its keys in
-/// revision order, durable ones only.
-async fn watch_session<D: BlockDevice + 'static>(
+/// revision order, durable ones only (as `durable`, the store's
+/// `durable_rev`, moves).
+pub(super) async fn watch_session<D: BlockDevice + 'static>(
     store: Arc<EtcdStore<D>>,
-    mut inbound: Streaming<pb::WatchRequest>,
+    mut inbound: impl futures::Stream<Item = std::result::Result<pb::WatchRequest, Status>>
+    + Unpin
+    + Send,
     tx: mpsc::Sender<std::result::Result<pb::WatchResponse, Status>>,
+    mut durable: tokio::sync::watch::Receiver<i64>,
 ) {
-    let mut durable = store.durable_rev();
+    use futures::StreamExt;
     let mut stopped = store.stopped();
     let mut watchers: BTreeMap<i64, Watcher> = BTreeMap::new();
     let mut next_id: i64 = 0;
@@ -312,15 +317,21 @@ async fn watch_session<D: BlockDevice + 'static>(
             }
         }
         tokio::select! {
-            m = inbound.message() => {
-                let Ok(Some(m)) = m else { return };
+            m = inbound.next() => {
+                let Some(Ok(m)) = m else { return };
                 match m.request_union {
                     Some(RequestUnion::CreateRequest(c)) => {
+                        // The revision as of now, not as of the loop's last
+                        // pass: an idle stream can wait in here while the
+                        // store moves on (audit E3). A watch from "now"
+                        // must not replay what came before it, nor be
+                        // cancelled as compacted past a stale `cur`.
+                        let now = *durable.borrow();
                         let id = if c.watch_id != 0 {
                             if watchers.contains_key(&c.watch_id) {
                                 // etcd's answer to a watch id in use.
                                 if !send(pb::WatchResponse {
-                                    header: store.header(cur),
+                                    header: store.header(now),
                                     watch_id: c.watch_id,
                                     created: true,
                                     canceled: true,
@@ -340,14 +351,14 @@ async fn watch_session<D: BlockDevice + 'static>(
                         };
                         let w = Watcher {
                             range: KeyRange::new(&c.key, &c.range_end),
-                            next: if c.start_revision > 0 { c.start_revision } else { cur + 1 },
+                            next: if c.start_revision > 0 { c.start_revision } else { now + 1 },
                             prev_kv: c.prev_kv,
                             no_put: c.filters.contains(&0),
                             no_delete: c.filters.contains(&1),
                             progress_notify: c.progress_notify,
                         };
                         if !send(pb::WatchResponse {
-                            header: store.header(cur),
+                            header: store.header(now),
                             watch_id: id,
                             created: true,
                             ..Default::default()
@@ -399,17 +410,22 @@ async fn watch_session<D: BlockDevice + 'static>(
     }
 }
 
-/// Events split into responses of about `WATCH_BYTES` (none if none).
-fn chunks(events: Vec<super::pb::mvccpb::Event>) -> Vec<Vec<super::pb::mvccpb::Event>> {
+/// Events split into responses of about `WATCH_BYTES` (none if none),
+/// only ever between revisions: a transaction's events arrive in one
+/// response, as `store.events` batches them (audit E3). A revision larger
+/// than `WATCH_BYTES` goes out whole.
+pub(super) fn chunks(events: Vec<super::pb::mvccpb::Event>) -> Vec<Vec<super::pb::mvccpb::Event>> {
+    let rev = |e: &super::pb::mvccpb::Event| e.kv.as_ref().map_or(0, |kv| kv.mod_revision);
     let mut out = Vec::new();
-    let mut cur = Vec::new();
+    let mut cur: Vec<super::pb::mvccpb::Event> = Vec::new();
     let mut bytes = 0;
     for e in events {
         let n = e.kv.as_ref().map_or(0, |kv| kv.key.len() + kv.value.len())
             + e.prev_kv
                 .as_ref()
                 .map_or(0, |kv| kv.key.len() + kv.value.len());
-        if !cur.is_empty() && bytes + n > WATCH_BYTES {
+        let new_rev = cur.last().is_some_and(|l| rev(l) != rev(&e));
+        if new_rev && bytes + n > WATCH_BYTES {
             out.push(std::mem::take(&mut cur));
             bytes = 0;
         }

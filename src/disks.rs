@@ -80,9 +80,32 @@ impl DiskSet {
         opts: DiskOptions,
         fence: Arc<crate::fence::ClientFence>,
     ) -> Self {
-        assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
         let results = join_all(paths.iter().map(|path| Disk::open_with(path, opts))).await;
+        Self::from_opened(paths, results, fence)
+    }
 
+    /// `new_with`, but a path already open in `open` shares that disk (the
+    /// same file, and its lock) rather than opening it a second time.
+    pub async fn new_sharing(paths: &[&str], opts: DiskOptions, open: &DiskSet) -> Self {
+        let results = join_all(paths.iter().map(|&path| async move {
+            match open.disks.iter().find(|c| c.path() == path) {
+                Some(Caddy::Healthy(_, disk)) => Ok(disk.clone()),
+                Some(Caddy::Unhealthy(_, e)) => Err(DiskError::IoError(std::io::Error::other(
+                    format!("unavailable: {}", e),
+                ))),
+                None => Disk::open_with(path, opts).await,
+            }
+        }))
+        .await;
+        Self::from_opened(paths, results, Default::default())
+    }
+
+    fn from_opened(
+        paths: &[&str],
+        results: Vec<Result<Disk, DiskError>>,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Self {
+        assert!(paths.len() <= MAX_DISKS, "at most {} disks", MAX_DISKS);
         let disks: Vec<Caddy> = results
             .into_iter()
             .zip(paths.iter())
@@ -473,6 +496,16 @@ pub fn fenced_any<T>(results: &[Result<T, DiskError>]) -> Option<DiskError> {
         Err(DiskError::Fenced) => Some(DiskError::Fenced),
         _ => None,
     })
+}
+
+/// Each member's verification read, `None` where it failed, unless one
+/// was a fencing refusal: that fails the whole scan, as it fails any vdev
+/// op (audit R2a), rather than counting the disk as unreadable.
+pub fn read_or_fenced<T>(results: Vec<Result<T, DiskError>>) -> Result<Vec<Option<T>>, DiskError> {
+    if let Some(e) = fenced_any(&results) {
+        return Err(e);
+    }
+    Ok(results.into_iter().map(Result::ok).collect())
 }
 
 /// The mask of `members` whose `results` are `Ok`.

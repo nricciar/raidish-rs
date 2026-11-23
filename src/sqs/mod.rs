@@ -526,9 +526,16 @@ impl Receipt {
         if b.len() != 16 {
             return Err(bad());
         }
+        let nonce = u64::from_be_bytes(b[8..].try_into().unwrap());
+        // 0 is a message never received (`send_one`): no receipt names it
+        // (`nonce()` never makes one), and a crafted one mustn't match it
+        // (audit Q1).
+        if nonce == 0 {
+            return Err(bad());
+        }
         Ok(Receipt {
             seq: u64::from_be_bytes(b[..8].try_into().unwrap()),
-            nonce: u64::from_be_bytes(b[8..].try_into().unwrap()),
+            nonce,
         })
     }
 }
@@ -780,6 +787,10 @@ impl<D: BlockDevice + 'static> Queue<D> {
                     let mut got = Vec::new();
                     let mut dead = Vec::new();
                     let mut changed = false;
+                    // Taken by this receive: with a visibility timeout of
+                    // 0 a message is put back visible at `now`, still ahead
+                    // in this scan, and must not be returned twice (Q1).
+                    let mut taken = std::collections::HashSet::new();
                     let hi = v_key(now, u64::MAX);
                     let mut from = vec![b'V'];
                     'scan: while got.len() < max {
@@ -794,6 +805,9 @@ impl<D: BlockDevice + 'static> Queue<D> {
                             let Some((_, seq)) = v_parts(&k) else {
                                 continue;
                             };
+                            if taken.contains(&seq) {
+                                continue;
+                            }
                             t.delete(&k).await?;
                             changed = true;
                             let Some(raw) = t.get(&q_key(seq)).await? else {
@@ -809,6 +823,9 @@ impl<D: BlockDevice + 'static> Queue<D> {
                                 && msg.receive_count >= r.max_receive_count
                             {
                                 msg.visible_at_ms = now + MOVE_HIDE_MS;
+                                // The last consumer's receipt stops working
+                                // now: the move owns the message (Q1).
+                                msg.nonce = nonce(seq ^ now);
                                 t.put(&q_key(seq), &bincode::serialize(&msg)?).await?;
                                 t.put(&v_key(msg.visible_at_ms, seq), &[1]).await?;
                                 dead.push(Dead { seq, msg });
@@ -820,6 +837,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                             }
                             msg.nonce = nonce(seq ^ now);
                             msg.visible_at_ms = now + vis;
+                            taken.insert(seq);
                             t.put(&q_key(seq), &bincode::serialize(&msg)?).await?;
                             t.put(&v_key(msg.visible_at_ms, seq), &[1]).await?;
                             got.push(Received {

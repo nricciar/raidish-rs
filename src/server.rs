@@ -23,9 +23,10 @@ pub async fn listen(
     let paths: Vec<&str> = serve.iter().map(|s| s.as_str()).collect();
     let disks = Arc::new(DiskSet::new_with(&paths, opts).await);
     let pool = match &spec {
-        // Serving the pool's own disks: share them.
+        // Serving the pool's own disks: share them. Otherwise share the
+        // local ones still: each local file is locked by its one open.
         Some(spec) if spec.paths == serve => Some(spec.on(disks.clone())),
-        Some(spec) => Some(spec.open(opts).await),
+        Some(spec) => Some(spec.open_sharing(opts, &disks).await),
         None => None,
     };
     let port = port.unwrap_or(8881);

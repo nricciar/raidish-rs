@@ -413,6 +413,61 @@ async fn r2a_a_fencing_refusal_fails_the_op_and_isnt_a_miss() {
     }
 }
 
+/// D6a: raidz3 survives any 3 failed (known missing) members: reads use
+/// the full parity. Only *silent* corruption is limited to 2 bad disks
+/// (see `read_verified`).
+#[tokio::test]
+async fn raidz3_reads_with_three_members_offline() {
+    let fp = FaultPool::raidz(3, 6).await;
+    let dev = fp.dev();
+    let blocks: Vec<Block> = (0..9).map(|i| blk(i + 1)).collect();
+    dev.write_blocks(0, &blocks).await.unwrap();
+    dev.flush().await.unwrap();
+    for offline in [[0, 1, 2], [0, 3, 5], [3, 4, 5]] {
+        for &d in &offline {
+            fp.disk(d).set_offline(true);
+        }
+        let mut back = vec![[0u8; BLOCK_SIZE]; blocks.len()];
+        dev.read_blocks(0, &mut back)
+            .await
+            .unwrap_or_else(|e| panic!("disks {:?} offline: {:?}", offline, e));
+        assert_eq!(back, blocks, "disks {:?} offline", offline);
+        for &d in &offline {
+            fp.disk(d).set_offline(false);
+        }
+    }
+}
+
+/// R2a, scrub side: a repair write a member refuses for who sent it fails
+/// the verification, rather than being counted as a failed repair (and the
+/// scrub running on as a fenced node).
+#[tokio::test]
+async fn r2a_a_fenced_repair_fails_the_scrub() {
+    for fp in [FaultPool::mirror(2).await, FaultPool::raidz(1, 3).await] {
+        let dev = fp.dev();
+        dev.write_blocks(0, &[blk(1), blk(2)]).await.unwrap();
+        dev.flush().await.unwrap();
+        // Checked against other contents: every member needs a repair.
+        let want: Vec<u8> = [blk(3), blk(4)].concat();
+        fp.disk(1).fail_writes(Some(FaultError::Fenced));
+        let r = dev.root().verify_blocks(0, &want, true).await;
+        assert!(
+            matches!(
+                r,
+                Err(crate::raidz::RaidZError::DiskError(
+                    crate::disk::DiskError::Fenced
+                ))
+            ),
+            "{:?}",
+            r.map(|c| c.write_failed)
+        );
+        // An ordinary failure is still a failed repair.
+        fp.disk(1).fail_writes(Some(FaultError::Io));
+        let c = dev.root().verify_blocks(0, &want, true).await.unwrap();
+        assert!(c.has_write_failed(1));
+    }
+}
+
 /// MiB `i` of volume "a" holds `pattern(MB, i + 1)`, for every `i < upto`.
 async fn d2_check(fs: &FileSystem<Pool>, upto: u8) {
     for i in 0..upto {
@@ -1652,5 +1707,40 @@ async fn a_stale_members_leftovers_in_a_blank_label_slot_are_zeroed() {
         assert!(report.label_unrecoverable.is_empty(), "{}", report);
         assert!(report.cleared.contains(&1), "{}", report);
         assert_eq!(raw_block(&fp, 1, blank), zero, "leftovers kept");
+    }
+}
+
+/// D6c: a mirror member's superblock copy rotten, or blank, doesn't fail
+/// the import while the other member has it. On a 2-way mirror every
+/// superblock block may come from one member, which used to be the only
+/// copy read. Each member in turn, so the primary is among them.
+#[tokio::test]
+async fn d6c_a_bad_superblock_copy_on_one_mirror_member_doesnt_fail_the_import() {
+    use std::os::unix::fs::FileExt;
+    for bad in [[0x5Au8; BLOCK_SIZE], [0u8; BLOCK_SIZE]] {
+        for d in 0..2 {
+            let fp = FaultPool::mirror(2).await;
+            drop(fp.format().await);
+            let blocks = crate::fs::HeaderLayout::new(fp.dev().align()).superblock_blocks;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(fp.disk(d).path())
+                .unwrap();
+            for b in 0..blocks {
+                f.write_all_at(&bad, (DISK_LABEL_BLOCKS + b) * BLOCK_SIZE as u64)
+                    .unwrap();
+            }
+            let dev = fp.dev();
+            let what = if bad[0] == 0 { "blank" } else { "rotten" };
+            assert!(
+                matches!(crate::fs::probe_superblock_of(&dev).await, Ok(Some(_))),
+                "probe, member {} {}",
+                d,
+                what
+            );
+            FileSystem::load(dev)
+                .await
+                .unwrap_or_else(|e| panic!("import, member {} {}: {:?}", d, what, e));
+        }
     }
 }

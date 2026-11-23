@@ -1706,6 +1706,85 @@ async fn a_sync_given_up_on_after_the_committer_applied_it_doesnt_wedge_the_volu
     assert!(fs.fsck(false).await.unwrap().is_clean());
 }
 
+/// Applies the first commit that drops a dataset's log (a detach's
+/// `retire_log`), then answers as if the reply was lost.
+struct LosesRetireAnswer {
+    inner: DirectSink<Pool>,
+    lost: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl CommitSink for LosesRetireAnswer {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(&self, want: u64) -> Result<LentMetaslab, CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(&self, c: DatasetCommit) -> Result<Committed, CommitError> {
+        let retire = c.log.is_none() && c.new_root == c.base_root;
+        let r = self.inner.commit(c).await;
+        if retire && r.is_ok() && !self.lost.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(CommitError::Retry("answer lost".into()));
+        }
+        r
+    }
+    async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+/// Audit A5: a detach whose log-dropping commit was applied but not
+/// answered keeps the volume attached (a handoff called off serves it on).
+/// Its flushes must not be acked into the retired log, whose regions the
+/// committer freed and the dnode no longer names: a crash would lose them.
+#[tokio::test]
+async fn a_detach_whose_answer_was_lost_doesnt_ack_into_the_retired_log() {
+    let s = setup(&["a"]).await;
+    let resource = "writer/1".to_string();
+    let epoch = lease(&s.auth, &resource, "1").await;
+    let sink = Arc::new(LosesRetireAnswer {
+        inner: DirectSink {
+            committer: s.committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        },
+        lost: Default::default(),
+    });
+    let fs = FileSystem::load_writer(s.pool.dev().await, sink)
+        .await
+        .unwrap();
+    let e = lease(&s.auth, &dataset_resource("a"), "o").await;
+    fs.attach_dataset("a", Holding::new("o", e)).await.unwrap();
+    // A log with a region flushes append to.
+    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+    fs.block_write("a", 0, &pattern(100_000, 2)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+
+    assert!(
+        fs.detach_dataset("a").await.is_err(),
+        "the retire's outcome is unknown"
+    );
+    // Served on: an acked flush, then a crash (no sync).
+    fs.block_write("a", 0, &pattern(100_000, 3)).await.unwrap();
+    fs.flush_for("a").await.unwrap();
+    drop(fs);
+
+    let fs = s.pool.load().await;
+    assert_eq!(
+        read(&fs, "a", 0, 100_000).await,
+        pattern(100_000, 3),
+        "an acked flush was lost"
+    );
+    assert!(fs.fsck(false).await.unwrap().is_clean());
+}
+
 /// The same, where the committer never got the commit before the caller
 /// gave up (it's sent again, and applied, by the next sync), or refused it.
 #[tokio::test]

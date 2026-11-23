@@ -240,3 +240,50 @@ fn a_node_that_never_reported_is_cold_at_best() {
     let v = check(&needs(VM).unwrap(), "node-1", Some(&a), None, None);
     assert_eq!(v.mode, Mode::Cold);
 }
+
+/// What `virsh dumpxml` of a running EPYC-Rome guest adds (qemu's model
+/// turns on `topoext`, libvirt's doesn't name it) is judged away; what
+/// qemu couldn't give the model (`disable`) stays.
+#[test]
+fn judged_domain_drops_requires_only_the_live_cpu_adds() {
+    let live = "<domain type='kvm'><name>v</name>
+      <cpu mode='custom' match='exact' check='full'><model fallback='forbid'>EPYC-Rome</model>
+        <feature policy='require' name='x2apic'/>
+        <feature policy='disable' name='rdseed'/>
+        <feature policy='disable' name='svm'/>
+        <feature policy='require' name='topoext'/></cpu></domain>";
+    let mig = "<domain type='kvm'><name>v</name>
+      <cpu mode='custom' match='exact' check='partial'><model fallback='forbid'>EPYC-Rome</model>
+        <feature policy='require' name='x2apic'/>
+        <feature policy='disable' name='rdseed'/></cpu></domain>";
+    let n = needs(&judged_domain(live, mig)).unwrap();
+    assert_eq!(n.cpu_features, vec!["x2apic".to_string()]);
+    let x = n.cpu_xml.unwrap();
+    assert!(!x.contains("topoext"), "{}", x);
+    assert!(x.contains("'svm'") || x.contains("\"svm\""), "{}", x);
+    assert!(x.contains("rdseed"), "{}", x);
+}
+
+/// A CPU-less domain: `--migratable` has no `<cpu>`, the live one is the
+/// bare model qemu gave it with what it couldn't (`svm` on Intel).
+#[test]
+fn judged_domain_keeps_disables_of_a_cpu_less_domain() {
+    let live = "<domain type='kvm'><name>v</name>
+      <cpu mode='custom' match='exact' check='full'><model fallback='forbid'>qemu64</model>
+        <feature policy='disable' name='svm'/>
+        <feature policy='require' name='x2apic'/></cpu></domain>";
+    let mig = "<domain type='kvm'><name>v</name></domain>";
+    let n = needs(&judged_domain(live, mig)).unwrap();
+    assert_eq!(n.cpu_model.as_deref(), Some("qemu64"));
+    assert!(n.cpu_features.is_empty());
+    assert!(n.cpu_xml.unwrap().contains("svm"));
+}
+
+#[test]
+fn judged_domain_unparsable_is_the_live_xml() {
+    assert_eq!(judged_domain("<domain/>", "<nope"), "<domain/>");
+    assert_eq!(
+        judged_domain("<domain><name>v</name></domain>", "<domain/>"),
+        "<domain><name>v</name></domain>"
+    );
+}

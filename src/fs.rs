@@ -432,6 +432,10 @@ pub(crate) use crate::types::now_ms;
 /// A random-enough 64-bit id (no RNG dependency needed).
 pub(crate) fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
+    // Secret per process: a restarted process (same pid in a container, a
+    // clock stepped back) doesn't repeat ids, and nonces can't be guessed.
+    #[cfg(not(target_arch = "wasm32"))]
+    h.update(&process_seed().to_le_bytes());
     h.update(
         &web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
@@ -484,6 +488,20 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
     Ok((header.txg, payload_len))
 }
 
+/// 64 random bits drawn once per process from the OS (audit R4c).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn process_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use ring::rand::SecureRandom;
+        let mut b = [0u8; 8];
+        ring::rand::SystemRandom::new()
+            .fill(&mut b)
+            .expect("the OS random source");
+        u64::from_le_bytes(b)
+    })
+}
+
 /// Read a pool device's superblock without loading the pool (None: not
 /// formatted, or unreadable).
 pub async fn read_superblock_of<D: BlockDevice>(dev: &D) -> Option<Superblock> {
@@ -502,27 +520,51 @@ pub async fn probe_superblock_of<D: BlockDevice>(
 ) -> Result<Option<Superblock>, Unreadable> {
     let header = HeaderLayout::new(dev.pool().map_or(1, |p| p.align()));
     let mut read_any = false;
+    // Every copy of every mirror block, rebuilt ones too (audit D6c): on a
+    // mirror every superblock block can come from one member, so a rotten
+    // or blank copy there would fail the import with good copies elsewhere.
+    // The normal read comes first, so a readable copy wins over a rebuild.
     for mirror in 0..header.superblock_blocks {
-        let mut buf = [0u8; BLOCK_SIZE];
-        if dev
-            .read_block(SUPERBLOCK_LBA + mirror, &mut buf)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        read_any = true;
-        let Ok((_, len)) = parse_label(&buf) else {
-            continue;
-        };
-        if let Ok(sb) =
-            bincode::deserialize::<Superblock>(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len])
-            && sb.magic == FS_ID
-        {
+        let (read, versions) =
+            label_versions_of::<_, Superblock>(dev, SUPERBLOCK_LBA + mirror).await;
+        read_any |= read;
+        if let Some((_, sb)) = versions.into_iter().find(|(_, sb)| sb.magic == FS_ID) {
             return Ok(Some(sb));
         }
     }
     if read_any { Ok(None) } else { Err(Unreadable) }
+}
+
+/// Every valid version of label block `lba` of `dev`: as normally read
+/// first, then as held by the other copies / rebuilt from parity. And
+/// whether any copy could be read at all.
+pub(crate) async fn label_versions_of<D: BlockDevice, T: for<'a> Deserialize<'a>>(
+    dev: &D,
+    lba: BlockId,
+) -> (bool, Vec<(Txg, T)>) {
+    let mut blocks = Vec::new();
+    let mut buf = [0u8; BLOCK_SIZE];
+    if dev.read_block(lba, &mut buf).await.is_ok() {
+        blocks.push(buf.to_vec());
+    }
+    if let Ok(c) = dev.reconstruct_candidates(lba).await {
+        for b in c.rebuilt.into_iter().flatten() {
+            if !blocks.contains(&b) {
+                blocks.push(b);
+            }
+        }
+    }
+    let read_any = !blocks.is_empty();
+    let versions = blocks
+        .iter()
+        .filter_map(|buf| {
+            let (txg, len) = parse_label(buf).ok()?;
+            let value =
+                bincode::deserialize(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len]).ok()?;
+            Some((txg, value))
+        })
+        .collect();
+    (read_any, versions)
 }
 
 /// An early-fold request: raised by a flush, taken by the sync loop.
@@ -1859,18 +1901,12 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     async fn read_superblock(&self) {
-        // The superblock is written to several mirrors; use the first good one.
-        for mirror in 0..self.header.superblock_blocks {
-            match self
-                .read_block_checked::<Superblock>(SUPERBLOCK_LBA + mirror)
-                .await
-            {
-                Ok((_, superblock)) => {
-                    *self.superblock.write().await = Some(superblock);
-                    break;
-                }
-                Err(e) => eprintln!("superblock mirror {}: {:?}", mirror, e),
-            }
+        // Written to several mirror blocks, each with its copies or parity:
+        // the first good one anywhere (see `probe_superblock_of`).
+        match probe_superblock_of(&self.dev).await {
+            Ok(Some(sb)) => *self.superblock.write().await = Some(sb),
+            Ok(None) => eprintln!("superblock: no copy is a raidish superblock"),
+            Err(Unreadable) => eprintln!("superblock: no copy could be read"),
         }
     }
 
@@ -1898,41 +1934,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// a single-data-shard raidz) every copy of an uberblock slot may come
     /// from that one disk, so the normal read alone could roll the pool back.
     async fn read_label_versions<T: for<'a> Deserialize<'a>>(&self, lba: BlockId) -> Vec<(Txg, T)> {
-        let mut blocks = Vec::new();
-        let mut buf = [0u8; BLOCK_SIZE];
-        if self.dev.read_block(lba, &mut buf).await.is_ok() {
-            blocks.push(buf.to_vec());
-        }
-        if let Ok(c) = self.dev.reconstruct_candidates(lba).await {
-            for b in c.rebuilt.into_iter().flatten() {
-                if !blocks.contains(&b) {
-                    blocks.push(b);
-                }
-            }
-        }
-        blocks
-            .iter()
-            .filter_map(|buf| {
-                let (txg, len) = parse_label(buf).ok()?;
-                let value =
-                    bincode::deserialize(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len]).ok()?;
-                Some((txg, value))
-            })
-            .collect()
-    }
-
-    /// Returns deserialized type from block
-    pub(crate) async fn read_block_checked<T: for<'a> Deserialize<'a>>(
-        &self,
-        lba: BlockId,
-    ) -> Result<(Txg, T), FileSystemError> {
-        let mut buf = [0u8; BLOCK_SIZE];
-        self.dev.read_block(lba, &mut buf).await?;
-
-        // parse_label bounds-checks the header (a corrupt length used to panic).
-        let (txg, len) = parse_label(&buf)?;
-        let value = bincode::deserialize(&buf[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + len])?;
-        Ok((txg, value))
+        label_versions_of(&self.dev, lba).await.1
     }
 }
 

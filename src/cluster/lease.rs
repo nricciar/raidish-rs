@@ -182,7 +182,9 @@ impl LeaseAuthority for HttpLeases {
 }
 
 /// An owner id unique to this call: two leases taken in the same
-/// millisecond by one process must not look like one holder.
+/// millisecond by one process must not look like one holder, nor two
+/// processes with one host name and pid (a restarted container is pid 1
+/// again) if the clock went back between them (audit R4c).
 pub fn owner_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -192,7 +194,14 @@ pub fn owner_id() -> String {
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".into());
-    format!("{}:{}:{}.{}", host, std::process::id(), super::now_ms(), n)
+    format!(
+        "{}:{}:{}.{}.{:016x}",
+        host,
+        std::process::id(),
+        super::now_ms(),
+        n,
+        crate::fs::process_seed()
+    )
 }
 
 /// Where a [`HeldLease`] stands, from this holder's side.

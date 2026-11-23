@@ -155,3 +155,15 @@ fn a_move_within_the_attached_nodes_wins_and_off_is_off() {
     p.automount = None;
     assert_eq!(place_attached(&p, Some("node-1"), &all, &att), None);
 }
+
+/// Audit A1: a handed-over volume not adopted yet goes with its own lease,
+/// and with the writer's: lost, or gone already (a takeover that finished
+/// after the writer was dropped).
+#[test]
+fn handed_over_volumes_go_with_their_lease_or_the_writers() {
+    let slots = [("kept", false), ("lapsed", true)];
+    let drop = |w| adopted_to_drop(slots.iter().copied(), w);
+    assert_eq!(drop(WriterStanding::Held), vec!["lapsed"]);
+    assert_eq!(drop(WriterStanding::Lost), vec!["kept", "lapsed"]);
+    assert_eq!(drop(WriterStanding::Gone), vec!["kept", "lapsed"]);
+}

@@ -474,7 +474,8 @@ async fn check_here(
 pub struct SourceNow {
     /// Its facts, its libvirt TLS to `node` probed now.
     pub facts: Option<crate::node_facts::NodeFacts>,
-    /// The VM's domain as it runs (its CPU as the guest has it).
+    /// The VM's domain as it runs (its CPU as the guest has it, see
+    /// `vm_check::judged_domain`).
     pub domain: Option<String>,
 }
 
@@ -491,7 +492,7 @@ async fn probe_now(
 
 async fn source_now(st: &VmsState, to: &str, vm: Option<&str>) -> SourceNow {
     let domain = match (&st.runtime, vm) {
-        (Some(rt), Some(vm)) => rt.virsh.dumpxml_live(vm).await.ok(),
+        (Some(rt), Some(vm)) => rt.virsh.dumpxml_judged(vm).await.ok(),
         _ => None,
     };
     SourceNow {

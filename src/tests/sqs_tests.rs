@@ -267,3 +267,76 @@ fn attribute_md5() {
     assert_eq!(md5_of_attrs(&attrs).unwrap(), md5_hex(&raw));
     assert_eq!(md5_of_attrs(&[]), None);
 }
+
+/// Q1: with a visibility timeout of 0, a message is visible again at once,
+/// but one receive returns it once, not again further on in its scan.
+#[tokio::test]
+async fn a_zero_visibility_receive_returns_each_message_once() {
+    let pool = TestPool::new().await;
+    let (_fs, q) = queue(&pool).await;
+    q.send(vec![msg("a"), msg("b"), msg("c")]).await.unwrap();
+    let (got, _) = q.receive(10, Some(0)).await.unwrap();
+    let mut bodies: Vec<_> = got.iter().map(|r| r.msg.body.as_str()).collect();
+    bodies.sort_unstable();
+    assert_eq!(bodies, ["a", "b", "c"]);
+    assert!(got.iter().all(|r| r.msg.receive_count == 1));
+    // Still visible: the next receive gets them all again.
+    assert_eq!(q.receive(10, Some(0)).await.unwrap().0.len(), 3);
+}
+
+/// Q1: a receipt naming nonce 0 (what a never-received message has) is
+/// invalid: it can't delete or hide a message nobody received.
+#[tokio::test]
+async fn a_receipt_with_nonce_zero_is_refused() {
+    let pool = TestPool::new().await;
+    let (_fs, q) = queue(&pool).await;
+    q.send(vec![msg("unseen")]).await.unwrap();
+    let forged = Receipt { seq: 0, nonce: 0 }.encode();
+    assert!(matches!(
+        Receipt::decode(&forged),
+        Err(SqsError::ReceiptHandleIsInvalid(_))
+    ));
+    let r = q.delete(vec![forged.clone()]).await.unwrap();
+    assert!(r[0].is_err(), "a forged receipt deleted a message");
+    let r = q.change_visibility(vec![(forged, 300)]).await.unwrap();
+    assert!(r[0].is_err(), "a forged receipt hid a message");
+    assert_eq!(q.meta().await.unwrap().messages, 1);
+    let (got, _) = q.receive(1, None).await.unwrap();
+    assert_eq!(got[0].msg.body, "unseen");
+}
+
+/// Q1: once a message is taken for a dead-letter move, its last
+/// consumer's receipt no longer deletes it or changes its visibility; the
+/// move's own removal still works.
+#[tokio::test]
+async fn a_dead_letter_move_ends_the_last_receipt() {
+    let pool = TestPool::new().await;
+    let (_fs, q) = queue(&pool).await;
+    q.set_attrs(vec![(
+        "RedrivePolicy".into(),
+        r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":"1"}"#
+            .into(),
+    )])
+    .await
+    .unwrap();
+    q.send(vec![msg("poison")]).await.unwrap();
+    let (got, _) = q.receive(1, Some(0)).await.unwrap();
+    let last = got[0].receipt.clone();
+    let (_, dead) = q.receive(1, Some(0)).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    let r = q.change_visibility(vec![(last.clone(), 0)]).await.unwrap();
+    assert!(r[0].is_err(), "the old receipt still changes visibility");
+    q.delete(vec![last]).await.unwrap();
+    assert_eq!(
+        q.meta().await.unwrap().messages,
+        1,
+        "the old receipt deleted it"
+    );
+    q.remove(Receipt {
+        seq: dead[0].seq,
+        nonce: dead[0].msg.nonce,
+    })
+    .await
+    .unwrap();
+    assert_eq!(q.meta().await.unwrap().messages, 0);
+}

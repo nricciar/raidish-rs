@@ -131,6 +131,44 @@ pub fn host_model_xml(facts: &NodeFacts) -> Option<String> {
     Some(x)
 }
 
+/// A running domain as its moves are judged: its live XML (`virsh
+/// dumpxml`), whose `<cpu>` says what the guest really has, less the
+/// `require`d features its migratable XML (`--migratable`) doesn't name.
+///
+/// The live CPU's `disable`s are what qemu couldn't give the model here
+/// (a bare `qemu64` on Intel without `svm`): the target needn't have them
+/// either, which `--migratable`, back at the model, would forget. Its
+/// added `require`s are what qemu's own model definition turned on beyond
+/// libvirt's (`topoext` in EPYC models): libvirt's view of every host,
+/// this one included, lacks them, so `cpu-compare` refuses them even where
+/// the guest runs, while the target's qemu gives them by the same model.
+/// Either XML that doesn't parse: the live one as it is.
+pub fn judged_domain(live: &str, migratable: &str) -> String {
+    let (Ok(mut root), Ok(mig)) = (parse_root(live), parse_root(migratable)) else {
+        return live.to_string();
+    };
+    let named: Vec<String> = mig
+        .child("cpu")
+        .map(|c| {
+            c.elements()
+                .filter(|e| e.name == "feature")
+                .filter_map(|e| e.attr("name").map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(cpu) = root.child_mut("cpu") else {
+        return live.to_string();
+    };
+    cpu.kids.retain(|k| match k {
+        crate::xml::Node::El(e) if e.name == "feature" => {
+            !matches!(e.attr("policy"), None | Some("require") | Some("force"))
+                || e.attr("name").is_some_and(|n| named.iter().any(|m| m == n))
+        }
+        _ => true,
+    });
+    crate::xml::el_xml(&root)
+}
+
 /// The `<cpu>` to ask the target about for a VM running (or to run) on
 /// `source`: its own if it names a model, else what host-model gives it
 /// on the source. None: nothing to ask (no `<cpu>`, or passthrough).

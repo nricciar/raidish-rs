@@ -398,3 +398,11 @@ async fn fence_domains_match_placement_on_every_layout() {
         );
     }
 }
+
+/// D6b: raidz parity is at most 3.
+#[test]
+fn raidz_parity_is_at_most_three() {
+    assert!(raidz(3, 0..6).validate(6).is_ok());
+    let e = raidz(4, 0..8).validate(8).unwrap_err();
+    assert!(e.contains("at most 3"), "{}", e);
+}

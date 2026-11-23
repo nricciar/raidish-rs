@@ -14,6 +14,12 @@
 //!   then written, all under the locks. An older epoch's write admitted
 //!   before a newer one's lands before it, or is refused once the newer one
 //!   is admitted; it can't land after.
+//! * Reads after writes: a stamped read takes the same stripe locks,
+//!   shared, before it's admitted. A write already admitted lands before
+//!   the read sees the blocks; once the read's stamp is admitted, an older
+//!   epoch's write arriving later is refused. A new committer's first read
+//!   of a label can't come back before an old committer's write to it,
+//!   already admitted, lands. Reads don't wait on each other.
 //! * Expiry (D5b): under the locks, just before it's admitted, a write whose
 //!   client has given up on it (its connection closed, or its deadline
 //!   passed) is refused instead of landing later.
@@ -24,7 +30,7 @@ use crate::fence::{Admit, Ready, ServerFence, Stamp};
 use crate::websocket::{WS_MAX_BLOCKS, WsStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::time::Instant;
 
 /// Blocks per stripe lock: a request (at most `WS_MAX_BLOCKS`) spans at
@@ -78,15 +84,16 @@ pub struct ValidatedRead {
 pub struct FencedDisks {
     disks: Arc<Vec<Caddy>>,
     floor: Arc<ServerFence>,
-    /// Per served disk, its stripe locks.
-    stripes: Vec<Vec<Mutex<()>>>,
+    /// Per served disk, its stripe locks: writes exclusive, stamped reads
+    /// shared.
+    stripes: Vec<Vec<RwLock<()>>>,
 }
 
 impl FencedDisks {
     pub fn new(disks: Arc<Vec<Caddy>>, floor: Arc<ServerFence>) -> Self {
         let stripes = disks
             .iter()
-            .map(|_| (0..STRIPES).map(|_| Mutex::new(())).collect())
+            .map(|_| (0..STRIPES).map(|_| RwLock::new(())).collect())
             .collect();
         FencedDisks {
             disks,
@@ -152,11 +159,18 @@ impl FencedDisks {
     }
 
     /// Read `r`. With a stamp, it's admitted first (a pool stamp raises
-    /// the pool floor: a new committer's first reads fence the old one out).
+    /// the pool floor: a new committer's first reads fence the old one out),
+    /// under its blocks' stripe locks, shared: writes admitted before it
+    /// have landed (see the module docs).
     pub async fn read(&self, r: ValidatedRead, stamp: Option<Stamp>) -> Result<Vec<u8>, WsStatus> {
-        if let Some(stamp) = stamp {
-            self.admit(r.disk, r.block, r.count, stamp, false)?;
-        }
+        let _locked = match stamp {
+            Some(stamp) => {
+                let locked = self.lock_shared(r.disk, r.block, r.count).await;
+                self.admit(r.disk, r.block, r.count, stamp, false)?;
+                Some(locked)
+            }
+            None => None,
+        };
         let mut buffer = crate::disk::zeroed_blocks(r.count as usize);
         self.disks[r.disk].read_blocks(r.block, &mut buffer).await?;
         Ok(buffer.into_flattened())
@@ -207,9 +221,9 @@ impl FencedDisks {
         }
     }
 
-    /// The stripe locks over `count` blocks from `block` of `disk`, taken
-    /// in index order (so two requests never wait on each other's).
-    async fn lock(&self, disk: usize, block: u64, count: u32) -> Vec<MutexGuard<'_, ()>> {
+    /// The stripe locks over `count` blocks from `block`, in index order
+    /// (so two requests never wait on each other's).
+    fn stripe_indexes(block: u64, count: u32) -> Vec<usize> {
         let first = block / STRIPE_BLOCKS;
         let last = (block + count as u64 - 1) / STRIPE_BLOCKS;
         let mut idx: Vec<usize> = (first..=last)
@@ -217,9 +231,28 @@ impl FencedDisks {
             .collect();
         idx.sort_unstable();
         idx.dedup();
-        let mut out = Vec::with_capacity(idx.len());
-        for i in idx {
-            out.push(self.stripes[disk][i].lock().await);
+        idx
+    }
+
+    /// The stripe locks over a write, exclusive.
+    async fn lock(&self, disk: usize, block: u64, count: u32) -> Vec<RwLockWriteGuard<'_, ()>> {
+        let mut out = Vec::new();
+        for i in Self::stripe_indexes(block, count) {
+            out.push(self.stripes[disk][i].write().await);
+        }
+        out
+    }
+
+    /// The stripe locks over a stamped read, shared.
+    async fn lock_shared(
+        &self,
+        disk: usize,
+        block: u64,
+        count: u32,
+    ) -> Vec<RwLockReadGuard<'_, ()>> {
+        let mut out = Vec::new();
+        for i in Self::stripe_indexes(block, count) {
+            out.push(self.stripes[disk][i].read().await);
         }
         out
     }

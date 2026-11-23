@@ -363,3 +363,35 @@ async fn concurrent_flushes_and_block_writes_lose_nothing() {
         );
     }
 }
+
+/// `masks_of` gives what filtering every mask did, in the same order.
+#[test]
+fn masks_of_is_every_mask_with_k_bits_in_order() {
+    for n in 0..=12usize {
+        for k in 0..=n {
+            let old: Vec<u128> = (0u128..1 << n)
+                .filter(|m| m.count_ones() as usize == k)
+                .collect();
+            assert_eq!(masks_of(n, k).collect::<Vec<_>>(), old, "n={} k={}", n, k);
+        }
+    }
+    // No overflow at the widest pool.
+    assert_eq!(masks_of(64, 61).count(), 41664); // C(64, 3)
+}
+
+/// D6b: label repair on a wide (valid) raidz group tries each way of
+/// leaving `parity` shards out once: C(disks, parity) rebuilds.
+#[test]
+fn label_candidates_on_a_wide_raidz_are_each_rebuild_once() {
+    let (data, parity) = (30, 1);
+    let n = data + parity;
+    // Inconsistent shards (the parity matches no data), so every rebuild
+    // is tried.
+    let mut shards: Vec<Shard> = (0..n).map(|i| [i as u8 + 1; BLOCK_SIZE]).collect();
+    shards[n - 1] = [0xEE; BLOCK_SIZE];
+    let present = vec![true; n];
+    let candidates = label_candidates(data, parity, &shards, &present)
+        .unwrap()
+        .expect("inconsistent shards have candidates");
+    assert_eq!(candidates.len(), n);
+}

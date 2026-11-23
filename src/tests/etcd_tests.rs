@@ -723,3 +723,94 @@ async fn compacting_at_a_change_keeps_its_prev_kv() {
     assert_eq!(s.range(get("w/a")).await.unwrap().count, 0);
     assert_eq!(s.range(get("w/b")).await.unwrap().count, 1);
 }
+
+fn event_at_rev(rev: i64, bytes: usize) -> super::pb::mvccpb::Event {
+    super::pb::mvccpb::Event {
+        kv: Some(super::pb::mvccpb::KeyValue {
+            key: b"k".to_vec(),
+            value: vec![0; bytes],
+            mod_revision: rev,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// E3: watch responses are split only between revisions, so a
+/// transaction's events (one revision) arrive together however large.
+#[test]
+fn watch_responses_never_split_a_revision() {
+    use super::server::{WATCH_BYTES, chunks};
+    let third = WATCH_BYTES / 3 + 1;
+    // Revision 2 is three events of over a third of the limit each.
+    let events = vec![
+        event_at_rev(2, third),
+        event_at_rev(2, third),
+        event_at_rev(2, third),
+        event_at_rev(3, 10),
+        event_at_rev(4, 10),
+    ];
+    let revs: Vec<Vec<i64>> = chunks(events)
+        .iter()
+        .map(|c| {
+            c.iter()
+                .map(|e| e.kv.as_ref().unwrap().mod_revision)
+                .collect()
+        })
+        .collect();
+    assert_eq!(revs, vec![vec![2, 2, 2], vec![3, 4]]);
+    // Small revisions still share a response.
+    let small = (1..=5).map(|r| event_at_rev(r, 10)).collect();
+    assert_eq!(chunks(small).len(), 1);
+}
+
+/// E3: a watch created from "now" (start revision 0) on a stream that
+/// was idle while the store moved on starts after the latest revision,
+/// not after the one the stream last saw: it doesn't replay the put just
+/// before it. The session is driven directly, on this one thread: the new
+/// revision and the create are both waiting when it next runs, and its
+/// select picks either first (each round is a coin flip for a stale `cur`).
+#[tokio::test]
+async fn a_watch_from_now_doesnt_replay_what_came_before_it() {
+    use pb::watch_request::RequestUnion;
+    let pool = TestPool::new().await;
+    let (_fs, s) = store(&pool).await;
+    let rev_now = |p: pb::PutResponse| p.header.unwrap().revision;
+    let first = rev_now(s.put(put("start", "x")).await.unwrap());
+    let (durable_tx, durable) = tokio::sync::watch::channel(first);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(8);
+    let (out_tx, mut out) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(super::server::watch_session(
+        s.clone(),
+        tokio_stream::wrappers::ReceiverStream::new(in_rx),
+        out_tx,
+        durable,
+    ));
+    let create = |key: &str| pb::WatchRequest {
+        request_union: Some(RequestUnion::CreateRequest(pb::WatchCreateRequest {
+            key: key.into(),
+            ..Default::default()
+        })),
+    };
+    let mut next = async || out.recv().await.unwrap().unwrap();
+    for i in 0..30 {
+        let key = format!("k{}", i);
+        let before = rev_now(s.put(put(&key, "before")).await.unwrap());
+        // No await between: the session sees both at once.
+        durable_tx.send(before).unwrap();
+        in_tx.try_send(Ok(create(&key))).unwrap();
+        let created = next().await;
+        assert!(created.created, "{:?}", created);
+        let after = rev_now(s.put(put(&key, "after")).await.unwrap());
+        durable_tx.send(after).unwrap();
+        let got = next().await;
+        assert_eq!(got.watch_id, created.watch_id);
+        let kv = got.events[0].kv.as_ref().unwrap();
+        assert_eq!(
+            (kv.mod_revision, kv.value.as_slice()),
+            (after, b"after".as_slice()),
+            "round {}: the watch replayed a put from before it",
+            i
+        );
+    }
+}

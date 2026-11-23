@@ -71,11 +71,21 @@ impl Stripe {
     }
 }
 
+/// The children's error, if any, a fencing refusal first (audit R2a): it
+/// must reach the caller as one, not hidden by another child's failure.
+/// Every child runs to the end (no child's write is cut off halfway).
+fn first_err(results: Vec<Result<(), DiskError>>) -> Result<(), DiskError> {
+    if let Some(e) = crate::disks::fenced_any(&results) {
+        return Err(e);
+    }
+    results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+}
+
 #[async_trait]
 impl BlockDevice for Stripe {
     async fn flush(&self) -> Result<(), DiskError> {
         let results = futures::future::join_all(self.children.iter().map(|c| c.flush())).await;
-        results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        first_err(results)
     }
 
     async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
@@ -106,7 +116,7 @@ impl BlockDevice for Stripe {
             rest = tail;
             reads.push(self.children[s.child].read_blocks(s.local, part));
         }
-        futures::future::try_join_all(reads).await.map(|_| ())
+        first_err(futures::future::join_all(reads).await)
     }
 
     async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
@@ -115,7 +125,7 @@ impl BlockDevice for Stripe {
             let at = s.offset as usize;
             self.children[s.child].write_blocks(s.local, &buf[at..at + s.len as usize])
         });
-        futures::future::try_join_all(writes).await.map(|_| ())
+        first_err(futures::future::join_all(writes).await)
     }
 
     async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {

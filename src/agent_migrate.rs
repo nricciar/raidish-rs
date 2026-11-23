@@ -109,8 +109,9 @@ pub(super) struct Job {
 impl Job {
     /// Steps 0–3 above. Ok once the guest runs on B.
     pub async fn run(self) -> Result<(), Failure> {
-        // Judged by what it runs as (its CPU as the guest has it).
-        let live_xml = self.virsh.dumpxml_live(&self.name).await?;
+        // Judged by what it runs as (its CPU as the guest has it, see
+        // `vm_check::judged_domain`).
+        let live_xml = self.virsh.dumpxml_judged(&self.name).await?;
         let verdict = self.check(&live_xml).await;
         if verdict.mode != crate::vm_check::Mode::Live {
             return Err(Failure::NotLive(verdict.why()));

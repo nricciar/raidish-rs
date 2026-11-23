@@ -145,6 +145,46 @@ async fn r1c_an_older_epochs_write_cant_land_after_a_newer_one() {
     );
 }
 
+/// A newer epoch's stamped read of blocks an older write was admitted to
+/// waits for that write to land (a new committer reading a label must not
+/// see it before the old committer's write to it does), and fences out
+/// that epoch's later writes once it's admitted.
+#[tokio::test]
+async fn a_stamped_read_waits_for_an_admitted_write() {
+    let (_f, h, d) = served(ServerFence::ready());
+    h.hold_writes(true);
+    let old = {
+        let d = d.clone();
+        tokio::spawn(async move { write(&d, 9, 0xA, 5, &Expiry::never()).await })
+    };
+    while h.held() == 0 {
+        tokio::task::yield_now().await;
+    }
+    let read = {
+        let d = d.clone();
+        tokio::spawn(async move {
+            let r = d.validate_read(0, 9, 1).unwrap();
+            d.read(r, Some(Stamp::Pool(ep(6)))).await.map(|b| b[0])
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!read.is_finished(), "the read didn't wait for the write");
+    h.hold_writes(false);
+    h.release_all();
+    assert_eq!(old.await.unwrap(), Ok(()));
+    assert_eq!(
+        read.await.unwrap(),
+        Ok(0xA),
+        "the read saw the block before the write"
+    );
+    assert_eq!(
+        write(&d, 9, 0xC, 5, &Expiry::never()).await,
+        Err(WsStatus::StaleEpoch)
+    );
+    // Unstamped reads raise nothing and wait for nothing.
+    assert_eq!(read_back(&d, 9).await, 0xA);
+}
+
 /// D5b: a write that waited past its deadline (behind another on its
 /// blocks) is refused, not written after its client gave up; so is one
 /// whose connection has closed.

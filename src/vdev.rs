@@ -24,6 +24,9 @@ use std::sync::Arc;
 /// of the pool's alignment that fits (30 blocks, ~120 KiB, for most pools).
 pub const RECORD_TARGET_BLOCKS: u64 = 30;
 
+/// The most parity a raidz group may have (raidz3).
+pub const MAX_RAIDZ_PARITY: usize = 3;
+
 /// Largest record, in blocks, for a pool aligned to `align`.
 pub fn max_record_blocks(align: u64) -> u64 {
     align * (RECORD_TARGET_BLOCKS / align).max(1)
@@ -151,6 +154,15 @@ impl Topology {
             Topology::RaidZ { parity, disks } => {
                 if *parity == 0 {
                     return Err("raidz parity must be at least 1".into());
+                }
+                // Label repair tries every way of leaving `parity` shards
+                // out (C(disks, parity) rebuilds), and raidz3 is as far as
+                // the rest is built and tested for (audit D6b).
+                if *parity > MAX_RAIDZ_PARITY {
+                    return Err(format!(
+                        "raidz parity is at most {} (raidz{} asked for)",
+                        MAX_RAIDZ_PARITY, parity
+                    ));
                 }
                 if disks.len() <= *parity {
                     return Err(format!(

@@ -545,14 +545,14 @@ impl<D: BlockDevice> FileSystem<D> {
             )));
         }
         let writer = w.sink.writer();
-        let root = vol.obj.root_ptr();
+        let root = vol.obj.root();
         let misses = self.new_misses();
         let commit = DatasetCommit {
             dataset: name.to_string(),
             writer,
             ds,
-            base_root: root.clone(),
-            new_root: root,
+            base_root: root.ptr.clone(),
+            new_root: root.ptr.clone(),
             allocs: Vec::new(),
             frees: Vec::new(),
             free_births: Vec::new(),
@@ -561,12 +561,23 @@ impl<D: BlockDevice> FileSystem<D> {
             log: None,
             min_birth: None,
         };
-        let c = w.sink.commit(commit).await?;
-        self.misses_reported(&misses);
-        self.note_open_txg(c.txg.next()).await;
-        self.set_dataset_log(w, &vol, None);
-        self.set_cursor(&vol, None);
-        Ok(())
+        // In doubt like any volume sync (audit A5): applied, it drops the
+        // log and the committer frees its regions, so on an unknown outcome
+        // flushes must stop logging there (the dataset stays attached: a
+        // handoff called off serves it on), and the next sync resends it.
+        let sent = InDoubt {
+            commit,
+            misses,
+            new_root: root,
+            allocated: Vec::new(),
+            new_log: None,
+            new_region: None,
+        };
+        *vol.in_doubt.lock().unwrap() = Some(sent.clone());
+        let mut waiting = LogNowhereOnDrop(Some(&vol));
+        let outcome = self.send_commit(w, name, sent.commit.clone()).await;
+        waiting.0 = None;
+        self.settle_commit(w, &vol, sent, outcome).await
     }
 
     /// Report disk misses no commit has reported yet to the committer, in
@@ -1007,8 +1018,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 *vol.in_doubt.lock().unwrap() = None;
                 self.misses_reported(&misses);
                 vol.obj.set_root(new_root);
+                // A new region moves flushes there; no log at all (a
+                // retired one) leaves them nowhere to go.
+                let no_log = new_log.is_none();
                 self.set_dataset_log(w, vol, new_log);
-                if new_region.is_some() {
+                if new_region.is_some() || no_log {
                     self.set_cursor(vol, new_region);
                 }
                 self.note_open_txg(c.txg.next()).await;

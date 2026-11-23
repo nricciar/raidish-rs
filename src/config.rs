@@ -99,6 +99,13 @@ impl PoolSpec {
         self.on(disks)
     }
 
+    /// `open`, sharing the disks already open in `open` (by path) instead
+    /// of opening them again: a locked local file can't be opened twice.
+    pub async fn open_sharing(&self, opts: DiskOptions, open: &DiskSet) -> Pool {
+        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
+        self.on(Arc::new(DiskSet::new_sharing(&paths, opts, open).await))
+    }
+
     /// Build the pool over already opened `disks` (in `paths` order).
     pub fn on(&self, disks: Arc<DiskSet>) -> Pool {
         Pool::new(disks, self.topology.clone()).expect("validated topology")
@@ -261,7 +268,10 @@ impl Config {
     }
 
     pub fn disk_options(&self) -> DiskOptions {
-        let mut opts = DiskOptions::default();
+        let mut opts = DiskOptions {
+            lock: true,
+            ..DiskOptions::default()
+        };
         if let Some(ms) = self.disk_timeout_ms {
             opts.request_timeout = std::time::Duration::from_millis(ms);
         }

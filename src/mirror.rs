@@ -8,7 +8,7 @@
 //! write since the last one is then durable on a member that took it.
 
 use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, zeroed_blocks};
-use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask};
+use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask, read_or_fenced};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
 use async_trait::async_trait;
@@ -66,16 +66,21 @@ impl Mirror {
     }
 
     /// Read every member's copy of `n` blocks at `lba` (fenced ones too).
-    async fn read_all_raw(&self, lba: BlockId, n: usize) -> Vec<Option<Vec<Block>>> {
+    /// Every member's copy, `None` where unreadable (a fencing refusal
+    /// fails it all, see `read_or_fenced`).
+    async fn read_all_raw(
+        &self,
+        lba: BlockId,
+        n: usize,
+    ) -> Result<Vec<Option<Vec<Block>>>, DiskError> {
         let reads = self.members.iter().map(|&d| async move {
             let mut run = zeroed_blocks(n);
             self.disks
                 .read_shards_raw(d, lba, &mut run)
                 .await
-                .ok()
                 .map(|_| run)
         });
-        futures::future::join_all(reads).await
+        read_or_fenced(futures::future::join_all(reads).await)
     }
 }
 
@@ -205,7 +210,7 @@ impl Vdev for Mirror {
         repair: bool,
     ) -> Result<StripeCheck, RaidZError> {
         let n = data.len() / BLOCK_SIZE;
-        let copies = self.read_all_raw(lba, n).await;
+        let copies = self.read_all_raw(lba, n).await?;
         let mut check = StripeCheck::new(self.disks.len(), n as u64);
         for (i, &d) in self.members.iter().enumerate() {
             let Some(run) = &copies[i] else {
@@ -225,6 +230,7 @@ impl Vdev for Mirror {
                         .await
                     {
                         Ok(()) => check.repaired[d] += 1,
+                        Err(e) if e.is_fencing() => return Err(e.into()),
                         Err(_) => check.write_failed[d] = true,
                     }
                 }
@@ -253,7 +259,7 @@ impl Vdev for Mirror {
         };
         for b in lba..lba + blocks {
             scan.units += 1;
-            let mut copies = self.read_all_raw(b, 1).await;
+            let mut copies = self.read_all_raw(b, 1).await?;
             // A stale member's copy doesn't vote while a current one is here.
             if (0..copies.len()).any(|i| copies[i].is_some() && !is_stale(i)) {
                 for (i, c) in copies.iter_mut().enumerate() {

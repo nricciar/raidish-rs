@@ -1,5 +1,5 @@
 use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, zeroed_blocks};
-use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask};
+use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask, read_or_fenced};
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
 use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
@@ -591,10 +591,9 @@ impl RaidZ {
             self.disks
                 .read_shards_raw(d, first_stripe, &mut run)
                 .await
-                .ok()
                 .map(|_| run)
         });
-        let actual = futures::future::join_all(reads).await;
+        let actual = read_or_fenced(futures::future::join_all(reads).await)?;
 
         let mut check = StripeCheck::new(self.disks.len(), n as u64);
         let buffered: Vec<bool> = (0..n as u64)
@@ -622,6 +621,7 @@ impl RaidZ {
                         .await
                     {
                         Ok(()) => check.repaired[d] += 1,
+                        Err(e) if e.is_fencing() => return Err(e.into()),
                         Err(_) => check.write_failed[d] = true,
                     }
                 }
@@ -653,11 +653,9 @@ impl RaidZ {
             self.disks
                 .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
                 .await
-                .ok()
                 .map(|_| b)
         });
-        for (i, r) in futures::future::join_all(reads)
-            .await
+        for (i, r) in read_or_fenced(futures::future::join_all(reads).await)?
             .into_iter()
             .enumerate()
         {
@@ -719,18 +717,23 @@ impl RaidZ {
 
     /// Never written: every readable current shard is zeros, and enough
     /// are readable to be sure. `ButStale`: a stale member's shard isn't.
-    async fn label_stripe_blankness(&self, stripe: u64, stale: &[bool]) -> Blank {
+    async fn label_stripe_blankness(
+        &self,
+        stripe: u64,
+        stale: &[bool],
+    ) -> Result<Blank, RaidZError> {
         let mut readable = 0;
         let mut stale_dirty = false;
         for &d in &self.members {
             let mut b = [0u8; BLOCK_SIZE];
-            if self
+            match self
                 .disks
                 .read_shards_raw(d, stripe, std::slice::from_mut(&mut b))
                 .await
-                .is_err()
             {
-                continue;
+                Ok(()) => {}
+                Err(e) if e.is_fencing() => return Err(e.into()),
+                Err(_) => continue,
             }
             let zero = b.iter().all(|&x| x == 0);
             if stale.get(d).copied().unwrap_or(false) {
@@ -738,15 +741,15 @@ impl RaidZ {
                 continue;
             }
             if !zero {
-                return Blank::No;
+                return Ok(Blank::No);
             }
             readable += 1;
         }
-        match (readable >= self.data, stale_dirty) {
+        Ok(match (readable >= self.data, stale_dirty) {
             (false, _) => Blank::No,
             (true, false) => Blank::Yes,
             (true, true) => Blank::ButStale,
-        }
+        })
     }
 }
 
@@ -791,7 +794,7 @@ impl Vdev for RaidZ {
                 // Never-written space map slots are all zeros and fine. A
                 // stale member's leftovers there don't count against that;
                 // they're zeroed like any other stale shard.
-                None => match self.label_stripe_blankness(stripe, stale).await {
+                None => match self.label_stripe_blankness(stripe, stale).await? {
                     Blank::No => scan.unrecoverable.push(stripe * d),
                     Blank::Yes => scan.check.stripes += 1,
                     Blank::ButStale => {
@@ -877,7 +880,7 @@ fn label_candidates(
 
     let mut out = Vec::new();
     // Every way of picking exactly `data` of the shards.
-    for m in (0u64..1 << n).filter(|m| m.count_ones() as usize == data) {
+    for m in masks_of(n, data) {
         let use_: Vec<bool> = (0..n).map(|d| m & (1 << d) != 0).collect();
         if (0..n).any(|i| use_[i] && !present[i]) {
             continue;
@@ -890,6 +893,24 @@ fn label_candidates(
         out.push((d, agree));
     }
     Ok(Some(out))
+}
+
+/// Every `n`-bit mask with exactly `k` bits set, in ascending order (as
+/// filtering `0..1 << n` would give them, so ties rank as they always
+/// did), by Gosper's hack: C(n, k) steps rather than 2^n (audit D6b; a
+/// 33-disk raidz3 is a valid pool), with no shift overflow at any width.
+fn masks_of(n: usize, k: usize) -> impl Iterator<Item = u128> {
+    let end: u128 = 1 << n;
+    let first: u128 = (1 << k) - 1;
+    std::iter::successors(Some(first), move |&m| {
+        if m == 0 {
+            return None; // k == 0: the empty mask only
+        }
+        let c = m.isolate_lowest_one();
+        let r = m + c;
+        Some((((r ^ m) >> 2) / c) | r)
+    })
+    .take_while(move |&m| m < end)
 }
 
 /// Reconstruct data shard `target_shard` of a `data` + `parity` stripe from

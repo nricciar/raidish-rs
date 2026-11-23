@@ -453,6 +453,7 @@ impl Drop for TestDiskServer {
 pub fn fast_disk_options() -> crate::disk::DiskOptions {
     use std::time::Duration;
     crate::disk::DiskOptions {
+        lock: false,
         request_timeout: Duration::from_millis(500),
         connect_timeout: Duration::from_millis(500),
         ping_interval: Duration::from_millis(100),

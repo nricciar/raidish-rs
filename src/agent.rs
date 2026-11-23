@@ -665,6 +665,7 @@ impl Agent {
     /// are fenced already; this keeps it from running on with I/O errors
     /// while another node starts it).
     async fn drop_lost(&mut self) {
+        self.drop_lost_adopted().await;
         let lost: Vec<String> = self
             .running
             .iter()
@@ -717,6 +718,11 @@ impl Agent {
                     self.node
                 ),
             );
+            // No takeover may publish onto this writer from here on (it
+            // checks under this lock, and undoes itself); those that did
+            // already are taken in with the rest (audit A1).
+            *self.shared.writer.lock().unwrap() = None;
+            self.drop_lost_adopted().await;
             let names: Vec<String> = self.running.keys().cloned().collect();
             self.destroy_vms_using(&names).await;
             for name in names {
@@ -728,9 +734,74 @@ impl Agent {
             }
             self.drop_proxies();
             self.writer = None;
-            *self.shared.writer.lock().unwrap() = None;
             self.shared.writing.lock().unwrap().clear();
             *self.files.write().unwrap() = None;
+        }
+    }
+
+    /// Volumes handed over to this node but not adopted yet (that's in
+    /// `tick`, which doesn't run without the node lease) are run all the
+    /// same: their exports and VMs must go once their lease does, or the
+    /// writer's (audit A1). Those that must go are put with the running
+    /// ones, for the rest of `drop_lost` to stop. With no writer at all
+    /// (a takeover that finished after it was dropped), they're stopped
+    /// here: nothing else would.
+    async fn drop_lost_adopted(&mut self) {
+        let writer = match &self.writer {
+            None => WriterStanding::Gone,
+            Some(w) if w.lost.is_lost() => WriterStanding::Lost,
+            Some(_) => WriterStanding::Held,
+        };
+        let taken: Vec<(String, handoff::Slot)> = {
+            let mut slots = self.shared.slots.lock().unwrap();
+            let adopted = slots.iter().filter_map(|(n, s)| match s {
+                handoff::Slot::Adopted { lost, .. } => Some((n.as_str(), lost.is_lost())),
+                _ => None,
+            });
+            adopted_to_drop(adopted, writer)
+                .into_iter()
+                .filter_map(|n| slots.remove(&n).map(|s| (n, s)))
+                .collect()
+        };
+        let mut names = Vec::new();
+        for (name, slot) in taken {
+            let handoff::Slot::Adopted {
+                lease,
+                lost,
+                transport,
+                device,
+            } = slot
+            else {
+                continue;
+            };
+            eprintln!(
+                "agent: dropping volume '{}', handed over but not adopted",
+                name
+            );
+            self.running.insert(
+                name.clone(),
+                Running {
+                    lease,
+                    lost,
+                    attach_tried: std::time::Instant::now(),
+                    info: RunningVolume {
+                        name: name.clone(),
+                        transport,
+                        attach: match device {
+                            Some(device) => Attach::Attached { device },
+                            None => Attach::Exported,
+                        },
+                        proxied: false,
+                    },
+                },
+            );
+            names.push(name);
+        }
+        if writer == WriterStanding::Gone && !names.is_empty() {
+            self.destroy_vms_using(&names).await;
+            for name in names {
+                self.stop(&name, false).await;
+            }
         }
     }
 
@@ -2243,7 +2314,9 @@ impl Agent {
                 p.peer.retire();
             }
         }
-        slots.clear();
+        // A handed-over volume is this node's to stop (`drop_lost_adopted`),
+        // not to forget: its export and VMs would run on.
+        slots.retain(|_, s| matches!(s, handoff::Slot::Adopted { .. }));
     }
 
     async fn helper(&self, args: &[&str]) -> Result<Option<String>, String> {
@@ -2303,6 +2376,28 @@ impl Agent {
         };
         self.helper(&[cmd, name]).await.map(|_| ())
     }
+}
+
+/// Where this node's writer lease stands, for what it runs under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterStanding {
+    Held,
+    Lost,
+    /// No writer (dropped after a loss, or not opened yet).
+    Gone,
+}
+
+/// Of the handed-over volumes not adopted yet, `(name, its lease lost)`,
+/// those to drop: every one once the writer is lost or gone (they ran
+/// under it), else those whose own lease is lost (audit A1).
+fn adopted_to_drop<'a>(
+    adopted: impl Iterator<Item = (&'a str, bool)>,
+    writer: WriterStanding,
+) -> Vec<String> {
+    adopted
+        .filter(|&(_, lost)| lost || writer != WriterStanding::Held)
+        .map(|(n, _)| n.to_string())
+        .collect()
 }
 
 /// Set once a held lease is lost.

@@ -391,3 +391,58 @@ fn block_pointers_refuse_what_they_cant_describe() {
     assert!(BlockPtr::new(10, 1, &data, Txg::from_raw(5)).is_err());
     assert!(BlockPtr::new(10, u32::MAX as u64 + 1, &data, Txg::from_raw(5)).is_err());
 }
+
+/// D6d: a missing local disk is an error, not a new empty disk.
+#[tokio::test]
+async fn a_missing_disk_file_isnt_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typo");
+    let r = Disk::open(path.to_str().unwrap()).await;
+    assert!(r.is_err(), "opened a disk that doesn't exist");
+    assert!(!path.exists(), "the open created the file");
+}
+
+fn locked() -> DiskOptions {
+    DiskOptions {
+        lock: true,
+        ..DiskOptions::default()
+    }
+}
+
+/// D6d: a locked disk file can't be opened (locked) again until its open
+/// is gone; the size is the file's.
+#[tokio::test]
+async fn a_locked_disk_file_is_held_exclusively() {
+    let (_f, path) = create_test_disk_file().await;
+    let path = path.to_str().unwrap();
+    let first = Disk::open_with(path, locked()).await.unwrap();
+    assert_eq!(
+        first.capacity_blocks().await.unwrap(),
+        100 * 1024 * 1024 / BLOCK_SIZE as u64
+    );
+    let second = Disk::open_with(path, locked()).await;
+    let e = second.expect_err("opened a locked disk twice");
+    assert!(e.to_string().contains("in use"), "{}", e);
+    // A clone shares the open, and its lock.
+    let clone = first.clone();
+    drop(first);
+    assert!(Disk::open_with(path, locked()).await.is_err());
+    drop(clone);
+    Disk::open_with(path, locked()).await.unwrap();
+}
+
+/// D6d: a pool spec over this node's served disks and others shares the
+/// served (locked) opens rather than failing to lock them again.
+#[tokio::test]
+async fn a_pool_shares_the_served_disks_opens() {
+    let (_a, a) = create_test_disk_file().await;
+    let (_b, b) = create_test_disk_file().await;
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let served = crate::disks::DiskSet::new_with(&[a], locked()).await;
+    assert!(served.disk(0).is_local());
+    let pool = crate::disks::DiskSet::new_sharing(&[a, b], locked(), &served).await;
+    assert!(pool.disk(0).is_local(), "the served disk wasn't shared");
+    assert!(pool.disk(1).is_local());
+    // The other one is locked by the pool's own open.
+    assert!(Disk::open_with(b, locked()).await.is_err());
+}
