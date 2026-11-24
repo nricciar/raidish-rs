@@ -123,7 +123,7 @@ async fn serve_conn(
     volumes: Arc<dyn PeerVolumes>,
 ) -> std::io::Result<()> {
     let tls = crate::net::tls_accept(&tls, sock).await?;
-    if crate::frontend::peer_role(&tls) != Some(Role::Node) {
+    if crate::tls::peer_role(&tls) != Some(Role::Node) {
         return Ok(()); // only nodes proxy volumes
     }
     let (rd, mut wr) = tokio::io::split(tls);

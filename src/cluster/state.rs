@@ -20,7 +20,7 @@ pub const POOL: LeaseResource = LeaseResource::Pool;
 /// The resource the NFSv4 state owner leases (see `crate::nfs::v4`).
 pub const NFS4: LeaseResource = LeaseResource::Nfs4;
 
-pub use crate::fence::Domain;
+pub use crate::types::Domain;
 
 /// Who may write a metaslab's data, and since which epoch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -62,10 +62,10 @@ impl MetaslabGrant {
     }
 
     /// What a disk server needs of it.
-    pub fn fence(&self) -> crate::fence::Grant {
+    pub fn fence(&self) -> crate::types::Grant {
         match self {
-            MetaslabGrant::Lent { epoch, .. } => crate::fence::Grant::Lent(*epoch),
-            MetaslabGrant::Returned { epoch, .. } => crate::fence::Grant::Returned(*epoch),
+            MetaslabGrant::Lent { epoch, .. } => crate::types::Grant::Lent(*epoch),
+            MetaslabGrant::Returned { epoch, .. } => crate::types::Grant::Returned(*epoch),
         }
     }
 }

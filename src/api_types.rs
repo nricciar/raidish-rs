@@ -4,7 +4,7 @@
 //! from the server. Each lives here rather than in its server module
 //! (which re-exports it); the server-side behaviour stays there.
 
-use crate::dataset::DatasetFormat;
+use crate::types::DatasetFormat;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -547,8 +547,8 @@ pub struct CheckView {
 
 // ---- volumes (`/api/v1/volumes`, see `crate::volumes_api`) ----
 
-use crate::snapshot::SnapshotInfo;
-use crate::volume::VolumeInfo;
+use crate::types::SnapshotInfo;
+use crate::types::VolumeInfo;
 
 /// A volume and its snapshots (oldest first).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -573,8 +573,8 @@ pub struct NewName {
 
 // ---- files (`/api/v1/dir`, `/api/v1/stat`..., see `crate::files_api`) ----
 
-use crate::inode::ObjType;
 use crate::types::FileId;
+use crate::types::ObjType;
 
 /// A directory entry (`GET /api/v1/dir/<path>`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -693,3 +693,129 @@ impl Principal {
 #[cfg(test)]
 #[path = "tests/api_types_tests.rs"]
 mod tests;
+
+// ---- the agent (`GET /api/v1/agent/status`, see `crate::agent`) ----
+
+use crate::types::Transport;
+
+/// A volume this agent runs, as reported by its status.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RunningVolume {
+    pub name: String,
+    pub transport: Transport,
+    /// Its kernel device here.
+    pub attach: Attach,
+    /// Exported here but written by another node (see `handoff`).
+    #[serde(default)]
+    pub proxied: bool,
+}
+
+/// A running volume's kernel device on its node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase", tag = "state")]
+pub enum Attach {
+    /// Exported only: no device wanted (a VM's disk), or the agent attaches
+    /// none (`automount.helper` is none).
+    #[default]
+    Exported,
+    Attached {
+        device: String,
+    },
+    /// Attaching failed (helper missing, a kernel module, ...): it's tried
+    /// again.
+    Failed {
+        error: String,
+    },
+}
+
+impl Attach {
+    /// What an attach (see `Agent::attach`) came to.
+    pub fn of(r: Result<Option<String>, String>) -> Self {
+        match r {
+            Ok(Some(device)) => Attach::Attached { device },
+            Ok(None) => Attach::Exported,
+            Err(error) => Attach::Failed { error },
+        }
+    }
+
+    /// From a proxied export's device, if it has one.
+    pub fn device_of(device: Option<String>) -> Self {
+        device.map_or(Attach::Exported, |device| Attach::Attached { device })
+    }
+
+    pub fn device(&self) -> Option<&str> {
+        match self {
+            Attach::Attached { device } => Some(device),
+            _ => None,
+        }
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Attach::Failed { error } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// " on <device>", if attached: for messages.
+    pub fn on(&self) -> String {
+        self.device()
+            .map(|d| format!(" on {}", d))
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AgentStatus {
+    pub node: String,
+    pub volumes: Vec<RunningVolume>,
+    /// Why VMs that should run here don't (as of the last tick).
+    #[serde(default)]
+    pub vm_errors: BTreeMap<String, String>,
+}
+
+impl Probe {
+    /// "ok", or the error and hint.
+    pub fn describe(&self) -> String {
+        if self.ok {
+            return "ok".into();
+        }
+        let mut s = self.error.clone().unwrap_or_else(|| "failed".into());
+        if let Some(h) = &self.hint {
+            s.push_str(" (");
+            s.push_str(h);
+            s.push(')');
+        }
+        s
+    }
+}
+
+impl NodeFacts {
+    /// The same facts, timestamps aside.
+    pub fn same_as(&self, other: &NodeFacts) -> bool {
+        fn strip(f: &NodeFacts) -> NodeFacts {
+            let mut f = f.clone();
+            f.collected_at = 0;
+            for p in f.peers.values_mut() {
+                for pr in [&mut p.libvirt, &mut p.peer_io].into_iter().flatten() {
+                    pr.checked_at = 0;
+                }
+            }
+            f
+        }
+        strip(self) == strip(other)
+    }
+
+    /// The qemu version as numbers, for comparing.
+    pub fn qemu_version(&self) -> Option<Vec<u64>> {
+        version_nums(&self.libvirt.as_ref()?.qemu_version)
+    }
+}
+
+pub fn version_nums(v: &str) -> Option<Vec<u64>> {
+    let n: Vec<u64> = v
+        .split('.')
+        .map(|p| p.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    (!n.is_empty()).then_some(n)
+}

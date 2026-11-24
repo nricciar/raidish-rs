@@ -1,9 +1,13 @@
 use super::*;
+use crate::committer::health::spawn_health_monitor;
+use crate::fs::LabelState;
 use crate::test_util::{TOTAL_BLOCKS, TestDiskServer, TestPool, wait_until};
 use crate::types::Txg;
 use crate::vdev::Pool;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 fn content(name: &str, generation: u8, len: usize) -> Vec<u8> {
     let seed = blake3::hash(name.as_bytes()).as_bytes()[0];

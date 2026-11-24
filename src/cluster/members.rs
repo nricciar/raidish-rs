@@ -13,7 +13,7 @@
 //! Membership records no addresses. Each node knows the others from its own
 //! config, and nobody has to know its own address as the others see it.
 
-use crate::config::disk_server_base;
+use crate::net::disk_server_base;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

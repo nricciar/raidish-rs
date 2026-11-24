@@ -2,6 +2,7 @@
 //! probe against a server like libvirtd's (wants a client certificate).
 
 use super::*;
+use crate::api_types::version_nums;
 use crate::pki::{Ca, Role};
 use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
 
@@ -86,7 +87,7 @@ fn facts_compare_without_their_timestamps() {
     a.peers.insert(
         "node-1".into(),
         PeerFacts {
-            peer_io: Some(Probe::ok(None)),
+            peer_io: Some(probe_ok(None)),
             ..Default::default()
         },
     );

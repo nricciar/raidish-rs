@@ -275,3 +275,24 @@ pub struct VmSpec {
     #[serde(skip)]
     pub xml: String,
 }
+
+impl VmSpec {
+    pub fn usable(&self) -> bool {
+        self.error().is_none()
+    }
+
+    /// The volume that places it (its first raidish disk), if usable.
+    pub fn anchor(&self) -> Option<&str> {
+        self.disks.anchor()
+    }
+
+    /// Every raidish volume it uses, the anchor first (none if unusable).
+    pub fn volumes(&self) -> &[String] {
+        self.disks.volumes()
+    }
+
+    /// Why the XML is unusable, if it is.
+    pub fn error(&self) -> Option<&str> {
+        self.disks.error()
+    }
+}

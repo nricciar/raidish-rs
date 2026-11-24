@@ -46,31 +46,9 @@ use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Body, Dnode, Head, Snap, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
 use crate::types::Txg;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// A snapshot as listed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SnapshotInfo {
-    /// `volume@snapshot`.
-    pub name: String,
-    pub txg: Txg,
-    /// Names these contents in any pool (kept by send/receive).
-    pub guid: u64,
-    /// When it was taken, ns since the epoch.
-    pub created_ns: u64,
-    /// Bytes only it references (freed if it's destroyed).
-    pub unique_bytes: u64,
-    /// Volumes cloned from it.
-    pub clones: Vec<String>,
-}
-
-impl SnapshotInfo {
-    /// The snapshot's own name (after the `@`).
-    pub fn short(&self) -> &str {
-        self.name.split_once('@').map_or(&self.name, |(_, s)| s)
-    }
-}
+pub use crate::types::SnapshotInfo;
 
 fn check_snap_name(name: &str) -> Result<(), FileSystemError> {
     crate::types::SnapshotName::try_from(name)?;

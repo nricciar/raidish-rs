@@ -23,7 +23,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::vm::VmSpec;
+use crate::vm_def::VmSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -40,9 +40,14 @@ const MAX_VMS: usize = 100_000;
 
 const META: &[u8] = b"M";
 
-impl VmDef {
-    pub fn spec(&self) -> VmSpec {
-        VmSpec::parse(&self.name, &self.xml, self.change)
+/// A stored definition's spec (its XML checked, see `crate::vm::parse_spec`).
+pub trait DefSpec {
+    fn spec(&self) -> VmSpec;
+}
+
+impl DefSpec for VmDef {
+    fn spec(&self) -> VmSpec {
+        crate::vm::parse_spec(&self.name, &self.xml, self.change)
     }
 }
 
@@ -161,7 +166,7 @@ impl<D: BlockDevice> VmStore<D> {
         if xml.len() > MAX_XML {
             return Err(bad(format!("a VM definition is at most {} bytes", MAX_XML)));
         }
-        let spec = VmSpec::parse(name, xml, 0);
+        let spec = crate::vm::parse_spec(name, xml, 0);
         if let Some(e) = spec.error() {
             return Err(bad(format!("VM '{}': {}", name, e)));
         }

@@ -1180,6 +1180,7 @@ pub struct PutVm {
 
 pub mod admin;
 mod client;
+pub mod health;
 pub use admin::{Admin, LocalAdmin, PoolAdmin};
 pub use client::CommitClient;
 
@@ -1197,7 +1198,7 @@ pub mod routes;
 /// every write is fenced the same way.
 #[derive(Clone)]
 pub struct PoolAccess {
-    pub spec: crate::config::PoolSpec,
+    pub spec: crate::vdev::PoolSpec,
     pub opts: crate::disk::DiskOptions,
 }
 
@@ -1287,11 +1288,8 @@ pub async fn run(
             "committer: this node commits the pool (epoch {})",
             held.epoch
         );
-        let monitor = crate::scan::spawn_health_monitor(
-            fs.clone(),
-            Duration::from_secs(30),
-            Some(events.clone()),
-        );
+        let monitor =
+            health::spawn_health_monitor(fs.clone(), Duration::from_secs(30), Some(events.clone()));
         *slot.write().await = Some(committer.clone());
         let mut observe_failing = false;
         let fenced_out = || fs.dev.pool().is_some_and(|p| p.disks().fence().is_stale());

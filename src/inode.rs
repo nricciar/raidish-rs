@@ -32,39 +32,7 @@ pub const DNODES_PER_LEAF: u64 = 32;
 /// pool's alignment).
 const TABLE_LEAF_BLOCKS: u64 = 8;
 
-/// What an object is. In JSON it's named as `name` gives it (on disk,
-/// bincode stores the variant's index).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ObjType {
-    File,
-    #[serde(rename = "dir")]
-    Directory,
-    /// Copy-on-write virtual block device (see `crate::volume`).
-    Volume,
-    /// A volume as it was at some TXG, read-only (see `crate::snapshot`).
-    /// No directory links it: its volume's dnode does.
-    Snapshot,
-    /// The dataset directory (see `crate::dataset`): the uberblock links it.
-    Datasets,
-    /// A `kv` dataset's B+tree (see `crate::btree`): its records are the
-    /// tree's nodes.
-    #[serde(rename = "kv")]
-    KvTree,
-}
-
-impl ObjType {
-    pub fn name(&self) -> &'static str {
-        match self {
-            ObjType::File => "file",
-            ObjType::Directory => "dir",
-            ObjType::Volume => "volume",
-            ObjType::Snapshot => "snapshot",
-            ObjType::Datasets => "datasets",
-            ObjType::KvTree => "kv",
-        }
-    }
-}
+pub use crate::types::ObjType;
 
 /// A directory entry.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,66 +334,7 @@ impl LogRegion {
     }
 }
 
-/// How a volume is exported to the kernel when it is auto-mounted.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Transport {
-    Nbd,
-    Nvme,
-}
-
-impl std::str::FromStr for Transport {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "nbd" => Ok(Transport::Nbd),
-            "nvme" => Ok(Transport::Nvme),
-            _ => Err(format!("unknown transport '{}' (nbd or nvme)", s)),
-        }
-    }
-}
-
-impl std::fmt::Display for Transport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Transport::Nbd => "nbd",
-            Transport::Nvme => "nvme",
-        })
-    }
-}
-
-/// Placement of a tree dataset across the cluster's `listen` nodes.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct DatasetProps {
-    /// Nodes (by name) that may run the dataset, most preferred first. It
-    /// runs on the first live one and stays there (no fail-back) until
-    /// moved. Empty: any node.
-    pub nodes: Vec<String>,
-    /// A volume's: export it and attach the kernel device wherever it runs.
-    /// None: only run by hand (`nbd` / `nvme`).
-    pub automount: Option<Transport>,
-    /// A disabled dataset isn't placed anywhere.
-    pub enabled: bool,
-    /// Asked to move to this node (`volume move`): it goes there while that
-    /// node is live, and the node clears this once it runs the volume.
-    pub move_to: Option<String>,
-    /// An `etcd` dataset's: the port every node takes its clients on (they
-    /// reach it wherever it runs, see `crate::frontend`).
-    #[serde(default)]
-    pub port: Option<u16>,
-}
-
-impl Default for DatasetProps {
-    fn default() -> Self {
-        DatasetProps {
-            nodes: Vec::new(),
-            automount: None,
-            enabled: true,
-            move_to: None,
-            port: None,
-        }
-    }
-}
+pub use crate::types::{DatasetProps, Transport};
 
 /// An object table record: `DNODES_PER_LEAF` slots, length-prefixed (the
 /// record is zero-padded to its block size).

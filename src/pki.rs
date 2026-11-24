@@ -532,7 +532,7 @@ pub fn status(dir: &Path) -> Result<(Vec<CertInfo>, Vec<CertInfo>), String> {
 pub fn hosts_in(paths: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in paths {
-        let Some(base) = crate::config::disk_server_base(p) else {
+        let Some(base) = crate::net::disk_server_base(p) else {
             continue;
         };
         let Ok(url) = url::Url::parse(&base) else {

@@ -6,10 +6,6 @@
 //! dashboard). The servers and the command line are native only.
 
 #[cfg(not(target_arch = "wasm32"))]
-#[macro_use]
-extern crate rocket;
-
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod agent;
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
@@ -44,7 +40,7 @@ pub(crate) mod etcd;
 pub(crate) mod events;
 #[cfg(not(target_arch = "wasm32"))]
 mod export;
-pub(crate) mod fence;
+pub mod fence;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fenced_disks;
 pub(crate) mod file_writer;

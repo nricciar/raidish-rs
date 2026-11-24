@@ -11,7 +11,7 @@
 //! data shards for raidz, 1 for a mirror, the LCM of its children for a
 //! stripe). The pool's alignment is the root's width.
 
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError};
+use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, DiskOptions};
 use crate::disks::{DiskSet, MAX_DISKS};
 use crate::mirror::Mirror;
 use crate::raidz::{RaidZ, RaidZError};
@@ -430,6 +430,43 @@ impl BlockDevice for Pool {
     }
     fn pool(&self) -> Option<&Pool> {
         Some(self)
+    }
+}
+
+/// A pool layout with its disks numbered: `topology` refers to `paths` by index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSpec {
+    pub paths: Vec<String>,
+    pub topology: Topology,
+}
+
+impl PoolSpec {
+    /// Open the disks and build the pool.
+    pub async fn open(&self, opts: DiskOptions) -> Pool {
+        self.open_fenced(opts, Default::default()).await
+    }
+
+    /// `open`, its requests carrying `fence`'s epochs from the first.
+    pub async fn open_fenced(
+        &self,
+        opts: DiskOptions,
+        fence: Arc<crate::fence::ClientFence>,
+    ) -> Pool {
+        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
+        let disks = Arc::new(DiskSet::new_fenced(&paths, opts, fence).await);
+        self.on(disks)
+    }
+
+    /// `open`, sharing the disks already open in `open` (by path) instead
+    /// of opening them again: a locked local file can't be opened twice.
+    pub async fn open_sharing(&self, opts: DiskOptions, open: &DiskSet) -> Pool {
+        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
+        self.on(Arc::new(DiskSet::new_sharing(&paths, opts, open).await))
+    }
+
+    /// Build the pool over already opened `disks` (in `paths` order).
+    pub fn on(&self, disks: Arc<DiskSet>) -> Pool {
+        Pool::new(disks, self.topology.clone()).expect("validated topology")
     }
 }
 

@@ -984,3 +984,269 @@ impl ErrorKind {
         }
     }
 }
+
+/// What an object is. In JSON it's named as `name` gives it (on disk,
+/// bincode stores the variant's index).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ObjType {
+    File,
+    #[serde(rename = "dir")]
+    Directory,
+    /// Copy-on-write virtual block device (see `crate::volume`).
+    Volume,
+    /// A volume as it was at some TXG, read-only (see `crate::snapshot`).
+    /// No directory links it: its volume's dnode does.
+    Snapshot,
+    /// The dataset directory (see `crate::dataset`): the uberblock links it.
+    Datasets,
+    /// A `kv` dataset's B+tree (see `crate::btree`): its records are the
+    /// tree's nodes.
+    #[serde(rename = "kv")]
+    KvTree,
+}
+
+impl ObjType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ObjType::File => "file",
+            ObjType::Directory => "dir",
+            ObjType::Volume => "volume",
+            ObjType::Snapshot => "snapshot",
+            ObjType::Datasets => "datasets",
+            ObjType::KvTree => "kv",
+        }
+    }
+}
+
+/// How a volume is exported to the kernel when it is auto-mounted.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    Nbd,
+    Nvme,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "nbd" => Ok(Transport::Nbd),
+            "nvme" => Ok(Transport::Nvme),
+            _ => Err(format!("unknown transport '{}' (nbd or nvme)", s)),
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Transport::Nbd => "nbd",
+            Transport::Nvme => "nvme",
+        })
+    }
+}
+
+/// Placement of a tree dataset across the cluster's `listen` nodes.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DatasetProps {
+    /// Nodes (by name) that may run the dataset, most preferred first. It
+    /// runs on the first live one and stays there (no fail-back) until
+    /// moved. Empty: any node.
+    pub nodes: Vec<String>,
+    /// A volume's: export it and attach the kernel device wherever it runs.
+    /// None: only run by hand (`nbd` / `nvme`).
+    pub automount: Option<Transport>,
+    /// A disabled dataset isn't placed anywhere.
+    pub enabled: bool,
+    /// Asked to move to this node (`volume move`): it goes there while that
+    /// node is live, and the node clears this once it runs the volume.
+    pub move_to: Option<String>,
+    /// An `etcd` dataset's: the port every node takes its clients on (they
+    /// reach it wherever it runs, see `crate::frontend`).
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl Default for DatasetProps {
+    fn default() -> Self {
+        DatasetProps {
+            nodes: Vec::new(),
+            automount: None,
+            enabled: true,
+            move_to: None,
+            port: None,
+        }
+    }
+}
+
+/// A snapshot as listed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// `volume@snapshot`.
+    pub name: String,
+    pub txg: Txg,
+    /// Names these contents in any pool (kept by send/receive).
+    pub guid: u64,
+    /// When it was taken, ns since the epoch.
+    pub created_ns: u64,
+    /// Bytes only it references (freed if it's destroyed).
+    pub unique_bytes: u64,
+    /// Volumes cloned from it.
+    pub clones: Vec<String>,
+}
+
+impl SnapshotInfo {
+    /// The snapshot's own name (after the `@`).
+    pub fn short(&self) -> &str {
+        self.name.split_once('@').map_or(&self.name, |(_, s)| s)
+    }
+}
+
+/// A volume as listed (see `FileSystem::list_volumes`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    pub volblocksize: u32,
+    pub props: DatasetProps,
+}
+
+/// How a dataset's contents are laid out.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DatasetFormat {
+    /// Directories and files; the root is a directory. Changed through the
+    /// committer, object by object (`crate::writer::FsOp`).
+    Posix,
+    /// A virtual block device (a volume, see `crate::volume`): a fixed-size
+    /// tree of `volblocksize` records.
+    Block,
+    /// Byte-string keys to values, in a B+tree whose nodes are the root
+    /// object's records (see `crate::kv`, `crate::btree`).
+    Kv,
+    /// An etcd v3 keyspace (revisions, history, leases; see `crate::etcd`)
+    /// in a B+tree.
+    Etcd,
+    /// An S3 bucket (objects and their bodies, uploads; see `crate::s3`)
+    /// in a B+tree.
+    S3,
+    /// An SQS queue (messages, their visibility; see `crate::sqs`) in a
+    /// B+tree.
+    Queue,
+    /// The cluster's activity log (see `crate::events`): one per pool,
+    /// written by the committer only, in a B+tree.
+    Events,
+    /// The cluster's VM definitions (see `crate::vm_store`): one per
+    /// pool, written by the committer only (each one checked as it's
+    /// stored), in a B+tree.
+    Vms,
+}
+
+impl DatasetFormat {
+    pub fn name(&self) -> &'static str {
+        match self {
+            DatasetFormat::Posix => "posix",
+            DatasetFormat::Block => "block",
+            DatasetFormat::Kv => "kv",
+            DatasetFormat::Etcd => "etcd",
+            DatasetFormat::S3 => "s3",
+            DatasetFormat::Queue => "queue",
+            DatasetFormat::Events => "events",
+            DatasetFormat::Vms => "vms",
+        }
+    }
+
+    /// Whether its root object holds a B+tree (see `crate::btree`).
+    pub fn is_btree(&self) -> bool {
+        matches!(
+            self,
+            DatasetFormat::Kv
+                | DatasetFormat::Etcd
+                | DatasetFormat::S3
+                | DatasetFormat::Queue
+                | DatasetFormat::Events
+                | DatasetFormat::Vms
+        )
+    }
+
+    /// Whether a front end serves it (see `crate::frontend`).
+    pub fn is_service(&self) -> bool {
+        matches!(
+            self,
+            DatasetFormat::Etcd | DatasetFormat::S3 | DatasetFormat::Queue
+        )
+    }
+
+    /// Whether the pool keeps it for itself (not listed, made or deleted
+    /// by users).
+    pub fn is_system(&self) -> bool {
+        matches!(self, DatasetFormat::Events | DatasetFormat::Vms)
+    }
+
+    /// Whether its contents are its root object's tree, run as a whole by
+    /// one writer (see the module docs).
+    pub fn is_tree(&self) -> bool {
+        !matches!(self, DatasetFormat::Posix)
+    }
+
+    /// The kind of its root object.
+    pub fn root_kind(&self) -> ObjType {
+        match self {
+            DatasetFormat::Posix => ObjType::Directory,
+            DatasetFormat::Block => ObjType::Volume,
+            f if f.is_btree() => ObjType::KvTree,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// A fencing domain: the pool, or one metaslab.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Domain {
+    Pool,
+    Metaslab(MetaslabIdx),
+}
+
+/// A metaslab's fencing grant, as the cluster recorded it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grant {
+    /// Lent to a writer at this epoch: only that lend's writes are admitted
+    /// (a new committer doesn't change it).
+    Lent(Epoch),
+    /// Back with the committer since this epoch: the pool floor applies too.
+    Returned(Epoch),
+}
+
+impl Grant {
+    pub fn epoch(self) -> Epoch {
+        match self {
+            Grant::Lent(e) | Grant::Returned(e) => e,
+        }
+    }
+}
+
+/// What learns the cluster's fencing grants as they're applied (a disk
+/// server's `crate::fence::ServerFence`): the cluster tells it, so the
+/// cluster needs nothing of the storage core.
+pub trait FenceObserver: Send + Sync {
+    /// The pool epoch and the metaslabs' grants, as of the state applied.
+    fn observe_grants(
+        &self,
+        pool_epoch: Epoch,
+        grants: &mut dyn Iterator<Item = (MetaslabIdx, Grant)>,
+    );
+}
+
+/// 64 random bits drawn once per process from the OS (audit R4c).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn process_seed() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        use ring::rand::SecureRandom;
+        let mut b = [0u8; 8];
+        ring::rand::SystemRandom::new()
+            .fill(&mut b)
+            .expect("the OS random source");
+        u64::from_le_bytes(b)
+    })
+}

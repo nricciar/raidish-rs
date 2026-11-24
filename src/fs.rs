@@ -488,19 +488,8 @@ pub(crate) fn parse_label(buf: &[u8]) -> Result<(Txg, usize), FileSystemError> {
     Ok((header.txg, payload_len))
 }
 
-/// 64 random bits drawn once per process from the OS (audit R4c).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn process_seed() -> u64 {
-    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SEED.get_or_init(|| {
-        use ring::rand::SecureRandom;
-        let mut b = [0u8; 8];
-        ring::rand::SystemRandom::new()
-            .fill(&mut b)
-            .expect("the OS random source");
-        u64::from_le_bytes(b)
-    })
-}
+pub(crate) use crate::types::process_seed;
 
 /// Read a pool device's superblock without loading the pool (None: not
 /// formatted, or unreadable).

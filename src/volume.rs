@@ -10,7 +10,7 @@ use crate::blkptr::BlockPtr;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
-use crate::inode::{DatasetProps, Dnode};
+use crate::inode::Dnode;
 use crate::object::{Dirty, levels_for};
 use std::sync::Arc;
 
@@ -45,14 +45,7 @@ impl std::fmt::Display for FragReport {
     }
 }
 
-/// A volume as listed (see `FileSystem::list_volumes`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct VolumeInfo {
-    pub name: String,
-    pub size_bytes: u64,
-    pub volblocksize: u32,
-    pub props: DatasetProps,
-}
+pub use crate::types::VolumeInfo;
 
 fn frag_of(leaves: &[(u64, BlockPtr)]) -> FragReport {
     FragReport {

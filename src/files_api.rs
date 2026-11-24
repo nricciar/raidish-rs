@@ -45,8 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
-/// This node's writer, once the agent has one.
-pub type WriterSlot = Arc<std::sync::RwLock<Option<Arc<FileSystem<Pool>>>>>;
+pub use crate::agent::WriterSlot;
 
 pub struct FilesState {
     pub node: String,
@@ -275,19 +274,18 @@ async fn get_file(
 
 pub use crate::api_types::{DirEntry, RenameRequest, Stat};
 
-impl Stat {
-    fn of(id: FileId, d: &Dnode) -> Self {
-        Stat {
-            id,
-            kind: d.kind(),
-            size: if d.is_directory() { 0 } else { d.size },
-            mode: d.attrs.mode,
-            uid: d.attrs.uid,
-            gid: d.attrs.gid,
-            nlink: d.attrs.nlink,
-            mtime_ns: d.attrs.mtime_ns,
-            ctime_ns: d.attrs.ctime_ns,
-        }
+/// A file's `Stat`, from its dnode.
+fn stat_of(id: FileId, d: &Dnode) -> Stat {
+    Stat {
+        id,
+        kind: d.kind(),
+        size: if d.is_directory() { 0 } else { d.size },
+        mode: d.attrs.mode,
+        uid: d.attrs.uid,
+        gid: d.attrs.gid,
+        nlink: d.attrs.nlink,
+        mtime_ns: d.attrs.mtime_ns,
+        ctime_ns: d.attrs.ctime_ns,
     }
 }
 
@@ -548,7 +546,7 @@ async fn patch_file(
 async fn stat<D: BlockDevice>(fs: &FileSystem<D>, path: &Path) -> Result<Stat, FileSystemError> {
     fs.refresh_root().await?;
     let (id, d) = fs.stat(path).await?;
-    Ok(Stat::of(id, &d))
+    Ok(stat_of(id, &d))
 }
 
 #[get("/api/v1/stat/<path..>")]

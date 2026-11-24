@@ -22,19 +22,11 @@
 
 use crate::blkptr::BlockPtr;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::events::{EventKind, Subject};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::fs::LabelState;
 use crate::fs::{FileSystem, FileSystemError, parse_label};
 use crate::fsck::{Node, table_node};
 use crate::object::TreeRoot;
 use crate::types::Txg;
 use crate::vdev::StripeCheck;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanReport {
@@ -569,95 +561,6 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
     }
-}
-
-/// Keep a served pool healthy: whenever a disk (re)connects, check its label
-/// (a replaced disk is fenced and fully resilvered), and whenever an online
-/// disk is degraded, resilver it. Also re-checks periodically, since misses
-/// are only noticed at commit time.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_health_monitor<D: BlockDevice + 'static>(
-    fs: Arc<FileSystem<D>>,
-    interval: Duration,
-    events: Option<crate::events::EventSink>,
-) -> tokio::task::JoinHandle<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-    if let Some(pool) = fs.dev.pool() {
-        for d in 0..pool.disks().len() {
-            if let Some(mut events) = pool.disks().disk(d).reconnects() {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    while events.changed().await.is_ok() {
-                        if tx.send(d).is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        }
-    }
-    drop(tx);
-
-    tokio::spawn(async move {
-        // A resilver that can't finish clean (say, an unreadable record) is
-        // retried with backoff instead of rescanning every interval.
-        let mut wait = interval;
-        loop {
-            if fs.needs_resilver() {
-                match fs.resilver().await {
-                    Ok(report) => {
-                        if report.since > Txg::ZERO || !report.cleared.is_empty() {
-                            eprintln!("{}", report);
-                            if let Some(ev) = &events {
-                                ev.clear(&Subject::Pool);
-                                let line = report.summary();
-                                if report.is_clean() {
-                                    ev.info(
-                                        EventKind::ResilverDone,
-                                        Subject::Pool,
-                                        format!("Resilver finished: {}", line),
-                                    );
-                                } else {
-                                    ev.warn(
-                                        EventKind::ResilverIncomplete,
-                                        Subject::Pool,
-                                        format!("Resilver incomplete (will retry): {}", line),
-                                    );
-                                }
-                            }
-                        }
-                        wait = if report.is_clean() {
-                            interval
-                        } else {
-                            (wait * 2).min(interval * 20)
-                        };
-                    }
-                    Err(e) => {
-                        eprintln!("resilver failed: {}", e);
-                        if let Some(ev) = &events {
-                            ev.once(
-                                crate::events::Level::Error,
-                                EventKind::ResilverFailed,
-                                Subject::Pool,
-                                format!("Resilver failed: {}", e),
-                            );
-                        }
-                        wait = (wait * 2).min(interval * 20);
-                    }
-                }
-            }
-            tokio::select! {
-                Some(d) = rx.recv() => {
-                    wait = interval;
-                    if fs.adopt_disk(d).await == LabelState::Foreign {
-                        // Persist the degraded mark before resilvering.
-                        let _ = fs.commit_txg().await;
-                    }
-                }
-                _ = tokio::time::sleep(wait) => {}
-            }
-        }
-    })
 }
 
 #[cfg(test)]

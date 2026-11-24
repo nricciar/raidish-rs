@@ -7,8 +7,8 @@ use super::pb::etcdserverpb::{
     auth_server, cluster_server, kv_server, lease_server, maintenance_server, watch_server,
 };
 use super::store::{EtcdError, EtcdStore, KeyRange, MAX_REQUEST_BYTES};
+use crate::api_types::Role;
 use crate::disk::BlockDevice;
-use crate::pki::Role;
 use futures::Stream;
 use pb::watch_request::RequestUnion;
 use std::collections::BTreeMap;

@@ -210,7 +210,7 @@ pub fn ws_connector() -> Option<tokio_tungstenite::Connector> {
 pub fn check_urls<'a>(urls: impl IntoIterator<Item = &'a String>) -> Result<(), String> {
     let want = scheme();
     for u in urls {
-        let Some(base) = crate::config::disk_server_base(u) else {
+        let Some(base) = crate::net::disk_server_base(u) else {
             continue;
         };
         if !base.starts_with(&format!("{}://", want)) {
@@ -222,4 +222,10 @@ pub fn check_urls<'a>(urls: impl IntoIterator<Item = &'a String>) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// The role of a TLS connection's client certificate.
+pub fn peer_role<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<crate::pki::Role> {
+    let der = tls.get_ref().1.peer_certificates()?.first()?;
+    crate::pki::inspect_der(der).ok()?.role
 }

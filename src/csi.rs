@@ -271,7 +271,7 @@ impl Driver {
     /// The kernel device this node's agent attached `name` on, or why
     /// there isn't one (yet).
     async fn local_device(&self, name: &str) -> Result<String, String> {
-        let status: crate::agent::AgentStatus = self
+        let status: crate::api_types::AgentStatus = self
             .http
             .get(format!("{}/api/v1/agent/status", self.agent))
             .send()
@@ -283,7 +283,7 @@ impl Driver {
         let Some(v) = status.volumes.into_iter().find(|v| v.name == name) else {
             return Err("not running on this node yet".into());
         };
-        use crate::agent::Attach;
+        use crate::api_types::Attach;
         match v.attach {
             Attach::Attached { device } if Path::new(&device).exists() => Ok(device),
             Attach::Attached { device } => Err(format!("{} doesn't exist (yet)", device)),

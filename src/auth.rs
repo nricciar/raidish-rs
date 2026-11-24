@@ -235,8 +235,22 @@ fn bearer<'r>(req: &'r Request<'_>) -> Option<&'r str> {
     req.query_value::<&str>("access_token").and_then(|r| r.ok())
 }
 
+/// Any authenticated caller, as a request guard. A newtype because
+/// `Principal` is plain data (`crate::api_types`, shared with the web
+/// dashboard): Rocket's `FromRequest` can only be implemented here, for
+/// a type of this crate.
+#[derive(Clone, Debug)]
+pub struct Authed(pub Principal);
+
+impl std::ops::Deref for Authed {
+    type Target = Principal;
+    fn deref(&self) -> &Principal {
+        &self.0
+    }
+}
+
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for Principal {
+impl<'r> FromRequest<'r> for Authed {
     type Error = String;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
@@ -271,7 +285,7 @@ impl<'r> FromRequest<'r> for Principal {
             })
             .await;
         match cached {
-            Ok(p) => Outcome::Success(p.clone()),
+            Ok(p) => Outcome::Success(Authed(p.clone())),
             Err(e) => Outcome::Error((Status::Unauthorized, e.clone())),
         }
     }
@@ -287,7 +301,7 @@ macro_rules! role_guard {
             type Error = String;
 
             async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-                match req.guard::<Principal>().await {
+                match req.guard::<Authed>().await.map(|a| a.0) {
                     Outcome::Success($p) if $ok => Outcome::Success($name($p)),
                     Outcome::Success(p) => Outcome::Error((
                         Status::Forbidden,
@@ -314,7 +328,7 @@ impl<'r> FromRequest<'r> for Actor {
     type Error = String;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-        let Outcome::Success(p) = req.guard::<Principal>().await else {
+        let Outcome::Success(Authed(p)) = req.guard::<Authed>().await else {
             return Outcome::Success(Actor(None));
         };
         if p.role == Role::Node {
@@ -335,8 +349,8 @@ role_guard!(IsNode, "Nodes only (Raft between peers).", |p| p.role
 
 /// GET /api/v1/auth/whoami: who the server thinks you are (401 if nobody).
 #[rocket::get("/api/v1/auth/whoami")]
-pub fn whoami(p: Principal) -> rocket::serde::json::Json<Principal> {
-    rocket::serde::json::Json(p)
+pub fn whoami(p: Authed) -> rocket::serde::json::Json<Principal> {
+    rocket::serde::json::Json(p.0)
 }
 
 /// Turn 401/403 into a short plain-text reason (Rocket's default is HTML).

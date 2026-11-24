@@ -52,7 +52,7 @@ fn ident() -> VmIdent {
 
 #[test]
 fn a_domain_is_its_pools_and_nodes() {
-    let s = VmSpec::parse("web", DUMPXML, 7);
+    let s = parse_spec("web", DUMPXML, 7);
     let xml = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     let meta = root.child("metadata").unwrap();
@@ -77,7 +77,7 @@ fn a_domain_is_its_pools_and_nodes() {
 
 #[test]
 fn finds_raidish_disks_anchor_first() {
-    let s = VmSpec::parse("web", DUMPXML, 7);
+    let s = parse_spec("web", DUMPXML, 7);
     assert_eq!(s.error(), None);
     assert_eq!(s.anchor(), Some("vm1"));
     assert_eq!(s.volumes(), vec!["vm1", "data", "iso"]);
@@ -85,18 +85,18 @@ fn finds_raidish_disks_anchor_first() {
 
 #[test]
 fn no_raidish_disk_is_an_error() {
-    let s = VmSpec::parse("x", "<domain><name>x</name><devices/></domain>", 1);
+    let s = parse_spec("x", "<domain><name>x</name><devices/></domain>", 1);
     assert!(s.error().is_some());
     assert!(!s.usable());
-    let s = VmSpec::parse("x", "<notadomain/>", 1);
+    let s = parse_spec("x", "<notadomain/>", 1);
     assert!(s.error().unwrap().contains("domain"));
-    let s = VmSpec::parse("x", "<domain><devices>", 1);
+    let s = parse_spec("x", "<domain><devices>", 1);
     assert!(s.error().is_some());
 }
 
 #[test]
 fn renders_disks_console_name_and_metadata() {
-    let s = VmSpec::parse("web", DUMPXML, 7);
+    let s = parse_spec("web", DUMPXML, 7);
     let xml = render(&s, ("127.0.0.1", 10809), "127.0.0.1", "host:1:2", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     assert_eq!(
@@ -154,7 +154,7 @@ fn renders_disks_console_name_and_metadata() {
     assert!(devices.child("video").is_some());
     assert!(root.child("uuid").is_some());
     // And it parses back to the same VM.
-    let again = VmSpec::parse("web", &xml, 7);
+    let again = parse_spec("web", &xml, 7);
     assert_eq!(again.volumes(), s.volumes());
 }
 
@@ -162,7 +162,7 @@ fn renders_disks_console_name_and_metadata() {
 fn escapes_survive_a_round_trip() {
     let xml = "<domain><name>a</name><description>x &amp; y &lt;z&gt;</description>\
                <devices><disk device='disk'><source file='raidish:v'/></disk></devices></domain>";
-    let s = VmSpec::parse("a", xml, 1);
+    let s = parse_spec("a", xml, 1);
     let out = render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).unwrap();
     assert!(out.contains("x &amp; y &lt;z&gt;"), "{}", out);
 }
@@ -191,7 +191,7 @@ fn parses_metadata_whatever_the_prefix() {
 
 #[test]
 fn reads_the_hardware() {
-    let s = VmSpec::parse("web", DUMPXML, 7);
+    let s = parse_spec("web", DUMPXML, 7);
     let hw = &s.hw;
     assert_eq!(hw.vcpus, Some(2));
     assert_eq!(hw.memory, Some(Bytes::from_mib(2048)));
@@ -214,7 +214,7 @@ fn reads_the_hardware() {
 #[test]
 fn memory_units() {
     let mem = |x: &str| {
-        VmSpec::parse("m", &format!("<domain>{}<devices/></domain>", x), 1)
+        parse_spec("m", &format!("<domain>{}<devices/></domain>", x), 1)
             .hw
             .memory
             .map(Bytes::kib)
@@ -241,7 +241,7 @@ fn a_new_vms_template_is_a_usable_vm() {
         iso: Some("debian-iso".into()),
         network: Some("default".into()),
     };
-    let s = VmSpec::parse("web1", &template(&new), 1);
+    let s = parse_spec("web1", &template(&new), 1);
     assert_eq!(s.error(), None);
     assert_eq!(s.anchor(), Some("web1-disk0"));
     assert_eq!(s.volumes(), vec!["web1-disk0", "debian-iso"]);
@@ -259,7 +259,7 @@ fn a_new_vms_template_is_a_usable_vm() {
         network: None,
         ..new
     };
-    let s = VmSpec::parse("web1", &template(&bare), 1);
+    let s = parse_spec("web1", &template(&bare), 1);
     assert_eq!(s.error(), None);
     assert_eq!(s.volumes(), vec!["web1-disk0"]);
     assert!(s.hw.nics.is_empty());
@@ -267,7 +267,7 @@ fn a_new_vms_template_is_a_usable_vm() {
 
 /// A domain with `devices` (and `extra` at the top), around a raidish disk.
 fn with(extra: &str, devices: &str) -> VmSpec {
-    VmSpec::parse(
+    parse_spec(
         "x",
         &format!(
             "<domain type='kvm'><name>x</name>{}<devices>\
@@ -394,7 +394,7 @@ fn refuses_what_reaches_the_host() {
         assert!(!s.usable(), "allowed: {} {}", extra, devices);
         assert!(render(&s, ("127.0.0.1", 1), "127.0.0.1", "o", &ident()).is_err());
     }
-    let s = VmSpec::parse(
+    let s = parse_spec(
         "x",
         "<domain type='lxc'><devices><disk device='disk'><source file='raidish:v'/></disk></devices></domain>",
         1,
@@ -431,7 +431,7 @@ fn a_volume_belongs_to_one_vm() {
             "<domain><devices><disk device='disk'><source file='raidish:{}'/></disk></devices></domain>",
             vols
         );
-        specs.insert(name.to_string(), VmSpec::parse(name, &xml, 1));
+        specs.insert(name.to_string(), parse_spec(name, &xml, 1));
     }
     mark_conflicts(&mut specs);
     assert!(specs["a"].usable());
@@ -441,7 +441,7 @@ fn a_volume_belongs_to_one_vm() {
 
 #[test]
 fn consoles_listen_where_configured() {
-    let s = VmSpec::parse("web", DUMPXML, 7);
+    let s = parse_spec("web", DUMPXML, 7);
     let xml = render(&s, ("127.0.0.1", 10809), "172.31.250.1", "o", &ident()).unwrap();
     let root = parse_domain(&xml).unwrap();
     let g = root.child("devices").unwrap().child("graphics").unwrap();

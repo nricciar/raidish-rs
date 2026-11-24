@@ -7,6 +7,22 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
+/// `http://host:port` of the `listen` node serving a remote disk path
+/// (`http://host:port/api/v1/disks/N`, or `ws://`), None for local paths.
+pub fn disk_server_base(path: &str) -> Option<String> {
+    let url = url::Url::parse(path).ok()?;
+    let scheme = match url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => return None,
+    };
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(p) => format!("{}://{}:{}", scheme, host, p),
+        None => format!("{}://{}", scheme, host),
+    })
+}
+
 /// How long a TLS handshake may take before the connection is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 

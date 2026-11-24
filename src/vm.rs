@@ -360,51 +360,32 @@ fn hardware(root: &El) -> VmHardware {
     hw
 }
 
-impl VmSpec {
-    pub fn parse(name: &str, xml: &str, change: u64) -> VmSpec {
-        let mut spec = VmSpec {
-            name: name.to_string(),
-            change,
-            disks: VmDisks::Unusable {
-                error: String::new(),
-            },
-            hw: VmHardware::default(),
-            xml: xml.to_string(),
-        };
-        let root = parse_domain(xml);
-        if let Ok(root) = &root {
-            spec.hw = hardware(root);
-        }
-        spec.disks = match root.and_then(|root| {
-            check_domain(&root)?;
-            raidish_disks(&root)
-        }) {
-            Ok(vols) => VmDisks::of(vols),
-            Err(e) => VmDisks::Unusable {
-                error: e.to_string(),
-            },
-        };
-        spec
+/// A VM definition as stored: its XML checked (`VmDisks::Unusable` if
+/// it isn't one raidish runs) and its hardware read.
+pub fn parse_spec(name: &str, xml: &str, change: u64) -> VmSpec {
+    let mut spec = VmSpec {
+        name: name.to_string(),
+        change,
+        disks: VmDisks::Unusable {
+            error: String::new(),
+        },
+        hw: VmHardware::default(),
+        xml: xml.to_string(),
+    };
+    let root = parse_domain(xml);
+    if let Ok(root) = &root {
+        spec.hw = hardware(root);
     }
-
-    pub fn usable(&self) -> bool {
-        self.error().is_none()
-    }
-
-    /// The volume that places it (its first raidish disk), if usable.
-    pub fn anchor(&self) -> Option<&str> {
-        self.disks.anchor()
-    }
-
-    /// Every raidish volume it uses, the anchor first (none if unusable).
-    pub fn volumes(&self) -> &[String] {
-        self.disks.volumes()
-    }
-
-    /// Why the XML is unusable, if it is.
-    pub fn error(&self) -> Option<&str> {
-        self.disks.error()
-    }
+    spec.disks = match root.and_then(|root| {
+        check_domain(&root)?;
+        raidish_disks(&root)
+    }) {
+        Ok(vols) => VmDisks::of(vols),
+        Err(e) => VmDisks::Unusable {
+            error: e.to_string(),
+        },
+    };
+    spec
 }
 
 /// Mark each VM that uses a volume an earlier one (by name) already uses
@@ -1280,11 +1261,11 @@ impl Virsh {
     }
 
     /// Running domain `name` as its moves are judged
-    /// (`crate::vm_check::judged_domain`).
+    /// (`judged_domain`).
     pub async fn dumpxml_judged(&self, name: &str) -> Result<String, VmError> {
         let live = self.dumpxml_live(name).await?;
         Ok(match self.dumpxml_migratable(name).await {
-            Ok(mig) => crate::vm_check::judged_domain(&live, &mig),
+            Ok(mig) => judged_domain(&live, &mig),
             Err(_) => live,
         })
     }
@@ -1489,6 +1470,57 @@ fn parse_list(out: &str) -> Vec<Domain> {
             })
         })
         .collect()
+}
+
+/// What `GET /api/v1/vm/local` answers.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LocalView {
+    pub node: String,
+    /// Does this node run VMs at all (a `vm:` config section)?
+    pub enabled: bool,
+    pub vms: Vec<LocalVm>,
+    /// Why VMs that should run here don't.
+    pub errors: BTreeMap<String, String>,
+    /// libvirt couldn't be asked.
+    pub error: Option<String>,
+}
+
+/// A running domain as its moves are judged: its live XML (`virsh
+/// dumpxml`), whose `<cpu>` says what the guest really has, less the
+/// `require`d features its migratable XML (`--migratable`) doesn't name.
+///
+/// The live CPU's `disable`s are what qemu couldn't give the model here
+/// (a bare `qemu64` on Intel without `svm`): the target needn't have them
+/// either, which `--migratable`, back at the model, would forget. Its
+/// added `require`s are what qemu's own model definition turned on beyond
+/// libvirt's (`topoext` in EPYC models): libvirt's view of every host,
+/// this one included, lacks them, so `cpu-compare` refuses them even where
+/// the guest runs, while the target's qemu gives them by the same model.
+/// Either XML that doesn't parse: the live one as it is.
+pub fn judged_domain(live: &str, migratable: &str) -> String {
+    let (Ok(mut root), Ok(mig)) = (parse_root(live), parse_root(migratable)) else {
+        return live.to_string();
+    };
+    let named: Vec<String> = mig
+        .child("cpu")
+        .map(|c| {
+            c.elements()
+                .filter(|e| e.name == "feature")
+                .filter_map(|e| e.attr("name").map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(cpu) = root.child_mut("cpu") else {
+        return live.to_string();
+    };
+    cpu.kids.retain(|k| match k {
+        crate::xml::Node::El(e) if e.name == "feature" => {
+            !matches!(e.attr("policy"), None | Some("require") | Some("force"))
+                || e.attr("name").is_some_and(|n| named.iter().any(|m| m == n))
+        }
+        _ => true,
+    });
+    crate::xml::el_xml(&root)
 }
 
 #[cfg(test)]

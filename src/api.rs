@@ -11,7 +11,7 @@ use rocket::figment::util::map;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
-use rocket::{State, get, put};
+use rocket::{State, get, post, put, routes};
 use std::sync::Arc;
 use ws::WebSocket;
 
@@ -205,7 +205,7 @@ pub(crate) async fn sync_fence(cluster: Arc<Cluster>, fence: Arc<EpochFloor>) {
             .await
         {
             Ok(state) => {
-                crate::cluster::store::observe(&fence, &state);
+                crate::cluster::store::observe(&*fence, &state);
                 fence.mark_synced();
                 return;
             }
@@ -374,7 +374,7 @@ const WS_MAX_IN_FLIGHT: usize = 256;
 
 #[get("/ws?<v>")]
 async fn ws_endpoint(
-    who: crate::auth::Principal,
+    who: crate::auth::Authed,
     ws: WebSocket,
     v: Option<u32>,
     server: &State<DiskServer>,

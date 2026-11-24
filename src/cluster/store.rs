@@ -62,7 +62,7 @@ pub struct Store {
     /// The applied state, for readers outside Raft (status, fencing).
     view: Arc<RwLock<ClusterState>>,
     /// This node's disk server fencing, fed every applied state.
-    fence: Arc<crate::fence::ServerFence>,
+    fence: Arc<dyn crate::types::FenceObserver>,
 }
 
 /// The file naming the Raft protocol a data directory was written in.
@@ -167,7 +167,7 @@ impl Inner {
 
 impl Store {
     /// Open (or create) the store in `dir`.
-    pub fn open(dir: &Path, fence: Arc<crate::fence::ServerFence>) -> Result<Self, String> {
+    pub fn open(dir: &Path, fence: Arc<dyn crate::types::FenceObserver>) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
         check_version(dir)?;
         let err = |e: SErr| format!("{}: {}", dir.display(), e);
@@ -194,7 +194,7 @@ impl Store {
             },
             _ => sm,
         };
-        observe(&fence, &sm.state);
+        observe(&*fence, &sm.state);
         Ok(Store {
             view: Arc::new(RwLock::new(sm.state.clone())),
             fence,
@@ -237,15 +237,15 @@ impl Store {
     }
 
     fn publish(&self, state: &ClusterState) {
-        observe(&self.fence, state);
+        observe(&*self.fence, state);
         *self.view.write().unwrap() = state.clone();
     }
 }
 
-pub(crate) fn observe(fence: &crate::fence::ServerFence, state: &ClusterState) {
-    fence.observe(
+pub(crate) fn observe(fence: &dyn crate::types::FenceObserver, state: &ClusterState) {
+    fence.observe_grants(
         state.pool_epoch(),
-        state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
+        &mut state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
     );
 }
 

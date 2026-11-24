@@ -47,100 +47,14 @@ use std::sync::{Arc, Mutex};
 /// The posix dataset every pool is formatted with.
 pub const DEFAULT_FS: &str = "fs";
 
-/// How a dataset's contents are laid out.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DatasetFormat {
-    /// Directories and files; the root is a directory. Changed through the
-    /// committer, object by object (`crate::writer::FsOp`).
-    Posix,
-    /// A virtual block device (a volume, see `crate::volume`): a fixed-size
-    /// tree of `volblocksize` records.
-    Block,
-    /// Byte-string keys to values, in a B+tree whose nodes are the root
-    /// object's records (see `crate::kv`, `crate::btree`).
-    Kv,
-    /// An etcd v3 keyspace (revisions, history, leases; see `crate::etcd`)
-    /// in a B+tree.
-    Etcd,
-    /// An S3 bucket (objects and their bodies, uploads; see `crate::s3`)
-    /// in a B+tree.
-    S3,
-    /// An SQS queue (messages, their visibility; see `crate::sqs`) in a
-    /// B+tree.
-    Queue,
-    /// The cluster's activity log (see `crate::events`): one per pool,
-    /// written by the committer only, in a B+tree.
-    Events,
-    /// The cluster's VM definitions (see `crate::vm_store`): one per
-    /// pool, written by the committer only (each one checked as it's
-    /// stored), in a B+tree.
-    Vms,
-}
+pub use crate::types::DatasetFormat;
 
-impl DatasetFormat {
-    pub fn name(&self) -> &'static str {
-        match self {
-            DatasetFormat::Posix => "posix",
-            DatasetFormat::Block => "block",
-            DatasetFormat::Kv => "kv",
-            DatasetFormat::Etcd => "etcd",
-            DatasetFormat::S3 => "s3",
-            DatasetFormat::Queue => "queue",
-            DatasetFormat::Events => "events",
-            DatasetFormat::Vms => "vms",
-        }
-    }
-
-    /// Whether its root object holds a B+tree (see `crate::btree`).
-    pub fn is_btree(&self) -> bool {
-        matches!(
-            self,
-            DatasetFormat::Kv
-                | DatasetFormat::Etcd
-                | DatasetFormat::S3
-                | DatasetFormat::Queue
-                | DatasetFormat::Events
-                | DatasetFormat::Vms
-        )
-    }
-
-    /// Whether a front end serves it (see `crate::frontend`).
-    pub fn is_service(&self) -> bool {
-        matches!(
-            self,
-            DatasetFormat::Etcd | DatasetFormat::S3 | DatasetFormat::Queue
-        )
-    }
-
-    /// Whether the pool keeps it for itself (not listed, made or deleted
-    /// by users).
-    pub fn is_system(&self) -> bool {
-        matches!(self, DatasetFormat::Events | DatasetFormat::Vms)
-    }
-
-    /// Whether its contents are its root object's tree, run as a whole by
-    /// one writer (see the module docs).
-    pub fn is_tree(&self) -> bool {
-        !matches!(self, DatasetFormat::Posix)
-    }
-
-    /// The kind of its root object.
-    pub fn root_kind(&self) -> ObjType {
-        match self {
-            DatasetFormat::Posix => ObjType::Directory,
-            DatasetFormat::Block => ObjType::Volume,
-            f if f.is_btree() => ObjType::KvTree,
-            _ => unreachable!(),
-        }
-    }
-
-    /// How writes may change a tree dataset's size.
-    pub(crate) fn sizing(&self) -> Sizing {
-        match self {
-            DatasetFormat::Posix => Sizing::Growable,
-            // A B+tree's node ids are a fixed (large, sparse) range.
-            _ => Sizing::Fixed,
-        }
+/// How writes may change a tree dataset's size.
+fn sizing(format: DatasetFormat) -> Sizing {
+    match format {
+        DatasetFormat::Posix => Sizing::Growable,
+        // A B+tree's node ids are a fixed (large, sparse) range.
+        _ => Sizing::Fixed,
     }
 }
 
@@ -347,7 +261,7 @@ impl<D: BlockDevice> FileSystem<D> {
             blksz: dnode.blksz as usize,
             obj: ObjTree::new(
                 dnode.blksz as usize,
-                e.format.sizing(),
+                sizing(e.format),
                 dnode.size,
                 dnode.tree,
             ),

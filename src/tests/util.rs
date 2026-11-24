@@ -196,7 +196,7 @@ impl<D> FaultyDev<D> {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
     async fn flush(&self) -> Result<(), crate::disk::DiskError> {
         if self.flush_fails.load(std::sync::atomic::Ordering::SeqCst) {

@@ -8,8 +8,8 @@ use dashmap::DashMap;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot, watch};
@@ -81,12 +81,35 @@ impl Drop for WsConn {
     }
 }
 
+/// The process's TLS client config (None: plain `ws://`), set once at
+/// startup from `crate::tls::client()` (see `crate::cli`). Handed in so
+/// the storage core needs nothing of the server's TLS setup.
+static TLS_CLIENT: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+
+/// Set the process's TLS client config; Err (giving it back) if it
+/// already was.
+pub fn set_tls_client(
+    cfg: Option<Arc<rustls::ClientConfig>>,
+) -> Result<(), Option<Arc<rustls::ClientConfig>>> {
+    TLS_CLIENT.set(cfg)
+}
+
+/// The process's TLS client config, None without TLS (or before it's set).
+pub fn tls_client() -> Option<Arc<rustls::ClientConfig>> {
+    TLS_CLIENT.get().cloned().flatten()
+}
+
+/// The websocket connector for `connect_async_tls_with_config`.
+pub fn ws_connector() -> Option<tokio_tungstenite::Connector> {
+    tls_client().map(tokio_tungstenite::Connector::Rustls)
+}
+
 impl WsConn {
     async fn connect(url: &str, opts: DiskOptions) -> Result<Arc<Self>, DiskError> {
         let versioned = crate::websocket::versioned(url);
         let (ws, _) = tokio::time::timeout(
             opts.connect_timeout,
-            connect_async_tls_with_config(&versioned, None, false, crate::tls::ws_connector()),
+            connect_async_tls_with_config(&versioned, None, false, ws_connector()),
         )
         .await
         .map_err(|_| DiskError::Timeout)?

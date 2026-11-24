@@ -86,11 +86,7 @@ impl ServiceTls {
     }
 }
 
-/// The role of a TLS connection's client certificate.
-pub fn peer_role<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<Role> {
-    let der = tls.get_ref().1.peer_certificates()?.first()?;
-    crate::pki::inspect_der(der).ok()?.role
-}
+pub use crate::tls::peer_role;
 
 /// What a forwarded etcd connection starts with, with this forwarding's
 /// version. Bump it with any change to the line.

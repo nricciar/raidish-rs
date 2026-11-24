@@ -326,6 +326,11 @@ mod remote;
 pub use remote::RemoteDisk;
 #[cfg(not(target_arch = "wasm32"))]
 pub use remote::WsConn;
+/// The process's TLS client config for remote disks (see `crate::tls`).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ws {
+    pub use super::remote::{set_tls_client, tls_client, ws_connector};
+}
 #[cfg(target_arch = "wasm32")]
 pub use remote::set_access_token;
 

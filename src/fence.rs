@@ -24,16 +24,11 @@ use crate::metaslab::MetaslabLayout;
 use crate::types::Epoch;
 use crate::types::MetaslabIdx;
 use crate::vdev::Topology;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Domain {
-    Pool,
-    Metaslab(MetaslabIdx),
-}
+pub use crate::types::{Domain, Grant};
 
 /// Where a raw block of a pool's leaf disk falls.
 #[derive(Debug, Clone)]
@@ -89,21 +84,14 @@ impl FenceMap {
     }
 }
 
-/// A metaslab's fencing grant, as the cluster recorded it.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Grant {
-    /// Lent to a writer at this epoch: only that lend's writes are admitted
-    /// (a new committer doesn't change it).
-    Lent(Epoch),
-    /// Back with the committer since this epoch: the pool floor applies too.
-    Returned(Epoch),
-}
-
-impl Grant {
-    pub fn epoch(self) -> Epoch {
-        match self {
-            Grant::Lent(e) | Grant::Returned(e) => e,
-        }
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::types::FenceObserver for ServerFence {
+    fn observe_grants(
+        &self,
+        pool_epoch: Epoch,
+        grants: &mut dyn Iterator<Item = (MetaslabIdx, Grant)>,
+    ) {
+        self.observe(pool_epoch, grants)
     }
 }
 

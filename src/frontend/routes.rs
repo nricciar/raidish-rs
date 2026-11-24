@@ -2,7 +2,7 @@
 //! for an S3/SQS access key (see [`super::keys`]).
 
 use super::keys::{self, AccessKey};
-use crate::auth::{AuthState, Principal, Via};
+use crate::auth::{AuthState, Authed, Principal, Via};
 use crate::cluster::Cluster;
 use crate::pki::Role;
 use rocket::http::Status;
@@ -82,7 +82,7 @@ pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res
 
 #[post("/api/v1/services/keys", data = "<req>")]
 pub async fn create_key(
-    caller: Result<Principal, String>,
+    caller: Result<Authed, String>,
     req: Json<KeyRequest>,
     auth: &State<AuthState>,
     cluster: &State<Arc<Cluster>>,
@@ -97,7 +97,7 @@ pub async fn create_key(
         Some(t) => verifier
             .verify_token(t)
             .map_err(|e| (Status::Unauthorized, e))?,
-        None => caller.map_err(|e| (Status::Unauthorized, e))?,
+        None => caller.map_err(|e| (Status::Unauthorized, e))?.0,
     };
     let service_key = cluster
         .ensure_service_key()

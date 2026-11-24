@@ -209,7 +209,7 @@ impl Cluster {
         name: &str,
         members: members::Members,
         data_dir: PathBuf,
-        fence: Arc<crate::fence::ServerFence>,
+        fence: Arc<dyn crate::types::FenceObserver>,
     ) -> Result<Arc<Cluster>, String> {
         let config = openraft::Config {
             cluster_name: "raidish".into(),
