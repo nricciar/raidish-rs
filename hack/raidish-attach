@@ -196,7 +196,8 @@ nvme_attach() {
 
     if [[ -n $DRY ]]; then
         run modprobe nvme-tcp
-        run nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn"
+        run nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn" \
+            --ctrl-loss-tmo=5 --reconnect-delay=1
         echo "# would verify the namespace via sysfs (subsysnqn, tcp $addr:$port, model RAIDISH*)"
         echo "# would print its /dev/disk/by-id/nvme-... path"
         return 0
@@ -208,7 +209,8 @@ nvme_attach() {
     if [[ -z $name ]]; then
         [[ -z $(ctrls_for_nqn "$nqn") ]] || die "$nqn is already connected to a different target"
         modprobe nvme-tcp
-        nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn" >/dev/null
+        nvme connect -t tcp -a "$addr" -s "$port" -n "$nqn" \
+            --ctrl-loss-tmo=5 --reconnect-delay=1 >/dev/null
         for _ in $(seq 1 100); do
             name=$(find_ns "$nqn" "$addr" "$port")
             [[ -n $name ]] && break
