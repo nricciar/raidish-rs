@@ -8,7 +8,7 @@ use crate::fmt;
 use crate::session::{now_ms, tab_hidden};
 use crate::upload::{self, Upload};
 use gloo_timers::callback::Interval;
-use raidish::inode::ObjType;
+use raidish_core::inode::ObjType;
 use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;

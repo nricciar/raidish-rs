@@ -99,7 +99,7 @@ pub struct SetAttrs {
     pub mtime_ns: Option<u64>,
 }
 
-pub(crate) fn now_ns() -> u64 {
+pub fn now_ns() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64)
@@ -363,7 +363,7 @@ pub(crate) fn decode_dir(data: &[u8]) -> Result<FileIndex, FileSystemError> {
     Ok(bincode::deserialize(data)?)
 }
 
-pub(crate) fn path_components(path: &Path) -> Vec<String> {
+pub fn path_components(path: &Path) -> Vec<String> {
     use std::path::Component;
     path.components()
         .filter_map(|c| match c {
@@ -374,7 +374,7 @@ pub(crate) fn path_components(path: &Path) -> Vec<String> {
 }
 
 /// Where a path leads: its parent directory and the entry, if any.
-pub(crate) struct Lookup {
+pub struct Lookup {
     pub parent_id: FileId,
     pub parent: Dnode,
     pub index: FileIndex,
@@ -519,7 +519,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// A directory's contents.
-    pub(crate) async fn read_dir(&self, dnode: &Dnode) -> Result<FileIndex, FileSystemError> {
+    pub async fn read_dir(&self, dnode: &Dnode) -> Result<FileIndex, FileSystemError> {
         if !dnode.is_directory() {
             return Err(FileSystemError::NotADirectory);
         }
@@ -582,7 +582,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The directory at `components` (from the root): its object number,
     /// dnode and contents.
-    pub(crate) async fn resolve_dir(
+    pub async fn resolve_dir(
         &self,
         components: &[String],
     ) -> Result<(FileId, Dnode, FileIndex), FileSystemError> {
@@ -605,7 +605,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Find `path`'s parent directory and its entry (if any).
-    pub(crate) async fn lookup(&self, path: &Path) -> Result<Lookup, FileSystemError> {
+    pub async fn lookup(&self, path: &Path) -> Result<Lookup, FileSystemError> {
         let components = path_components(path);
         let (name, parents) = components
             .split_last()
@@ -701,7 +701,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Move `from` to `to` (under `begin_tx`); see `rename_at_locked`.
-    pub(crate) async fn rename_locked(
+    pub async fn rename_locked(
         &self,
         tx: &mut crate::tx::Tx,
         from: &Path,

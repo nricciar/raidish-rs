@@ -170,7 +170,7 @@ pub enum LeaseOp {
 impl LeaseOp {
     /// Stamp with the leader's clock, ready to propose.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn stamp(self, now_ms: u64) -> Request {
+    pub fn stamp(self, now_ms: u64) -> Request {
         Request { op: self, now_ms }
     }
 }
@@ -580,5 +580,44 @@ impl ClusterState {
                 Response::Recorded
             }
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemberView {
+    pub id: u64,
+    /// None for the node that answered.
+    pub addr: Option<String>,
+    pub disks: Vec<usize>,
+}
+
+/// `GET /api/v1/cluster/status` (what `raidish cluster status` prints).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// The node that answered (name and id).
+    pub node: String,
+    pub id: u64,
+    pub leader: Option<u64>,
+    pub term: u64,
+    pub members: Vec<MemberView>,
+    pub fingerprint: String,
+    pub state: ClusterState,
+    pub now_ms: u64,
+    /// The answering node has Raft state (a log or a vote).
+    #[serde(default)]
+    pub initialized: bool,
+    /// Its last log index. A group that never elected a leader has only
+    /// the initial membership entry (index 0): nothing was ever committed.
+    #[serde(default)]
+    pub last_log_index: Option<u64>,
+    /// It votes: false while it catches up after losing its state.
+    #[serde(default)]
+    pub voting: bool,
+}
+
+impl Status {
+    /// The member serving pool disk `disk`.
+    pub fn owner_of(&self, disk: usize) -> Option<&MemberView> {
+        self.members.iter().find(|m| m.disks.contains(&disk))
     }
 }

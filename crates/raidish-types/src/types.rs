@@ -47,14 +47,14 @@ impl Epoch {
 }
 
 /// Tests write epochs as literals.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl From<u64> for Epoch {
     fn from(v: u64) -> Self {
         Epoch(v)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl PartialEq<u64> for Epoch {
     fn eq(&self, other: &u64) -> bool {
         self.0 == *other
@@ -62,25 +62,25 @@ impl PartialEq<u64> for Epoch {
 }
 
 /// Shorthand for an epoch literal in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub const fn ep(v: u64) -> Epoch {
     Epoch(v)
 }
 
 /// A lease resource from its string form, in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub fn res(r: impl fmt::Display) -> LeaseResource {
     r.to_string().parse().expect("a lease resource")
 }
 
 /// Shorthand for a file id literal in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub const fn fid(v: u64) -> FileId {
     FileId(v)
 }
 
 /// Shorthand for a metaslab index literal in tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub const fn ms(v: u32) -> MetaslabIdx {
     MetaslabIdx(v)
 }
@@ -160,21 +160,21 @@ impl std::str::FromStr for Txg {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl From<u64> for Txg {
     fn from(v: u64) -> Self {
         Txg(v)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl PartialEq<u64> for Txg {
     fn eq(&self, other: &u64) -> bool {
         self.0 == *other
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl PartialOrd<u64> for Txg {
     fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
         self.0.partial_cmp(other)
@@ -215,7 +215,7 @@ impl fmt::Display for MetaslabIdx {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl From<u32> for MetaslabIdx {
     fn from(v: u32) -> Self {
         MetaslabIdx(v)
@@ -257,14 +257,14 @@ impl fmt::Display for FileId {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl From<u64> for FileId {
     fn from(v: u64) -> Self {
         FileId(v)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 impl PartialEq<u64> for FileId {
     fn eq(&self, other: &u64) -> bool {
         self.0 == *other

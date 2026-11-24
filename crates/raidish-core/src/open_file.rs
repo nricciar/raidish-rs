@@ -61,7 +61,7 @@ impl OpenFile {
         self.obj.size()
     }
 
-    pub(crate) fn needs_sync(&self) -> bool {
+    pub fn needs_sync(&self) -> bool {
         self.obj.is_dirty() || self.resized.load(Ordering::SeqCst)
     }
 }

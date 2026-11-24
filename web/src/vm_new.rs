@@ -227,8 +227,8 @@ impl NewVmDialog {
             NewVm {
                 name: name.to_string(),
                 vcpus,
-                memory: raidish::types::Bytes::new(memory),
-                disk: raidish::vm_def::disk_volume(name),
+                memory: raidish_types::types::Bytes::new(memory),
+                disk: raidish_types::vm_def::disk_volume(name),
                 iso: (!self.iso.is_empty()).then(|| self.iso.clone()),
                 network: (!network.is_empty()).then(|| network.to_string()),
             },
@@ -269,7 +269,7 @@ impl NewVmDialog {
         let disk = if name.is_empty() {
             "<name>-disk0".to_string()
         } else {
-            raidish::vm_def::disk_volume(name)
+            raidish_types::vm_def::disk_volume(name)
         };
         html! {
             <>

@@ -2431,8 +2431,9 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "quick-xml",
+ "raidish-core",
+ "raidish-types",
  "rcgen",
- "reed-solomon-simd",
  "reqwest",
  "ring",
  "rocket",
@@ -2462,6 +2463,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "raidish-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "crossbeam-queue",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "gloo-timers",
+ "js-sys",
+ "libc",
+ "raidish-types",
+ "reed-solomon-simd",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "term_size",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tungstenite 0.28.0",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+]
+
+[[package]]
+name = "raidish-types"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "web-time",
+]
+
+[[package]]
 name = "raidish-web"
 version = "0.1.0"
 dependencies = [
@@ -2469,7 +2513,8 @@ dependencies = [
  "gloo-net 0.7.0",
  "gloo-timers",
  "js-sys",
- "raidish",
+ "raidish-core",
+ "raidish-types",
  "serde",
  "serde_json",
  "wasm-bindgen",

@@ -120,7 +120,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `blksz` records) to the file at `l`: replace `current`'s (freeing
     /// the old), or create the file. Under `begin_tx`; the caller has done
     /// the compare-and-swap. Returns the file's object number.
-    pub(crate) async fn set_file_contents(
+    pub async fn set_file_contents(
         &self,
         tx: &mut crate::tx::Tx,
         l: Lookup,
@@ -147,7 +147,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// The file at `l` with its dnode (None: nothing there). Refused if
     /// something else is there.
-    pub(crate) async fn current_file(
+    pub async fn current_file(
         &self,
         l: &Lookup,
     ) -> Result<Option<(FileId, Dnode)>, FileSystemError> {

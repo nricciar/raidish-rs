@@ -95,7 +95,7 @@ pub fn coalesce_groups(ptrs: &[BlockPtr]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// Logical size of an object.
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
     ptrs.iter().map(|p| p.lsize as u64).sum()
 }
@@ -138,7 +138,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Write a record's data, zero-padded to whole stripes so the device can
     /// write full stripes directly instead of read-modify-writing parity.
     /// Write `data` as a single contiguous record (at most `max_record_blocks()`).
-    pub(crate) async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
+    pub async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
         let blocks = data.len().div_ceil(BLOCK_SIZE) as u64;
         assert!(
             blocks > 0 && blocks <= self.max_record_blocks(),
@@ -192,11 +192,7 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(ptrs)
     }
 
-    pub(crate) async fn write_record_blocks(
-        &self,
-        lba: u64,
-        data: &[u8],
-    ) -> Result<(), FileSystemError> {
+    pub async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
         let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = zeroed_blocks(blocks as usize);
         buf.as_flattened_mut()[..data.len()].copy_from_slice(data);

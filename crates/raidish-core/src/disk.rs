@@ -342,11 +342,11 @@ enum DiskBackend {
     Local(Arc<std::fs::File>),
     WebSocket(Arc<RemoteDisk>),
     /// A local file behind test-controlled faults (see `disk_fault`).
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
     Fault(Arc<fault::FaultDisk>),
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
 #[path = "disk_fault.rs"]
 pub mod fault;
 
@@ -361,7 +361,7 @@ impl Disk {
         return false;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testutil"))]
             if matches!(self.backend, DiskBackend::Fault(_)) {
                 return true;
             }
@@ -370,7 +370,7 @@ impl Disk {
     }
 
     /// A disk whose I/O goes through `fault`'s switches (tests only).
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
     pub fn faulty(fault: fault::FaultHandle) -> Self {
         Disk {
             backend: DiskBackend::Fault(fault),
@@ -383,7 +383,7 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => true,
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(f) => f.is_online(),
             DiskBackend::WebSocket(r) => r.is_online(),
         }
@@ -411,7 +411,7 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => {}
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testutil"))]
             DiskBackend::Fault(_) => {}
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::WebSocket(r) => r.set_fence(index, fence),
@@ -423,7 +423,7 @@ impl Disk {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(_) => None,
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(_) => None,
             DiskBackend::WebSocket(r) => Some(r.subscribe()),
         }
@@ -544,7 +544,7 @@ impl BlockDevice for Disk {
                 tokio::task::spawn_blocking(move || file.sync_data()).await??;
                 drop(span);
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(f) => f.flush().await?,
             DiskBackend::WebSocket(r) => {
                 r.request(WsOp::Flush, 0, 0, None).await?;
@@ -575,7 +575,7 @@ impl BlockDevice for Disk {
                 .await??;
                 Ok(len / BLOCK_SIZE as u64)
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(f) => f.capacity(),
             DiskBackend::WebSocket(r) => {
                 let data = r.request(WsOp::Info, 0, 0, None).await?;
@@ -604,7 +604,7 @@ impl BlockDevice for Disk {
                 buf.copy_from_slice(&data);
                 Ok(())
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(f) => f.read(start, buf),
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
@@ -638,7 +638,7 @@ impl BlockDevice for Disk {
                 tokio::task::spawn_blocking(move || file.write_all_at(&data, offset)).await??;
                 Ok(())
             }
-            #[cfg(all(test, not(target_arch = "wasm32")))]
+            #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
             DiskBackend::Fault(f) => f.write(start, buf).await,
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;

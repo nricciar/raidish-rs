@@ -1,0 +1,52 @@
+[package]
+name = "raidish-core"
+version = "0.1.0"
+edition = "2024"
+description = "The RAIDish storage core: disks, vdevs, the object store, the filesystem, volumes. Native and wasm32."
+
+[features]
+# Test fixtures (`test_util`: pools on sparse files, fault injection) and
+# the `cfg(test)` helpers, for other crates' tests.
+testutil = ["dep:tempfile", "raidish-types/testutil"]
+
+[dependencies]
+raidish-types = { workspace = true }
+reed-solomon-simd = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+futures-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+url = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-queue = { workspace = true }
+web-time = { workspace = true }
+tempfile = { workspace = true, optional = true }
+
+# Local disks, remote disks over websocket, the disk server's side.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util"] }
+serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
+tungstenite = { workspace = true }
+rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
+term_size = { workspace = true }
+libc = { workspace = true }
+bytes = { workspace = true }
+
+# The browser disk backend (websocket via web-sys).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+gloo-timers = { workspace = true, features = ["futures"] }
+chrono = { workspace = true, features = ["wasmbind"] }
+web-sys = { workspace = true, features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

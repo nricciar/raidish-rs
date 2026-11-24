@@ -11,7 +11,7 @@
 //! `crate::zil`), elsewhere by a commit.
 
 use crate::btree::CheckReport;
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 use crate::btree::Txn;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::dataset::Dataset;
@@ -22,7 +22,7 @@ use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::volume::DIRTY_LIMIT_BYTES;
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 use std::ops::Bound;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -140,7 +140,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// B+tree dataset `name` of format `format`, opened.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn open_btree(
+    pub async fn open_btree(
         &self,
         name: &str,
         format: DatasetFormat,
@@ -158,13 +158,13 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// `kv` dataset `name`, opened.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub(crate) async fn open_kv(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
         self.open_btree(name, DatasetFormat::Kv).await
     }
 
     /// The value of `key` (uncommitted changes included).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_get(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
@@ -172,7 +172,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Set `key` to `value`. Returns whether it replaced a value.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_put(
         &self,
         name: &str,
@@ -192,7 +192,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Remove `key`. Returns whether it was there.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_delete(&self, name: &str, key: &[u8]) -> Result<bool, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let removed = {
@@ -207,7 +207,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Up to `limit` entries with keys within `start` and `end`, in order.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_range(
         &self,
         name: &str,
@@ -225,7 +225,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Up to `limit` entries whose keys start with `prefix`, after `after`
     /// (exclusive; None: from the first).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_scan_prefix(
         &self,
         name: &str,
@@ -246,7 +246,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// How many keys `name` holds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_len(&self, name: &str) -> Result<u64, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
@@ -257,7 +257,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// effort: whether the caller's own dataset is durable is the flush's
     /// answer, and another dataset failing its sync mustn't fail this one.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn kv_settle(&self) -> Result<(), FileSystemError> {
+    pub async fn kv_settle(&self) -> Result<(), FileSystemError> {
         if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
             let _ = self
                 .commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)

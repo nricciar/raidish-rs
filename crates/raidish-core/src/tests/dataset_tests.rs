@@ -152,7 +152,7 @@ async fn snapshots_and_clones_are_datasets_too() {
 #[test]
 fn the_lease_is_per_dataset() {
     assert_eq!(
-        crate::committer::dataset_resource("vol").to_string(),
+        crate::types::LeaseResource::dataset("vol").to_string(),
         "ds/vol"
     );
 }

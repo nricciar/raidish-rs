@@ -329,7 +329,7 @@ pub trait CommitSink: Send + Sync {
 }
 
 /// A volume a writer runs.
-pub(crate) struct Attached {
+pub struct Attached {
     /// The `ds/<name>` lease.
     pub ds: Holding,
     /// Turns true once that lease is lost: a commit still waiting for the
@@ -346,7 +346,7 @@ pub(crate) struct Attached {
 pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A writer's side of things.
-pub(crate) struct WriterState {
+pub struct WriterState {
     pub sink: Arc<dyn CommitSink>,
     /// Dataset name → its lease.
     pub datasets: std::sync::Mutex<HashMap<String, Attached>>,
@@ -597,7 +597,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// wait until it's durable (see `crate::zil`: a flush whose records a
     /// disk missed isn't acknowledged before that). Waits for a commit in
     /// progress, which may have reported them already.
-    pub(crate) async fn writer_report_misses(
+    pub async fn writer_report_misses(
         &self,
         w: &WriterState,
         vol: &crate::dataset::Dataset,
@@ -686,7 +686,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Follow the newest committed object table (a writer's view of the
     /// pool goes stale as the committer commits).
-    pub(crate) async fn reload_root_index(&self) -> Result<(), FileSystemError> {
+    pub async fn reload_root_index(&self) -> Result<(), FileSystemError> {
         let ring = self.read_uberblock_ring().await;
         let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
         self.objects.follow_root(newest.objects.clone());
@@ -1330,7 +1330,7 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// `object_ok(id)` says whether `c` may change object `id` (the caller
     /// checks it against the `obj/<id>` leases).
-    pub(crate) async fn apply_fs_commit(
+    pub async fn apply_fs_commit(
         &self,
         c: &FsCommit,
         leases_ok: impl Fn(&crate::tx::Tx) -> Result<(), CommitError>,
@@ -1678,7 +1678,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Apply a writer's commit. `lent_to_writer(idx)` says whether metaslab
     /// `idx` is lent to the committing writer (the caller checked the
     /// leases). Returns the durable TXG.
-    pub(crate) async fn apply_dataset_commit(
+    pub async fn apply_dataset_commit(
         &self,
         c: &DatasetCommit,
         leases_ok: impl Fn(&crate::tx::Tx) -> Result<(), CommitError>,

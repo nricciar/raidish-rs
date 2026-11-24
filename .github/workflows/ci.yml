@@ -50,7 +50,7 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
       - name: Clippy (wasm)
-        run: cargo clippy -p raidish -p raidish-web --target wasm32-unknown-unknown
+        run: cargo clippy -p raidish-types -p raidish-core -p raidish-web --target wasm32-unknown-unknown
 
       - name: Check formatting
         run: cargo fmt --all --check

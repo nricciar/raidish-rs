@@ -90,7 +90,7 @@ impl Component for Root {
             },
             State::In(who) => html! {
                 <App
-                    user={(who.via != raidish::api_types::Via::Open).then(|| format!("{} ({})", who.name, who.role))}
+                    user={(who.via != raidish_types::api_types::Via::Open).then(|| format!("{} ({})", who.name, who.role))}
                     on_sign_out={ctx.link().callback(|_| Msg::SignOut)}
                     can_write={who.can_write()}
                 />

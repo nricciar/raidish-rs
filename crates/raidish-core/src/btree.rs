@@ -65,7 +65,7 @@ const VERSION: u32 = 3;
 pub const MAX_VALUE: usize = 64 << 20;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Header {
+pub struct Header {
     magic: u64,
     version: u32,
     /// The root node (None: the tree is empty).
@@ -101,7 +101,7 @@ impl Default for Header {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Val {
+pub enum Val {
     Inline(#[serde(with = "bytes")] Vec<u8>),
     /// `len` bytes in `ceil(len / blksz)` pages, listed in order in the
     /// chain of id lists from `index`.
@@ -307,7 +307,7 @@ fn split_point(sizes: &[usize]) -> usize {
 
 /// One operation on a tree: reads see its own writes, which are applied
 /// together by [`Txn::apply`].
-pub(crate) struct Txn<'a, D: BlockDevice> {
+pub struct Txn<'a, D: BlockDevice> {
     fs: &'a FileSystem<D>,
     obj: &'a ObjTree,
     lim: Limits,
@@ -323,10 +323,7 @@ pub(crate) struct Txn<'a, D: BlockDevice> {
 impl<'a, D: BlockDevice> Txn<'a, D> {
     /// Start an operation on the tree in `obj` (an object with no records
     /// is an empty tree).
-    pub(crate) async fn begin(
-        fs: &'a FileSystem<D>,
-        obj: &'a ObjTree,
-    ) -> Result<Self, FileSystemError> {
+    pub async fn begin(fs: &'a FileSystem<D>, obj: &'a ObjTree) -> Result<Self, FileSystemError> {
         let header = match fs.object_record(obj, 0).await? {
             None => Header::default(),
             Some(buf) => {
@@ -350,13 +347,13 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
 
     /// Whether it changed nothing (yet).
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.writes.is_empty() && !self.header_dirty
     }
 
     /// The longest key this tree takes.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn max_key(&self) -> usize {
+    pub fn max_key(&self) -> usize {
         self.lim.max_key
     }
 
@@ -521,7 +518,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn read_val(&self, v: &Val) -> Result<Vec<u8>, FileSystemError> {
+    pub async fn read_val(&self, v: &Val) -> Result<Vec<u8>, FileSystemError> {
         match v {
             Val::Inline(b) => Ok(b.clone()),
             Val::Overflow { index, len } => {
@@ -578,7 +575,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
         let Some(root) = self.header.root else {
             return Ok(None);
         };
@@ -611,7 +608,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     /// Set `key` to `value`. Returns whether it replaced a value.
-    pub(crate) async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
         self.check_sizes(key, value)?;
         let val = self.make_val(value).await?;
         let Some(root) = self.header.root else {
@@ -650,7 +647,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     }
 
     /// Remove `key`. Returns whether it was there.
-    pub(crate) async fn delete(&mut self, key: &[u8]) -> Result<bool, FileSystemError> {
+    pub async fn delete(&mut self, key: &[u8]) -> Result<bool, FileSystemError> {
         let Some(root) = self.header.root else {
             return Ok(false);
         };
@@ -776,7 +773,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
 
     /// Up to `limit` entries with keys in `(start, end)`, in key order.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn range(
+    pub async fn range(
         &self,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
@@ -793,7 +790,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     /// As `range`, values unread (see `read_val`): large ones cost a read
     /// each, which a scan of keys doesn't need.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn range_raw(
+    pub async fn range_raw(
         &self,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
@@ -867,7 +864,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     /// queue them for the intent log as one entry: a replay redoes all of
     /// them or none, as a commit has them all or none.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn apply_logged(mut self) -> Result<(), FileSystemError> {
+    pub fn apply_logged(mut self) -> Result<(), FileSystemError> {
         let op = match self.effects.len() {
             0 => None,
             1 => self.effects.pop(),
@@ -897,7 +894,7 @@ impl<'a, D: BlockDevice> Txn<'a, D> {
     /// Apply this operation's writes (all at once; see the module docs),
     /// queuing `op` (its effect) for the intent log if it changed anything
     /// (None: not logged; durable once committed).
-    pub(crate) fn apply(mut self, op: Option<KeyedOp>) -> Result<(), FileSystemError> {
+    pub fn apply(mut self, op: Option<KeyedOp>) -> Result<(), FileSystemError> {
         if self.header_dirty {
             let h = encode(&self.header)?;
             if h.len() > self.lim.blksz {

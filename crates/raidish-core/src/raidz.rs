@@ -440,7 +440,7 @@ impl RaidZ {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub fn is_local_disk(&self, index: usize) -> bool {
         self.disks.is_local(self.members[index])
     }

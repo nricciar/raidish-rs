@@ -28,7 +28,7 @@ pub const SUPERBLOCK_LBA: u64 = 0;
 
 /// Holds back the release of deferred frees (see `scan_hold`) while it
 /// lives. Frees deferred meanwhile go at the first commit after it drops.
-pub(crate) struct FreeHold(Arc<AtomicUsize>);
+pub struct FreeHold(Arc<AtomicUsize>);
 
 impl FreeHold {
     pub(crate) fn new(hold: &Arc<AtomicUsize>) -> Self {
@@ -49,7 +49,7 @@ impl Drop for FreeHold {
 /// given back meanwhile (only the committer frees and reuses space, and it
 /// can't touch lent space; if it reclaims it anyway, the writer lost its
 /// lease, and the disk servers fence its writes out).
-pub(crate) enum RepairHold {
+pub enum RepairHold {
     /// Held for its drop.
     Frees(#[allow(dead_code)] FreeHold),
     Pinned(
@@ -70,7 +70,7 @@ impl Drop for RepairHold {
 
 impl RepairHold {
     /// The metaslabs pinned (none for a committer's hold).
-    pub(crate) fn pinned(&self) -> &[crate::types::MetaslabIdx] {
+    pub fn pinned(&self) -> &[crate::types::MetaslabIdx] {
         match self {
             RepairHold::Frees(_) => &[],
             RepairHold::Pinned(_, pins) => pins,
@@ -104,7 +104,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// process mustn't repair them: a writer repairs only in space lent to
     /// it. The committer can't see a writer's hold, and the writer's writes
     /// anywhere else are fenced out.
-    pub(crate) fn repair_hold(&self, lba: u64, n: u64) -> Option<RepairHold> {
+    pub fn repair_hold(&self, lba: u64, n: u64) -> Option<RepairHold> {
         let Some(w) = &self.writer else {
             return Some(RepairHold::Frees(FreeHold::new(&self.scan_hold)));
         };
@@ -427,10 +427,10 @@ pub enum LabelState {
     Foreign,
 }
 
-pub(crate) use crate::types::now_ms;
+pub use crate::types::now_ms;
 
 /// A random-enough 64-bit id (no RNG dependency needed).
-pub(crate) fn new_guid(salt: u64) -> u64 {
+pub fn new_guid(salt: u64) -> u64 {
     let mut h = blake3::Hasher::new();
     // Secret per process: a restarted process (same pid in a container, a
     // clock stepped back) doesn't repeat ids, and nonces can't be guessed.
@@ -558,7 +558,7 @@ pub(crate) async fn label_versions_of<D: BlockDevice, T: for<'a> Deserialize<'a>
 
 /// An early-fold request: raised by a flush, taken by the sync loop.
 #[derive(Default)]
-pub(crate) struct FoldWanted {
+pub struct FoldWanted {
     raised: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -573,14 +573,14 @@ impl FoldWanted {
 
     /// Wait for a request.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn wait(&self) {
+    pub async fn wait(&self) {
         self.notify.notified().await
     }
 
     /// Clear the request once a fold has run; later flushes may raise a
     /// new one.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn take(&self) -> bool {
+    pub fn take(&self) -> bool {
         self.raised.swap(false, Ordering::SeqCst)
     }
 }
@@ -590,8 +590,8 @@ pub struct FileSystem<D: BlockDevice> {
     superblock: Arc<RwLock<Option<Superblock>>>,
     /// Last committed uberblock. The open TXG is always `uberblock.txg + 1`.
     pub(crate) uberblock: Arc<Mutex<Option<Uberblock>>>,
-    pub(crate) layout: MetaslabLayout,
-    pub(crate) metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
+    pub layout: MetaslabLayout,
+    pub metaslabs: Arc<Vec<Arc<RwLock<MetaslabState>>>>,
     /// The object table, with the open TXG's changes (see `crate::inode`).
     pub(crate) objects: Arc<ObjTree>,
     /// The dataset directory's object number (from the uberblock; fixed
@@ -601,7 +601,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// directory; fixed once formatted).
     pub(crate) root_dir: Arc<AtomicU64>,
     /// Open copy-on-write volumes and their dirty records.
-    pub(crate) open_datasets: Arc<std::sync::Mutex<HashMap<String, Arc<Dataset>>>>,
+    pub open_datasets: Arc<std::sync::Mutex<HashMap<String, Arc<Dataset>>>>,
     /// Files open for writing at any offset (see `crate::open_file`).
     pub(crate) files: Arc<std::sync::Mutex<HashMap<FileId, Arc<crate::open_file::OpenFile>>>>,
     commit_lock: Arc<Mutex<()>>,
@@ -626,7 +626,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
     /// See `Uberblock::degraded`; persisted with every commit.
-    pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<Txg>>>>,
+    pub degraded: Arc<std::sync::Mutex<Vec<Option<Txg>>>>,
     /// Per disk: how many times it has been marked degraded (this process).
     /// A resilver clears a disk only if no mark came while it scanned: one
     /// that did is a write the scan's snapshot doesn't have (audit D4).
@@ -635,14 +635,14 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) miss_seen: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Record alignment in blocks (the pool's, or 1 for a plain device).
     pub(crate) align: u64,
-    pub(crate) header: HeaderLayout,
+    pub header: HeaderLayout,
     /// While non-zero, expired deferred frees are not made allocatable, so
     /// nothing a running scan may still rewrite can be reallocated.
-    pub(crate) scan_hold: Arc<AtomicUsize>,
+    pub scan_hold: Arc<AtomicUsize>,
     /// One scrub/resilver at a time.
     pub(crate) scan_lock: Arc<Mutex<()>>,
     /// Set when opened as a volume writer (see `crate::writer`).
-    pub(crate) writer: Option<Arc<crate::writer::WriterState>>,
+    pub writer: Option<Arc<crate::writer::WriterState>>,
     /// Next pool-wide object number (persisted in every uberblock).
     pub(crate) next_object: Arc<AtomicU64>,
     /// Serializes a writer's intent log appends (see `crate::zil`).
@@ -651,7 +651,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// A volume's intent log is filling up: the background sync loop (see
     /// `crate::nbd::ensure_sync_loop`) folds early, so the next region is
     /// registered before flushes would have to fall back to a commit.
-    pub(crate) fold_wanted: Arc<FoldWanted>,
+    pub fold_wanted: Arc<FoldWanted>,
     /// The lowest TXG new blocks may be stamped with (see
     /// `raise_birth_floor`).
     pub(crate) birth_floor: Arc<AtomicU64>,
@@ -727,11 +727,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// block a later commit adds is born after the snapshot (and a block's
     /// birth says whether a snapshot has it). Writers whose blocks are
     /// stamped lower (their view of the TXG lags) are told to restamp.
-    pub(crate) fn raise_birth_floor(&self, txg: Txg) {
+    pub fn raise_birth_floor(&self, txg: Txg) {
         self.birth_floor.fetch_max(txg.get(), Ordering::SeqCst);
     }
 
-    pub(crate) fn birth_floor(&self) -> Txg {
+    pub fn birth_floor(&self) -> Txg {
         Txg::from_raw(self.birth_floor.load(Ordering::SeqCst))
     }
 
@@ -756,7 +756,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Round `blocks` up to whole aligned units.
-    pub(crate) fn align_blocks(&self, blocks: u64) -> u64 {
+    pub fn align_blocks(&self, blocks: u64) -> u64 {
         blocks.div_ceil(self.align) * self.align
     }
 
@@ -769,7 +769,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// TXG that blocks written right now belong to.
-    pub(crate) async fn open_txg(&self) -> Result<Txg, FileSystemError> {
+    pub async fn open_txg(&self) -> Result<Txg, FileSystemError> {
         self.uberblock
             .lock()
             .await
@@ -1418,7 +1418,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// `delete` under `begin_tx`, without committing.
-    pub(crate) async fn delete_locked(
+    pub async fn delete_locked(
         &self,
         tx: &mut crate::tx::Tx,
         path: &Path,
@@ -1493,7 +1493,7 @@ impl<D: BlockDevice> FileSystem<D> {
     ///
     /// Only after step 4 does in-memory state advance (active slots, deferred
     /// frees). On failure, the TXG stays open and can be retried.
-    pub(crate) async fn commit_txg(&self) -> Result<Txg, FileSystemError> {
+    pub async fn commit_txg(&self) -> Result<Txg, FileSystemError> {
         let mut tx = self.begin_tx().await;
         self.commit_locked(&mut tx).await
     }
@@ -1516,7 +1516,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// (and other metadata operations) until dropped, so no commit can
     /// capture a half-done operation, and undoes one that fails. Finish
     /// with `commit_locked`.
-    pub(crate) async fn begin_tx(&self) -> crate::tx::Tx {
+    pub async fn begin_tx(&self) -> crate::tx::Tx {
         crate::tx::Tx::begin(
             &self.commit_lock,
             self.objects.clone(),
@@ -1528,10 +1528,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Commit the open TXG under `tx`. What it takes stands, whether it
     /// succeeds or not (see `crate::tx`).
-    pub(crate) async fn commit_locked(
-        &self,
-        tx: &mut crate::tx::Tx,
-    ) -> Result<Txg, FileSystemError> {
+    pub async fn commit_locked(&self, tx: &mut crate::tx::Tx) -> Result<Txg, FileSystemError> {
         debug_assert!(tx.is_of(&self.commit_lock), "another pool's tx");
         tx.begin_commit();
         let r = self.commit_in(tx).await;
@@ -1691,7 +1688,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Mark `disk` as needing everything from TXG `since` (persisted at the
     /// next commit).
-    pub(crate) fn mark_degraded(&self, disk: usize, since: Txg) {
+    pub fn mark_degraded(&self, disk: usize, since: Txg) {
         let mut degraded = self.degraded.lock().unwrap();
         degraded[disk] = Some(degraded[disk].map_or(since, |t| t.min(since)));
         self.degraded_marks.lock().unwrap()[disk] += 1;
@@ -1699,7 +1696,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Per disk: have writes failed since the last commit folded them into
     /// `degraded`?
-    pub(crate) fn unaccounted_misses(&self) -> Vec<bool> {
+    pub fn unaccounted_misses(&self) -> Vec<bool> {
         let seen = self.miss_seen.lock().unwrap();
         self.miss_counts()
             .iter()
@@ -1778,7 +1775,7 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    pub(crate) async fn adopt_disk(&self, d: usize) -> LabelState {
+    pub async fn adopt_disk(&self, d: usize) -> LabelState {
         let state = self.check_disk_label(d).await;
         let Some(pool) = self.dev.pool() else {
             return state;

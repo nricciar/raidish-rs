@@ -78,7 +78,7 @@ pub const LOG_REGION_BLOCKS: u64 = 4096;
 pub const FOLD_AT_PERCENT: u64 = 75;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct Header {
+pub struct Header {
     magic: u64,
     guid: u64,
     seq: u64,
@@ -113,7 +113,7 @@ enum Entry {
 /// of the operations before the rest leaves every key as the last of them
 /// set it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) enum KeyedOp {
+pub enum KeyedOp {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
     /// Several, atomically (one transaction: replayed all or none).
@@ -122,12 +122,24 @@ pub(crate) enum KeyedOp {
 
 /// A writer's place in a volume's log: the region it appends to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LogCursor {
+pub struct LogCursor {
     pub region: LogRegion,
     /// Blocks used so far.
     pub used: u64,
     /// The next record's sequence number.
     pub seq: u64,
+}
+
+/// A log record holding one whole-record write (`Entry::Data`), for tests
+/// that plant records a log must refuse (another log's guid, say).
+#[cfg(any(test, feature = "testutil"))]
+pub fn encode_data_record(
+    guid: u64,
+    seq: u64,
+    record: u64,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, FileSystemError> {
+    encode(guid, seq, &[Entry::Data(record, data)])
 }
 
 fn encode(guid: u64, seq: u64, entries: &[Entry]) -> Result<Vec<u8>, FileSystemError> {
@@ -541,7 +553,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// too few members, says nothing about what's there. That's an error,
     /// so replay keeps the log rather than committing a prefix of it and
     /// freeing the rest (structural triage I-4).
-    pub(crate) async fn region_records(
+    pub async fn region_records(
         &self,
         region: &LogRegion,
         from_seq: u64,
@@ -743,16 +755,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
 /// One intent log record as written: at `lba`, `bytes` (header and
 /// payload) zero-padded to whole stripes on disk.
-pub(crate) struct LogRecord {
+pub struct LogRecord {
     pub lba: u64,
     pub bytes: Vec<u8>,
 }
 
 /// The extent of a log region, as a commit's allocation.
-pub(crate) fn region_alloc(r: &LogRegion) -> crate::types::Extent {
+pub fn region_alloc(r: &LogRegion) -> crate::types::Extent {
     crate::types::Extent::new(r.start, r.len)
 }
-
-#[cfg(test)]
-#[path = "tests/zil_tests.rs"]
-mod tests;

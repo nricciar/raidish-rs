@@ -1,7 +1,7 @@
 //! Number and time formatting.
 
-use raidish::disk::BLOCK_SIZE;
-use raidish::inspect::BlockKind;
+use raidish_core::disk::BLOCK_SIZE;
+use raidish_core::inspect::BlockKind;
 
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

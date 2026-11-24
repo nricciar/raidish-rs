@@ -1,11 +1,11 @@
 //! The pool, opened by the browser itself: the raidish core, compiled to
 //! wasm, reading the disks over the nodes' websocket block protocol.
 
-use raidish::disk::{DiskOptions, IoStats};
-use raidish::disks::DiskSet;
-use raidish::fs::FileSystem;
-use raidish::inspect::{Layout, MetaslabReport, PoolMap, PoolReport};
-use raidish::vdev::{Pool, Topology};
+use raidish_core::disk::{DiskOptions, IoStats};
+use raidish_core::disks::DiskSet;
+use raidish_core::fs::FileSystem;
+use raidish_core::inspect::{Layout, MetaslabReport, PoolMap, PoolReport};
+use raidish_core::vdev::{Pool, Topology};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ pub struct Snapshot {
 
 pub struct LayoutData {
     pub layout: Layout,
-    pub txg: raidish::types::Txg,
+    pub txg: raidish_types::types::Txg,
 }
 
 /// `Rc` compared by identity, for component props: cheap, and a new
@@ -72,7 +72,7 @@ pub fn set_token(token: Option<&str>) {
         };
     }
     #[cfg(target_arch = "wasm32")]
-    raidish::disk::set_access_token(token.map(str::to_string));
+    raidish_core::disk::set_access_token(token.map(str::to_string));
 }
 
 /// A GET to this node, with the token if there is one.
@@ -85,7 +85,7 @@ pub fn get(url: &str) -> gloo_net::http::RequestBuilder {
 }
 
 /// Who this node says we are.
-pub use raidish::api_types::Principal as Whoami;
+pub use raidish_types::api_types::Principal as Whoami;
 
 /// Why [`whoami`] got no answer.
 pub enum NotIn {

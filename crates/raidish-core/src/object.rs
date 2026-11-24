@@ -67,7 +67,7 @@ enum SyncJob<'a> {
 pub(crate) type Indirect = Vec<Option<BlockPtr>>;
 
 #[derive(Debug, Clone)]
-pub(crate) enum Dirty {
+pub enum Dirty {
     Data(Vec<u8>),
     Hole,
 }
@@ -82,7 +82,7 @@ impl Dirty {
 }
 
 #[derive(Default)]
-pub(crate) struct DirtyState {
+pub struct DirtyState {
     pub(crate) records: BTreeMap<u64, Dirty>,
     /// Records taken by an in-progress sync (readable until it finishes).
     pub(crate) syncing: Option<Arc<BTreeMap<u64, Dirty>>>,
@@ -94,7 +94,7 @@ pub(crate) struct DirtyState {
     /// with their sequence numbers: what the intent log carries for a
     /// dataset whose records are changed only by them (a `kv` dataset's
     /// B+tree, see `crate::zil`), instead of the records.
-    pub(crate) ops: Vec<(u64, KeyedOp)>,
+    pub ops: Vec<(u64, KeyedOp)>,
     /// The next operation's sequence number.
     pub(crate) next_op: u64,
     /// Operations before this one are in the records a sync in progress
@@ -109,7 +109,7 @@ const MAX_UNLOGGED_RANGES: usize = 16;
 
 /// What of a dirty record changed since it was last logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Unlogged {
+pub enum Unlogged {
     Whole,
     /// Sorted, disjoint, non-adjacent byte ranges `[start, end)`.
     Ranges(Vec<(u32, u32)>),
@@ -117,7 +117,7 @@ pub(crate) enum Unlogged {
 
 impl Unlogged {
     /// Add `other`'s changes to these.
-    pub(crate) fn merge(&mut self, other: &Unlogged) {
+    pub fn merge(&mut self, other: &Unlogged) {
         let Unlogged::Ranges(theirs) = other else {
             *self = Unlogged::Whole;
             return;
@@ -128,7 +128,7 @@ impl Unlogged {
     }
 
     /// Add bytes `[start, end)`.
-    pub(crate) fn add(&mut self, start: u32, end: u32) {
+    pub fn add(&mut self, start: u32, end: u32) {
         let Unlogged::Ranges(rs) = self else {
             return;
         };
@@ -151,7 +151,7 @@ impl Unlogged {
     }
 
     /// Bytes covered (None: the whole record).
-    pub(crate) fn bytes(&self) -> Option<usize> {
+    pub fn bytes(&self) -> Option<usize> {
         match self {
             Unlogged::Whole => None,
             Unlogged::Ranges(rs) => Some(rs.iter().map(|&(s, e)| (e - s) as usize).sum()),
@@ -175,11 +175,7 @@ impl DirtyState {
 
     /// Put back changes taken for a log append that didn't make it (the
     /// operations ahead of any applied since, less those committed since).
-    pub(crate) fn restore_unlogged(
-        &mut self,
-        taken: BTreeMap<u64, Unlogged>,
-        ops: Vec<(u64, KeyedOp)>,
-    ) {
+    pub fn restore_unlogged(&mut self, taken: BTreeMap<u64, Unlogged>, ops: Vec<(u64, KeyedOp)>) {
         let synced = self.ops_synced;
         let mut back: Vec<(u64, KeyedOp)> = ops.into_iter().filter(|(n, _)| *n >= synced).collect();
         back.append(&mut self.ops);
@@ -294,7 +290,7 @@ pub struct ObjTree {
     pub sizing: Sizing,
     size: AtomicU64,
     root: Mutex<TreeRoot>,
-    pub(crate) dirty: Mutex<DirtyState>,
+    pub dirty: Mutex<DirtyState>,
     /// Indirect blocks keyed by (lba, birth_txg): immutable once written, and
     /// a reused lba always has a newer birth TXG.
     cache: Mutex<HashMap<(u64, Txg), Arc<Indirect>>>,
@@ -326,7 +322,7 @@ impl ObjTree {
     }
 
     /// The root pointer of the committed tree.
-    pub(crate) fn root_ptr(&self) -> Option<BlockPtr> {
+    pub fn root_ptr(&self) -> Option<BlockPtr> {
         self.root.lock().unwrap().ptr.clone()
     }
 
@@ -516,7 +512,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Pointer to node `index` at `level` (0 = data records) of `root`.
     /// Nodes beyond what the tree addresses are holes.
-    pub(crate) async fn tree_lookup(
+    pub async fn tree_lookup(
         &self,
         obj: &ObjTree,
         root: &TreeRoot,
@@ -574,7 +570,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Read from `obj` at byte `offset`, up to its end. Returns the bytes read.
-    pub(crate) async fn object_read(
+    pub async fn object_read(
         &self,
         obj: &ObjTree,
         offset: u64,
@@ -1229,7 +1225,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Write `data` as a new tree of `blksz`-byte records (the last one
     /// short). Pushes everything written to `allocated`.
-    pub(crate) async fn write_tree(
+    pub async fn write_tree(
         &self,
         blksz: usize,
         data: &[u8],
@@ -1280,10 +1276,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Every extent a tree occupies (indirects and data records).
-    pub(crate) async fn tree_extents(
-        &self,
-        root: &TreeRoot,
-    ) -> Result<Vec<Extent>, FileSystemError> {
+    pub async fn tree_extents(&self, root: &TreeRoot) -> Result<Vec<Extent>, FileSystemError> {
         let mut out = Vec::new();
         let mut stack: Vec<(BlockPtr, u8)> =
             root.ptr.iter().map(|r| (r.clone(), root.levels)).collect();
@@ -1298,7 +1291,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Every allocated data record of a committed tree, in index order.
-    pub(crate) async fn tree_leaves(
+    pub async fn tree_leaves(
         &self,
         root: &TreeRoot,
     ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
@@ -1330,7 +1323,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The first byte at `offset` or after that is data (`data`) or in a
     /// hole, by record (unsynced writes included); None: there is none
     /// before the end. `offset` must be within the object.
-    pub(crate) async fn object_seek(
+    pub async fn object_seek(
         &self,
         obj: &ObjTree,
         offset: u64,

@@ -17,7 +17,7 @@ use std::time::Duration;
 /// Proof that a dataset's operations lock (`Dataset::ops`) is held, for
 /// reading or writing. Only a guard makes one, so a function taking it
 /// can't be called outside the lock (audit X1).
-pub(crate) struct OpsHeld<'a>(std::marker::PhantomData<&'a ()>);
+pub struct OpsHeld<'a>(std::marker::PhantomData<&'a ()>);
 
 impl<'a> OpsHeld<'a> {
     pub(crate) fn read(_g: &'a tokio::sync::RwLockReadGuard<'_, ()>) -> Self {
@@ -27,10 +27,10 @@ impl<'a> OpsHeld<'a> {
 
 /// Proof that a dataset's operations lock is held for writing: nothing
 /// reads or writes the dataset meanwhile.
-pub(crate) struct OpsWriteHeld<'a>(std::marker::PhantomData<&'a ()>);
+pub struct OpsWriteHeld<'a>(std::marker::PhantomData<&'a ()>);
 
 impl<'a> OpsWriteHeld<'a> {
-    pub(crate) fn of(_g: &'a tokio::sync::RwLockWriteGuard<'_, ()>) -> Self {
+    pub fn of(_g: &'a tokio::sync::RwLockWriteGuard<'_, ()>) -> Self {
         OpsWriteHeld(std::marker::PhantomData)
     }
 }
@@ -76,7 +76,7 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    pub(crate) async fn ds<E: ServiceError>(&self) -> Result<Arc<Dataset>, E> {
+    pub async fn ds<E: ServiceError>(&self) -> Result<Arc<Dataset>, E> {
         if self.is_stopped() {
             return Err(E::stopped());
         }
@@ -84,7 +84,7 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
     }
 
     /// Run a logged write, and make it durable.
-    pub(crate) async fn write<T, E, F>(&self, f: F) -> Result<T, E>
+    pub async fn write<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: ServiceError,
         F: for<'a, 'b> FnOnce(
@@ -107,7 +107,7 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
     }
 
     /// Run a read (of durable state only).
-    pub(crate) async fn read<T, E, F>(&self, f: F) -> Result<T, E>
+    pub async fn read<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: ServiceError,
         F: for<'a> FnOnce(
@@ -118,7 +118,7 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
     }
 
     /// `read`, with proof the operations lock is held for the read.
-    pub(crate) async fn read_held<T, E, F>(&self, f: F) -> Result<T, E>
+    pub async fn read_held<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: ServiceError,
         F: for<'a> FnOnce(

@@ -282,3 +282,25 @@ async fn truncating_a_single_record_object_keeps_its_head() {
     sync_obj(&fs, &obj).await;
     assert_eq!(read(&fs, &obj, 0, 10).await, b"he");
 }
+
+#[test]
+fn restored_operations_go_back_ahead_of_newer_ones() {
+    use crate::zil::KeyedOp;
+    use std::collections::BTreeMap;
+    let op = |k: &str| KeyedOp::Delete(k.as_bytes().to_vec());
+    let mut d = DirtyState {
+        ops: vec![(0, op("a")), (1, op("b"))],
+        next_op: 2,
+        ..Default::default()
+    };
+    let taken = std::mem::take(&mut d.ops);
+    d.ops.push((2, op("c")));
+    d.next_op = 3;
+    d.restore_unlogged(BTreeMap::new(), taken.clone());
+    assert_eq!(d.ops, vec![(0, op("a")), (1, op("b")), (2, op("c"))]);
+    // Committed meanwhile: not put back.
+    let taken = std::mem::take(&mut d.ops);
+    d.ops_synced = 2;
+    d.restore_unlogged(BTreeMap::new(), taken);
+    assert_eq!(d.ops, vec![(2, op("c"))]);
+}

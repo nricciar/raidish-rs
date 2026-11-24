@@ -40,7 +40,7 @@ struct Savepoint(usize);
 
 /// The commit lock, held, and the changes made under it since the last
 /// commit (see the module docs).
-pub(crate) struct Tx {
+pub struct Tx {
     guard: Option<OwnedMutexGuard<()>>,
     lock: Arc<Mutex<()>>,
     undo: Vec<Undo>,
@@ -97,7 +97,7 @@ impl Tx {
 
     /// Collect the pointers an op allocates: journaled when the
     /// collection drops, however the op ends (a dropped future included).
-    pub(crate) fn allocs(&mut self) -> Allocs<'_> {
+    pub fn allocs(&mut self) -> Allocs<'_> {
         Allocs {
             tx: self,
             ptrs: Vec::new(),
@@ -136,7 +136,7 @@ impl Tx {
 
     /// An operation's result: on an error, undo everything since the last
     /// commit (or `applied`); otherwise it stands (`applied`).
-    pub(crate) async fn check<T, E>(&mut self, r: Result<T, E>) -> Result<T, E> {
+    pub async fn check<T, E>(&mut self, r: Result<T, E>) -> Result<T, E> {
         match r {
             Ok(v) => {
                 self.applied();
@@ -175,9 +175,9 @@ impl Drop for Tx {
 }
 
 /// Pointers allocated under a [`Tx`] (see [`Tx::allocs`]).
-pub(crate) struct Allocs<'t> {
+pub struct Allocs<'t> {
     tx: &'t mut Tx,
-    pub(crate) ptrs: Vec<BlockPtr>,
+    pub ptrs: Vec<BlockPtr>,
 }
 
 impl Drop for Allocs<'_> {

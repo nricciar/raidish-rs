@@ -652,7 +652,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Space that can be allocated right now (excludes deferred frees).
-    pub(crate) async fn allocatable_blocks(&self) -> u64 {
+    pub async fn allocatable_blocks(&self) -> u64 {
         let mut total = 0;
         for ms in self.metaslabs.iter() {
             let ms = ms.read().await;

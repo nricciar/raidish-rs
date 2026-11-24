@@ -109,14 +109,14 @@ pub struct Dataset {
     /// Bytes per record.
     pub blksz: usize,
     /// The contents: the committed tree and dirty records.
-    pub(crate) obj: ObjTree,
+    pub obj: ObjTree,
     /// Placement settings (rewritten with the dnode, see `DatasetProps`).
     pub(crate) props: Mutex<DatasetProps>,
     /// The intent log the dnode records (rewritten with it).
-    pub(crate) log: Mutex<Option<DatasetLog>>,
+    pub log: Mutex<Option<DatasetLog>>,
     /// A writer's place in its own log (None: nothing to append to; the
     /// next flush commits instead). See `crate::zil`. Locked before `dirty`.
-    pub(crate) cursor: Mutex<Option<crate::zil::LogCursor>>,
+    pub cursor: Mutex<Option<crate::zil::LogCursor>>,
     /// Where the log stood when the sync in progress took its records: the
     /// region and the first record not covered by it.
     pub(crate) fold_from: Mutex<Option<(crate::inode::LogRegion, u64)>>,
@@ -126,7 +126,7 @@ pub struct Dataset {
     pub(crate) in_doubt: Mutex<Option<crate::writer::InDoubt>>,
     /// Serializes the format's operations that read and rewrite several
     /// records (a B+tree's): readers share it, a change holds it alone.
-    pub(crate) ops: tokio::sync::RwLock<()>,
+    pub ops: tokio::sync::RwLock<()>,
 }
 
 impl Dataset {
@@ -221,7 +221,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Tree dataset `name`'s root object number.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) async fn dataset_id(&self, name: &str) -> Result<FileId, FileSystemError> {
+    pub async fn dataset_id(&self, name: &str) -> Result<FileId, FileSystemError> {
         let e = self.dataset_entry(name).await?;
         if !e.format.is_tree() {
             return Err(FileSystemError::NotAFile);
@@ -365,7 +365,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// `delete_dataset` under `begin_tx`, without committing.
-    pub(crate) async fn delete_dataset_locked(
+    pub async fn delete_dataset_locked(
         &self,
         tx: &mut crate::tx::Tx,
         name: &str,

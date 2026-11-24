@@ -24,7 +24,7 @@ pub mod members;
 pub mod network;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod routes;
-pub mod state;
+pub use raidish_types::cluster_state as state;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
@@ -32,7 +32,7 @@ pub mod store;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 #[cfg(not(target_arch = "wasm32"))]
 use openraft::{BasicNode, Raft};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use state::ClusterState;
 pub use state::LeaseOp;
 #[cfg(not(target_arch = "wasm32"))]
@@ -91,44 +91,7 @@ pub const FORWARD_WAIT: Duration = Duration::from_secs(4);
 
 pub use crate::types::now_ms;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct MemberView {
-    pub id: u64,
-    /// None for the node that answered.
-    pub addr: Option<String>,
-    pub disks: Vec<usize>,
-}
-
-/// `GET /api/v1/cluster/status` (what `raidish cluster status` prints).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Status {
-    /// The node that answered (name and id).
-    pub node: String,
-    pub id: u64,
-    pub leader: Option<u64>,
-    pub term: u64,
-    pub members: Vec<MemberView>,
-    pub fingerprint: String,
-    pub state: ClusterState,
-    pub now_ms: u64,
-    /// The answering node has Raft state (a log or a vote).
-    #[serde(default)]
-    pub initialized: bool,
-    /// Its last log index. A group that never elected a leader has only
-    /// the initial membership entry (index 0): nothing was ever committed.
-    #[serde(default)]
-    pub last_log_index: Option<u64>,
-    /// It votes: false while it catches up after losing its state.
-    #[serde(default)]
-    pub voting: bool,
-}
-
-impl Status {
-    /// The member serving pool disk `disk`.
-    pub fn owner_of(&self, disk: usize) -> Option<&MemberView> {
-        self.members.iter().find(|m| m.disks.contains(&disk))
-    }
-}
+pub use state::{MemberView, Status};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Cluster {

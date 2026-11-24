@@ -3,8 +3,9 @@
 //!
 //! Writes `$OUT_DIR/ui_assets.rs`: a table of `(path, mime, bytes)`. It is
 //! empty (the server then serves `web/dist` from disk, if present) for
-//! debug builds, wasm builds of this crate (that's trunk building the
-//! dashboard, which depends on us) and when `RAIDISH_SKIP_UI` is set.
+//! debug builds, wasm builds of this crate and when `RAIDISH_SKIP_UI` is
+//! set. (The dashboard itself builds on `raidish-types` and
+//! `raidish-core`, not on this crate.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,7 +56,9 @@ fn main() {
         "web/Trunk.toml",
         "web/Cargo.toml",
         "web/novnc",
-        "src",
+        // What the dashboard builds on.
+        "crates/raidish-types",
+        "crates/raidish-core",
     ] {
         println!("cargo:rerun-if-changed={}", manifest.join(dir).display());
     }
