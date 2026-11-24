@@ -1,6 +1,6 @@
 # raidish-services
 
-Network services over [RAIDish](../../README.md) B+tree datasets: **S3**, **SQS**, AWS Signature V4 authentication, and the multi-node **frontend** serving S3, SQS, and `etcd`.
+Network services over [RAIDish](../../README.md) B+tree datasets ([`raidish-core`](../raidish-core/)): **S3**, **SQS**, AWS Signature V4 authentication, and the multi-node **frontend** serving S3, SQS, and [`raidish-etcd`](../raidish-etcd/).
 
 Each bucket, queue, or `etcd` instance is a standalone dataset run by one writer node at a time under its `ds/<name>` lease. Every `listen` node exposes the service ports and transparently proxies or forwards requests to whichever node currently owns the target dataset.
 
@@ -58,6 +58,23 @@ services:
   # s3_domain: s3.local # optional virtual-hosted bucket suffix
   sqs_port: 9324        # default (0 to disable)
   region: us-east-1     # default
+```
+
+## CLI Usage
+
+```bash
+# Create an S3 bucket or SQS queue dataset (or use CreateBucket / CreateQueue via AWS APIs)
+raidish dataset create photos --format s3
+raidish dataset create jobs --format queue
+raidish dataset list
+
+# Mint S3/SQS access keys from your admin cert (or pass --token <token>)
+eval "$(raidish token s3-key | sed 's/^/export /')"
+
+# Use standard AWS CLI / SDKs against any node
+aws --endpoint-url https://node0:9000 --ca-bundle pki/ca.pem s3 cp photo.jpg s3://photos/
+aws --endpoint-url https://node0:9324 --ca-bundle pki/ca.pem sqs send-message \
+  --queue-url https://node0:9324/000000000000/jobs --message-body "hello"
 ```
 
 ## Building & Testing

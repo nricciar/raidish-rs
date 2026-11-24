@@ -2,7 +2,7 @@
 
 An etcd v3 gRPC server backed by a [RAIDish](../../README.md) B+tree dataset.
 
-`raidish-etcd` implements etcd's multi-version key-value store and gRPC API (reporting as etcd `3.5.17`) on top of an `etcd`-format dataset in `raidish-core`, allowing `etcdctl`, standard client libraries, and etcd consumers such as Kubernetes to run against a RAIDish pool unchanged.
+`raidish-etcd` implements etcd's multi-version key-value store and gRPC API (reporting as etcd `3.5.17`) on top of an `etcd`-format dataset in [`raidish-core`](../raidish-core/), allowing `etcdctl`, standard client libraries, and etcd consumers such as Kubernetes to run against a RAIDish pool unchanged.
 
 ## Scope
 
@@ -43,7 +43,24 @@ A <lease id> <key>                 key attached to a lease
 
 ### Placement & Failover
 
-One node serves an `etcd` dataset at a time under its `ds/<name>` lease (peer nodes forward client connections to it). Lease countdowns live in memory on the active server; on failover, the new server restarts every persisted lease's TTL afresh, matching etcd's behavior across leader changes.
+One node serves an `etcd` dataset at a time under its `ds/<name>` lease (peer nodes forward client connections to it via [`raidish-services`](../raidish-services/)). Lease countdowns live in memory on the active server; on failover, the new server restarts every persisted lease's TTL afresh, matching etcd's behavior across leader changes.
+
+## CLI Usage
+
+Create an `etcd` dataset with its dedicated client port, then connect with `etcdctl` using a client certificate issued by the cluster CA (`admin`/`node` for writes, `readonly` for reads/watches):
+
+```bash
+# Create the dataset (every node listens on port 2379 and forwards to the holder)
+raidish dataset create cfg --format etcd --port 2379
+
+# Read and write with standard etcdctl
+etcdctl --endpoints=https://node0:2379 \
+  --cacert pki/ca.pem --cert pki/admin/cert.pem --key pki/admin/key.pem \
+  put /hello world
+etcdctl --endpoints=https://node0:2379 \
+  --cacert pki/ca.pem --cert pki/admin/cert.pem --key pki/admin/key.pem \
+  get /hello
+```
 
 ## Building & Testing
 

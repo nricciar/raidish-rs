@@ -2,7 +2,7 @@
 
 Libvirt virtual machine support and definition storage for [RAIDish](../../README.md).
 
-`raidish-vm` validates, renders, stores, and runs libvirt domains whose disks are RAIDish volumes. Nothing about a VM lives in `/etc/libvirt` on any host: definitions are stored in the pool's `.vms` dataset, rendered per host to point at that node's NBD exports, and started as transient domains through `virsh`.
+`raidish-vm` validates, renders, stores, and runs libvirt domains whose disks are RAIDish volumes. Nothing about a VM lives in `/etc/libvirt` on any host: definitions are stored in the pool's `.vms` dataset (via [`raidish-core`](../raidish-core/)), rendered per host to point at that node's NBD exports ([`raidish-block`](../raidish-block/)), and started as transient domains through `virsh`.
 
 ## Scope
 
@@ -57,6 +57,24 @@ vm:
   migrate_timeout_s: 300    # default; live migration is qemu+tls:// only
   # nbd_host / nbd_port     # override if libvirt is on another network stack
   # migrate_uri / migrate_host
+```
+
+## CLI Usage
+
+```bash
+# Import a domain XML (with <source file='raidish:VOLUME'/>) and start it
+raidish vm import myvm myvm.xml        # --replace to update an existing definition
+raidish vm start myvm
+raidish vm list
+
+# Check migration compatibility across nodes, then move (live if supported, else cold)
+raidish vm check myvm
+raidish vm move myvm node-2            # --live refuses a cold fallback
+
+# Lifecycle and heterogeneous-CPU baseline helper
+raidish vm restart myvm                # applies pending XML edits
+raidish vm stop myvm
+raidish vm cpu-baseline                # <cpu> element common to all VM hosts
 ```
 
 ## Building & Testing

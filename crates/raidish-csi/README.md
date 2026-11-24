@@ -2,7 +2,7 @@
 
 The Kubernetes Container Storage Interface (`csi.raidish.io`) driver for [RAIDish](../../README.md).
 
-`raidish-csi` serves the CSI Identity, Controller, and Node gRPC services on a Unix domain socket, allowing Kubernetes pods and virtual machines to consume RAIDish volumes as PersistentVolumes. It runs on each node alongside `raidish listen` (as root, to format and mount block devices) and delegates placement, NVMe/TCP export, and kernel attachment to the existing RAIDish committer and node agent.
+`raidish-csi` serves the CSI Identity, Controller, and Node gRPC services on a Unix domain socket, allowing Kubernetes pods and virtual machines to consume RAIDish volumes as PersistentVolumes. It runs on each node alongside `raidish listen` (as root, to format and mount block devices) and delegates placement, NVMe/TCP export ([`raidish-block`](../raidish-block/)), and kernel attachment to the existing RAIDish committer ([`raidish-committer`](../raidish-committer/)) and node agent.
 
 ## Scope
 

@@ -2,7 +2,7 @@
 
 The storage engine crate for [RAIDish](../../README.md).
 
-`raidish-core` implements the on-disk format, RAID pool topologies, copy-on-write object store, datasets (filesystems, block volumes, key-value stores), snapshots, replication, and pool repair. It compiles both natively and to `wasm32-unknown-unknown`.
+`raidish-core` implements the on-disk format, RAID pool topologies, copy-on-write object store, datasets (filesystems, block volumes, key-value stores), snapshots, replication, and pool repair on top of [`raidish-types`](../raidish-types/). It compiles both natively and to `wasm32-unknown-unknown`.
 
 ## Scope
 

@@ -12,7 +12,7 @@ In a multi-writer RAIDish pool, one node at a time holds the `pool` lease and ac
 - Rocket HTTP routes (`/api/v1/pool/*`, `routes`) mounted by every `listen` node; non-committers return `CommitError::Retry` so clients fail over to the active committer
 - Automatic disk health monitoring and resilvering (`health::spawn_health_monitor`) driven by disk reconnects and periodic checks
 - Cluster activity log (`events::EventLog`, `EventSink`) persisted in the `.events` B+tree system dataset
-- Single-object write leases (`object_lease`) bridging `raidish-core`'s `ObjLease` with `raidish-cluster`'s `HeldLease` for HTTP file uploads and NFS writers
+- Single-object write leases (`object_lease`) bridging [`raidish-core`](../raidish-core/)'s `ObjLease` with [`raidish-cluster`](../raidish-cluster/)'s `HeldLease` for HTTP file uploads and NFS writers
 
 ## Architecture & Module Map
 

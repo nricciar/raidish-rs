@@ -2,7 +2,7 @@
 
 The NFSv3, NFSv4.1, and NFSv4.2 server for [RAIDish](../../README.md).
 
-`raidish-nfs` serves the pool's filesystem dataset on every `listen` node over a single TCP port (default `2049`, multiplexing NFS, MOUNT, and portmapper). Every node serves the same files under the same file handles, so clients can mount any node—or trunk across multiple nodes—and keep working through node failovers.
+`raidish-nfs` serves the pool's filesystem dataset ([`raidish-core`](../raidish-core/)) on every `listen` node over a single TCP port (default `2049`, multiplexing NFS, MOUNT, and portmapper). Every node serves the same files under the same file handles, so clients can mount any node—or trunk across multiple nodes—and keep working through node failovers (coordinated via [`raidish-cluster`](../raidish-cluster/) leases).
 
 ## Scope
 

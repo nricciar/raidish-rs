@@ -2,7 +2,7 @@
 
 Block device exports and cross-node volume I/O for [RAIDish](../../README.md).
 
-`raidish-block` exposes RAIDish copy-on-write volumes over **NBD** and **NVMe/TCP**, and provides the mTLS **peer I/O** proxy used when a volume is attached on a non-writer node (such as during live VM migration and volume handoff).
+`raidish-block` exposes [RAIDish](../../README.md) copy-on-write volumes (from [`raidish-core`](../raidish-core/)) over **NBD** and **NVMe/TCP**, and provides the mTLS **peer I/O** proxy (using [`raidish-auth`](../raidish-auth/)) used when a volume is attached on a non-writer node (such as during live VM migration and volume handoff).
 
 ## Scope
 
@@ -46,19 +46,59 @@ Because exports hold their backend inside a `SwitchableIo`, volume handoff can p
 - **Space reclamation**: `TRIM` / `WRITE_ZEROES` (NBD) and `DSM` / `WRITE_ZEROES` (NVMe) deallocate full records back to the pool.
 - **Debugging**: Set `RAIDISH_NVME_TRACE=1` to log incoming NVMe/TCP commands.
 
+### Peer I/O
+
+When a volume is exported on a node that does not hold its `ds/<name>` lease, `PeerIo` connects over mTLS (requiring a `node` certificate) to the active writer on port `10810`, verifies the writer's lease epoch in the preamble, and multiplexes concurrent block requests over the NBD transmission framing. If the writer fails over without a clean handoff while unflushed writes were acknowledged, `PeerIo` fails the next `FLUSH` rather than falsely acknowledging durability.
+
+## CLI Usage
+
+### Cluster Placement & Auto-Mount
+
+In a cluster, each `listen` node's agent automatically exports and attaches volumes placed on it (configured via `automount:` in the node config):
+
+```bash
+# Create a 20 GiB volume and auto-mount it over NVMe/TCP (or nbd) on the first live node
+raidish volume create vm0 21474836480
+raidish volume set vm0 --nodes node-0,node-1 --automount nvme
+raidish volume list
+
+# Explicitly move a running volume to another node
+raidish volume move vm0 node-1
+```
+
+Node config overrides (all optional; set `helper: none` to export without attaching a kernel device):
+
+```yaml
+automount:
+  bind: 127.0.0.1
+  nbd_port: 10809
+  nvme_port: 4420
+  helper: /usr/local/sbin/raidish-attach
+```
+
+### Standalone Exports & Client Attach
+
+To run a single export manually without the cluster agent:
+
+```bash
+# Create a 1 GiB volume and export it over NBD (10809) or NVMe/TCP (4420)
+raidish --config remote-config.yaml block vdisk0 1073741824
+raidish --config remote-config.yaml nbd vdisk0
+# or:
+raidish --config remote-config.yaml nvme vdisk0
+```
+
 Connecting from a Linux host (default ports):
 
 ```bash
 # NBD
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N <volume>
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N vdisk0
 
 # NVMe/TCP
-sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 -n nqn.2024-01.com.raidish:nvme:<volume>
+sudo modprobe nvme-tcp
+sudo nvme connect -t tcp -a 127.0.0.1 -s 4420 -n nqn.2024-01.com.raidish:nvme:vdisk0
+sudo nvme disconnect -n nqn.2024-01.com.raidish:nvme:vdisk0
 ```
-
-### Peer I/O
-
-When a volume is exported on a node that does not hold its `ds/<name>` lease, `PeerIo` connects over mTLS (requiring a `node` certificate) to the active writer on port `10810`, verifies the writer's lease epoch in the preamble, and multiplexes concurrent block requests over the NBD transmission framing. If the writer fails over without a clean handoff while unflushed writes were acknowledged, `PeerIo` fails the next `FLUSH` rather than falsely acknowledging durability.
 
 ## Building & Testing
 
