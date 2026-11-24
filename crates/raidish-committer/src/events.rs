@@ -598,7 +598,7 @@ impl EventSink {
     }
 
     /// Queued, not yet sent.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub fn pending(&self) -> usize {
         self.state.lock().unwrap().queue.len()
     }

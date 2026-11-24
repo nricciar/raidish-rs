@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub use crate::vm_def::{DomState, VmDisk, VmDisks, VmHardware, VmNic, VmSpec};
-pub(crate) use crate::xml::{El, Node, el_xml, parse_root};
+pub use crate::xml::{El, Node, el_xml, parse_root};
 
 /// The XML namespace of the metadata raidish puts on the domains it runs.
 pub const META_NS: &str = "https://raidish.dev/xmlns/vm/1";

@@ -95,7 +95,7 @@ async fn node_facts_next_to_the_definitions() {
     store_with_volumes(&fs, &["a"]).await;
     let st = VmStore::open(fs.clone()).await.unwrap();
     st.put("one", &xml(&["a"]), true, None).await.unwrap();
-    let mut f = crate::node_facts::NodeFacts {
+    let mut f = crate::api_types::NodeFacts {
         node: "node-1".into(),
         ..Default::default()
     };

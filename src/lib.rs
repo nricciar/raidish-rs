@@ -29,6 +29,7 @@ pub(crate) use raidish_core::send;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_core::service_tree;
 pub(crate) use raidish_core::snapshot;
+#[cfg(test)]
 pub(crate) use raidish_core::tx;
 pub use raidish_core::vdev;
 pub(crate) use raidish_core::volume;
@@ -44,16 +45,16 @@ mod api;
 #[cfg(not(target_arch = "wasm32"))]
 mod api_error;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod auth;
+pub(crate) use raidish_auth::auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_vm;
-pub mod cluster;
+pub use raidish_cluster as cluster;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod committer;
+pub(crate) use raidish_committer as committer;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
@@ -63,7 +64,7 @@ mod dashboard;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod etcd;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod events;
+pub(crate) use raidish_committer::events;
 #[cfg(not(target_arch = "wasm32"))]
 mod export;
 #[cfg(not(target_arch = "wasm32"))]
@@ -75,7 +76,7 @@ pub(crate) mod frontend;
 #[cfg(not(target_arch = "wasm32"))]
 mod nbd;
 #[cfg(not(target_arch = "wasm32"))]
-mod net;
+pub(crate) use raidish_auth::net;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod nfs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -83,13 +84,13 @@ pub(crate) mod node_facts;
 #[cfg(not(target_arch = "wasm32"))]
 mod nvme;
 #[cfg(not(target_arch = "wasm32"))]
-mod object_lease;
+pub(crate) use raidish_committer::object_lease;
 #[cfg(not(target_arch = "wasm32"))]
 mod peer_io;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod pki;
+pub(crate) use raidish_auth::pki;
 #[cfg(not(target_arch = "wasm32"))]
-mod proc;
+pub(crate) use raidish_vm::proc;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod s3;
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,13 +100,13 @@ pub(crate) mod sigv4;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod sqs;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod tls;
+pub(crate) use raidish_auth::tls;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod vm;
+pub(crate) use raidish_vm::vm;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod vm_check;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod vm_store;
+pub(crate) use raidish_vm::vm_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod vms_api;
 #[cfg(not(target_arch = "wasm32"))]
@@ -113,14 +114,20 @@ mod volume_io;
 #[cfg(not(target_arch = "wasm32"))]
 mod volumes_api;
 #[cfg(not(target_arch = "wasm32"))]
-mod xml;
+pub(crate) use raidish_vm::xml;
 
+#[cfg(test)]
+#[path = "tests/cluster_tests.rs"]
+mod cluster_tests;
 #[cfg(test)]
 #[path = "tests/disk_remote_tests.rs"]
 mod disk_remote_tests;
 #[cfg(test)]
 #[path = "tests/fault_tests.rs"]
 mod fault_tests;
+#[cfg(test)]
+#[path = "tests/multinode_tests.rs"]
+mod multinode_tests;
 #[cfg(test)]
 #[path = "tests/scan_remote_tests.rs"]
 mod scan_remote_tests;

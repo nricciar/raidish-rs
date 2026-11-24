@@ -28,15 +28,15 @@ impl std::fmt::Display for XmlError {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum Node {
+pub enum Node {
     El(El),
     /// Text, comments, CDATA... written back as they were read.
     Raw(Event<'static>),
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct El {
-    pub(crate) name: String,
+pub struct El {
+    pub name: String,
     pub(crate) attrs: Vec<(String, String)>,
     pub(crate) kids: Vec<Node>,
 }
@@ -52,7 +52,7 @@ impl El {
             kids: Vec::new(),
         }
     }
-    pub(crate) fn attr(&self, k: &str) -> Option<&str> {
+    pub fn attr(&self, k: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(n, _)| n == k)
@@ -61,7 +61,7 @@ impl El {
     pub(crate) fn local(&self) -> &str {
         self.name.rsplit(':').next().unwrap_or(&self.name)
     }
-    pub(crate) fn child(&self, name: &str) -> Option<&El> {
+    pub fn child(&self, name: &str) -> Option<&El> {
         self.elements().find(|e| e.name == name)
     }
     pub(crate) fn child_mut(&mut self, name: &str) -> Option<&mut El> {
@@ -71,7 +71,7 @@ impl El {
         })
     }
     /// Its text (what's between its tags, not its children's).
-    pub(crate) fn text(&self) -> String {
+    pub fn text(&self) -> String {
         let mut t = String::new();
         for k in &self.kids {
             match k {
@@ -84,7 +84,7 @@ impl El {
         }
         t.trim().to_string()
     }
-    pub(crate) fn elements(&self) -> impl Iterator<Item = &El> {
+    pub fn elements(&self) -> impl Iterator<Item = &El> {
         self.kids.iter().filter_map(|k| match k {
             Node::El(e) => Some(e),
             _ => None,
@@ -101,11 +101,11 @@ impl El {
         self.elements().find(|e| e.local() == name)
     }
     /// Every child whose local name is `name`.
-    pub(crate) fn find_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a El> + 'a {
+    pub fn find_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a El> + 'a {
         self.elements().filter(move |e| e.local() == name)
     }
     /// The text of the child `find` finds.
-    pub(crate) fn text_of(&self, name: &str) -> Option<String> {
+    pub fn text_of(&self, name: &str) -> Option<String> {
         self.find(name).map(El::text)
     }
 }
@@ -134,7 +134,7 @@ pub(crate) const MAX_DEPTH: usize = 128;
 /// The root element of `xml`: exactly one, nested at most [`MAX_DEPTH`]
 /// deep, with nothing but whitespace, comments and declarations around it,
 /// and every entity in its text resolvable.
-pub(crate) fn parse_root(xml: &str) -> Result<El, XmlError> {
+pub fn parse_root(xml: &str) -> Result<El, XmlError> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut stack: Vec<El> = Vec::new();
     let mut root: Option<El> = None;
@@ -226,7 +226,7 @@ fn write_el(w: &mut quick_xml::Writer<Vec<u8>>, el: &El) -> std::io::Result<()> 
 }
 
 /// `el` as XML.
-pub(crate) fn el_xml(el: &El) -> String {
+pub fn el_xml(el: &El) -> String {
     let mut w = quick_xml::Writer::new(Vec::new());
     write_el(&mut w, el).expect("writing to memory");
     String::from_utf8(w.into_inner()).expect("utf-8 in, utf-8 out")

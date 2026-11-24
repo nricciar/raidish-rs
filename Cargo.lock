@@ -2431,8 +2431,12 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "quick-xml",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
  "raidish-core",
  "raidish-types",
+ "raidish-vm",
  "rcgen",
  "reqwest",
  "ring",
@@ -2460,6 +2464,69 @@ dependencies = [
  "web-sys",
  "web-time",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "raidish-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "raidish-types",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rocket",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-tungstenite 0.28.0",
+ "url",
+ "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "raidish-cluster"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "hex",
+ "openraft",
+ "raidish-auth",
+ "raidish-types",
+ "reqwest",
+ "ring",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "raidish-committer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-core",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2503,6 +2570,19 @@ dependencies = [
  "serde",
  "serde_json",
  "web-time",
+]
+
+[[package]]
+name = "raidish-vm"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "raidish-core",
+ "raidish-types",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

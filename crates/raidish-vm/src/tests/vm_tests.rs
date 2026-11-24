@@ -623,7 +623,7 @@ fn the_migration_target_defaults_to_its_host() {
 fn vm_errors_say_whose_fault_they_are() {
     use crate::types::ErrorKind;
     use crate::vm::VmError;
-    let e = crate::vm_check::needs("<notadomain/>").unwrap_err();
+    let e = parse_domain("<notadomain/>").unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Invalid);
     assert_eq!(e.kind().http_status(), 400);
     let e = VmError::Virsh {

@@ -131,13 +131,13 @@ const MAX_KEYS: usize = 1024;
 
 /// Says whether a repeated log message may be logged now: once per `every`
 /// per key, counting what it held back meanwhile.
-pub(crate) struct LogThrottle {
+pub struct LogThrottle {
     every: Duration,
     last: std::sync::Mutex<std::collections::HashMap<String, (Instant, u64)>>,
 }
 
 impl LogThrottle {
-    pub(crate) fn new(every: Duration) -> Self {
+    pub fn new(every: Duration) -> Self {
         LogThrottle {
             every,
             last: Default::default(),
@@ -146,7 +146,7 @@ impl LogThrottle {
 
     /// `Some(n)`: log it now, `n` more having been held back since it last
     /// was. `None`: hold it back.
-    pub(crate) fn allow(&self, key: &str) -> Option<u64> {
+    pub fn allow(&self, key: &str) -> Option<u64> {
         let now = Instant::now();
         let mut m = self.last.lock().unwrap();
         // Forget keys gone quiet, so a stream of distinct ones can't grow

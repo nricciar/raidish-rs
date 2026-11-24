@@ -1,0 +1,28 @@
+[package]
+name = "raidish-committer"
+version = "0.1.0"
+edition = "2024"
+description = "The RAIDish committer: committing the pool for the cluster, the health monitor, the activity log."
+
+[features]
+testutil = ["raidish-types/testutil", "raidish-core/testutil", "raidish-auth/testutil", "raidish-cluster/testutil", "raidish-vm/testutil"]
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-vm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
+rocket = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

@@ -7,6 +7,10 @@ resolver = "3"
 [workspace.dependencies]
 raidish-types = { path = "crates/raidish-types" }
 raidish-core = { path = "crates/raidish-core" }
+raidish-auth = { path = "crates/raidish-auth" }
+raidish-vm = { path = "crates/raidish-vm" }
+raidish-cluster = { path = "crates/raidish-cluster" }
+raidish-committer = { path = "crates/raidish-committer" }
 reed-solomon-simd = "3.1.0"
 tokio = "1"
 futures-util = "0.3"
@@ -79,6 +83,10 @@ path = "src/main.rs"
 [dependencies]
 raidish-types = { workspace = true }
 raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-vm = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-committer = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 futures-util = { workspace = true }
 futures = { workspace = true }
@@ -147,5 +155,9 @@ protoc-bin-vendored = { workspace = true }
 [dev-dependencies]
 raidish-types = { workspace = true, features = ["testutil"] }
 raidish-core = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+raidish-vm = { workspace = true, features = ["testutil"] }
+raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-committer = { workspace = true, features = ["testutil"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

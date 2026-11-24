@@ -1,0 +1,22 @@
+[package]
+name = "raidish-vm"
+version = "0.1.0"
+edition = "2024"
+description = "RAIDish VMs: libvirt domain XML, running domains through virsh, the pool's VM definition store."
+
+[features]
+testutil = ["raidish-types/testutil", "raidish-core/testutil"]
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "process", "io-util"] }
+serde = { workspace = true }
+quick-xml = { workspace = true }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

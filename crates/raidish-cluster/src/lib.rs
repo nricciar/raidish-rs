@@ -16,6 +16,9 @@
 // openraft's error types are large by design.
 #![allow(clippy::result_large_err)]
 
+pub(crate) use raidish_auth::{auth, net, tls};
+pub(crate) use raidish_types::types;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lease;
 #[cfg(not(target_arch = "wasm32"))]
@@ -135,7 +138,7 @@ pub enum Refusal {
 /// In the data dir while the node is catching up: a restart midway
 /// resumes it (by then the node has a log, so that alone wouldn't tell).
 #[cfg(not(target_arch = "wasm32"))]
-const CATCHING_UP: &str = "catching-up";
+pub const CATCHING_UP: &str = "catching-up";
 
 /// What this node's peers say, for a node starting without Raft state.
 #[cfg(not(target_arch = "wasm32"))]
@@ -734,7 +737,3 @@ pub fn default_data_dir(name: &str) -> PathBuf {
     let base = std::env::var("HOME").map_or(PathBuf::from("."), PathBuf::from);
     base.join(".raidish").join(name)
 }
-
-#[cfg(test)]
-#[path = "../tests/cluster_tests.rs"]
-mod tests;

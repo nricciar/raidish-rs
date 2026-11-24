@@ -329,7 +329,7 @@ fn byte_sizes() {
 #[tokio::test]
 async fn the_committer_records_what_it_sees() {
     use crate::cluster::LeaseOp;
-    use crate::committer::{Authority, Committer, LocalAuthority};
+    use crate::{Authority, Committer, LocalAuthority};
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let auth = Arc::new(LocalAuthority::default());
@@ -389,7 +389,7 @@ async fn the_committer_records_what_it_sees() {
     );
 }
 
-async fn log_of<D: crate::disk::BlockDevice>(c: &crate::committer::Committer<D>) -> EventPage {
+async fn log_of<D: crate::disk::BlockDevice>(c: &crate::Committer<D>) -> EventPage {
     c.events()
         .await
         .unwrap()
@@ -433,8 +433,8 @@ fn kinds_and_subjects_round_trip() {
 /// that fails isn't recorded at all.
 #[tokio::test]
 async fn admin_changes_are_logged_as_their_callers() {
-    use crate::committer::{Authority, Committer, LocalAdmin, LocalAuthority, PoolAdmin};
     use crate::types::{DatasetName, ErrorKind};
+    use crate::{Authority, Committer, LocalAdmin, LocalAuthority, PoolAdmin};
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let auth = Arc::new(LocalAuthority::default());

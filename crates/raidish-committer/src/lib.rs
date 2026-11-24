@@ -3,6 +3,22 @@
 //! and does the pool's metadata operations (create and delete datasets,
 //! change their settings, snapshots). `listen` runs one on whichever node wins the `pool`
 //! lease; the others keep trying, so it fails over.
+//!
+//! The crate also holds the activity log (`events`) and single-object
+//! leases (`object_lease`).
+
+pub(crate) use raidish_auth::{auth, tls};
+pub(crate) use raidish_cluster as cluster;
+#[cfg(test)]
+pub(crate) use raidish_core::test_util;
+pub(crate) use raidish_core::{
+    btree, dataset, disk, fs, inode, send, service_tree, snapshot, tx, vdev, volume, writer,
+};
+pub(crate) use raidish_types::{api_types, types};
+pub(crate) use raidish_vm::vm_store;
+
+pub mod events;
+pub mod object_lease;
 
 pub use crate::api_types::{CreateVolume, NewName};
 use crate::cluster::lease::{HeldLease, LeaseClient};
@@ -70,11 +86,11 @@ impl Authority for Cluster {
 }
 
 /// A cluster state machine in memory (tests).
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 #[derive(Default)]
 pub struct LocalAuthority(pub std::sync::Mutex<ClusterState>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 #[async_trait]
 impl Authority for LocalAuthority {
     async fn propose(&self, op: LeaseOp) -> Result<Response, String> {
@@ -108,7 +124,7 @@ fn check_live(state: &ClusterState, lease: &LeaseRef) -> Result<(), CommitError>
 /// Why `resource` isn't held (by `owner`, if given) at `epoch`:
 /// `Err(Refused)` if it never will be again (taken over, released),
 /// `Err(Retry)` if it's not visible or has lapsed but may still be renewed.
-fn check_lease(
+pub fn check_lease(
     state: &ClusterState,
     resource: &LeaseResource,
     owner: Option<&str>,
@@ -224,7 +240,7 @@ fn object_lease_ok(
 
 /// Where an intent log's `ds/<name>` lease stands, for replaying it.
 #[derive(Debug, PartialEq, Eq)]
-enum Orphan {
+pub enum Orphan {
     /// Held (or this view hasn't caught up with its grant yet): keep it.
     Live,
     /// Taken over or released: nothing more can be acknowledged; replay.
@@ -236,7 +252,7 @@ enum Orphan {
 /// Like `check_lease`: an older epoch in this view means the view lags (a
 /// committer on a Raft follower, or just after a failover), not that the
 /// log's holder is gone.
-fn orphan_state(
+pub fn orphan_state(
     lease: Option<&crate::cluster::state::Lease>,
     l: &crate::inode::DatasetLog,
     now: u64,
@@ -252,7 +268,7 @@ fn orphan_state(
 }
 
 pub struct Committer<D: BlockDevice> {
-    fs: Arc<FileSystem<D>>,
+    pub fs: Arc<FileSystem<D>>,
     auth: Arc<dyn Authority>,
     /// Its `pool` lease.
     pool: Holding,
@@ -370,7 +386,7 @@ impl<D: BlockDevice> Committer<D> {
     // ---- the activity log (see `crate::events`) ----
 
     /// The pool it commits.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutil"))]
     pub fn fs(&self) -> &Arc<FileSystem<D>> {
         &self.fs
     }
@@ -1108,13 +1124,13 @@ impl<D: BlockDevice> Committer<D> {
 // ---- writers talking to a committer ----
 
 /// A writer's sink for a committer in the same process (tests).
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 pub struct DirectSink<D: BlockDevice> {
     pub committer: Arc<Committer<D>>,
     pub writer: LeaseRef,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testutil"))]
 #[async_trait]
 impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
     fn writer(&self) -> LeaseRef {
@@ -1333,7 +1349,3 @@ pub async fn run(
         monitor.abort();
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/multinode_tests.rs"]
-mod tests;

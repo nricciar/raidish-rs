@@ -242,7 +242,7 @@ impl Store {
     }
 }
 
-pub(crate) fn observe(fence: &dyn crate::types::FenceObserver, state: &ClusterState) {
+pub fn observe(fence: &dyn crate::types::FenceObserver, state: &ClusterState) {
     fence.observe_grants(
         state.pool_epoch(),
         &mut state.metaslabs.iter().map(|(&i, g)| (i, g.fence())),
