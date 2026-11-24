@@ -1,7 +1,75 @@
 [workspace]
-members = [".", "web"]
-default-members = ["."]
+members = [".", "crates/*", "web"]
+default-members = [".", "crates/*"]
 resolver = "3"
+
+# Versions shared by the workspace's crates (each crate picks its features).
+[workspace.dependencies]
+raidish-types = { path = "crates/raidish-types" }
+raidish-core = { path = "crates/raidish-core" }
+raidish-auth = { path = "crates/raidish-auth" }
+raidish-vm = { path = "crates/raidish-vm" }
+raidish-cluster = { path = "crates/raidish-cluster" }
+raidish-committer = { path = "crates/raidish-committer" }
+raidish-etcd = { path = "crates/raidish-etcd" }
+raidish-csi = { path = "crates/raidish-csi" }
+raidish-nfs = { path = "crates/raidish-nfs" }
+raidish-block = { path = "crates/raidish-block" }
+raidish-services = { path = "crates/raidish-services" }
+reed-solomon-simd = "3.1.0"
+tokio = "1"
+futures-util = "0.3"
+futures = "0.3"
+serde = { version = "1.0.216", features = ["derive"] }
+url = "2.5.8"
+bincode = "1"
+blake3 = "1.8.3"
+chrono = "0.4.43"
+async-trait = "0.1"
+dashmap = "6.1.0"
+crossbeam-queue = "0.3.12"
+web-time = "1.1"
+tokio-stream = "0.1.17"
+serde_json = "1.0.133"
+tokio-tungstenite = "0.28.0"
+tungstenite = "0.28"
+serde_yaml = "0.9"
+rocket = "0.5.1"
+ws = { package = "rocket_ws", version = "0.1.1" }
+openraft = "=0.9.26"
+reqwest = { version = "0.12", default-features = false }
+rustls = { version = "0.23", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false }
+rcgen = { version = "0.13", default-features = false }
+x509-parser = "0.16"
+ring = "0.17"
+base64 = "0.22"
+time = "0.3"
+clap = "4.5"
+term_size = "0.3.2"
+quick-xml = "0.37"
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+libc = "0.2"
+hyper = "1"
+hyper-util = "0.1"
+http-body-util = "0.1"
+bytes = "1"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+percent-encoding = "2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = "0.3"
+web-sys = "0.3"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+tempfile = "3.24.0"
 
 [package]
 name = "raidish"
@@ -16,74 +84,86 @@ path = "src/lib.rs"
 name = "raidish"
 path = "src/main.rs"
 
-# The storage core: builds natively and for wasm32 (the web dashboard).
+# What builds for wasm32 too (the web dashboard).
 [dependencies]
-reed-solomon-simd = "3.1.0"
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
-futures-util = "0.3"
-futures = "0.3"
-serde = { version = "1.0.216", features = ["derive"] }
-url = "2.5.8"
-bincode = "1"
-blake3 = "1.8.3"
-chrono = "0.4.43"
-async-trait = "0.1"
-dashmap = "6.1.0"
-crossbeam-queue = "0.3.12"
-web-time = "1.1"
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-vm = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-committer = { workspace = true }
+raidish-etcd = { workspace = true }
+raidish-csi = { workspace = true }
+raidish-nfs = { workspace = true }
+raidish-block = { workspace = true }
+raidish-services = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+futures-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+url = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-queue = { workspace = true }
+web-time = { workspace = true }
 
 # Servers, cluster and the command line.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process"] }
-tokio-stream = { version = "0.1.17", features = ["io-util", "net"] }
-serde_json = { version = "1.0.133", features = ["raw_value"] }
-tokio-tungstenite = { version = "0.28.0", features = ["__rustls-tls"] }
-tungstenite = "0.28"
-serde_yaml = "0.9"
-rocket = { version = "0.5.1", features = ["json", "uuid", "tls", "mtls"] }
-ws = { package = "rocket_ws", version = "0.1.1" }
-openraft = { version = "=0.9.26", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots", "stream"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
-x509-parser = "0.16"
-ring = "0.17"
-base64 = "0.22"
-time = "0.3"
-clap = { version = "4.5", features = ["derive", "color"] }
-term_size = "0.3.2"
-quick-xml = "0.37"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process"] }
+tokio-stream = { workspace = true, features = ["io-util", "net"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
+tungstenite = { workspace = true }
+serde_yaml = { workspace = true }
+rocket = { workspace = true, features = ["json", "uuid", "tls", "mtls"] }
+ws = { workspace = true }
+openraft = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
+rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
+rcgen = { workspace = true, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+clap = { workspace = true, features = ["derive", "color"] }
+term_size = { workspace = true }
+quick-xml = { workspace = true }
 # The etcd v3 API (see `crate::etcd`).
-tonic = "0.12"
-prost = "0.13"
-prost-types = "0.13"
-libc = "0.2"
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+libc = { workspace = true }
 # The S3 and SQS endpoints (see `crate::s3`, `crate::sqs`).
-hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
-http-body-util = "0.1"
-bytes = "1"
-hmac = "0.12"
-sha2 = "0.10"
-md-5 = "0.10"
-sha1 = "0.10"
-hex = "0.4"
-percent-encoding = "2"
+hyper = { workspace = true, features = ["server", "client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+percent-encoding = { workspace = true }
 
 # The browser disk backend (websocket via web-sys).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-gloo-timers = { version = "0.3", features = ["futures"] }
-chrono = { version = "0.4.43", features = ["wasmbind"] }
-web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
-
-[build-dependencies]
-tonic-build = "0.12"
-protoc-bin-vendored = "3"
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+gloo-timers = { workspace = true, features = ["futures"] }
+chrono = { workspace = true, features = ["wasmbind"] }
+web-sys = { workspace = true, features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
 
 [dev-dependencies]
-tempfile = "3.24.0"
-tokio = { version = "1", features = ["test-util"] }
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+raidish-vm = { workspace = true, features = ["testutil"] }
+raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-committer = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

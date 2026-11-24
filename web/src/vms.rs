@@ -247,7 +247,7 @@ pub fn state(vm: &VmView) -> (&'static str, String, Option<String>) {
             vm.spec.disks.error().map(str::to_string),
         )
     } else if let Some(s) = &vm.state {
-        let running = *s == raidish::vm_def::DomState::Running;
+        let running = *s == raidish_types::vm_def::DomState::Running;
         if !vm.want_running && running {
             return (
                 "warn",

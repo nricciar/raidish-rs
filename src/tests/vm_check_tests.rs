@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::node_facts::{CpuFacts, HostFacts, LibvirtFacts, PeerFacts, Probe};
+use crate::vm::judged_domain;
 
 const VM: &str = "<domain type='kvm'><name>v</name>
   <memory unit='MiB'>512</memory>

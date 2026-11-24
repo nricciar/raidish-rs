@@ -3,8 +3,9 @@
 //!
 //! Writes `$OUT_DIR/ui_assets.rs`: a table of `(path, mime, bytes)`. It is
 //! empty (the server then serves `web/dist` from disk, if present) for
-//! debug builds, wasm builds of this crate (that's trunk building the
-//! dashboard, which depends on us) and when `RAIDISH_SKIP_UI` is set.
+//! debug builds, wasm builds of this crate and when `RAIDISH_SKIP_UI` is
+//! set. (The dashboard itself builds on `raidish-types` and
+//! `raidish-core`, not on this crate.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,28 +17,6 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target = std::env::var("TARGET").unwrap_or_default();
     let profile = std::env::var("PROFILE").unwrap_or_default();
-
-    // The etcd v3 API's gRPC code (native builds: the servers).
-    if !target.starts_with("wasm32") {
-        println!("cargo:rerun-if-changed=proto");
-        // A protoc of our own: nothing to install.
-        let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
-        // SAFETY: build scripts are single threaded.
-        unsafe { std::env::set_var("PROTOC", protoc) };
-        tonic_build::configure()
-            .build_client(true)
-            .build_server(true)
-            .compile_protos(&["proto/etcd/api/etcdserverpb/rpc.proto"], &["proto"])
-            .expect("compiling the etcd protos");
-        // The Container Storage Interface (`raidish csi`, see `crate::csi`):
-        // servers only, kubelet and the sidecars are the clients.
-        let wkt = protoc_bin_vendored::include_path().expect("vendored protobuf includes");
-        tonic_build::configure()
-            .build_client(false)
-            .build_server(true)
-            .compile_protos(&["proto/csi/csi.proto"], &[PathBuf::from("proto"), wkt])
-            .expect("compiling the CSI proto");
-    }
 
     let bundle = !target.starts_with("wasm32")
         && profile == "release"
@@ -55,7 +34,9 @@ fn main() {
         "web/Trunk.toml",
         "web/Cargo.toml",
         "web/novnc",
-        "src",
+        // What the dashboard builds on.
+        "crates/raidish-types",
+        "crates/raidish-core",
     ] {
         println!("cargo:rerun-if-changed={}", manifest.join(dir).display());
     }

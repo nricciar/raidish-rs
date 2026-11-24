@@ -1,12 +1,20 @@
 //! Several writers on one pool: a committer and volume writers, in process.
 
-use super::*;
+use crate::cluster::LeaseOp;
 use crate::cluster::state::Response;
+use crate::cluster::state::{ClusterState, POOL};
+use crate::committer::*;
 use crate::fence::FenceMap;
+use crate::fs::{FileSystem, FileSystemError};
 use crate::test_util::{TestDiskServer, TestPool};
 use crate::types::Txg;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep};
 use crate::vdev::Pool;
+use crate::writer::{
+    CommitError, CommitSink, Committed, DatasetCommit, FsCommit, FsCommitted, LentMetaslab,
+};
+use async_trait::async_trait;
+use std::sync::Arc;
 
 const MB: usize = 1024 * 1024;
 

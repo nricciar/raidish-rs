@@ -1,18 +1,18 @@
 //! `GET /api/v1/cluster/status` (the same answer `raidish cluster status`
 //! prints).
 
-pub use raidish::cluster::state::Lease;
+pub use raidish_types::cluster_state::Lease;
 
 /// The cluster's status, and when we got it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Status {
-    pub answer: raidish::cluster::Status,
+    pub answer: raidish_types::cluster_state::Status,
     /// Our clock when the answer arrived.
     pub fetched_ms: f64,
 }
 
 impl std::ops::Deref for Status {
-    type Target = raidish::cluster::Status;
+    type Target = raidish_types::cluster_state::Status;
     fn deref(&self) -> &Self::Target {
         &self.answer
     }

@@ -1,0 +1,23 @@
+[package]
+name = "raidish-block"
+version = "0.1.0"
+edition = "2024"
+description = "RAIDish block exports: volume I/O, NBD, NVMe/TCP and peer I/O between nodes."
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+blake3 = { workspace = true }
+rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

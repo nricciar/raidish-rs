@@ -54,67 +54,24 @@ pub use crate::api_types::{
     CertSummary, CpuFacts, HostFacts, LibvirtFacts, NodeFacts, PeerFacts, Probe,
 };
 
-impl Probe {
-    fn ok(cert: Option<CertSummary>) -> Probe {
-        Probe {
-            ok: true,
-            checked_at: crate::cluster::now_ms(),
-            cert,
-            ..Default::default()
-        }
-    }
-    fn fail(error: impl Into<String>, hint: impl Into<String>) -> Probe {
-        Probe {
-            ok: false,
-            checked_at: crate::cluster::now_ms(),
-            error: Some(error.into()),
-            hint: Some(hint.into()).filter(|h: &String| !h.is_empty()),
-            cert: None,
-        }
-    }
-    /// "ok", or the error and hint.
-    pub fn describe(&self) -> String {
-        if self.ok {
-            return "ok".into();
-        }
-        let mut s = self.error.clone().unwrap_or_else(|| "failed".into());
-        if let Some(h) = &self.hint {
-            s.push_str(" (");
-            s.push_str(h);
-            s.push(')');
-        }
-        s
+/// A probe that worked.
+fn probe_ok(cert: Option<CertSummary>) -> Probe {
+    Probe {
+        ok: true,
+        checked_at: crate::cluster::now_ms(),
+        cert,
+        ..Default::default()
     }
 }
-
-impl NodeFacts {
-    /// The same facts, timestamps aside.
-    pub fn same_as(&self, other: &NodeFacts) -> bool {
-        fn strip(f: &NodeFacts) -> NodeFacts {
-            let mut f = f.clone();
-            f.collected_at = 0;
-            for p in f.peers.values_mut() {
-                for pr in [&mut p.libvirt, &mut p.peer_io].into_iter().flatten() {
-                    pr.checked_at = 0;
-                }
-            }
-            f
-        }
-        strip(self) == strip(other)
+/// A probe that failed, and what to do about it.
+fn probe_fail(error: impl Into<String>, hint: impl Into<String>) -> Probe {
+    Probe {
+        ok: false,
+        checked_at: crate::cluster::now_ms(),
+        error: Some(error.into()),
+        hint: Some(hint.into()).filter(|h: &String| !h.is_empty()),
+        cert: None,
     }
-
-    /// The qemu version as numbers, for comparing.
-    pub fn qemu_version(&self) -> Option<Vec<u64>> {
-        version_nums(&self.libvirt.as_ref()?.qemu_version)
-    }
-}
-
-pub fn version_nums(v: &str) -> Option<Vec<u64>> {
-    let n: Vec<u64> = v
-        .split('.')
-        .map(|p| p.trim().parse().ok())
-        .collect::<Option<_>>()?;
-    (!n.is_empty()).then_some(n)
 }
 
 // ---- parsing (what the host and virsh say) ------------------------------
@@ -380,7 +337,7 @@ pub async fn probe_tls(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            return Probe::fail(
+            return probe_fail(
                 format!("nothing listens on {}", addr),
                 format!(
                     "on {}: enable libvirt's TLS socket (systemctl stop libvirtd.service; \
@@ -391,13 +348,13 @@ pub async fn probe_tls(
             );
         }
         Ok(Err(e)) => {
-            return Probe::fail(
+            return probe_fail(
                 format!("{}: {}", addr, e),
                 "check the network or firewall between the nodes",
             );
         }
         Err(_) => {
-            return Probe::fail(
+            return probe_fail(
                 format!("{} doesn't answer", addr),
                 "a firewall dropping it? libvirt's TLS port must be open between the nodes",
             );
@@ -410,7 +367,7 @@ pub async fn probe_tls(
     }
     let inner = match rustls::client::WebPkiServerVerifier::builder(Arc::new(store)).build() {
         Ok(v) => v,
-        Err(e) => return Probe::fail(format!("the cluster CA: {}", e), ""),
+        Err(e) => return probe_fail(format!("the cluster CA: {}", e), ""),
     };
     let capture = Arc::new(Capture {
         inner,
@@ -422,7 +379,7 @@ pub async fn probe_tls(
         .with_no_client_auth();
     let name = match ServerName::try_from(host.to_string()) {
         Ok(n) => n,
-        Err(e) => return Probe::fail(format!("'{}': {}", host, e), ""),
+        Err(e) => return probe_fail(format!("'{}': {}", host, e), ""),
     };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let handshake = tokio::time::timeout(PROBE_TIMEOUT, connector.connect(name, tcp)).await;
@@ -433,7 +390,7 @@ pub async fn probe_tls(
             Err(_) => "timed out".into(),
             Ok(Ok(_)) => "no certificate".into(),
         };
-        return Probe::fail(
+        return probe_fail(
             format!("no TLS from {}: {}", addr, why),
             format!("is libvirt's TLS socket what listens on {}?", addr),
         );
@@ -455,7 +412,7 @@ pub async fn probe_tls(
         cn, san, node
     );
     let mut p = match verified {
-        Ok(()) => Probe::ok(cert.clone()),
+        Ok(()) => probe_ok(cert.clone()),
         Err(e) => {
             let hint = if e.contains("UnknownIssuer") || e.contains("BadSignature") {
                 format!("not signed by this cluster's CA: {}", reissue)
@@ -468,13 +425,13 @@ pub async fn probe_tls(
             } else {
                 reissue.clone()
             };
-            Probe::fail(format!("{}'s libvirt certificate: {}", node, e), hint)
+            probe_fail(format!("{}'s libvirt certificate: {}", node, e), hint)
         }
     };
     if p.ok {
         if let Some(c) = &cert {
             if c.ou.as_deref() != Some("libvirt") {
-                p = Probe::fail(
+                p = probe_fail(
                     format!(
                         "{}'s libvirt certificate isn't a raidish libvirt certificate (OU {:?})",
                         node,
@@ -521,7 +478,7 @@ pub async fn probe_virsh(node: &str, host: &str, bin: &str) -> Result<(), Probe>
             } else {
                 String::new()
             };
-            Err(Probe::fail(format!("virsh -c {}: {}", v.uri, e), hint))
+            Err(probe_fail(format!("virsh -c {}: {}", v.uri, e), hint))
         }
     }
 }
@@ -550,9 +507,9 @@ pub async fn probe_libvirt(
 pub async fn probe_port(host: &str, port: u16, what: &str) -> Probe {
     let addr = format!("{}:{}", host, port);
     match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(_)) => Probe::ok(None),
-        Ok(Err(e)) => Probe::fail(format!("{} ({}): {}", what, addr, e), ""),
-        Err(_) => Probe::fail(
+        Ok(Ok(_)) => probe_ok(None),
+        Ok(Err(e)) => probe_fail(format!("{} ({}): {}", what, addr, e), ""),
+        Err(_) => probe_fail(
             format!("{} ({}) doesn't answer", what, addr),
             "a firewall between the nodes?",
         ),
@@ -676,7 +633,7 @@ impl Collector {
             Some(async move {
                 let libvirt = match &self.vm {
                     Some(vm) => Some(if self.roots.is_empty() {
-                        Probe::fail(
+                        probe_fail(
                             "no tls: here (no cluster CA to check against)",
                             "add `tls:` to this node's config",
                         )

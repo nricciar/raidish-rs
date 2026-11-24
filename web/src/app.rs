@@ -9,7 +9,7 @@ use crate::vm_page::VmPage;
 use crate::vms::Vms;
 use crate::volumes::Volumes;
 use gloo_timers::callback::Interval;
-use raidish::disk::IoStats;
+use raidish_core::disk::IoStats;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;

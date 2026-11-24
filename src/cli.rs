@@ -12,7 +12,7 @@ use crate::types::{DatasetName, SnapshotRef};
 use crate::vdev::Topology;
 use crate::volume::VolumeInfo;
 use crate::writer::CommitError;
-use crate::{cluster, fs, nbd, nvme, scan};
+use crate::{cluster, fs, nbd, nvme};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::{path::Path, path::PathBuf};
@@ -495,6 +495,8 @@ pub async fn main() -> std::io::Result<()> {
     }
     let config = load_config(&cli.config)?;
     crate::tls::init(config.tls.as_ref()).unwrap_or_else(|e| fail(e));
+    // The storage core's remote disks speak the same TLS.
+    let _ = crate::disk::ws::set_tls_client(crate::tls::client());
     if let Ok(Some(spec)) = config.pool_spec() {
         crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
     }
@@ -671,12 +673,12 @@ pub async fn main() -> std::io::Result<()> {
     match cli.command {
         Commands::Nbd { name, size: _ } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
+            crate::committer::health::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             nbd::serve_nbd(fs, name, nbd::NBD_PORT).await.unwrap();
         }
         Commands::Nvme { name } => {
             let fs = Arc::new(open_fs(raid, false, rewind).await);
-            scan::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
+            crate::committer::health::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             let server = nvme::NvmeTcpServer::new(fs, name, nvme::NVME_PORT)
                 .await
                 .unwrap();
@@ -1356,7 +1358,11 @@ async fn via_committer(
             let writer = VolumeWriter::start(endpoints, spec, opts, name, command.describe())
                 .await
                 .unwrap_or_else(|e| fail(e));
-            scan::spawn_health_monitor(writer.fs.clone(), HEALTH_INTERVAL, None);
+            crate::committer::health::spawn_health_monitor(
+                writer.fs.clone(),
+                HEALTH_INTERVAL,
+                None,
+            );
             if let Commands::Nbd { .. } = command {
                 nbd::serve_nbd(writer.fs.clone(), name.clone(), nbd::NBD_PORT)
                     .await

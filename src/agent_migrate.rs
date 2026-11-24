@@ -108,7 +108,7 @@ pub(super) fn whereabouts(here: Option<bool>, there: Option<bool>) -> Whereabout
 /// Does the node at `url` run VM `name` (`GET /api/v1/vm/local`)? None: it
 /// couldn't be asked, or couldn't ask its libvirt.
 pub(super) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) -> Option<bool> {
-    let view: crate::vms_api::LocalView = http
+    let view: crate::vm::LocalView = http
         .get(format!("{}/api/v1/vm/local", url))
         .send()
         .await

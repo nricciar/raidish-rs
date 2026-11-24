@@ -4,7 +4,7 @@
 
 use crate::fmt;
 use crate::session::{LayoutData, Shared};
-use raidish::inspect::{BlockKind, Bucket};
+use raidish_core::inspect::{BlockKind, Bucket};
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
 use yew::prelude::*;

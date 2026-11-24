@@ -1,8 +1,12 @@
-use super::lease::{HeldLease, LeaseClient};
-use super::state::{ClusterState, LeaseOp, POOL, Request, Response};
-use super::*;
+use crate::cluster::lease::{HeldLease, LeaseClient};
+use crate::cluster::state::{ClusterState, LeaseOp, POOL, Request, Response};
+use crate::cluster::*;
 use crate::test_util::wait_until;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep, ms};
+use openraft::BasicNode;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn acquire(owner: &str, now_ms: u64, ttl_ms: u64) -> Request {
     LeaseOp::Acquire {
@@ -28,7 +32,7 @@ fn renew(owner: &str, epoch: Epoch, now_ms: u64, ttl_ms: u64) -> Request {
 /// replay), nor wrap into a lease that never expires.
 #[test]
 fn a_huge_ttl_is_clamped() {
-    use super::state::MAX_LEASE_TTL_MS;
+    use crate::cluster::state::MAX_LEASE_TTL_MS;
     let mut s = ClusterState::default();
     let now = 1_000;
     let Response::Granted { epoch, expires_ms } = s.apply(&acquire("a", now, u64::MAX)) else {
@@ -169,7 +173,7 @@ fn epochs_increase_across_resources() {
 
 // ---- membership from the pool config ----
 
-use super::members::{Members, derive, is_local_base};
+use crate::cluster::members::{Members, derive, is_local_base};
 
 fn urls(ports: &[u16]) -> Vec<String> {
     ports
@@ -674,7 +678,7 @@ fn lend(
 
 #[test]
 fn metaslab_lend_and_return() {
-    use super::state::Domain;
+    use crate::cluster::state::Domain;
     let mut s = ClusterState::default();
     s.apply(&acquire("c", 0, 1000)); // committer: epoch 1
     let w = LeaseOp::Acquire {
@@ -751,7 +755,7 @@ fn metaslab_lend_and_return() {
 /// NFSv4 client records are written only by the `nfs4` lease holder.
 #[test]
 fn nfs_client_records_are_fenced_by_the_nfs4_lease() {
-    use super::state::NFS4;
+    use crate::cluster::state::NFS4;
     let mut s = ClusterState::default();
     let grant = s.apply(
         &LeaseOp::Acquire {
@@ -1186,7 +1190,7 @@ async fn lease_calls_move_to_the_node_that_answers() {
 /// one of another version (or from before versions) isn't opened.
 #[test]
 fn raft_data_of_another_version_is_refused() {
-    use super::store::Store;
+    use crate::cluster::store::Store;
     let fence = || Arc::new(crate::fence::ServerFence::default());
     let dir = tempfile::tempdir().unwrap();
     let fresh = dir.path().join("fresh");

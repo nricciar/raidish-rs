@@ -6,7 +6,7 @@ use crate::inspect::PoolMap;
 use rocket::http::{ContentType, Header, Status};
 use rocket::response::{self, Responder, Response};
 use rocket::serde::json::Json;
-use rocket::{Request, State};
+use rocket::{Request, State, get, routes};
 use std::io::Cursor;
 use std::path::PathBuf;
 

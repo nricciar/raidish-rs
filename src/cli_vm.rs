@@ -1,6 +1,5 @@
 //! `raidish vm ...`: VMs through any `listen` node's API (see `crate::vms_api`).
 
-use crate::vm::VmSpec;
 use crate::vms_api::VmView;
 use clap::Subcommand;
 use std::time::Duration;
@@ -137,7 +136,7 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
             crate::types::VmName::try_from(name.as_str()).map_err(|e| e.to_string())?;
 
             let body = std::fs::read_to_string(xml).map_err(|e| format!("{}: {}", xml, e))?;
-            let spec = VmSpec::parse(name, &body, 0);
+            let spec = crate::vm::parse_spec(name, &body, 0);
             if let Some(e) = spec.error() {
                 return Err(e.to_string());
             }

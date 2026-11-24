@@ -1,0 +1,49 @@
+[package]
+name = "raidish-services"
+version = "0.1.0"
+edition = "2024"
+description = "RAIDish network services: S3, SQS, SigV4, and the frontend serving them and etcd."
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-committer = { workspace = true }
+raidish-etcd = { workspace = true }
+raidish-vm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+tokio-stream = { workspace = true, features = ["io-util", "net"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
+rocket = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
+tonic = { workspace = true }
+hyper = { workspace = true, features = ["server", "client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+percent-encoding = { workspace = true }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-committer = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

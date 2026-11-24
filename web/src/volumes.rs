@@ -62,15 +62,15 @@ pub struct Volumes {
     _timer: Interval,
 }
 
-/// The server's rules (`raidish::types`), checked before asking.
+/// The server's rules (`raidish_types::types`), checked before asking.
 fn check_name(name: &str, what: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
         return Err(format!("a {} name is needed", what));
     }
     let checked = match what {
-        "snapshot" => raidish::types::SnapshotName::try_from(n).map(drop),
-        _ => raidish::types::DatasetName::user(n).map(drop),
+        "snapshot" => raidish_types::types::SnapshotName::try_from(n).map(drop),
+        _ => raidish_types::types::DatasetName::user(n).map(drop),
     };
     checked.map_err(|e| e.to_string())?;
     Ok(n.to_string())
@@ -181,7 +181,7 @@ impl Component for Volumes {
                                 .collect();
                             let automount = match get("automount").as_str() {
                                 "" => None,
-                                t => Some(t.parse::<raidish::inode::Transport>()?),
+                                t => Some(t.parse::<raidish_core::inode::Transport>()?),
                             };
                             let move_to =
                                 Some(get("move_to").trim().to_string()).filter(|s| !s.is_empty());
@@ -382,7 +382,7 @@ impl Volumes {
         let lease = c
             .state
             .leases
-            .get(&raidish::types::LeaseResource::dataset(name))?;
+            .get(&raidish_types::types::LeaseResource::dataset(name))?;
         (!lease.released && c.remaining_ms(lease, now_ms()) > 0.0).then(|| {
             lease
                 .holder

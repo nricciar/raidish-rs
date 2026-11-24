@@ -18,10 +18,8 @@
 
 use crate::cluster::ClusterConfig;
 use crate::disk::DiskOptions;
-use crate::disks::DiskSet;
-use crate::vdev::{Pool, Topology};
+use crate::vdev::Topology;
 use serde::Deserialize;
-use std::sync::Arc;
 
 #[derive(Deserialize, Debug, Default)]
 pub struct Config {
@@ -75,42 +73,7 @@ pub enum StripeMember {
     Vdev(VdevConfig),
 }
 
-/// A pool layout with its disks numbered: `topology` refers to `paths` by index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolSpec {
-    pub paths: Vec<String>,
-    pub topology: Topology,
-}
-
-impl PoolSpec {
-    /// Open the disks and build the pool.
-    pub async fn open(&self, opts: DiskOptions) -> Pool {
-        self.open_fenced(opts, Default::default()).await
-    }
-
-    /// `open`, its requests carrying `fence`'s epochs from the first.
-    pub async fn open_fenced(
-        &self,
-        opts: DiskOptions,
-        fence: Arc<crate::fence::ClientFence>,
-    ) -> Pool {
-        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
-        let disks = Arc::new(DiskSet::new_fenced(&paths, opts, fence).await);
-        self.on(disks)
-    }
-
-    /// `open`, sharing the disks already open in `open` (by path) instead
-    /// of opening them again: a locked local file can't be opened twice.
-    pub async fn open_sharing(&self, opts: DiskOptions, open: &DiskSet) -> Pool {
-        let paths: Vec<&str> = self.paths.iter().map(|s| s.as_str()).collect();
-        self.on(Arc::new(DiskSet::new_sharing(&paths, opts, open).await))
-    }
-
-    /// Build the pool over already opened `disks` (in `paths` order).
-    pub fn on(&self, disks: Arc<DiskSet>) -> Pool {
-        Pool::new(disks, self.topology.clone()).expect("validated topology")
-    }
-}
+pub use crate::vdev::PoolSpec;
 
 impl VdevConfig {
     pub fn to_spec(&self) -> Result<PoolSpec, String> {
@@ -279,21 +242,7 @@ impl Config {
     }
 }
 
-/// `http://host:port` of the `listen` node serving a remote disk path
-/// (`http://host:port/api/v1/disks/N`, or `ws://`), None for local paths.
-pub fn disk_server_base(path: &str) -> Option<String> {
-    let url = url::Url::parse(path).ok()?;
-    let scheme = match url.scheme() {
-        "http" | "ws" => "http",
-        "https" | "wss" => "https",
-        _ => return None,
-    };
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(p) => format!("{}://{}:{}", scheme, host, p),
-        None => format!("{}://{}", scheme, host),
-    })
-}
+pub use crate::net::disk_server_base;
 
 #[cfg(test)]
 #[path = "tests/config_tests.rs"]

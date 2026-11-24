@@ -25,13 +25,19 @@ use crate::inode::{DatasetProps, Transport};
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
 use crate::types::{Holder, HolderRole, LeaseResource};
+use crate::vm_store::DefSpec;
 use crate::volume::VolumeInfo;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// This node's writer, once the agent has one.
+pub type WriterSlot = std::sync::Arc<
+    std::sync::RwLock<Option<std::sync::Arc<crate::fs::FileSystem<crate::vdev::Pool>>>>,
+>;
 
 /// How often the agent looks at what should run where.
 pub const TICK: Duration = Duration::from_secs(2);
@@ -162,81 +168,7 @@ pub fn place_on(
     }
 }
 
-/// A volume this agent runs, as reported by its status.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct RunningVolume {
-    pub name: String,
-    pub transport: Transport,
-    /// Its kernel device here.
-    pub attach: Attach,
-    /// Exported here but written by another node (see `handoff`).
-    #[serde(default)]
-    pub proxied: bool,
-}
-
-/// A running volume's kernel device on its node.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase", tag = "state")]
-pub enum Attach {
-    /// Exported only: no device wanted (a VM's disk), or the agent attaches
-    /// none (`automount.helper` is none).
-    #[default]
-    Exported,
-    Attached {
-        device: String,
-    },
-    /// Attaching failed (helper missing, a kernel module, ...): it's tried
-    /// again.
-    Failed {
-        error: String,
-    },
-}
-
-impl Attach {
-    /// What an attach (see `Agent::attach`) came to.
-    pub fn of(r: Result<Option<String>, String>) -> Self {
-        match r {
-            Ok(Some(device)) => Attach::Attached { device },
-            Ok(None) => Attach::Exported,
-            Err(error) => Attach::Failed { error },
-        }
-    }
-
-    /// From a proxied export's device, if it has one.
-    pub fn device_of(device: Option<String>) -> Self {
-        device.map_or(Attach::Exported, |device| Attach::Attached { device })
-    }
-
-    pub fn device(&self) -> Option<&str> {
-        match self {
-            Attach::Attached { device } => Some(device),
-            _ => None,
-        }
-    }
-
-    pub fn error(&self) -> Option<&str> {
-        match self {
-            Attach::Failed { error } => Some(error),
-            _ => None,
-        }
-    }
-
-    /// " on <device>", if attached: for messages.
-    fn on(&self) -> String {
-        self.device()
-            .map(|d| format!(" on {}", d))
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct AgentStatus {
-    pub node: String,
-    pub volumes: Vec<RunningVolume>,
-    /// Why VMs that should run here don't (as of the last tick).
-    #[serde(default)]
-    pub vm_errors: BTreeMap<String, String>,
-}
+pub use crate::api_types::{AgentStatus, Attach, RunningVolume};
 
 pub type AgentState = Arc<std::sync::RwLock<AgentStatus>>;
 
@@ -404,7 +336,7 @@ pub struct Agent {
     state: AgentState,
     writer: Option<NodeWriter>,
     /// Where this node's file API finds the writer.
-    files: crate::files_api::WriterSlot,
+    files: WriterSlot,
     running: BTreeMap<String, Running>,
     /// Running VMs here (None: this node runs none).
     vm: Option<Arc<crate::vm::VmRuntime>>,
@@ -463,7 +395,7 @@ impl Agent {
         access: PoolAccess,
         config: AutomountConfig,
         state: AgentState,
-        files: crate::files_api::WriterSlot,
+        files: WriterSlot,
     ) -> Self {
         // Leases and writers' commits go to the same nodes.
         let endpoints = committer.client.endpoints().to_vec();

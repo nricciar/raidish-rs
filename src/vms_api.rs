@@ -37,8 +37,8 @@ use crate::committer::PoolAdmin;
 use crate::committer::PutVm;
 use crate::committer::dataset_resource;
 use crate::events::{EventKind, Subject};
-use crate::vm::{LocalVm, VmRuntime, VmSpec};
-use crate::vm_store::VmDef;
+use crate::vm::{VmRuntime, VmSpec};
+use crate::vm_store::{DefSpec, VmDef};
 use crate::volumes_api::VolumesState;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
@@ -68,18 +68,7 @@ impl VmsState {
     }
 }
 
-/// What `GET /api/v1/vm/local` answers.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct LocalView {
-    pub node: String,
-    /// Does this node run VMs at all (a `vm:` config section)?
-    pub enabled: bool,
-    pub vms: Vec<LocalVm>,
-    /// Why VMs that should run here don't.
-    pub errors: BTreeMap<String, String>,
-    /// libvirt couldn't be asked.
-    pub error: Option<String>,
-}
+pub use crate::vm::LocalView;
 
 /// The node holding VM `spec`'s anchor volume (where it runs, or would).
 fn vm_node(cluster: &Cluster, spec: &VmSpec) -> Option<String> {

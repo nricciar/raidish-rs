@@ -1,14 +1,18 @@
 //! Dataset intent logs: flushes acknowledged without the committer, replayed
 //! after the writer goes away.
 
-use super::*;
 use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset_resource};
+use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::fs::{FileSystem, FileSystemError};
 use crate::test_util::TestPool;
 use crate::types::Txg;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx};
 use crate::vdev::Pool;
+use crate::zil::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MB: usize = 1024 * 1024;
@@ -382,12 +386,7 @@ async fn replay_stops_at_the_end_of_the_log() {
     // Leftovers past the last record: a record from another log (wrong
     // guid), then garbage.
     let c = cursor(&w.fs).await.unwrap();
-    let foreign = encode(
-        c.region.guid ^ 1,
-        c.seq,
-        &[Entry::Data(0, pattern(48 * 1024, 9))],
-    )
-    .unwrap();
+    let foreign = encode_data_record(c.region.guid ^ 1, c.seq, 0, pattern(48 * 1024, 9)).unwrap();
     w.fs.write_record_blocks(c.region.start + c.used, &foreign)
         .await
         .unwrap();
@@ -1170,27 +1169,6 @@ async fn committed_kv_operations_leave_the_queue() {
     // A delete of nothing changes nothing, so it queues nothing.
     fs.kv_delete("k", b"absent").await.unwrap();
     assert!(ds.obj.dirty.lock().unwrap().ops.is_empty());
-}
-
-#[test]
-fn restored_operations_go_back_ahead_of_newer_ones() {
-    use crate::object::DirtyState;
-    let op = |k: &str| KeyedOp::Delete(k.as_bytes().to_vec());
-    let mut d = DirtyState {
-        ops: vec![(0, op("a")), (1, op("b"))],
-        next_op: 2,
-        ..Default::default()
-    };
-    let taken = std::mem::take(&mut d.ops);
-    d.ops.push((2, op("c")));
-    d.next_op = 3;
-    d.restore_unlogged(BTreeMap::new(), taken.clone());
-    assert_eq!(d.ops, vec![(0, op("a")), (1, op("b")), (2, op("c"))]);
-    // Committed meanwhile: not put back.
-    let taken = std::mem::take(&mut d.ops);
-    d.ops_synced = 2;
-    d.restore_unlogged(BTreeMap::new(), taken);
-    assert_eq!(d.ops, vec![(2, op("c"))]);
 }
 
 #[tokio::test]

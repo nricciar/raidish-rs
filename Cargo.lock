@@ -2429,10 +2429,19 @@ dependencies = [
  "percent-encoding",
  "prost",
  "prost-types",
- "protoc-bin-vendored",
  "quick-xml",
+ "raidish-auth",
+ "raidish-block",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-csi",
+ "raidish-etcd",
+ "raidish-nfs",
+ "raidish-services",
+ "raidish-types",
+ "raidish-vm",
  "rcgen",
- "reed-solomon-simd",
  "reqwest",
  "ring",
  "rocket",
@@ -2451,7 +2460,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
  "tonic",
- "tonic-build",
  "tungstenite 0.28.0",
  "url",
  "wasm-bindgen",
@@ -2462,6 +2470,238 @@ dependencies = [
 ]
 
 [[package]]
+name = "raidish-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "raidish-types",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rocket",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-tungstenite 0.28.0",
+ "url",
+ "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "raidish-block"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "raidish-auth",
+ "raidish-core",
+ "raidish-types",
+ "rustls 0.23.46",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.6",
+]
+
+[[package]]
+name = "raidish-cluster"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "hex",
+ "openraft",
+ "raidish-auth",
+ "raidish-types",
+ "reqwest",
+ "ring",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "raidish-committer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-core",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "raidish-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "crossbeam-queue",
+ "dashmap",
+ "futures",
+ "futures-util",
+ "gloo-timers",
+ "js-sys",
+ "libc",
+ "raidish-types",
+ "reed-solomon-simd",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "term_size",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tungstenite 0.28.0",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+]
+
+[[package]]
+name = "raidish-csi"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "raidish-etcd"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "prost",
+ "protoc-bin-vendored",
+ "raidish-core",
+ "raidish-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "raidish-nfs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-types",
+ "reqwest",
+ "rocket",
+ "serde",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "raidish-services"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "md-5",
+ "percent-encoding",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-etcd",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "ring",
+ "rocket",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "raidish-types"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "web-time",
+]
+
+[[package]]
+name = "raidish-vm"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "raidish-core",
+ "raidish-types",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "raidish-web"
 version = "0.1.0"
 dependencies = [
@@ -2469,7 +2709,8 @@ dependencies = [
  "gloo-net 0.7.0",
  "gloo-timers",
  "js-sys",
- "raidish",
+ "raidish-core",
+ "raidish-types",
  "serde",
  "serde_json",
  "wasm-bindgen",

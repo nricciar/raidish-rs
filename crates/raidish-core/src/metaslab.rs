@@ -1,0 +1,1006 @@
+//! Metaslab allocator.
+//!
+//! Allocation and freeing are purely in-memory operations; nothing touches the
+//! disk until the transaction group (TXG) is synced by `commit_txg`.
+//!
+//! On-disk, every metaslab owns two fixed-size space map *slots* (A/B). When a
+//! TXG is synced, each dirty metaslab serializes its complete state into its
+//! *inactive* slot, tagging every block with the new TXG, before the uberblock
+//! for that TXG is written. On load, the valid slot with the highest TXG that is
+//! `<=` the committed uberblock TXG wins, so a torn or uncommitted slot write is
+//! never observed.
+//!
+//! The slot payload is two bitmaps, one bit per block in the metaslab:
+//! `allocated` followed by `deferred` (freed, but not yet reusable). Bitmaps
+//! have a fixed size, so a heavily fragmented metaslab can never overflow its
+//! slot.
+//!
+//! Frees are deferred for `TXG_DEFER_SIZE` TXGs before the space becomes
+//! allocatable again, so the previous uberblocks in the ring never reference
+//! blocks that have since been overwritten (every one of them is a safe
+//! rewind target, see `fs::Rewind`).
+
+use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::fs::{
+    BLOCK_HEADER_SIZE as BLOCK_HEADER, BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock,
+};
+use crate::inode::Extent;
+use crate::types::MetaslabIdx;
+use crate::types::Txg;
+use std::collections::{BTreeMap, VecDeque};
+
+/// Number of TXGs a freed block waits before it can be reallocated: one
+/// less than the uberblock ring, so every older uberblock stays intact.
+pub const TXG_DEFER_SIZE: u64 = crate::fs::UBERBLOCK_SLOTS - 1;
+/// Number of space map slots per metaslab (A/B).
+pub const SPACEMAP_SLOTS: u64 = 2;
+/// Bounds on metaslab size, in blocks (rounded down to the pool's alignment).
+pub const METASLAB_MIN_BLOCKS: u64 = 1026;
+pub const METASLAB_MAX_BLOCKS: u64 = 262_143;
+/// Aim for roughly this many metaslabs per pool.
+pub const METASLAB_TARGET_COUNT: u64 = 128;
+
+fn align_up(v: u64, align: u64) -> u64 {
+    v.div_ceil(align) * align
+}
+
+fn align_down(v: u64, align: u64) -> u64 {
+    (v / align) * align
+}
+
+/// Deterministic placement of space map slots and metaslabs on the device.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetaslabLayout {
+    pub metaslab_count: u64,
+    pub metaslab_size_blocks: u64,
+    pub spacemap_start: u64,
+    pub spacemap_slot_blocks: u64,
+    pub data_start: u64,
+    /// Allocation alignment in blocks (the pool's record alignment).
+    pub align: u64,
+}
+
+impl MetaslabLayout {
+    pub fn compute(total_blocks: u64, spacemap_start: u64, align: u64) -> Self {
+        assert!(
+            spacemap_start.is_multiple_of(align),
+            "spacemap region must be stripe aligned"
+        );
+
+        let size = align_down(
+            (total_blocks / METASLAB_TARGET_COUNT).clamp(METASLAB_MIN_BLOCKS, METASLAB_MAX_BLOCKS),
+            align,
+        );
+        let slot_blocks = Self::slot_blocks_for(size, align);
+        let per_metaslab = size + SPACEMAP_SLOTS * slot_blocks;
+        let metaslab_count = total_blocks.saturating_sub(spacemap_start) / per_metaslab;
+        let data_start = spacemap_start + metaslab_count * SPACEMAP_SLOTS * slot_blocks;
+
+        MetaslabLayout {
+            metaslab_count,
+            metaslab_size_blocks: size,
+            spacemap_start,
+            spacemap_slot_blocks: slot_blocks,
+            data_start,
+            align,
+        }
+    }
+
+    pub fn from_superblock(sb: &Superblock) -> Self {
+        MetaslabLayout {
+            metaslab_count: sb.metaslab_count,
+            metaslab_size_blocks: sb.metaslab_size_blocks,
+            spacemap_start: sb.spacemap_start,
+            spacemap_slot_blocks: sb.spacemap_slot_blocks,
+            data_start: sb.data_start,
+            align: sb.align,
+        }
+    }
+
+    fn bitmap_bytes(metaslab_size: u64) -> usize {
+        metaslab_size.div_ceil(8) as usize
+    }
+
+    fn slot_blocks_for(metaslab_size: u64, align: u64) -> u64 {
+        let bytes = 2 * Self::bitmap_bytes(metaslab_size) as u64;
+        align_up(bytes.div_ceil(BLOCK_PAYLOAD_SIZE as u64), align)
+    }
+
+    pub fn slot_lba(&self, ms_idx: usize, slot: u64) -> u64 {
+        self.spacemap_start + (ms_idx as u64 * SPACEMAP_SLOTS + slot) * self.spacemap_slot_blocks
+    }
+
+    pub fn metaslab_start(&self, ms_idx: usize) -> u64 {
+        self.data_start + ms_idx as u64 * self.metaslab_size_blocks
+    }
+
+    pub fn metaslab_for_block(&self, lba: u64) -> Option<MetaslabIdx> {
+        if lba < self.data_start {
+            return None;
+        }
+        let idx = (lba - self.data_start) / self.metaslab_size_blocks;
+        (idx < self.metaslab_count).then(|| MetaslabIdx::of_index(idx as usize))
+    }
+
+    /// Every metaslab of the pool, in order.
+    pub fn metaslabs(&self) -> impl Iterator<Item = MetaslabIdx> + use<> {
+        (0..self.metaslab_count as usize).map(MetaslabIdx::of_index)
+    }
+}
+
+#[derive(Debug)]
+pub struct MetaslabState {
+    pub start_block: u64,
+    pub block_count: u64,
+    /// Space that can be allocated right now.
+    pub free_extents: BTreeMap<u64, u64>,
+    /// Space freed during the currently open TXG.
+    pub freeing: Vec<Extent>,
+    /// Space freed in earlier TXGs, keyed by the committed TXG at which it
+    /// becomes allocatable again.
+    pub deferred: VecDeque<(Txg, Vec<Extent>)>,
+    /// State changed since the last synced slot was written.
+    pub dirty: bool,
+    /// Slot holding the most recently committed state, if any.
+    pub active_slot: Option<u64>,
+    pub synced_txg: Txg,
+    /// Allocation alignment in blocks.
+    pub align: u64,
+    /// Lent to a volume writer (see `crate::writer`): the committer doesn't
+    /// allocate from it, though its map (free space, frees) stays here.
+    pub lent: bool,
+}
+
+impl MetaslabState {
+    pub fn new_empty(start_block: u64, block_count: u64, align: u64) -> Self {
+        let mut free_extents = BTreeMap::new();
+        free_extents.insert(start_block, block_count);
+        MetaslabState {
+            start_block,
+            block_count,
+            free_extents,
+            freeing: Vec::new(),
+            deferred: VecDeque::new(),
+            dirty: true,
+            active_slot: None,
+            synced_txg: Txg::ZERO,
+            align,
+            lent: false,
+        }
+    }
+
+    pub fn free_blocks(&self) -> u64 {
+        self.free_extents.values().sum()
+    }
+
+    pub fn pending_free_blocks(&self) -> u64 {
+        let freeing: u64 = self.freeing.iter().map(|e| e.len).sum();
+        let deferred: u64 = self
+            .deferred
+            .iter()
+            .flat_map(|(_, v)| v.iter())
+            .map(|e| e.len)
+            .sum();
+        freeing + deferred
+    }
+
+    /// Iterate every extent that is not currently allocated (free, freeing or deferred).
+    fn released_extents(&self) -> impl Iterator<Item = Extent> + '_ {
+        self.free_extents
+            .iter()
+            .map(|(&s, &l)| Extent::new(s, l))
+            .chain(self.freeing.iter().copied())
+            .chain(self.deferred.iter().flat_map(|(_, v)| v.iter().copied()))
+    }
+
+    /// Is all of `[start, start + len)` allocatable free space?
+    pub(crate) fn is_free(&self, start: u64, len: u64) -> bool {
+        self.free_extents
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(&s, &l)| s + l >= start + len)
+    }
+
+    fn overlaps_released(&self, start: u64, len: u64) -> bool {
+        let end = start + len;
+        self.released_extents()
+            .any(|e| e.start < end && start < e.end())
+    }
+
+    /// Insert a range into the free map, merging with neighbours.
+    fn insert_free(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let mut new_start = start;
+        let mut new_end = start + len;
+
+        if let Some((&ps, &pl)) = map.range(..=start).next_back()
+            && ps + pl >= start
+        {
+            new_start = ps;
+            new_end = new_end.max(ps + pl);
+            map.remove(&ps);
+        }
+        while let Some((&ns, &nl)) = map.range(new_start..).next() {
+            if ns > new_end {
+                break;
+            }
+            new_end = new_end.max(ns + nl);
+            map.remove(&ns);
+        }
+        map.insert(new_start, new_end - new_start);
+    }
+
+    /// Remove `[start, start + len)` from a free map, splitting extents.
+    pub(crate) fn remove_range(map: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
+        let end = start + len;
+        let hit: Vec<(u64, u64)> = map
+            .range(..end)
+            .rev()
+            .take_while(|(s, l)| *s + *l > start)
+            .map(|(&s, &l)| (s, l))
+            .collect();
+        for (s, l) in hit {
+            map.remove(&s);
+            if s < start {
+                map.insert(s, start - s);
+            }
+            if s + l > end {
+                map.insert(end, s + l - end);
+            }
+        }
+    }
+
+    /// Remove `[start, start + len)` from a list of extents, splitting them.
+    fn remove_from_extents(list: &mut Vec<Extent>, start: u64, len: u64) {
+        let end = start + len;
+        let mut out = Vec::with_capacity(list.len());
+        for e in list.drain(..) {
+            let e_end = e.start + e.len;
+            if e_end <= start || e.start >= end {
+                out.push(e);
+                continue;
+            }
+            if e.start < start {
+                out.push(Extent {
+                    start: e.start,
+                    len: start - e.start,
+                });
+            }
+            if e_end > end {
+                out.push(Extent {
+                    start: end,
+                    len: e_end - end,
+                });
+            }
+        }
+        *list = out;
+    }
+
+    /// Mark `[start, start + len)` allocated, whatever state it was in (free,
+    /// freeing or deferred). Used by repair when live data is found in space
+    /// the map considers released.
+    pub(crate) fn mark_allocated(&mut self, start: u64, len: u64) {
+        Self::remove_range(&mut self.free_extents, start, len);
+        Self::remove_from_extents(&mut self.freeing, start, len);
+        for (_, v) in self.deferred.iter_mut() {
+            Self::remove_from_extents(v, start, len);
+        }
+        self.deferred.retain(|(_, v)| !v.is_empty());
+        self.dirty = true;
+    }
+
+    /// Take back a pending free of exactly `[start, start + len)` (an
+    /// operation undone, see `crate::tx`). False if there's none.
+    pub(crate) fn unfree(&mut self, start: u64, len: u64) -> bool {
+        match self
+            .freeing
+            .iter()
+            .rposition(|e| e.start == start && e.len == len)
+        {
+            Some(i) => {
+                self.freeing.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Return allocated space that nothing committed references.
+    pub(crate) fn unallocate(&mut self, start: u64, len: u64) {
+        Self::insert_free(&mut self.free_extents, start, len);
+        self.dirty = true;
+    }
+
+    /// Give back space whose write may still land: a write that failed or
+    /// was dropped can still be queued in a disk server or a blocking
+    /// thread. Unlike `unallocate`, it isn't reusable at once, where a new
+    /// record could be written and then overwritten by the late write, at
+    /// the same epoch (structural triage I-3). A committer frees it like
+    /// any other free, reusable only `TXG_DEFER_SIZE` commits on. A
+    /// writer, whose frees go through the committer, keeps it: it stays
+    /// unused here until the metaslab is returned, and the committer
+    /// never counted it allocated.
+    pub(crate) fn abandon(&mut self, start: u64, len: u64, writer: bool) {
+        if writer || len == 0 {
+            return;
+        }
+        if self.overlaps_released(start, len) {
+            eprintln!(
+                "WARNING: abandoning already-free extent {{{}:{}}}",
+                start, len
+            );
+            return;
+        }
+        self.freeing.push(Extent { start, len });
+        self.dirty = true;
+    }
+
+    /// Every released extent (free, freeing or deferred), merged.
+    pub(crate) fn released_map(&self) -> BTreeMap<u64, u64> {
+        let mut released = BTreeMap::new();
+        for e in self.released_extents() {
+            Self::insert_free(&mut released, e.start, e.len);
+        }
+        released
+    }
+
+    /// Carve out exactly `want` (stripe-aligned) contiguous blocks, from the
+    /// first free extent that fits at or after block `from`.
+    fn take_aligned_exact(&mut self, want: u64, from: u64) -> Option<Extent> {
+        if self.lent {
+            return None;
+        }
+        let align = self.align;
+        let containing = self
+            .free_extents
+            .range(..=from)
+            .next_back()
+            .filter(|(s, l)| *s + *l > from);
+        let (s, l, aligned) = containing
+            .into_iter()
+            .chain(self.free_extents.range(from + 1..))
+            .find_map(|(&s, &l)| {
+                let aligned = align_up(s.max(from), align);
+                (aligned + want <= s + l).then_some((s, l, aligned))
+            })?;
+        self.free_extents.remove(&s);
+        if aligned > s {
+            self.free_extents.insert(s, aligned - s);
+        }
+        let tail_start = aligned + want;
+        if tail_start < s + l {
+            self.free_extents.insert(tail_start, s + l - tail_start);
+        }
+        self.dirty = true;
+        Some(Extent {
+            start: aligned,
+            len: want,
+        })
+    }
+
+    /// Carve out a single stripe-aligned extent of at most `want` blocks.
+    #[cfg(test)]
+    fn take_aligned(&mut self, want: u64) -> Option<Extent> {
+        if self.lent {
+            return None;
+        }
+        let found = self.free_extents.iter().find_map(|(&s, &l)| {
+            let aligned = align_up(s, self.align);
+            let end = s + l;
+            if aligned >= end {
+                return None;
+            }
+            let avail = align_down(end - aligned, self.align);
+            (avail > 0).then(|| (s, l, aligned, avail.min(want)))
+        })?;
+
+        let (s, l, aligned, take) = found;
+        self.free_extents.remove(&s);
+        if aligned > s {
+            self.free_extents.insert(s, aligned - s);
+        }
+        let tail_start = aligned + take;
+        if tail_start < s + l {
+            self.free_extents.insert(tail_start, s + l - tail_start);
+        }
+        self.dirty = true;
+        Some(Extent {
+            start: aligned,
+            len: take,
+        })
+    }
+
+    /// Release deferred frees whose wait has elapsed as of committed `txg`.
+    fn release_deferred(&mut self, txg: Txg) {
+        while let Some((release_txg, _)) = self.deferred.front() {
+            if *release_txg > txg {
+                break;
+            }
+            let (_, extents) = self.deferred.pop_front().unwrap();
+            for e in extents {
+                Self::insert_free(&mut self.free_extents, e.start, e.len);
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Serialize as `[allocated bitmap][deferred bitmap]`.
+    fn encode(&self) -> Vec<u8> {
+        let n = self.block_count;
+        let bm = MetaslabLayout::bitmap_bytes(n);
+        let mut buf = vec![0u8; 2 * bm];
+
+        let set = |buf: &mut [u8], base: usize, start: u64, len: u64, value: bool| {
+            for b in start..start + len {
+                let i = base * 8 + (b as usize);
+                if value {
+                    buf[i / 8] |= 1 << (i % 8);
+                } else {
+                    buf[i / 8] &= !(1 << (i % 8));
+                }
+            }
+        };
+
+        set(&mut buf, 0, 0, n, true);
+        for (&s, &l) in &self.free_extents {
+            set(&mut buf, 0, s - self.start_block, l, false);
+        }
+        let pending = self
+            .freeing
+            .iter()
+            .chain(self.deferred.iter().flat_map(|(_, v)| v.iter()));
+        for e in pending {
+            set(&mut buf, 0, e.start - self.start_block, e.len, false);
+            set(&mut buf, bm, e.start - self.start_block, e.len, true);
+        }
+        buf
+    }
+
+    /// Rebuild state from an encoded slot. Deferred space is held until
+    /// committed TXG `release_txg`.
+    fn decode(
+        start_block: u64,
+        block_count: u64,
+        align: u64,
+        bytes: &[u8],
+        release_txg: Txg,
+    ) -> Self {
+        let bm = MetaslabLayout::bitmap_bytes(block_count);
+        let bit = |i: usize| bytes.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0);
+
+        #[derive(PartialEq, Clone, Copy)]
+        enum S {
+            Alloc,
+            Deferred,
+            Free,
+        }
+
+        let mut free_extents = BTreeMap::new();
+        let mut deferred = Vec::new();
+        let mut run: Option<(S, u64)> = None;
+
+        let mut flush = |state: S, from: u64, to: u64| match state {
+            S::Free => {
+                free_extents.insert(start_block + from, to - from);
+            }
+            S::Deferred => deferred.push(Extent {
+                start: start_block + from,
+                len: to - from,
+            }),
+            S::Alloc => {}
+        };
+
+        for b in 0..block_count {
+            let state = if bit(b as usize) {
+                S::Alloc
+            } else if bit(bm * 8 + b as usize) {
+                S::Deferred
+            } else {
+                S::Free
+            };
+            match run {
+                Some((s, _)) if s == state => {}
+                Some((s, from)) => {
+                    flush(s, from, b);
+                    run = Some((state, b));
+                }
+                None => run = Some((state, b)),
+            }
+        }
+        if let Some((s, from)) = run {
+            flush(s, from, block_count);
+        }
+
+        let mut deferred_q = VecDeque::new();
+        if !deferred.is_empty() {
+            deferred_q.push_back((release_txg, deferred));
+        }
+
+        MetaslabState {
+            start_block,
+            block_count,
+            free_extents,
+            freeing: Vec::new(),
+            deferred: deferred_q,
+            dirty: false,
+            active_slot: None,
+            synced_txg: Txg::ZERO,
+            align,
+            lent: false,
+        }
+    }
+}
+
+/// Per slot block: every (txg, payload, rebuilt-from-parity block) seen.
+type SlotVersions = Vec<Vec<(Txg, Vec<u8>, Option<[u8; BLOCK_SIZE]>)>>;
+
+tokio::task_local! {
+    /// Set while a `FileWriter` writes (`FileWriter::pinning`): on a volume
+    /// writer, every lent metaslab it allocates from is pinned as the space
+    /// is taken, under that metaslab's lock, before anything is written
+    /// there. Pinned only afterwards, `return_full` could give the
+    /// metaslab back in between, with the file's uncommitted records in it
+    /// (structural triage I-5).
+    pub(crate) static PIN_ALLOCS: PinScope;
+}
+
+/// The pins a [`PIN_ALLOCS`] scope took. Dropped with pins still in it
+/// (the scope's future was dropped mid-allocation, before its owner took
+/// them), it unpins them: nobody else knows of them, and a metaslab
+/// pinned for good is never given back.
+pub(crate) struct PinScope {
+    writer: Option<std::sync::Arc<crate::writer::WriterState>>,
+    pins: std::cell::RefCell<Vec<MetaslabIdx>>,
+}
+
+impl PinScope {
+    pub(crate) fn new(writer: Option<std::sync::Arc<crate::writer::WriterState>>) -> Self {
+        PinScope {
+            writer,
+            pins: Default::default(),
+        }
+    }
+
+    /// The pins taken, now the caller's to undo.
+    pub(crate) fn take(&self) -> Vec<MetaslabIdx> {
+        self.pins.take()
+    }
+}
+
+impl Drop for PinScope {
+    fn drop(&mut self) {
+        if let Some(w) = &self.writer {
+            for idx in self.pins.get_mut().drain(..) {
+                w.unpin(idx);
+            }
+        }
+    }
+}
+
+/// Bookkeeping for a metaslab whose slot was written during a TXG sync.
+pub(crate) struct SyncedMetaslab {
+    ms_idx: usize,
+    slot: u64,
+    freeing: Vec<Extent>,
+}
+
+impl<D: BlockDevice> FileSystem<D> {
+    /// Free an extent. The space is not reusable until `TXG_DEFER_SIZE` TXGs
+    /// after the TXG in which the free is committed.
+    pub(crate) async fn free(
+        &self,
+        tx: &mut crate::tx::Tx,
+
+        start: u64,
+        len: u64,
+    ) -> Result<(), FileSystemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let ms_idx = match self.layout.metaslab_for_block(start) {
+            Some(idx) => idx,
+            None => {
+                eprintln!("WARNING: free of block {} outside any metaslab", start);
+                return Ok(());
+            }
+        };
+
+        let mut ms = self.metaslabs[ms_idx.index()].write().await;
+        if start + len > ms.start_block + ms.block_count {
+            eprintln!(
+                "WARNING: free {{{}:{}}} crosses metaslab {} boundary",
+                start, len, ms_idx
+            );
+            return Ok(());
+        }
+        if ms.overlaps_released(start, len) {
+            eprintln!(
+                "WARNING: attempted to free already-free extent {{{}:{}}}",
+                start, len
+            );
+            return Ok(());
+        }
+        ms.freeing.push(Extent { start, len });
+        ms.dirty = true;
+        tx.journal(crate::tx::Undo::Freed { start, len });
+        Ok(())
+    }
+
+    /// Return space allocated in the open TXG that was never referenced by
+    /// anything committed (e.g. a sync that failed). Unlike `free`, there is
+    /// no deferral: no uberblock can point at it.
+    pub(crate) async fn unallocate(&self, start: u64, len: u64) {
+        if let Some(idx) = self.layout.metaslab_for_block(start) {
+            self.metaslabs[idx.index()]
+                .write()
+                .await
+                .unallocate(start, len);
+        }
+    }
+
+    /// Give back space whose write failed or was dropped, and so may still
+    /// land (see `MetaslabState::abandon`).
+    pub(crate) async fn release_unsettled(&self, start: u64, len: u64) {
+        if let Some(idx) = self.layout.metaslab_for_block(start) {
+            self.metaslabs[idx.index()]
+                .write()
+                .await
+                .abandon(start, len, self.writer.is_some());
+        }
+    }
+
+    /// Space that can be allocated right now (excludes deferred frees).
+    pub async fn allocatable_blocks(&self) -> u64 {
+        let mut total = 0;
+        for ms in self.metaslabs.iter() {
+            let ms = ms.read().await;
+            if !ms.lent {
+                total += ms.free_blocks();
+            }
+        }
+        total
+    }
+
+    /// Allocate one contiguous, stripe-aligned extent of `blocks` (rounded up
+    /// to whole stripes).
+    pub(crate) async fn allocate_contiguous(&self, blocks: u64) -> Result<Extent, FileSystemError> {
+        self.allocate_run(blocks, None).await
+    }
+
+    /// `e`, just taken from metaslab `idx` (whose lock `ms` is), if it may
+    /// be used: inside a [`PIN_ALLOCS`] scope on a writer, only once `idx`
+    /// is pinned, and so can't be given back under the records about to be
+    /// written there. If it's no longer lent (being given back), `e` is put
+    /// back and None returned: allocate elsewhere.
+    fn pinned_alloc(&self, idx: usize, ms: &mut MetaslabState, e: Extent) -> Option<Extent> {
+        let Some(w) = &self.writer else {
+            return Some(e);
+        };
+        let idx = MetaslabIdx::from_raw(idx as u32);
+        let pinned = PIN_ALLOCS.try_with(|pins| {
+            let ok = w.pin_if_lent(idx);
+            if ok {
+                pins.pins.borrow_mut().push(idx);
+            }
+            ok
+        });
+        match pinned {
+            // Not in a scope: no pin wanted.
+            Err(_) | Ok(true) => Some(e),
+            Ok(false) => {
+                ms.unallocate(e.start, e.len);
+                None
+            }
+        }
+    }
+
+    /// Allocate one contiguous, stripe-aligned extent of `blocks`, preferably
+    /// at or just after block `hint` (so related records end up next to each
+    /// other), else first fit.
+    pub(crate) async fn allocate_run(
+        &self,
+        blocks: u64,
+        hint: Option<u64>,
+    ) -> Result<Extent, FileSystemError> {
+        let want = align_up(blocks, self.layout.align);
+        // With a hint: from the hint onwards in its metaslab, then the
+        // following metaslabs, wrapping around. Without: first fit.
+        let mut first = 0;
+        if let Some(h) = hint
+            && let Some(idx) = self.layout.metaslab_for_block(h)
+        {
+            let mut ms = self.metaslabs[idx.index()].write().await;
+            if let Some(extent) = ms.take_aligned_exact(want, h)
+                && let Some(extent) = self.pinned_alloc(idx.index(), &mut ms, extent)
+            {
+                return Ok(extent);
+            }
+            first = idx.index() + 1;
+        }
+        let n = self.metaslabs.len();
+        for i in 0..n {
+            let at = (first + i) % n;
+            let mut ms = self.metaslabs[at].write().await;
+            if let Some(extent) = ms.take_aligned_exact(want, 0)
+                && let Some(extent) = self.pinned_alloc(at, &mut ms, extent)
+            {
+                return Ok(extent);
+            }
+        }
+        Err(FileSystemError::NoSpace(format!("{} blocks", want)))
+    }
+
+    // Only tests still allocate scattered space (records are contiguous).
+    #[cfg(test)]
+    pub(crate) async fn allocate_blocks_stripe_aligned(
+        &self,
+        blocks_needed: u64,
+    ) -> Result<Vec<Extent>, FileSystemError> {
+        if blocks_needed == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut remaining = align_up(blocks_needed, self.layout.align);
+        // Whole object in one piece if it fits anywhere; split only if not.
+        if remaining <= self.layout.metaslab_size_blocks
+            && let Ok(extent) = self.allocate_run(remaining, None).await
+        {
+            return Ok(vec![extent]);
+        }
+        let mut allocated: Vec<(usize, Extent)> = Vec::new();
+
+        for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let mut ms = ms.write().await;
+            while remaining > 0 {
+                match ms.take_aligned(remaining) {
+                    Some(extent) => {
+                        remaining -= extent.len;
+                        allocated.push((ms_idx, extent));
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        if remaining == 0 {
+            return Ok(allocated.into_iter().map(|(_, e)| e).collect());
+        }
+
+        // Never committed, so return straight to the free map (no deferral).
+        for (ms_idx, extent) in allocated {
+            let mut ms = self.metaslabs[ms_idx].write().await;
+            MetaslabState::insert_free(&mut ms.free_extents, extent.start, extent.len);
+        }
+        Err(FileSystemError::NoSpace(format!("{} blocks", remaining)))
+    }
+
+    /// Write every dirty metaslab into its inactive slot, tagged with `txg`.
+    /// Must be followed by `finish_metaslab_sync` once the uberblock for `txg`
+    /// is durable, or `abort_metaslab_sync` if it is not.
+    pub(crate) async fn sync_metaslabs(
+        &self,
+        txg: Txg,
+    ) -> Result<Vec<SyncedMetaslab>, FileSystemError> {
+        let mut synced = Vec::new();
+        let mut payloads = Vec::new();
+
+        for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
+            let mut ms = ms.write().await;
+            if !ms.dirty {
+                continue;
+            }
+            let slot = match ms.active_slot {
+                Some(s) => (s + 1) % SPACEMAP_SLOTS,
+                None => 0,
+            };
+            payloads.push((self.layout.slot_lba(ms_idx, slot), ms.encode()));
+            let freeing = std::mem::take(&mut ms.freeing);
+            ms.dirty = false;
+            synced.push(SyncedMetaslab {
+                ms_idx,
+                slot,
+                freeing,
+            });
+        }
+
+        for (lba, bytes) in payloads {
+            if let Err(e) = self.write_slot(lba, txg, &bytes).await {
+                self.abort_metaslab_sync(synced).await;
+                return Err(e);
+            }
+        }
+
+        Ok(synced)
+    }
+
+    async fn write_slot(&self, lba: u64, txg: Txg, bytes: &[u8]) -> Result<(), FileSystemError> {
+        let mut chunks = bytes.chunks(BLOCK_PAYLOAD_SIZE);
+        for b in 0..self.layout.spacemap_slot_blocks {
+            let chunk = chunks.next().unwrap_or(&[]);
+            self.write_raw_block_txg(lba + b, txg, chunk).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_metaslab_sync(&self, txg: Txg, synced: Vec<SyncedMetaslab>) {
+        for s in synced {
+            let mut ms = self.metaslabs[s.ms_idx].write().await;
+            ms.active_slot = Some(s.slot);
+            ms.synced_txg = txg;
+            if !s.freeing.is_empty() {
+                ms.deferred
+                    .push_back((txg.after(TXG_DEFER_SIZE), s.freeing));
+            }
+        }
+        if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            for ms in self.metaslabs.iter() {
+                ms.write().await.release_deferred(txg);
+            }
+        }
+    }
+
+    /// Release the deferred frees a scan held back (call after the hold is
+    /// dropped). Takes the commit lock so it can't interleave with a sync.
+    pub(crate) async fn release_held_frees(&self) {
+        let _tx = self.begin_tx().await;
+        if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return;
+        }
+        let Some(txg) = self.uberblock().await.map(|u| u.txg) else {
+            return;
+        };
+        for ms in self.metaslabs.iter() {
+            ms.write().await.release_deferred(txg);
+        }
+    }
+
+    pub(crate) async fn abort_metaslab_sync(&self, synced: Vec<SyncedMetaslab>) {
+        for s in synced {
+            let mut ms = self.metaslabs[s.ms_idx].write().await;
+            let mut freeing = s.freeing;
+            freeing.append(&mut ms.freeing);
+            ms.freeing = freeing;
+            ms.dirty = true;
+        }
+    }
+
+    /// Load every metaslab from the newest valid slot not newer than `uber_txg`.
+    /// Also returns the metaslabs that had no valid slot (loaded as full).
+    pub(crate) async fn load_metaslabs(
+        &self,
+        uber_txg: Txg,
+    ) -> Result<(Vec<MetaslabState>, Vec<usize>), FileSystemError> {
+        let mut out = Vec::with_capacity(self.layout.metaslab_count as usize);
+        let mut missing = Vec::new();
+
+        for ms_idx in 0..self.layout.metaslab_count as usize {
+            let start = self.layout.metaslab_start(ms_idx);
+            let count = self.layout.metaslab_size_blocks;
+
+            let mut best: Option<(Txg, u64, Vec<u8>)> = None;
+            for slot in 0..SPACEMAP_SLOTS {
+                if let Some((txg, bytes)) = self
+                    .read_slot(self.layout.slot_lba(ms_idx, slot), uber_txg)
+                    .await
+                    && txg <= uber_txg
+                    && best.as_ref().is_none_or(|(t, _, _)| txg > *t)
+                {
+                    best = Some((txg, slot, bytes));
+                }
+            }
+
+            let state = match best {
+                Some((txg, slot, bytes)) => {
+                    let mut st = MetaslabState::decode(
+                        start,
+                        count,
+                        self.layout.align,
+                        &bytes,
+                        uber_txg.after(TXG_DEFER_SIZE),
+                    );
+                    st.active_slot = Some(slot);
+                    st.synced_txg = txg;
+                    st
+                }
+                None => {
+                    // Treat as fully allocated: leaking space is safe, double
+                    // allocating it is not.
+                    eprintln!(
+                        "WARNING: metaslab {} has no valid space map slot; treating as full",
+                        ms_idx
+                    );
+                    missing.push(ms_idx);
+                    let mut st = MetaslabState::new_empty(start, count, self.layout.align);
+                    st.free_extents.clear();
+                    st.dirty = false;
+                    st
+                }
+            };
+            out.push(state);
+        }
+
+        Ok((out, missing))
+    }
+
+    /// Read a slot: valid at TXG `t` only if every block is a good label
+    /// from TXG `t`. A disk that missed writes while it was away returns
+    /// stale but well-formed blocks, so every block is also read from the
+    /// other copies / rebuilt from parity, and the slot is taken at the
+    /// newest TXG (no newer than `max_txg`) that every block can reach.
+    /// Blocks that came from elsewhere are repaired.
+    async fn read_slot(&self, lba: u64, max_txg: Txg) -> Option<(Txg, Vec<u8>)> {
+        // versions[b]: every (txg, payload, came-from-parity) seen for block b.
+        let mut versions: SlotVersions = Vec::new();
+        for b in 0..self.layout.spacemap_slot_blocks {
+            let mut v = Vec::new();
+            let mut buf = [0u8; BLOCK_SIZE];
+            if self.dev.read_block(lba + b, &mut buf).await.is_ok()
+                && let Ok((txg, len)) = crate::fs::parse_label(&buf)
+            {
+                v.push((txg, buf[BLOCK_HEADER..BLOCK_HEADER + len].to_vec(), None));
+            }
+            versions.push(v);
+        }
+
+        // Every other copy / rebuild of every block is an alternative too,
+        // even when the normal read looks consistent: a member that missed
+        // commits (back from an outage, or silently dropping writes) serves
+        // well-formed slots from an older TXG, and on a mirror it can be the
+        // one serving every block of both slots (audit D2).
+        for (b, v) in versions.iter_mut().enumerate() {
+            if let Ok(c) = self.dev.reconstruct_candidates(lba + b as u64).await {
+                for rebuilt in c.rebuilt.into_iter().flatten() {
+                    if let Ok((txg, len)) = crate::fs::parse_label(&rebuilt)
+                        && !v.iter().any(|(t, _, _)| *t == txg)
+                    {
+                        let block: [u8; BLOCK_SIZE] = rebuilt[..].try_into().ok()?;
+                        v.push((
+                            txg,
+                            rebuilt[BLOCK_HEADER..BLOCK_HEADER + len].to_vec(),
+                            Some(block),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut txgs: Vec<Txg> = versions
+            .iter()
+            .flat_map(|v| v.iter().map(|(t, _, _)| *t))
+            .filter(|&t| t <= max_txg)
+            .collect();
+        txgs.sort_unstable();
+        txgs.dedup();
+        for &t in txgs.iter().rev() {
+            let picks: Option<Vec<_>> = versions
+                .iter()
+                .map(|v| v.iter().find(|(txg, _, _)| *txg == t))
+                .collect();
+            let Some(picks) = picks else { continue };
+            let mut bytes = Vec::new();
+            for (b, (_, payload, healed)) in picks.into_iter().enumerate() {
+                if let Some(block) = healed {
+                    eprintln!(
+                        "space map: block {} was stale; rebuilt from parity",
+                        lba + b as u64
+                    );
+                    if !self.read_only {
+                        let _ = self.dev.repair_block(lba + b as u64, block).await;
+                    }
+                }
+                bytes.extend_from_slice(payload);
+            }
+            return Some((t, bytes));
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/metaslab_tests.rs"]
+mod tests;

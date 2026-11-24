@@ -53,7 +53,7 @@ fn remember_height(h: Option<f64>) {
     }
 }
 
-pub use raidish::api_types::{Event, EventPage as Page, Level, Subject};
+pub use raidish_types::api_types::{Event, EventPage as Page, Level, Subject};
 
 async fn fetch(query: String) -> Result<Page, String> {
     let resp = crate::session::get(&format!("/api/v1/events?{}", query))
@@ -457,7 +457,7 @@ fn row(e: &Event) -> Html {
         },
         Subject::Node(n) => named("node", n),
         Subject::Disk(d) => named("disk", d),
-        Subject::Dataset(f, n) => named(raidish::api_types::format_slug(*f), n),
+        Subject::Dataset(f, n) => named(raidish_types::api_types::format_slug(*f), n),
         s @ (Subject::Pool | Subject::Cluster) => {
             html! { <span class="muted">{ s.to_string() }</span> }
         }

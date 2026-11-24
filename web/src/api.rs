@@ -4,11 +4,11 @@
 
 use crate::session::token;
 use gloo_net::http::{Request, RequestBuilder, Response};
-pub use raidish::api_types::{
+pub use raidish_core::inode::DatasetProps;
+pub use raidish_types::api_types::{
     CheckView, CreateVolume, DirEntry, FactsView, MoveTo, NewName, NodeFacts, RenameRequest,
     Verdict, VmDef, VmView, VolumeView,
 };
-pub use raidish::inode::DatasetProps;
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -107,7 +107,7 @@ pub async fn delete_tree(path: String, is_dir: bool) -> Result<u64, String> {
         if dir && !listed {
             stack.push((p.clone(), true, true));
             for e in list_dir(&p).await? {
-                if e.kind == raidish::inode::ObjType::Volume {
+                if e.kind == raidish_core::inode::ObjType::Volume {
                     return Err(format!(
                         "{}/{} is a volume: delete it under Volumes",
                         p, e.name
@@ -141,7 +141,7 @@ pub async fn volumes() -> Result<Vec<VolumeView>, String> {
 
 pub async fn create_volume(name: &str, size_bytes: u64) -> Result<(), String> {
     // Checked here too, so a bad name is said before anything is sent.
-    let name = raidish::types::DatasetName::user(name).map_err(|e| e.to_string())?;
+    let name = raidish_types::types::DatasetName::user(name).map_err(|e| e.to_string())?;
     send_json(
         Request::post("/api/v1/volumes"),
         &CreateVolume { name, size_bytes },
@@ -235,11 +235,11 @@ pub fn parse_size(s: &str) -> Option<u64> {
 
 // ---- VMs ----
 
-pub use raidish::vm_def::NewVm;
+pub use raidish_types::vm_def::NewVm;
 
-/// A valid VM name (`raidish::types::VmName`).
+/// A valid VM name (`raidish_types::types::VmName`).
 pub fn valid_vm_name(name: &str) -> bool {
-    raidish::types::VmName::try_from(name).is_ok()
+    raidish_types::types::VmName::try_from(name).is_ok()
 }
 
 pub async fn vm_definition(name: &str) -> Result<VmDef, String> {
@@ -337,7 +337,7 @@ pub async fn vm_create_simple(new: NewVm, disk_bytes: u64) -> Result<(), String>
     create_volume(&new.disk, disk_bytes)
         .await
         .map_err(|e| format!("creating volume {}: {}", new.disk, e))?;
-    let xml = raidish::vm_def::template(&new);
+    let xml = raidish_types::vm_def::template(&new);
     if let Err(e) = vm_create(&new.name, &xml).await {
         let _ = delete_volume(&new.disk).await;
         return Err(e);
