@@ -61,8 +61,37 @@ impl OpenFile {
         self.obj.size()
     }
 
-    fn needs_sync(&self) -> bool {
+    pub(crate) fn needs_sync(&self) -> bool {
         self.obj.is_dirty() || self.resized.load(Ordering::SeqCst)
+    }
+}
+
+/// A file's sync under way (`sync_files`). Dropped before it settles (the
+/// commit's future was dropped), it gives the taken records and the resize
+/// back, as a failed sync does. Otherwise the file would look clean, with
+/// its writes in `syncing` for good, never committed (structural triage
+/// I-6).
+struct FileSyncOnDrop<'a> {
+    f: &'a OpenFile,
+    taken: Option<Arc<BTreeMap<u64, Dirty>>>,
+    resized: bool,
+}
+
+impl FileSyncOnDrop<'_> {
+    /// The sync's outcome is in: its caller settles the records itself.
+    fn settle(mut self) -> (Option<Arc<BTreeMap<u64, Dirty>>>, bool) {
+        (self.taken.take(), std::mem::take(&mut self.resized))
+    }
+}
+
+impl Drop for FileSyncOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            self.f.obj.end_sync(&taken, None);
+        }
+        if self.resized {
+            self.f.resized.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -212,10 +241,17 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    /// Sync and forget an open file.
+    /// Sync and forget an open file. Forgotten even if the sync failed:
+    /// its callers let the file's lease go next, and a commit must not
+    /// write it after that (they report the writes as lost). Only `f`
+    /// itself is forgotten: the file may have been closed and opened again
+    /// meanwhile, by someone else (structural triage I-6).
     pub async fn close_file(&self, f: &OpenFile) -> Result<(), FileSystemError> {
         let r = self.file_sync(f).await;
-        self.files.lock().unwrap().remove(&f.id);
+        let mut files = self.files.lock().unwrap();
+        if files.get(&f.id).is_some_and(|o| std::ptr::eq(&**o, f)) {
+            files.remove(&f.id);
+        }
         r
     }
 
@@ -273,9 +309,15 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             let resized = f.resized.swap(false, Ordering::SeqCst);
             let (taken, size) = f.obj.begin_sync_sized();
+            let guard = FileSyncOnDrop {
+                f: &f,
+                taken,
+                resized,
+            };
             let empty = BTreeMap::new();
-            let records = taken.as_deref().unwrap_or(&empty);
+            let records = guard.taken.as_deref().unwrap_or(&empty);
             let result = self.sync_file(tx, &f, records, size).await;
+            let (taken, resized) = guard.settle();
             let dropped = matches!(result, Err(FileSystemError::Conflict(_)));
             if let Some(t) = &taken
                 && !dropped

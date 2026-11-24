@@ -220,6 +220,11 @@ enum HoldState {
     /// again; refused, it's lost (`on_lost`). The same transfer may be
     /// tried again meanwhile.
     InDoubt = 3,
+    /// Renewal was refused, or couldn't be had in time: the lease is gone
+    /// (`on_lost` has run). Never `fresh` again, so nothing more is acked
+    /// under it while the last renewal is still recent (structural triage
+    /// I-15).
+    Lost = 4,
 }
 
 /// A [`HoldState`] shared with the renew loop.
@@ -232,6 +237,7 @@ impl AtomicHoldState {
             0 => HoldState::Held,
             1 => HoldState::HandingOff,
             3 => HoldState::InDoubt,
+            4 => HoldState::Lost,
             _ => HoldState::Released,
         }
     }
@@ -365,6 +371,7 @@ impl HeldLease {
         {
             return Err(TransferError::Refused(match self.state.get() {
                 HoldState::HandingOff => format!("lease on {} is being handed off", self.resource),
+                HoldState::Lost => format!("lease on {} was lost", self.resource),
                 _ => format!("lease on {} was released", self.resource),
             }));
         }
@@ -473,18 +480,25 @@ impl HeldLease {
                         me.state.advance(HoldState::InDoubt, HoldState::Held);
                     }
                     Ok(_) => match me.state.get() {
-                        HoldState::Released => return,
+                        HoldState::Released | HoldState::Lost => return,
                         // Refused while a transfer is in flight: it went
                         // through (`transfer` then lets go), or it didn't
                         // and the next renewal finds out.
                         HoldState::HandingOff => pause = RETRY_PAUSE,
                         HoldState::Held | HoldState::InDoubt => {
+                            me.state.set(HoldState::Lost);
                             on_lost(format!("lease on {} lost ({:?})", me.resource, result));
                             return;
                         }
                     },
                     Err(e) => {
                         if valid_from.elapsed() >= ttl * 4 / 5 {
+                            // Let go of meanwhile (released, or handed off
+                            // and released): nothing was lost.
+                            if matches!(me.state.get(), HoldState::Released | HoldState::Lost) {
+                                return;
+                            }
+                            me.state.set(HoldState::Lost);
                             on_lost(format!(
                                 "lease on {} could not be renewed: {}",
                                 me.resource, e

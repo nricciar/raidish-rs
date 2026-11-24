@@ -38,6 +38,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The largest a growable object (a file) gets: what an `off_t` holds.
+pub const MAX_GROWABLE_SIZE: u64 = i64::MAX as u64;
+
 pub const INDIRECT_FANOUT: u64 = 512;
 const INDIRECT_CACHE_ENTRIES: usize = 1024;
 /// Clean data records kept in memory per object.
@@ -681,7 +684,20 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 ((size - offset) as usize).min(len)
             }
-            Sizing::Growable => len,
+            // Its end must be a size (I-31): `offset + len` wrapping would
+            // write at the start and leave the size where it was.
+            Sizing::Growable => {
+                if offset
+                    .checked_add(len as u64)
+                    .is_none_or(|end| end > MAX_GROWABLE_SIZE)
+                {
+                    return Err(FileSystemError::InvalidArgument(format!(
+                        "{} bytes at offset {} end past the largest size ({})",
+                        len, offset, MAX_GROWABLE_SIZE
+                    )));
+                }
+                len
+            }
         };
         if len == 0 {
             return Ok(0);
@@ -783,6 +799,12 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(FileSystemError::InvalidArgument(
                 "a fixed-size object can't be truncated".into(),
             ));
+        }
+        if new_size > MAX_GROWABLE_SIZE {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "{} is past the largest size ({})",
+                new_size, MAX_GROWABLE_SIZE
+            )));
         }
         let old = obj.size();
         if new_size < old {
@@ -1059,7 +1081,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         match self.write_records_at(start, record_blocks, &datas).await {
                             Ok(ptrs) => Ok(records.iter().map(|(i, _)| *i).zip(ptrs).collect()),
                             Err(e) => {
-                                self.unallocate(start, len).await;
+                                // Some of the run may still land.
+                                self.release_unsettled(start, len).await;
                                 Err(e)
                             }
                         }

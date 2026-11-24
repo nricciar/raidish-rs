@@ -251,11 +251,17 @@ impl<D: BlockDevice + 'static> Server<D> {
             name_ok(&to)?;
             let (sb, db) = (self.dir_change(src).await, self.dir_change(dst).await);
             let replaced = self.backend.lookup(dst, &to).await.ok().map(|a| a.id);
+            let moved = self.backend.lookup(src, &from).await.ok().map(|a| a.id);
             self.backend
                 .rename(src, &from, dst, &to)
                 .await
                 .map_err(v4)?;
-            if let Some(id) = replaced {
+            // The file replaced is gone, and its state with it; unless it's
+            // the one moved (a rename onto itself, or onto another link to
+            // it), which is still there and still open (I-32).
+            if let Some(id) = replaced
+                && replaced != moved
+            {
                 self.st().forget_file(id);
             }
             Ok((

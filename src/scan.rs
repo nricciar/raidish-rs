@@ -385,7 +385,17 @@ impl<D: BlockDevice> FileSystem<D> {
         for (name, log) in logs {
             for (i, region) in log.regions.iter().enumerate() {
                 let from = if i == 0 { log.from_seq } else { 0 };
-                for rec in self.region_records(region, from).await {
+                let records = match self.region_records(region, from).await {
+                    Ok(records) => records,
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "volume '{}': intent log region at {}: {}",
+                            name, region.start, e
+                        ));
+                        continue;
+                    }
+                };
+                for rec in records {
                     let blocks = self.align_blocks(rec.bytes.len().div_ceil(BLOCK_SIZE) as u64);
                     let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
                     padded[..rec.bytes.len()].copy_from_slice(&rec.bytes);

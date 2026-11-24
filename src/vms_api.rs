@@ -149,7 +149,8 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
     crate::types::VmName::try_from(name).map_err(|e| ApiError::bad(e.to_string()))?;
     // Only a domain this node started (see `crate::vm::DomMeta::pool`).
     let ours = match (rt.ident(), rt.virsh.meta(name).await) {
-        (Some(me), Some(m)) => me.owns(&m),
+        (Some(me), Ok(Some(m))) => me.owns(&m),
+        (_, Err(e)) => return Err(ApiError::new(Status::ServiceUnavailable, e.to_string())),
         _ => false,
     };
     if !ours {
@@ -827,7 +828,10 @@ async fn console(
             })?;
             // Only a domain this node started (as `local_do`).
             let ours = match (rt.ident(), rt.virsh.meta(name).await) {
-                (Some(me), Some(m)) => me.owns(&m),
+                (Some(me), Ok(Some(m))) => me.owns(&m),
+                (_, Err(e)) => {
+                    return Err(ApiError::new(Status::ServiceUnavailable, e.to_string()));
+                }
                 _ => false,
             };
             if !ours {

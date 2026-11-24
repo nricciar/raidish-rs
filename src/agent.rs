@@ -895,12 +895,25 @@ impl Agent {
         };
         // Only this node's: whatever else shares its libvirt (other nodes,
         // other clusters, domains nobody stamped) is left alone.
+        // A running domain whose owner libvirt couldn't tell (I-25) makes
+        // the whole listing unknown: it may be ours, using volumes that
+        // must stay, or one to start again.
+        let mut listed = listed;
         let mut ours = Vec::new();
         if let (Some(vm), Ok(doms)) = (&self.vm, &listed) {
+            let mut unknown = None;
             for d in doms.iter().filter(|d| d.id.is_some()) {
-                if let Some(v) = vm.our_vm(d.clone()).await {
-                    ours.push(v);
+                match vm.our_vm(d.clone()).await {
+                    Ok(Some(v)) => ours.push(v),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("agent: who owns domain '{}' is unknown: {}", d.name, e);
+                        unknown.get_or_insert(format!("domain '{}': {}", d.name, e));
+                    }
                 }
+            }
+            if let Some(e) = unknown {
+                listed = Err(e);
             }
         }
         Domains { listed, ours }
@@ -1263,28 +1276,54 @@ impl Agent {
         let Some(vm) = self.vm.clone() else {
             return;
         };
-        let Ok(vms) = vm.local_vms().await else {
-            return;
-        };
-        for v in vms.iter().filter(|v| v.domain.id.is_some()) {
-            if v.meta.volumes.iter().any(|x| volumes.contains(x)) {
+        let doms = match vm.virsh.list().await {
+            Ok(d) => d,
+            Err(e) => {
                 eprintln!(
-                    "agent: destroying VM '{}' (its volume lease is gone)",
-                    v.domain.name
+                    "agent: the leases of {:?} are gone, but libvirt can't be asked what \
+                     uses them: {}",
+                    volumes, e
                 );
-                self.events.error(
-                    EventKind::VmKilled,
-                    Subject::vm(&v.domain.name),
-                    format!(
-                        "VM '{}' was killed on {}: its volume lease was lost",
-                        v.domain.name, self.node
-                    ),
-                );
-                if let Err(e) = vm.virsh.destroy(&v.domain.name).await {
-                    eprintln!("agent: {}", e);
-                }
-                self.vms.stopping.remove(&v.domain.name);
+                return;
             }
+        };
+        for d in doms.into_iter().filter(|d| d.id.is_some()) {
+            // Whose it is unknown (I-25): it goes if its disks reach a lost
+            // volume through this node's export, which is going anyway;
+            // that fails safe without touching another node's domains.
+            let uses = match vm.our_vm(d.clone()).await {
+                Ok(Some(v)) => v.meta.volumes.iter().any(|x| volumes.contains(x)),
+                Ok(None) => false,
+                Err(e) => match vm.exported_volumes_of(&d.name, volumes).await {
+                    Ok(used) => !used.is_empty(),
+                    Err(e2) => {
+                        eprintln!(
+                            "agent: whether domain '{}' uses a lost volume is unknown: {}; {}",
+                            d.name, e, e2
+                        );
+                        false
+                    }
+                },
+            };
+            if !uses {
+                continue;
+            }
+            eprintln!(
+                "agent: destroying VM '{}' (its volume lease is gone)",
+                d.name
+            );
+            self.events.error(
+                EventKind::VmKilled,
+                Subject::vm(&d.name),
+                format!(
+                    "VM '{}' was killed on {}: its volume lease was lost",
+                    d.name, self.node
+                ),
+            );
+            if let Err(e) = vm.virsh.destroy(&d.name).await {
+                eprintln!("agent: {}", e);
+            }
+            self.vms.stopping.remove(&d.name);
         }
     }
 

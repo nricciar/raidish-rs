@@ -1451,3 +1451,62 @@ async fn flexfiles_layouts_point_at_every_node() {
     let res = x.call(layoutget(1, sx)).await;
     assert_eq!(res.status, err::LAYOUTUNAVAILABLE);
 }
+
+/// I-32: renaming an open file onto itself (or onto another link to it)
+/// replaces nothing: its opens stay, and a write with one still works.
+#[tokio::test]
+async fn renaming_a_file_onto_itself_keeps_its_opens() {
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    let addr = serve(fs.clone()).await;
+    let mut v = V4::connect(addr, "client-a").await;
+    let cid = v.clientid;
+    let res = v
+        .call(open(putroot(Ops::new()), cid, "owner1", "f", true, 0).op(op::GETFH, |_| {}))
+        .await;
+    assert_eq!(res.status, 0, "open");
+    let mut r = res.reader();
+    skip_sequence(&mut r);
+    assert_eq!(next(&mut r, op::PUTROOTFH), 0);
+    let sid = opened(&mut r);
+
+    let res = v
+        .call(
+            putroot(Ops::new())
+                .op(op::SAVEFH, |_| {})
+                .op(op::RENAME, |w| {
+                    w.string("f").string("f");
+                }),
+        )
+        .await;
+    assert_eq!(res.status, 0, "rename f f");
+
+    let res = v
+        .call(
+            putroot(Ops::new())
+                .op(op::LOOKUP, |w| {
+                    w.string("f");
+                })
+                .op(op::WRITE, move |w| {
+                    put_stateid(w, sid);
+                    w.u64(0).u32(2).opaque(b"still open"); // FILE_SYNC
+                }),
+        )
+        .await;
+    assert_eq!(res.status, 0, "a write with the open's stateid");
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"still open");
+}
+
+/// A modify time the client sets past what nanoseconds since the epoch
+/// hold saturates; it doesn't overflow (a panic in a debug build).
+#[test]
+fn a_huge_set_time_saturates() {
+    let mut vals = Writer::new();
+    vals.u32(1).u64(u64::MAX / 1_000_000_000).u32(999_999_999); // SET_TO_CLIENT_TIME4
+    let mut w = Writer::new();
+    write_bitmap(&mut w, &bitmap_of(&[attrs::TIME_MODIFY_SET]));
+    w.opaque(&vals.buf);
+    let mut r = Reader::new(&w.buf);
+    let s = attrs::decode(&mut r, 0).unwrap();
+    assert_eq!(s.set.mtime_ns, Some(u64::MAX));
+}

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 /// The on-disk format: a superblock's magic. Bumped by every format change.
@@ -620,6 +620,14 @@ pub struct FileSystem<D: BlockDevice> {
     /// Lets concurrent `sync` calls share one commit (group commit).
     commits_started: Arc<AtomicU64>,
     commits_done: Arc<AtomicU64>,
+    /// Set while an uberblock's copies are being written, and left set if
+    /// that fails (or is cancelled): some copy may have landed, so that
+    /// TXG may be what an import picks, and the space-map slots it names
+    /// must not be rewritten. A retry would rewrite them for the same TXG,
+    /// with different contents (structural triage I-2). From then on this
+    /// pool commits nothing; reopening it reads what's really there. A
+    /// committer steps down on it.
+    uberblock_in_doubt: Arc<AtomicBool>,
     /// Per open dataset, the newest commit (by `commits_started` id) that
     /// left it with nothing dirty from before that commit began: its writes
     /// up to then are durable, whatever happened to other datasets in that
@@ -688,6 +696,7 @@ impl<D: BlockDevice> FileSystem<D> {
             commit_lock: Arc::new(Mutex::new(())),
             commits_started: Arc::new(AtomicU64::new(0)),
             commits_done: Arc::new(AtomicU64::new(0)),
+            uberblock_in_doubt: Arc::new(AtomicBool::new(false)),
             clean_at: Default::default(),
             read_only: false,
             degraded: Arc::new(std::sync::Mutex::new(vec![None; disks])),
@@ -1568,6 +1577,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 "pool opened read-only".into(),
             ));
         }
+        if self.uberblock_in_doubt() {
+            return Err(FileSystemError::Unavailable(
+                "an uberblock write failed partway: reopen the pool to commit again".into(),
+            ));
+        }
         let id = self.commits_started.fetch_add(1, Ordering::SeqCst) + 1;
 
         let mut span = crate::trace::Span::new("commit");
@@ -1607,6 +1621,12 @@ impl<D: BlockDevice> FileSystem<D> {
                 Err(e)
             }
         }
+    }
+
+    /// Whether an uberblock write failed after its first copy was started
+    /// (see `uberblock_in_doubt`): this pool commits nothing more.
+    pub fn uberblock_in_doubt(&self) -> bool {
+        self.uberblock_in_doubt.load(Ordering::SeqCst)
     }
 
     /// Write the object table's changed records into the open TXG. On
@@ -1820,11 +1840,18 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut block_buf = [0u8; BLOCK_SIZE];
         self.prepare_block_buffer(txg, &payload, &mut block_buf)?;
 
+        // Up to here a failure leaves no trace of `txg` anywhere an import
+        // looks: the space-map slots it wrote aren't named by any
+        // uberblock, so a retry may rewrite them. From the first copy on,
+        // `txg` may be on disk (see `uberblock_in_doubt`). Cleared only on
+        // success, so a cancelled write leaves it set too.
+        self.uberblock_in_doubt.store(true, Ordering::SeqCst);
         for copy in 0..slot_blocks {
             self.dev.write_block(base_lba + copy, &block_buf).await?;
         }
 
         self.dev.flush().await?;
+        self.uberblock_in_doubt.store(false, Ordering::SeqCst);
 
         Ok(uberblock)
     }

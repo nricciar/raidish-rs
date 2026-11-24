@@ -99,27 +99,44 @@ pub enum Grant {
     Returned(Epoch),
 }
 
+impl Grant {
+    pub fn epoch(self) -> Epoch {
+        match self {
+            Grant::Lent(e) | Grant::Returned(e) => e,
+        }
+    }
+}
+
 /// The fencing state a disk server knows: from the cluster (what was
-/// granted) and from requests (newer epochs it saw first).
+/// granted) and from requests (newer epochs it saw first). All of it sits
+/// under one lock, so an admission sees one consistent state: a grant
+/// observed between its checks can't let a stamp past the kind check and
+/// then judge it against another grant's floor (structural triage I-11).
 #[derive(Debug, Default)]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct ServerFence {
+    inner: std::sync::Mutex<FenceInner>,
+}
+
+#[derive(Debug, Default)]
+#[cfg(not(target_arch = "wasm32"))]
+struct FenceInner {
     /// Pool floor: the newest pool epoch from the cluster or from requests.
-    pool: AtomicU64,
+    pool: Epoch,
     /// Per metaslab: the grant from the cluster.
-    grants: RwLock<HashMap<MetaslabIdx, Grant>>,
+    grants: HashMap<MetaslabIdx, Grant>,
     /// Per metaslab: newest epoch seen on an admitted write.
-    seen: RwLock<HashMap<MetaslabIdx, Epoch>>,
+    seen: HashMap<MetaslabIdx, Epoch>,
     /// Domain map; None until the pool's layout is known (then everything
     /// is the pool domain).
-    map: RwLock<Option<FenceMap>>,
+    map: Option<FenceMap>,
     /// Served disk index → pool leaf index (None: identity).
-    served: RwLock<Option<HashMap<usize, usize>>>,
+    served: Option<HashMap<usize, usize>>,
     /// The pool was found unformatted (or there's no pool to map): with no
     /// map, every block is the pool's. See [`Ready`].
-    unmapped: std::sync::atomic::AtomicBool,
+    unmapped: bool,
     /// Whether one linearizable read of the cluster's grants is in.
-    synced: std::sync::atomic::AtomicBool,
+    synced: bool,
 }
 
 /// Whether a disk server may admit writes (audit R1b). Its floors live in
@@ -141,26 +158,69 @@ pub enum Ready {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl FenceInner {
+    fn raise_pool(&mut self, epoch: Epoch) {
+        self.pool = self.pool.max(epoch);
+    }
+
+    fn floor(&self, domain: Domain) -> Epoch {
+        match domain {
+            Domain::Pool => self.pool,
+            Domain::Metaslab(i) => {
+                let seen = self.seen.get(&i).copied().unwrap_or_default();
+                let base = match self.grants.get(&i) {
+                    Some(&Grant::Lent(e)) => e,
+                    Some(&Grant::Returned(e)) => e.max(self.pool),
+                    None => self.pool,
+                };
+                base.max(seen)
+            }
+        }
+    }
+
+    fn domains(&self, served_disk: usize, block: u64, count: u32) -> Vec<Domain> {
+        let Some(map) = self.map.as_ref() else {
+            return vec![Domain::Pool];
+        };
+        let disk = match self.served.as_ref() {
+            None => served_disk,
+            Some(m) => match m.get(&served_disk) {
+                Some(&d) => d,
+                None => return vec![Domain::Pool],
+            },
+        };
+        map.domains(disk, block, count)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl ServerFence {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FenceInner> {
+        // Nothing panics under this lock; a poisoned one still holds a
+        // consistent state (every update is a single assignment).
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A fence that has done its startup (tests, and servers of raw disks
     /// with no cluster to wait for).
     pub fn ready() -> Self {
         let f = ServerFence::default();
-        f.unmapped.store(true, Ordering::SeqCst);
-        f.synced.store(true, Ordering::SeqCst);
+        {
+            let mut i = f.lock();
+            i.unmapped = true;
+            i.synced = true;
+        }
         f
     }
 
     /// Asked live (see [`Ready`]): a lend arriving while there's no map
     /// takes a ready server back to `Starting`.
     pub fn readiness(&self) -> Ready {
-        if !self.synced.load(Ordering::SeqCst) {
+        let i = self.lock();
+        if !i.synced {
             return Ready::Starting;
         }
-        if self.map.read().unwrap().is_some() {
-            return Ready::Ready;
-        }
-        if self.unmapped.load(Ordering::SeqCst) && self.grants.read().unwrap().is_empty() {
+        if i.map.is_some() || (i.unmapped && i.grants.is_empty()) {
             Ready::Ready
         } else {
             Ready::Starting
@@ -169,89 +229,72 @@ impl ServerFence {
 
     /// The cluster's grants as of a linearizable read are in (`observe`d).
     pub fn mark_synced(&self) {
-        self.synced.store(true, Ordering::SeqCst);
+        self.lock().synced = true;
     }
 
     /// The pool layout is known to be none: no pool here, or not formatted.
     pub fn mark_unmapped(&self) {
-        *self.map.write().unwrap() = None;
-        self.unmapped.store(true, Ordering::SeqCst);
+        let mut i = self.lock();
+        i.map = None;
+        i.unmapped = true;
     }
 
     /// The pool floor (for status and tests).
     pub fn pool_floor(&self) -> Epoch {
-        Epoch::from_raw(self.pool.load(Ordering::SeqCst))
+        self.lock().pool
     }
 
     /// Raise the pool floor (cluster grant or a test).
     pub fn raise_pool(&self, epoch: Epoch) {
-        self.pool.fetch_max(epoch.get(), Ordering::SeqCst);
+        self.lock().raise_pool(epoch);
     }
 
     /// Take in the cluster's view: the pool epoch and every metaslab grant.
+    ///
+    /// Views come from more than one place (the startup `sync_fence` read,
+    /// and each Raft apply), and may arrive out of order, so a grant only
+    /// ever moves forward: one is taken only if it's newer than the one
+    /// held (structural triage I-10). Every grant has its own epoch, and
+    /// epochs only grow, so newer is never ambiguous. A grant missing from
+    /// a view is kept: the cluster never forgets a metaslab's grant, so a
+    /// view without it is just from before its first lend, and dropping it
+    /// would let pool stamps into lent space.
     pub fn observe(
         &self,
         pool_epoch: Epoch,
         grants: impl IntoIterator<Item = (MetaslabIdx, Grant)>,
     ) {
-        self.raise_pool(pool_epoch);
-        let mut g = self.grants.write().unwrap();
+        let mut i = self.lock();
+        i.raise_pool(pool_epoch);
         for (idx, grant) in grants {
-            g.insert(idx, grant);
-        }
-    }
-
-    pub fn set_map(&self, map: Option<FenceMap>) {
-        if map.is_none() {
-            self.unmapped.store(true, Ordering::SeqCst);
-        }
-        *self.map.write().unwrap() = map;
-    }
-
-    pub fn has_map(&self) -> bool {
-        self.map.read().unwrap().is_some()
-    }
-
-    pub fn set_served(&self, served: HashMap<usize, usize>) {
-        *self.served.write().unwrap() = Some(served);
-    }
-
-    /// The current floor of `domain`.
-    pub fn floor(&self, domain: Domain) -> Epoch {
-        let pool = self.pool_floor();
-        match domain {
-            Domain::Pool => pool,
-            Domain::Metaslab(i) => {
-                let seen = self
-                    .seen
-                    .read()
-                    .unwrap()
-                    .get(&i)
-                    .copied()
-                    .unwrap_or_default();
-                let base = match self.grants.read().unwrap().get(&i) {
-                    Some(&Grant::Lent(e)) => e,
-                    Some(&Grant::Returned(e)) => e.max(pool),
-                    None => pool,
-                };
-                base.max(seen)
+            match i.grants.get(&idx) {
+                Some(held) if held.epoch() >= grant.epoch() => {}
+                _ => {
+                    i.grants.insert(idx, grant);
+                }
             }
         }
     }
 
-    fn domains(&self, served_disk: usize, block: u64, count: u32) -> Vec<Domain> {
-        let map = self.map.read().unwrap();
-        let Some(map) = map.as_ref() else {
-            return vec![Domain::Pool];
-        };
-        let disk = match self.served.read().unwrap().as_ref() {
-            None => served_disk,
-            Some(m) => match m.get(&served_disk) {
-                Some(&d) => d,
-                None => return vec![Domain::Pool],
-            },
-        };
-        map.domains(disk, block, count)
+    pub fn set_map(&self, map: Option<FenceMap>) {
+        let mut i = self.lock();
+        if map.is_none() {
+            i.unmapped = true;
+        }
+        i.map = map;
+    }
+
+    pub fn has_map(&self) -> bool {
+        self.lock().map.is_some()
+    }
+
+    pub fn set_served(&self, served: HashMap<usize, usize>) {
+        self.lock().served = Some(served);
+    }
+
+    /// The current floor of `domain`.
+    pub fn floor(&self, domain: Domain) -> Epoch {
+        self.lock().floor(domain)
     }
 
     /// `admit_stamp` for a request stamped with a pool epoch: admitted or
@@ -279,6 +322,9 @@ impl ServerFence {
     /// are always served and raise only the pool floor, and only with a
     /// pool stamp (a new committer's first reads fence the old one out).
     /// Flushes are always served: they only make admitted writes durable.
+    ///
+    /// The checks and the floor raises happen under one lock: what is
+    /// checked is what is raised (I-11).
     pub fn admit_stamp(
         &self,
         served_disk: usize,
@@ -287,21 +333,20 @@ impl ServerFence {
         stamp: Stamp,
         write: bool,
     ) -> Admit {
-        let domains = self.domains(served_disk, block, count);
+        let mut i = self.lock();
+        let domains = i.domains(served_disk, block, count);
         let epoch = stamp.epoch();
         let pool_stamp = matches!(stamp, Stamp::Pool(_));
         if !write {
             if pool_stamp && domains.contains(&Domain::Pool) {
-                self.raise_pool(epoch);
+                i.raise_pool(epoch);
             }
             return Admit::Yes;
         }
         for &d in &domains {
             let lent = match d {
                 Domain::Pool => false,
-                Domain::Metaslab(i) => {
-                    matches!(self.grants.read().unwrap().get(&i), Some(Grant::Lent(_)))
-                }
+                Domain::Metaslab(m) => matches!(i.grants.get(&m), Some(Grant::Lent(_))),
             };
             let fits = match stamp {
                 Stamp::Pool(_) => !lent,
@@ -311,7 +356,7 @@ impl ServerFence {
             if !fits {
                 return Admit::Fenced;
             }
-            if epoch < self.floor(d) {
+            if epoch < i.floor(d) {
                 return Admit::Stale;
             }
         }
@@ -319,12 +364,11 @@ impl ServerFence {
             match d {
                 Domain::Pool => {
                     if pool_stamp {
-                        self.raise_pool(epoch)
+                        i.raise_pool(epoch)
                     }
                 }
-                Domain::Metaslab(i) => {
-                    let mut seen = self.seen.write().unwrap();
-                    let e = seen.entry(i).or_default();
+                Domain::Metaslab(m) => {
+                    let e = i.seen.entry(m).or_default();
                     *e = (*e).max(epoch);
                 }
             }

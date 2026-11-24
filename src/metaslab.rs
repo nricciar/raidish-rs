@@ -313,6 +313,30 @@ impl MetaslabState {
         self.dirty = true;
     }
 
+    /// Give back space whose write may still land: a write that failed or
+    /// was dropped can still be queued in a disk server or a blocking
+    /// thread. Unlike `unallocate`, it isn't reusable at once, where a new
+    /// record could be written and then overwritten by the late write, at
+    /// the same epoch (structural triage I-3). A committer frees it like
+    /// any other free, reusable only `TXG_DEFER_SIZE` commits on. A
+    /// writer, whose frees go through the committer, keeps it: it stays
+    /// unused here until the metaslab is returned, and the committer
+    /// never counted it allocated.
+    pub(crate) fn abandon(&mut self, start: u64, len: u64, writer: bool) {
+        if writer || len == 0 {
+            return;
+        }
+        if self.overlaps_released(start, len) {
+            eprintln!(
+                "WARNING: abandoning already-free extent {{{}:{}}}",
+                start, len
+            );
+            return;
+        }
+        self.freeing.push(Extent { start, len });
+        self.dirty = true;
+    }
+
     /// Every released extent (free, freeing or deferred), merged.
     pub(crate) fn released_map(&self) -> BTreeMap<u64, u64> {
         let mut released = BTreeMap::new();
@@ -512,6 +536,49 @@ impl MetaslabState {
 /// Per slot block: every (txg, payload, rebuilt-from-parity block) seen.
 type SlotVersions = Vec<Vec<(Txg, Vec<u8>, Option<[u8; BLOCK_SIZE]>)>>;
 
+tokio::task_local! {
+    /// Set while a `FileWriter` writes (`FileWriter::pinning`): on a volume
+    /// writer, every lent metaslab it allocates from is pinned as the space
+    /// is taken, under that metaslab's lock, before anything is written
+    /// there. Pinned only afterwards, `return_full` could give the
+    /// metaslab back in between, with the file's uncommitted records in it
+    /// (structural triage I-5).
+    pub(crate) static PIN_ALLOCS: PinScope;
+}
+
+/// The pins a [`PIN_ALLOCS`] scope took. Dropped with pins still in it
+/// (the scope's future was dropped mid-allocation, before its owner took
+/// them), it unpins them: nobody else knows of them, and a metaslab
+/// pinned for good is never given back.
+pub(crate) struct PinScope {
+    writer: Option<std::sync::Arc<crate::writer::WriterState>>,
+    pins: std::cell::RefCell<Vec<MetaslabIdx>>,
+}
+
+impl PinScope {
+    pub(crate) fn new(writer: Option<std::sync::Arc<crate::writer::WriterState>>) -> Self {
+        PinScope {
+            writer,
+            pins: Default::default(),
+        }
+    }
+
+    /// The pins taken, now the caller's to undo.
+    pub(crate) fn take(&self) -> Vec<MetaslabIdx> {
+        self.pins.take()
+    }
+}
+
+impl Drop for PinScope {
+    fn drop(&mut self) {
+        if let Some(w) = &self.writer {
+            for idx in self.pins.get_mut().drain(..) {
+                w.unpin(idx);
+            }
+        }
+    }
+}
+
 /// Bookkeeping for a metaslab whose slot was written during a TXG sync.
 pub(crate) struct SyncedMetaslab {
     ms_idx: usize,
@@ -573,6 +640,17 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
+    /// Give back space whose write failed or was dropped, and so may still
+    /// land (see `MetaslabState::abandon`).
+    pub(crate) async fn release_unsettled(&self, start: u64, len: u64) {
+        if let Some(idx) = self.layout.metaslab_for_block(start) {
+            self.metaslabs[idx.index()]
+                .write()
+                .await
+                .abandon(start, len, self.writer.is_some());
+        }
+    }
+
     /// Space that can be allocated right now (excludes deferred frees).
     pub(crate) async fn allocatable_blocks(&self) -> u64 {
         let mut total = 0;
@@ -591,6 +669,33 @@ impl<D: BlockDevice> FileSystem<D> {
         self.allocate_run(blocks, None).await
     }
 
+    /// `e`, just taken from metaslab `idx` (whose lock `ms` is), if it may
+    /// be used: inside a [`PIN_ALLOCS`] scope on a writer, only once `idx`
+    /// is pinned, and so can't be given back under the records about to be
+    /// written there. If it's no longer lent (being given back), `e` is put
+    /// back and None returned: allocate elsewhere.
+    fn pinned_alloc(&self, idx: usize, ms: &mut MetaslabState, e: Extent) -> Option<Extent> {
+        let Some(w) = &self.writer else {
+            return Some(e);
+        };
+        let idx = MetaslabIdx::from_raw(idx as u32);
+        let pinned = PIN_ALLOCS.try_with(|pins| {
+            let ok = w.pin_if_lent(idx);
+            if ok {
+                pins.pins.borrow_mut().push(idx);
+            }
+            ok
+        });
+        match pinned {
+            // Not in a scope: no pin wanted.
+            Err(_) | Ok(true) => Some(e),
+            Ok(false) => {
+                ms.unallocate(e.start, e.len);
+                None
+            }
+        }
+    }
+
     /// Allocate one contiguous, stripe-aligned extent of `blocks`, preferably
     /// at or just after block `hint` (so related records end up next to each
     /// other), else first fit.
@@ -606,10 +711,9 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(h) = hint
             && let Some(idx) = self.layout.metaslab_for_block(h)
         {
-            if let Some(extent) = self.metaslabs[idx.index()]
-                .write()
-                .await
-                .take_aligned_exact(want, h)
+            let mut ms = self.metaslabs[idx.index()].write().await;
+            if let Some(extent) = ms.take_aligned_exact(want, h)
+                && let Some(extent) = self.pinned_alloc(idx.index(), &mut ms, extent)
             {
                 return Ok(extent);
             }
@@ -617,8 +721,11 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let n = self.metaslabs.len();
         for i in 0..n {
-            let ms = &self.metaslabs[(first + i) % n];
-            if let Some(extent) = ms.write().await.take_aligned_exact(want, 0) {
+            let at = (first + i) % n;
+            let mut ms = self.metaslabs[at].write().await;
+            if let Some(extent) = ms.take_aligned_exact(want, 0)
+                && let Some(extent) = self.pinned_alloc(at, &mut ms, extent)
+            {
                 return Ok(extent);
             }
         }

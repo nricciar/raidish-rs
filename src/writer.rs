@@ -371,6 +371,18 @@ impl WriterState {
             }
         }
     }
+    /// Pin `idx` if it's still lent to this writer. Under the lent list's
+    /// lock, where giving a metaslab back checks the pins and takes it off
+    /// the list: either the pin lands first and it stays, or it's already
+    /// gone and nothing is pinned.
+    pub(crate) fn pin_if_lent(&self, idx: MetaslabIdx) -> bool {
+        let lent = self.lent.lock().unwrap();
+        if !lent.contains(&idx) {
+            return false;
+        }
+        self.pin(idx);
+        true
+    }
     fn is_pinned(&self, idx: MetaslabIdx) -> bool {
         self.pinned.lock().unwrap().contains_key(&idx)
     }

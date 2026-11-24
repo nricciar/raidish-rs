@@ -152,11 +152,12 @@ impl<D: BlockDevice> FileSystem<D> {
             extent.len,
             self.metaslabs.clone(),
             self.layout,
+            self.writer.is_some(),
         );
         let r = self.write_record_blocks(extent.start, data).await;
         unwritten.disarm();
         if let Err(e) = r {
-            self.unallocate(extent.start, extent.len).await;
+            self.release_unsettled(extent.start, extent.len).await;
             return Err(e);
         }
         BlockPtr::new(extent.start, extent.len, data, txg)

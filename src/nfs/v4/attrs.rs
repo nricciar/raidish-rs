@@ -364,7 +364,7 @@ pub fn decode(r: &mut Reader<'_>, now: u64) -> Result<Settable, NfsStat> {
                 if ns >= 1_000_000_000 {
                     return Err(err::INVAL);
                 }
-                Ok(s.saturating_mul(1_000_000_000) + ns as u64)
+                Ok(s.saturating_mul(1_000_000_000).saturating_add(ns as u64))
             }
             _ => Err(err::BADXDR),
         }

@@ -395,3 +395,89 @@ fn label_candidates_on_a_wide_raidz_are_each_rebuild_once() {
         .expect("inconsistent shards have candidates");
     assert_eq!(candidates.len(), n);
 }
+
+/// A read of a block still buffered in a stripe must not hold the stripe
+/// map's shard lock while it waits for that stripe (a flush holds it across
+/// disk I/O): a write to another stripe in the same shard would then block
+/// its thread outright. On one thread that's a deadlock: the flush can
+/// never finish.
+#[test]
+fn a_read_waiting_on_a_buffered_stripe_doesnt_block_the_map() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let files: Vec<NamedTempFile> = (0..3)
+                .map(|_| {
+                    let f = NamedTempFile::new().unwrap();
+                    f.as_file().set_len(16 * 1024 * 1024).unwrap();
+                    f
+                })
+                .collect();
+            let handles: Vec<_> = files
+                .iter()
+                .map(|f| crate::test_util::FaultDisk::open(f.path()).unwrap())
+                .collect();
+            let caddies = handles
+                .iter()
+                .map(|h| {
+                    crate::disks::Caddy::Healthy(
+                        h.path().to_string_lossy().into_owned(),
+                        crate::disk::Disk::faulty(h.clone()),
+                    )
+                })
+                .collect();
+            let disks = Arc::new(crate::disks::DiskSet::from_caddies(caddies));
+            let raidz = Arc::new(RaidZ::new(disks, vec![0, 1, 2], 1));
+            let data = raidz.data as u64;
+            // Stripe 0, half written: buffered.
+            raidz.write_block(0, &[1u8; BLOCK_SIZE]).await.unwrap();
+
+            for h in &handles {
+                h.hold_writes(true);
+            }
+            let flush = tokio::spawn({
+                let raidz = raidz.clone();
+                async move { raidz.flush().await }
+            });
+            while handles.iter().map(|h| h.held()).sum::<usize>() == 0 {
+                tokio::task::yield_now().await;
+            }
+            // Waits on stripe 0, which the flush holds.
+            let read = tokio::spawn({
+                let raidz = raidz.clone();
+                async move {
+                    let mut buf = [0u8; BLOCK_SIZE];
+                    raidz.read_block(0, &mut buf).await.map(|_| buf[0])
+                }
+            });
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            // Inserts into many stripes, so into the shard the read held
+            // (all but certainly: a few hundred shards at most).
+            for other in 1..2000u64 {
+                raidz
+                    .write_block(other * data, &[2u8; BLOCK_SIZE])
+                    .await
+                    .unwrap();
+            }
+            for h in &handles {
+                h.hold_writes(false);
+                h.release_all();
+            }
+            flush.await.unwrap().unwrap();
+            assert_eq!(read.await.unwrap().unwrap(), 1);
+        });
+        let _ = done.send(());
+    });
+    assert!(
+        finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .is_ok(),
+        "deadlocked: the read held the map's shard while waiting"
+    );
+}

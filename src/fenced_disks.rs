@@ -5,7 +5,8 @@
 //!
 //! * Shape (R1a): a [`ValidatedWrite`] or [`ValidatedRead`] is the only way
 //!   to name blocks. Building one checks that the disk is local and served,
-//!   that `1 <= count <= WS_MAX_BLOCKS`, that the range doesn't wrap, and
+//!   that `1 <= count <= WS_MAX_BLOCKS`, that the range doesn't wrap (in
+//!   blocks or in bytes), and
 //!   (for a write) that the data is exactly `count` blocks, before anything
 //!   is admitted (an admitted request raises floors).
 //! * Readiness (R1b): writes wait for the fence's startup barrier
@@ -29,7 +30,7 @@ use crate::disks::Caddy;
 use crate::fence::{Admit, Ready, ServerFence, Stamp};
 use crate::websocket::{WS_MAX_BLOCKS, WsStatus};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::time::Instant;
 
@@ -87,6 +88,8 @@ pub struct FencedDisks {
     /// Per served disk, its stripe locks: writes exclusive, stamped reads
     /// shared.
     stripes: Vec<Vec<RwLock<()>>>,
+    /// Per served disk, its capacity in blocks as last seen (0: not yet).
+    capacity: Vec<AtomicU64>,
 }
 
 impl FencedDisks {
@@ -95,10 +98,12 @@ impl FencedDisks {
             .iter()
             .map(|_| (0..STRIPES).map(|_| RwLock::new(())).collect())
             .collect();
+        let capacity = disks.iter().map(|_| AtomicU64::new(0)).collect();
         FencedDisks {
             disks,
             floor,
             stripes,
+            capacity,
         }
     }
 
@@ -124,9 +129,33 @@ impl FencedDisks {
             .ok_or(WsStatus::ErrorNotFound)
     }
 
+    /// The request's shape. The range must be addressable in bytes, not
+    /// just in blocks (I-9): a block number whose byte offset wraps would
+    /// be fenced, and stripe-locked, as one block and land on another.
     fn check_range(&self, disk: usize, block: u64, count: u32) -> Result<(), WsStatus> {
         self.local(disk)?;
-        if count == 0 || count > WS_MAX_BLOCKS || block.checked_add(count as u64).is_none() {
+        if count == 0
+            || count > WS_MAX_BLOCKS
+            || crate::disk::byte_offset(block, count as u64).is_none()
+        {
+            return Err(WsStatus::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    /// Whether `count` blocks from `block` are on the disk. The capacity is
+    /// cached, and asked again only for a range past it, so a disk that
+    /// grew is seen and the common case costs nothing. Without this, a
+    /// write past the end of a file disk grows the file, and a read past it
+    /// returns zeros, both outside anything the fence maps.
+    async fn check_capacity(&self, disk: usize, block: u64, count: u32) -> Result<(), WsStatus> {
+        let end = block + count as u64; // checked by `check_range`
+        if end <= self.capacity[disk].load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let cap = self.capacity_blocks(disk).await?;
+        self.capacity[disk].fetch_max(cap, Ordering::Relaxed);
+        if end > cap {
             return Err(WsStatus::InvalidRequest);
         }
         Ok(())
@@ -163,6 +192,7 @@ impl FencedDisks {
     /// under its blocks' stripe locks, shared: writes admitted before it
     /// have landed (see the module docs).
     pub async fn read(&self, r: ValidatedRead, stamp: Option<Stamp>) -> Result<Vec<u8>, WsStatus> {
+        self.check_capacity(r.disk, r.block, r.count).await?;
         let _locked = match stamp {
             Some(stamp) => {
                 let locked = self.lock_shared(r.disk, r.block, r.count).await;
@@ -187,6 +217,7 @@ impl FencedDisks {
             return Err(WsStatus::NotReady);
         }
         let count = w.data.len() as u32;
+        self.check_capacity(w.disk, w.block, count).await?;
         let _locked = self.lock(w.disk, w.block, count).await;
         // From here to the write starting: no await.
         if expiry.is_expired() {
