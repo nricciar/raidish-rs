@@ -1,0 +1,27 @@
+[package]
+name = "raidish-etcd"
+version = "0.1.0"
+edition = "2024"
+description = "An etcd v3 server (KV, Watch, Lease and the status services) over a RAIDish B+tree dataset."
+build = "build.rs"
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "io-util"] }
+tokio-stream = { workspace = true, features = ["io-util", "net"] }
+futures = { workspace = true }
+serde = { workspace = true }
+blake3 = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

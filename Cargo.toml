@@ -11,6 +11,11 @@ raidish-auth = { path = "crates/raidish-auth" }
 raidish-vm = { path = "crates/raidish-vm" }
 raidish-cluster = { path = "crates/raidish-cluster" }
 raidish-committer = { path = "crates/raidish-committer" }
+raidish-etcd = { path = "crates/raidish-etcd" }
+raidish-csi = { path = "crates/raidish-csi" }
+raidish-nfs = { path = "crates/raidish-nfs" }
+raidish-block = { path = "crates/raidish-block" }
+raidish-services = { path = "crates/raidish-services" }
 reed-solomon-simd = "3.1.0"
 tokio = "1"
 futures-util = "0.3"
@@ -87,6 +92,11 @@ raidish-auth = { workspace = true }
 raidish-vm = { workspace = true }
 raidish-cluster = { workspace = true }
 raidish-committer = { workspace = true }
+raidish-etcd = { workspace = true }
+raidish-csi = { workspace = true }
+raidish-nfs = { workspace = true }
+raidish-block = { workspace = true }
+raidish-services = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 futures-util = { workspace = true }
 futures = { workspace = true }
@@ -147,10 +157,6 @@ js-sys = { workspace = true }
 gloo-timers = { workspace = true, features = ["futures"] }
 chrono = { workspace = true, features = ["wasmbind"] }
 web-sys = { workspace = true, features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
-
-[build-dependencies]
-tonic-build = { workspace = true }
-protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 raidish-types = { workspace = true, features = ["testutil"] }

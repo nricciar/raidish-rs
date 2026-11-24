@@ -10,7 +10,6 @@ pub use raidish_types::{api_types, types, vm_def};
 // The storage core.
 #[cfg(test)]
 pub(crate) use raidish_core::blkptr;
-pub(crate) use raidish_core::btree;
 pub(crate) use raidish_core::dataset;
 pub use raidish_core::disk;
 pub use raidish_core::disks;
@@ -18,7 +17,6 @@ pub use raidish_core::fence;
 pub use raidish_core::fs;
 pub use raidish_core::inode;
 pub use raidish_core::inspect;
-pub(crate) use raidish_core::kv;
 pub(crate) use raidish_core::metaslab;
 pub(crate) use raidish_core::object;
 pub(crate) use raidish_core::open_file;
@@ -26,8 +24,6 @@ pub(crate) use raidish_core::open_file;
 pub(crate) use raidish_core::raidz;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_core::send;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use raidish_core::service_tree;
 pub(crate) use raidish_core::snapshot;
 #[cfg(test)]
 pub(crate) use raidish_core::tx;
@@ -58,47 +54,39 @@ pub(crate) use raidish_committer as committer;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod csi;
+pub(crate) use raidish_csi as csi;
 #[cfg(not(target_arch = "wasm32"))]
 mod dashboard;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod etcd;
+pub(crate) use raidish_block::export;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_committer::events;
-#[cfg(not(target_arch = "wasm32"))]
-mod export;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fenced_disks;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod files_api;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod frontend;
-#[cfg(not(target_arch = "wasm32"))]
-mod nbd;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_auth::net;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod nfs;
+pub(crate) use raidish_block::nbd;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use raidish_nfs as nfs;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use raidish_services::frontend;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod node_facts;
 #[cfg(not(target_arch = "wasm32"))]
-mod nvme;
+pub(crate) use raidish_auth::pki;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use raidish_block::nvme;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use raidish_block::peer_io;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_committer::object_lease;
 #[cfg(not(target_arch = "wasm32"))]
-mod peer_io;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use raidish_auth::pki;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_vm::proc;
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod s3;
-#[cfg(not(target_arch = "wasm32"))]
 mod server;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod sigv4;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod sqs;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use raidish_auth::tls;
 #[cfg(not(target_arch = "wasm32"))]
@@ -110,11 +98,9 @@ pub(crate) use raidish_vm::vm_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod vms_api;
 #[cfg(not(target_arch = "wasm32"))]
-mod volume_io;
+pub(crate) use raidish_block::volume_io;
 #[cfg(not(target_arch = "wasm32"))]
 mod volumes_api;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use raidish_vm::xml;
 
 #[cfg(test)]
 #[path = "tests/cluster_tests.rs"]

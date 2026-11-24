@@ -2429,12 +2429,16 @@ dependencies = [
  "percent-encoding",
  "prost",
  "prost-types",
- "protoc-bin-vendored",
  "quick-xml",
  "raidish-auth",
+ "raidish-block",
  "raidish-cluster",
  "raidish-committer",
  "raidish-core",
+ "raidish-csi",
+ "raidish-etcd",
+ "raidish-nfs",
+ "raidish-services",
  "raidish-types",
  "raidish-vm",
  "rcgen",
@@ -2456,7 +2460,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
  "tonic",
- "tonic-build",
  "tungstenite 0.28.0",
  "url",
  "wasm-bindgen",
@@ -2487,6 +2490,22 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "url",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "raidish-block"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "raidish-auth",
+ "raidish-core",
+ "raidish-types",
+ "rustls 0.23.46",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.6",
 ]
 
 [[package]]
@@ -2560,6 +2579,103 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+]
+
+[[package]]
+name = "raidish-csi"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "raidish-etcd"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "prost",
+ "protoc-bin-vendored",
+ "raidish-core",
+ "raidish-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "raidish-nfs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-types",
+ "reqwest",
+ "rocket",
+ "serde",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "raidish-services"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "md-5",
+ "percent-encoding",
+ "raidish-auth",
+ "raidish-cluster",
+ "raidish-committer",
+ "raidish-core",
+ "raidish-etcd",
+ "raidish-types",
+ "raidish-vm",
+ "reqwest",
+ "ring",
+ "rocket",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

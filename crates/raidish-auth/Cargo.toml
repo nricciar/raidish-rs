@@ -5,7 +5,7 @@ edition = "2024"
 description = "RAIDish identity and transport: the cluster PKI, TLS, request authentication, the TCP accept loop."
 
 [features]
-testutil = ["raidish-types/testutil"]
+testutil = ["dep:tempfile", "raidish-types/testutil"]
 
 [dependencies]
 raidish-types = { workspace = true }
@@ -24,6 +24,7 @@ ring = { workspace = true }
 base64 = { workspace = true }
 time = { workspace = true }
 blake3 = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 raidish-types = { workspace = true, features = ["testutil"] }

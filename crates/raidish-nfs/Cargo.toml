@@ -1,0 +1,27 @@
+[package]
+name = "raidish-nfs"
+version = "0.1.0"
+edition = "2024"
+description = "The RAIDish NFS server: NFSv3 and NFSv4.1 (sessions, delegations, pNFS layouts) over a filesystem dataset."
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-committer = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+url = { workspace = true }
+rocket = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots"] }
+
+[dev-dependencies]
+raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-committer = { workspace = true, features = ["testutil"] }
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
