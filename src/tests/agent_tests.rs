@@ -167,3 +167,89 @@ fn handed_over_volumes_go_with_their_lease_or_the_writers() {
     assert_eq!(drop(WriterStanding::Lost), vec!["kept", "lapsed"]);
     assert_eq!(drop(WriterStanding::Gone), vec!["kept", "lapsed"]);
 }
+
+/// A6: a failed migration's guest may have switched over before the
+/// failure; only where it runs decides what's done, and not knowing
+/// leaves it alone (never moved cold, so never started twice).
+#[test]
+fn a_failed_migration_is_settled_by_where_its_guest_runs() {
+    use migrate::{Whereabouts::*, whereabouts};
+    assert_eq!(whereabouts(Some(true), None), Here);
+    assert_eq!(whereabouts(Some(true), Some(true)), Here);
+    assert_eq!(whereabouts(Some(true), Some(false)), Here);
+    assert_eq!(whereabouts(Some(false), Some(true)), There);
+    assert_eq!(whereabouts(Some(false), Some(false)), Neither);
+    assert_eq!(whereabouts(Some(false), None), Unknown);
+    assert_eq!(whereabouts(None, Some(false)), Unknown);
+    assert_eq!(whereabouts(None, None), Unknown);
+}
+
+/// One HTTP answer to whatever is asked, from a throwaway listener.
+async fn answer_once(status: &'static str, body: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut c, _) = l.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = c.read(&mut buf).await;
+        let r = format!(
+            "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        let _ = c.write_all(r.as_bytes()).await;
+    });
+    url
+}
+
+#[tokio::test]
+async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
+    use crate::vm::{DomMeta, DomOwner, DomState, Domain, LocalVm};
+    use crate::vms_api::LocalView;
+    let http = reqwest::Client::new();
+    let vm = |name: &str| LocalVm {
+        domain: Domain {
+            name: name.into(),
+            id: Some(1),
+            state: DomState::Running,
+        },
+        meta: DomMeta {
+            anchor: name.into(),
+            volumes: vec![name.into()],
+            change: 1,
+            owner: DomOwner::Migrating,
+            pool: String::new(),
+            node: "2".into(),
+        },
+        vcpus: None,
+        memory: None,
+        cpu_s: None,
+        vnc_port: None,
+    };
+    let view = |vms, error: Option<&str>| {
+        serde_json::to_string(&LocalView {
+            node: "2".into(),
+            enabled: true,
+            vms,
+            errors: Default::default(),
+            error: error.map(String::from),
+        })
+        .unwrap()
+    };
+    let url = answer_once("200 OK", view(vec![vm("web")], None)).await;
+    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(true));
+    let url = answer_once("200 OK", view(vec![vm("db")], None)).await;
+    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(false));
+    // Its libvirt couldn't be asked: not "it doesn't run there".
+    let url = answer_once("200 OK", view(vec![], Some("libvirt down"))).await;
+    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    let url = answer_once("503 Service Unavailable", "{}".into()).await;
+    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    // Nobody there.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+}

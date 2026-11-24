@@ -17,8 +17,13 @@
 //!
 //! The agent loop then finishes it (see `super::Agent::poll_migrations`):
 //! on success A detaches itself, so each volume is handed to B; once none
-//! runs here, B is detached too. On failure both are detached and the VM
-//! moves cold. B re-stamps the domain's metadata once it runs the volumes.
+//! runs here, B is detached too. On failure where the guest runs now is
+//! asked first (`Whereabouts`): a migration can fail after the switchover
+//! (its answer lost, a timeout at the very end), so the guest may be on B.
+//! There: it's finished as if it had succeeded. Here or nowhere: both are
+//! detached and the VM moves cold. Not here and B can't be asked: nothing
+//! is done (and it isn't started here) until B answers. B re-stamps the
+//! domain's metadata once it runs the volumes.
 
 use crate::cluster::LeaseOp;
 use crate::cluster::lease::LeaseClient;
@@ -66,6 +71,57 @@ pub(super) struct Migrated {
     pub volumes: Vec<String>,
     /// This node detached from them (so they're handed over).
     pub detached: bool,
+}
+
+/// A live migration that failed, until where its guest runs is known.
+pub(super) struct Unsettled {
+    pub to: String,
+    pub volumes: Vec<String>,
+    pub why: String,
+    /// It was said that B couldn't be asked (said once).
+    pub told: bool,
+}
+
+/// Where a failed migration's guest runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Whereabouts {
+    /// Still here (or both: here wins, B destroys its copy once detached).
+    Here,
+    /// On B only: the switchover happened.
+    There,
+    /// Neither runs it.
+    Neither,
+    /// Not here, and B (or this node's libvirt) couldn't be asked.
+    Unknown,
+}
+
+/// From whether it runs `here` and on B (`there`); None: couldn't be asked.
+pub(super) fn whereabouts(here: Option<bool>, there: Option<bool>) -> Whereabouts {
+    match (here, there) {
+        (Some(true), _) => Whereabouts::Here,
+        (Some(false), Some(true)) => Whereabouts::There,
+        (Some(false), Some(false)) => Whereabouts::Neither,
+        _ => Whereabouts::Unknown,
+    }
+}
+
+/// Does the node at `url` run VM `name` (`GET /api/v1/vm/local`)? None: it
+/// couldn't be asked, or couldn't ask its libvirt.
+pub(super) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) -> Option<bool> {
+    let view: crate::vms_api::LocalView = http
+        .get(format!("{}/api/v1/vm/local", url))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    if view.error.is_some() {
+        return None;
+    }
+    Some(view.vms.iter().any(|v| v.domain.name == name))
 }
 
 /// Attach `volume` to `node` too, or (`on: false`) no longer.

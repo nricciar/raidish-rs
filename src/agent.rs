@@ -435,6 +435,9 @@ struct VmBook {
     migrated: BTreeMap<String, migrate::Migrated>,
     /// VMs whose live migration to a node failed: they move there cold.
     migrate_failed: BTreeMap<String, String>,
+    /// Failed live migrations whose guest's whereabouts aren't settled yet
+    /// (see `Agent::settle_failed`).
+    unsettled: BTreeMap<String, migrate::Unsettled>,
 }
 
 /// The services (S3, SQS, etcd datasets) this node serves.
@@ -1046,7 +1049,7 @@ impl Agent {
         });
         for v in ours {
             let name = &v.domain.name;
-            if self.vms.migrations.contains_key(name) {
+            if self.vms.migrations.contains_key(name) || self.vms.unsettled.contains_key(name) {
                 continue; // leaving: see `poll_migrations`
             }
             // Migrated here: left alone while its volumes are proxied here
@@ -1175,8 +1178,10 @@ impl Agent {
             }
             // Leaving, or just left, by migration: it runs elsewhere even
             // where its domain is already gone from here.
+            // Or a failed migration's guest may run elsewhere (unknown yet).
             if self.vms.migrations.contains_key(&spec.name)
                 || self.vms.migrated.contains_key(&spec.name)
+                || self.vms.unsettled.contains_key(&spec.name)
             {
                 continue;
             }
@@ -1872,9 +1877,8 @@ impl Agent {
                 Ok(r) => r,
                 Err(e) => Err(migrate::Failure::Failed(e.to_string())),
             };
-            if let Err(migrate::Failure::Failed(e)) = &result {
-                self.facts.note_migration(&m.to, &Err(e.clone()));
-            } else if result.is_ok() {
+            // A failure is noted once it's settled (`settle_failed`).
+            if result.is_ok() {
                 self.facts.note_migration(&m.to, &Ok(()));
             }
             match result {
@@ -1921,29 +1925,19 @@ impl Agent {
                     self.vms.migrate_failed.insert(name, m.to);
                 }
                 Err(migrate::Failure::Failed(e)) => {
-                    eprintln!(
-                        "agent: migrating VM '{}' to {} failed: {} (moving it cold)",
-                        name, m.to, e
+                    self.vms.unsettled.insert(
+                        name,
+                        migrate::Unsettled {
+                            to: m.to,
+                            volumes: m.volumes,
+                            why: e,
+                            told: false,
+                        },
                     );
-                    self.events.warn(
-                        EventKind::VmMigrateFailed,
-                        Subject::vm(&name),
-                        format!(
-                            "VM '{}' couldn't migrate live from {} to {} ({}); moving it cold",
-                            name, self.node, m.to, e
-                        ),
-                    );
-                    for v in &m.volumes {
-                        for node in [m.to.as_str(), self.node.as_str()] {
-                            if let Err(e) = migrate::attach(&self.leases, v, node, false).await {
-                                eprintln!("agent: detaching '{}' from {}: {}", v, node, e);
-                            }
-                        }
-                    }
-                    self.vms.migrate_failed.insert(name, m.to);
                 }
             }
         }
+        self.settle_failed().await;
         // Migrated: detach here (so each volume is handed over), then, once
         // none runs here, there too (back to their own placement).
         let names: Vec<String> = self.vms.migrated.keys().cloned().collect();
@@ -1976,6 +1970,112 @@ impl Agent {
                 self.vms.migrated.insert(name, m);
             }
         }
+    }
+
+    /// Failed live migrations: where does the guest run now? It may have
+    /// switched over before the failure (`migrate::Whereabouts`).
+    async fn settle_failed(&mut self) {
+        let names: Vec<String> = self.vms.unsettled.keys().cloned().collect();
+        for name in names {
+            let mut u = self.vms.unsettled.remove(&name).unwrap();
+            let here = match &self.vm {
+                Some(vm) => vm
+                    .virsh
+                    .list()
+                    .await
+                    .ok()
+                    .map(|l| l.iter().any(|d| d.name == name && d.id.is_some())),
+                None => Some(false),
+            };
+            // B only matters if it isn't here.
+            let there = if here == Some(false) {
+                self.ask_runs_there(&u.to, &name).await
+            } else {
+                None
+            };
+            match migrate::whereabouts(here, there) {
+                migrate::Whereabouts::Unknown => {
+                    if !u.told {
+                        u.told = true;
+                        eprintln!(
+                            "agent: migrating VM '{}' to {} failed ({}) and it isn't here: \
+                             waiting for {} to say whether it runs there",
+                            name, u.to, u.why, u.to
+                        );
+                        self.events.warn(
+                            EventKind::VmMigrateFailed,
+                            Subject::vm(&name),
+                            format!(
+                                "VM '{}' couldn't migrate live from {} to {} ({}) and no \
+                                 longer runs on {}; {} can't be asked whether it runs there, \
+                                 so it's left alone until it can",
+                                name, self.node, u.to, u.why, self.node, u.to
+                            ),
+                        );
+                    }
+                    self.vms.unsettled.insert(name, u);
+                }
+                migrate::Whereabouts::There => {
+                    println!(
+                        "agent: migrating VM '{}' to {} failed ({}) but it runs there: \
+                         handing its volumes over",
+                        name, u.to, u.why
+                    );
+                    self.facts.note_migration(&u.to, &Ok(()));
+                    self.events.info(
+                        EventKind::VmMigrated,
+                        Subject::vm(&name),
+                        format!(
+                            "VM '{}' migrated live from {} to {} (though {} said it failed: {})",
+                            name, self.node, u.to, self.node, u.why
+                        ),
+                    );
+                    self.vms.migrated.insert(
+                        name,
+                        migrate::Migrated {
+                            to: u.to,
+                            volumes: u.volumes,
+                            detached: false,
+                        },
+                    );
+                }
+                w @ (migrate::Whereabouts::Here | migrate::Whereabouts::Neither) => {
+                    let at = if w == migrate::Whereabouts::Here {
+                        format!("it still runs on {}", self.node)
+                    } else {
+                        "it runs nowhere".to_string()
+                    };
+                    eprintln!(
+                        "agent: migrating VM '{}' to {} failed: {}; {} (moving it cold)",
+                        name, u.to, u.why, at
+                    );
+                    self.facts.note_migration(&u.to, &Err(u.why.clone()));
+                    self.events.warn(
+                        EventKind::VmMigrateFailed,
+                        Subject::vm(&name),
+                        format!(
+                            "VM '{}' couldn't migrate live from {} to {} ({}); {}; moving it cold",
+                            name, self.node, u.to, u.why, at
+                        ),
+                    );
+                    for v in &u.volumes {
+                        for node in [u.to.as_str(), self.node.as_str()] {
+                            if let Err(e) = migrate::attach(&self.leases, v, node, false).await {
+                                eprintln!("agent: detaching '{}' from {}: {}", v, node, e);
+                            }
+                        }
+                    }
+                    self.vms.migrate_failed.insert(name, u.to);
+                }
+            }
+        }
+    }
+
+    /// Does `node` run VM `name`? None: it couldn't be asked.
+    async fn ask_runs_there(&self, node: &str, name: &str) -> Option<bool> {
+        let url = peer_url(&self.cluster.members.peers, node)?;
+        let http = crate::tls::http_client(Some(Duration::from_secs(5))).ok()?;
+        migrate::runs_there(&http, &url, name).await
     }
 
     /// VM `v` migrated here and its volumes run here now: make it this
