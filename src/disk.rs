@@ -11,6 +11,19 @@ use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type BlockId = u64;
+
+/// The byte offset of block `start`, if `blocks` blocks from it end at a
+/// byte offset a file can address (`i64`). `None` for a range whose bytes
+/// would wrap: `start * BLOCK_SIZE` must never be computed unchecked, since
+/// a wrapped offset lands on some other block (structural triage I-9).
+pub fn byte_offset(start: BlockId, blocks: u64) -> Option<u64> {
+    let end = start.checked_add(blocks)?.checked_mul(BLOCK_SIZE as u64)?;
+    (end <= i64::MAX as u64).then(|| start * BLOCK_SIZE as u64)
+}
+
+fn bad_offset() -> DiskError {
+    DiskError::IoError(std::io::ErrorKind::InvalidInput.into())
+}
 pub use crate::types::FileId;
 
 #[derive(Debug)]
@@ -576,9 +589,11 @@ impl BlockDevice for Disk {
             DiskBackend::Local(file) => {
                 let file = file.clone();
                 let len = buf.len();
+                let offset =
+                    byte_offset(start, (len / BLOCK_SIZE) as u64).ok_or_else(bad_offset)?;
                 let data = tokio::task::spawn_blocking(move || {
                     let mut data = vec![0u8; len];
-                    read_at_zero_fill(&file, &mut data, start * BLOCK_SIZE as u64).map(|_| data)
+                    read_at_zero_fill(&file, &mut data, offset).map(|_| data)
                 })
                 .await??;
                 buf.copy_from_slice(&data);
@@ -612,11 +627,10 @@ impl BlockDevice for Disk {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
+                let offset =
+                    byte_offset(start, (buf.len() / BLOCK_SIZE) as u64).ok_or_else(bad_offset)?;
                 let data = buf.to_vec();
-                tokio::task::spawn_blocking(move || {
-                    file.write_all_at(&data, start * BLOCK_SIZE as u64)
-                })
-                .await??;
+                tokio::task::spawn_blocking(move || file.write_all_at(&data, offset)).await??;
                 Ok(())
             }
             #[cfg(all(test, not(target_arch = "wasm32")))]

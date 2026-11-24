@@ -67,6 +67,8 @@ pub const INLINE_DATA_SIZE: usize = 8192;
 const MDTS: u8 = 8;
 pub const MAX_TRANSFER: usize = (1 << MDTS) * LBA_SIZE as usize;
 const MAX_PDU: usize = MAX_TRANSFER + 8192;
+/// The most of a log page `GET_LOG_PAGE` returns.
+const LOG_PAGE_MAX: usize = 4096;
 const C2H_CHUNK: usize = 128 * 1024;
 /// Entries per queue (CAP.MQES + 1).
 pub const QUEUE_ENTRIES: u16 = 128;
@@ -610,6 +612,11 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
                 }
             }
             PDU_H2C_DATA => {
+                // Its header is 24 bytes; a PDU only 8 long must not be read
+                // past (a panic, here, as the host likes).
+                if pdu.len() < 24 {
+                    break Err(invalid("short H2C data PDU"));
+                }
                 let ttag = le16(&pdu, 10);
                 let datao = le32(&pdu, 12) as usize;
                 let datal = le32(&pdu, 16) as usize;
@@ -635,7 +642,7 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
                 trace!(
                     "nvme: {}: host terminated connection (fes {:#x})",
                     conn.peer,
-                    le16(&pdu, 8)
+                    pdu.get(8..10).map_or(0, |f| le16(f, 0))
                 );
                 break Ok(());
             }
@@ -940,8 +947,11 @@ fn admin<D: BlockDevice>(
         }
         ADM_GET_LOG_PAGE => {
             let lid = sqe.cdw(10) & 0xff;
-            let numd = ((sqe.cdw(10) >> 16) | ((sqe.cdw(11) & 0xffff) << 16)) as usize + 1;
-            let len = (numd * 4).min(sqe.data_len());
+            let numd =
+                (((sqe.cdw(10) >> 16) | ((sqe.cdw(11) & 0xffff) << 16)) as usize).saturating_add(1);
+            // Each of these pages fits in 4 KiB: no more is made, whatever
+            // length the host names.
+            let len = numd.saturating_mul(4).min(sqe.data_len()).min(LOG_PAGE_MAX);
             match lid {
                 // Error information, SMART / health, firmware slots: all empty.
                 0x01..=0x03 => Completion::with_data(vec![0u8; len]),
@@ -956,8 +966,8 @@ fn admin<D: BlockDevice>(
                 0x07 => {
                     // Number of queues (0-based in both directions).
                     if set {
-                        let nsqr = (sqe.cdw(11) & 0xffff) as u16 + 1;
-                        let ncqr = (sqe.cdw(11) >> 16) as u16 + 1;
+                        let nsqr = ((sqe.cdw(11) & 0xffff) as u16).saturating_add(1);
+                        let ncqr = ((sqe.cdw(11) >> 16) as u16).saturating_add(1);
                         regs.io_queues = nsqr.min(ncqr).min(MAX_IO_QUEUES);
                     }
                     let n = regs.io_queues.max(1) as u32 - 1;

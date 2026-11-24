@@ -279,3 +279,51 @@ async fn syncing_a_file_closed_under_its_writes_fails() {
     fs.file_sync(&g).await.unwrap();
     assert_eq!(fs.read_file(Path::new("/f")).await.unwrap(), b"CD23456789");
 }
+
+/// I-6: closing an `OpenFile` forgets only that one. Closed (or dropped by
+/// the pool) and opened again meanwhile, the new opener's file stays open,
+/// with its writes.
+#[tokio::test]
+async fn closing_a_stale_handle_leaves_the_new_one_open() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.write_file(Path::new("/f"), b"x").await.unwrap();
+    let old = fs.open_file(Path::new("/f"), None).await.unwrap();
+    fs.discard_file(old.id);
+    let new = fs.open_file(Path::new("/f"), None).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    fs.file_write(&new, 0, b"new").await.unwrap();
+    let _ = fs.close_file(&old).await;
+    assert!(
+        fs.opened(new.id).is_some_and(|o| Arc::ptr_eq(&o, &new)),
+        "closing the old handle closed the new one"
+    );
+    fs.file_sync(&new).await.unwrap();
+    assert_eq!(fs.read_file(Path::new("/f")).await.unwrap(), b"new");
+}
+
+/// I-31: a write whose end wraps (or is past what a size can be) is
+/// refused, not applied at the start of the file with the size unchanged.
+/// So is growing a file past that.
+#[tokio::test]
+async fn a_write_whose_end_wraps_is_refused() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    fs.write_file(Path::new("/f"), b"head").await.unwrap();
+    let f = fs.open_file(Path::new("/f"), None).await.unwrap();
+    for at in [u64::MAX - 10, crate::object::MAX_GROWABLE_SIZE - 2] {
+        let r = fs.file_write(&f, at, b"wraps").await;
+        assert!(
+            matches!(r, Err(FileSystemError::InvalidArgument(_))),
+            "{}: {:?}",
+            at,
+            r
+        );
+    }
+    assert_eq!(f.size(), 4);
+    let mut buf = [0u8; 4];
+    fs.file_read(&f, 0, &mut buf).await.unwrap();
+    assert_eq!(&buf, b"head");
+    assert!(fs.file_truncate(&f, u64::MAX).await.is_err());
+    assert_eq!(f.size(), 4);
+}

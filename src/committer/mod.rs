@@ -246,7 +246,7 @@ fn orphan_state(
         Some(lease) if lease.epoch < l.ds.epoch => Orphan::Live,
         Some(lease) if lease.epoch > l.ds.epoch => Orphan::Gone,
         Some(lease) if lease.owner != l.ds.owner || lease.released => Orphan::Gone,
-        Some(lease) if lease.expires_ms + RECLAIM_GRACE_MS < now => Orphan::Lapsed,
+        Some(lease) if lease.expires_ms.saturating_add(RECLAIM_GRACE_MS) < now => Orphan::Lapsed,
         Some(_) => Orphan::Live,
     }
 }
@@ -884,7 +884,7 @@ impl<D: BlockDevice> Committer<D> {
                     Some(l) => {
                         l.epoch != writer.epoch
                             || l.released
-                            || l.expires_ms + RECLAIM_GRACE_MS < now
+                            || l.expires_ms.saturating_add(RECLAIM_GRACE_MS) < now
                     }
                     // Not visible here yet: a lend this node's view hasn't caught up with.
                     None => false,
@@ -1295,6 +1295,7 @@ pub async fn run(
         *slot.write().await = Some(committer.clone());
         let mut observe_failing = false;
         let fenced_out = || fs.dev.pool().is_some_and(|p| p.disks().fence().is_stale());
+        let mut ticked = false;
         while !lost.load(Ordering::SeqCst) {
             if fenced_out() {
                 // A disk server refused our pool epoch: a newer committer
@@ -1303,6 +1304,20 @@ pub async fn run(
                 held.release().await;
                 break;
             }
+            if fs.uberblock_in_doubt() {
+                // An uberblock write failed partway: this pool can't commit
+                // until it's reopened. The next term opens it afresh
+                // (structural triage I-2).
+                eprintln!("committer: an uberblock write failed partway; stepping down");
+                held.release().await;
+                break;
+            }
+            // Each tick after the first, once the checks above passed: a
+            // committer stepping down doesn't reclaim on its way out.
+            if ticked {
+                committer.reclaim().await;
+            }
+            ticked = true;
             match committer.observe().await {
                 Ok(()) => observe_failing = false,
                 Err(e) if !observe_failing => {
@@ -1312,7 +1327,6 @@ pub async fn run(
                 Err(_) => {}
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
-            committer.reclaim().await;
         }
         *slot.write().await = None;
         // It holds the pool (and its disk connections) for as long as it

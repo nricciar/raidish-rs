@@ -635,3 +635,63 @@ fn vm_errors_say_whose_fault_they_are() {
     let e = VmError::Timeout(std::time::Duration::from_secs(3));
     assert_eq!(e.kind().http_status(), 503);
 }
+
+/// A `virsh` that answers `metadata` with `reason` on stderr (exit 1).
+fn failing_virsh(dir: &std::path::Path, reason: &str) -> crate::vm::Virsh {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("virsh");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho 'error: {}' >&2\nexit 1\n", reason),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::vm::Virsh {
+        bin: bin.to_string_lossy().into_owned(),
+        uri: "test:///default".into(),
+    }
+}
+
+/// I-25: a domain with no raidish metadata, or gone, isn't ours; libvirt
+/// failing to say whose it is leaves it unknown, never "not ours" (which
+/// would leave a VM running on a lost lease, or start a second copy).
+#[tokio::test]
+async fn unreadable_metadata_is_unknown_not_foreign() {
+    let d = tempfile::tempdir().unwrap();
+    let v = failing_virsh(
+        d.path(),
+        "metadata not found: Requested metadata element is not present",
+    );
+    assert!(matches!(v.meta("vm1").await, Ok(None)));
+    let v = failing_virsh(d.path(), "failed to get domain 'vm1'");
+    assert!(matches!(v.meta("vm1").await, Ok(None)));
+    let v = failing_virsh(
+        d.path(),
+        "failed to connect to the hypervisor; error: Cannot recv data: Connection reset by peer",
+    );
+    assert!(v.meta("vm1").await.is_err(), "unknown, not foreign");
+}
+
+/// I-25: with its metadata unreadable, what a domain is known to use here
+/// is the volumes its NBD disks reach through this node's export.
+#[test]
+fn a_domains_volumes_through_this_export() {
+    let xml = r#"<domain type='kvm'><name>x</name><devices>
+      <disk type='network' device='disk'>
+        <source protocol='nbd' name='vm1'><host name='127.0.0.1' port='10809'/></source>
+      </disk>
+      <disk type='network' device='disk'>
+        <source protocol='nbd' name='vm2'><host name='10.0.0.9' port='10809'/></source>
+      </disk>
+      <disk type='network' device='disk'>
+        <source protocol='nbd' name='vm3'><host name='127.0.0.1' port='10809'/></source>
+      </disk>
+    </devices></domain>"#;
+    let lost: Vec<String> = ["vm1", "vm2"].map(String::from).to_vec();
+    let used = crate::vm::exported_volumes(xml, ("127.0.0.1", 10809), &lost).unwrap();
+    assert_eq!(
+        used,
+        vec!["vm1".to_string()],
+        "vm2 is another node's export"
+    );
+}

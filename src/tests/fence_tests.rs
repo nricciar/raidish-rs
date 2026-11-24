@@ -248,3 +248,30 @@ fn a_client_splits_requests_by_stamp() {
     let runs = c.stamps(Some(0), u64::MAX - 1, 4);
     assert_eq!(runs.iter().map(|r| r.1).sum::<u32>(), 4);
 }
+
+/// I-10: views of the cluster's grants can arrive out of order (the
+/// startup read and each Raft apply). An older one never takes a grant
+/// back: a stale `Returned(11)` arriving after `Lent(12)` would let pool
+/// stamps into the writer's space. Nor does a view that predates a lend
+/// (the metaslab missing from it) drop the grant.
+#[test]
+fn an_older_view_never_takes_a_grant_back() {
+    let f = fence();
+    let ms0 = raw(40);
+    f.observe(ep(10), [(ms(0), Grant::Lent(ep(12)))]);
+    assert!(!writes(&f, ms0, pool(13)), "pool stamp in lent space");
+    // The older view lands after.
+    f.observe(ep(10), [(ms(0), Grant::Returned(ep(11)))]);
+    assert!(!writes(&f, ms0, pool(13)), "an older view revoked the lend");
+    assert!(writes(&f, ms0, lend(12)));
+    // A view from before any lend.
+    f.observe(ep(10), std::iter::empty());
+    assert!(
+        !writes(&f, ms0, pool(13)),
+        "a view without the grant dropped it"
+    );
+    // A newer return does move it on.
+    f.observe(ep(10), [(ms(0), Grant::Returned(ep(14)))]);
+    assert!(writes(&f, ms0, returned(14)));
+    assert!(!writes(&f, ms0, lend(12)), "a returned lend still writes");
+}

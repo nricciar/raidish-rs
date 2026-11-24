@@ -85,6 +85,60 @@ async fn r1a_only_well_formed_requests_are_built() {
     assert_eq!(d.floor().pool_floor(), ep(0));
 }
 
+/// I-9: a block number whose byte offset wraps is refused when the request
+/// is built. `(1 << 52) + 200` is a valid block count but `* 4096` wraps to
+/// block 200's offset; it was fenced (and stripe-locked) as a block past
+/// the pool's end, then landed on block 200.
+#[tokio::test]
+async fn i9_a_range_whose_bytes_wrap_is_refused() {
+    let (_f, _h, d) = served(ServerFence::ready());
+    let one = blocks(1, 1);
+    let wraps = (1u64 << 52) + 200;
+    assert_eq!(
+        d.validate_write(0, wraps, 1, &one).err(),
+        Some(WsStatus::InvalidRequest)
+    );
+    assert!(d.validate_read(0, wraps, 1).is_err());
+    // The last addressable byte range, and one block past it.
+    let last = i64::MAX as u64 / BLOCK_SIZE as u64;
+    assert_eq!(
+        crate::disk::byte_offset(last - 1, 1),
+        Some((last - 1) * 4096)
+    );
+    assert_eq!(crate::disk::byte_offset(last, 1), None);
+    assert_eq!(crate::disk::byte_offset(u64::MAX / 4096, 1), None);
+    // Nothing was written anywhere.
+    assert_eq!(read_back(&d, 200).await, 0);
+}
+
+/// I-9: a range past the disk's end is refused, read or write, rather than
+/// growing a file disk or reading zeros; a disk that grew is seen.
+#[tokio::test]
+async fn i9_a_range_past_the_disk_is_refused() {
+    let (f, _h, d) = served(ServerFence::ready());
+    let never = Expiry::never();
+    let end = MB / BLOCK_SIZE as u64;
+    assert_eq!(write(&d, end - 1, 1, 1, &never).await, Ok(()));
+    assert_eq!(
+        write(&d, end, 1, 1, &never).await,
+        Err(WsStatus::InvalidRequest)
+    );
+    let two = blocks(1, 2);
+    let w = d.validate_write(0, end - 1, 2, &two).unwrap();
+    assert_eq!(
+        d.write(w, Stamp::Pool(ep(1)), &never).await,
+        Err(WsStatus::InvalidRequest),
+        "a range that runs off the end"
+    );
+    let r = d.validate_read(0, end + 100, 1).unwrap();
+    assert_eq!(d.read(r, None).await, Err(WsStatus::InvalidRequest));
+    assert_eq!(f.as_file().metadata().unwrap().len(), MB, "the file grew");
+    // The disk grows: the cached capacity is asked again.
+    f.as_file().set_len(2 * MB).unwrap();
+    assert_eq!(write(&d, end, 2, 1, &never).await, Ok(()));
+    assert_eq!(read_back(&d, end).await, 2);
+}
+
 /// R1b: a fence that hasn't started refuses writes (and serves reads)
 /// until the domain map is known and the cluster's grants are in.
 #[tokio::test]

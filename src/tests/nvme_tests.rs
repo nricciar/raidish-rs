@@ -767,3 +767,38 @@ async fn an_exports_backend_switches_under_a_connected_queue() {
     assert!(r.data[..8192] == before[..] && r.data[8192..] == after[..]);
     assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
+
+/// Remote input bounds: a SET_FEATURES asking for 0x10000 queues (0-based
+/// 0xffff) gets the most there are, not an overflow that drops the
+/// connection; and a GET_LOG_PAGE naming a huge length gets the page, not
+/// that many bytes made for it.
+#[tokio::test]
+async fn admin_lengths_and_counts_are_bounded() {
+    let pool = TestPool::new().await;
+    let (_fs, addr) = serve(&pool, 64 * MB).await;
+    let mut h = Host::connect(addr).await;
+    h.bring_up_admin(4).await;
+
+    // An overflow there kills the queue's task, and the reply never comes.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h.admin(ADM_SET_FEATURES, 0, 0x07, u32::MAX, 0),
+    )
+    .await
+    .expect("SET_FEATURES answered");
+    assert!(r.ok(), "status {:#x}", r.status);
+    let n = MAX_IO_QUEUES as u32 - 1;
+    assert_eq!(r.dw0, n << 16 | n);
+
+    let r = h
+        .admin(
+            ADM_GET_LOG_PAGE,
+            0,
+            0x02 | (0xffff << 16),
+            0xffff,
+            16 * MB as usize,
+        )
+        .await;
+    assert!(r.ok(), "status {:#x}", r.status);
+    assert!(r.data.len() <= 4096, "{} bytes", r.data.len());
+}

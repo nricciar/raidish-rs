@@ -195,8 +195,13 @@ impl BlockDevice for RaidZ {
         let stripe = lba / self.data as u64;
         let data_index = (lba % self.data as u64) as usize;
 
-        if let Some(stripe_buf_ref) = self.writes.get(&stripe) {
-            let stripe_buf = stripe_buf_ref.lock().await;
+        // Clone the buffer out and let go of the map's shard lock before
+        // waiting on it: held across the await, every insert or removal on
+        // that shard would block its thread while a flush holds the buffer
+        // across disk I/O.
+        let pending = self.writes.get(&stripe).map(|r| r.value().clone());
+        if let Some(stripe_buf) = pending {
+            let stripe_buf = stripe_buf.lock().await;
             if stripe_buf.has_shard(data_index) && stripe_buf.get_shard(data_index, buf) {
                 return Ok(());
             }

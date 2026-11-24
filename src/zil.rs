@@ -516,32 +516,49 @@ impl<D: BlockDevice> FileSystem<D> {
     /// The records of `region` from `from_seq` on, in order, up to the first
     /// that doesn't verify (the end of the log, or a write that never
     /// completed).
-    async fn read_region(&self, region: &LogRegion, from_seq: u64) -> Vec<Entry> {
+    async fn read_region(
+        &self,
+        region: &LogRegion,
+        from_seq: u64,
+    ) -> Result<Vec<Entry>, FileSystemError> {
         let mut out = Vec::new();
-        for rec in self.region_records(region, from_seq).await {
+        for rec in self.region_records(region, from_seq).await? {
             let Ok(entries) = bincode::deserialize::<Vec<Entry>>(&rec.bytes[HEADER_BYTES..]) else {
                 break;
             };
             out.extend(entries);
         }
-        out
+        Ok(out)
     }
 
     /// The verified records of `region` from `from_seq` on (as
     /// `read_region` reads them), with where each is: what replay needs,
     /// and so what a resilver must check (audit D4).
-    pub(crate) async fn region_records(&self, region: &LogRegion, from_seq: u64) -> Vec<LogRecord> {
+    ///
+    /// The log ends at the first slot that doesn't verify: never written,
+    /// or torn by a crash mid-append. A slot that can't be *read* is not an
+    /// end: a disk timing out, unreachable or fencing us, or a stripe with
+    /// too few members, says nothing about what's there. That's an error,
+    /// so replay keeps the log rather than committing a prefix of it and
+    /// freeing the rest (structural triage I-4).
+    pub(crate) async fn region_records(
+        &self,
+        region: &LogRegion,
+        from_seq: u64,
+    ) -> Result<Vec<LogRecord>, FileSystemError> {
         let unit = self.align_blocks(1);
         let mut out = Vec::new();
         let (mut used, mut seq) = (0u64, 0u64);
         while used + unit <= region.len {
             let lba = region.start + used;
             let check_header = move |d: &[u8]| parse_header(d, region.guid, seq).is_some();
-            let Ok(head) = self
+            let head = match self
                 .read_verified(lba, unit, HEADER_BYTES, &check_header, false)
                 .await
-            else {
-                break;
+            {
+                Ok(head) => head,
+                Err(FileSystemError::ChecksumMismatch) => break,
+                Err(e) => return Err(e),
             };
             let Some(h) = parse_header(&head, region.guid, seq) else {
                 break;
@@ -556,18 +573,20 @@ impl<D: BlockDevice> FileSystem<D> {
                 let check_record = move |d: &[u8]| {
                     d.len() == total && blake3::hash(&d[HEADER_BYTES..]).as_bytes() == &sum
                 };
-                let Ok(bytes) = self
+                let bytes = match self
                     .read_verified(lba, blocks, total, &check_record, false)
                     .await
-                else {
-                    break;
+                {
+                    Ok(bytes) => bytes,
+                    Err(FileSystemError::ChecksumMismatch) => break,
+                    Err(e) => return Err(e),
                 };
                 out.push(LogRecord { lba, bytes });
             }
             used += blocks;
             seq += 1;
         }
-        out
+        Ok(out)
     }
 
     /// Apply volume `name`'s intent log `log` and commit, dropping the log
@@ -600,7 +619,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut entries = Vec::new();
         for (i, r) in log.regions.iter().enumerate() {
             let from = if i == 0 { log.from_seq } else { 0 };
-            entries.extend(self.read_region(r, from).await);
+            entries.extend(self.read_region(r, from).await?);
         }
         let n = entries.len();
         let bs = vol.obj.blksz;

@@ -483,7 +483,10 @@ async fn patch_body(
             )));
         }
         fs.file_write(f, offset, &buf[..n]).await?;
-        offset += n as u64;
+        // `file_write` refuses a range whose end isn't a size (I-31).
+        offset = offset.checked_add(n as u64).ok_or_else(|| {
+            FileSystemError::InvalidArgument("the body ends past the largest size".into())
+        })?;
     }
     if let Some(size) = size {
         fs.file_truncate(f, size).await?;

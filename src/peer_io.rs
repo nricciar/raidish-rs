@@ -412,8 +412,21 @@ impl PeerIo {
 
     /// Acknowledged writes already known lost and not yet reported (see
     /// `unflushed`): what a clean takeover must still report.
+    #[cfg(test)]
     pub fn lost(&self) -> bool {
         self.durability.lock().unwrap().lost
+    }
+
+    /// Whether a clean handoff from the writer at `from` still owes a
+    /// failed flush (I-22): writes already known lost, or acknowledged by
+    /// some other writer and never flushed. An idle proxy never reconnected
+    /// after that writer went, so `reached` never judged them; `from` made
+    /// durable only what it acknowledged itself. (Whether `from` took over
+    /// cleanly from theirs is a hop further back than a proxy knows: count
+    /// them lost, which fails safe.) Ask once nothing is in flight.
+    pub fn owed_on_handoff(&self, from: Epoch) -> bool {
+        let d = self.durability.lock().unwrap();
+        d.lost || (d.epoch != from && d.acked > d.flushed)
     }
 
     async fn connect(&self, addr: &str, port: u16, epoch: Epoch) -> Result<Arc<Conn>, String> {

@@ -23,6 +23,35 @@ fn renew(owner: &str, epoch: Epoch, now_ms: u64, ttl_ms: u64) -> Request {
     .stamp(now_ms)
 }
 
+/// I-16: a lease op's TTL is bounded, so `now_ms + ttl_ms` can't overflow
+/// in `apply` (a panic under the store's lock, on every node and every
+/// replay), nor wrap into a lease that never expires.
+#[test]
+fn a_huge_ttl_is_clamped() {
+    use super::state::MAX_LEASE_TTL_MS;
+    let mut s = ClusterState::default();
+    let now = 1_000;
+    let Response::Granted { epoch, expires_ms } = s.apply(&acquire("a", now, u64::MAX)) else {
+        panic!("not granted");
+    };
+    assert_eq!(expires_ms, now + MAX_LEASE_TTL_MS);
+    let Response::Granted { expires_ms, .. } = s.apply(&renew("a", epoch, now + 1, u64::MAX - 1))
+    else {
+        panic!("not renewed");
+    };
+    assert_eq!(expires_ms, now + 1 + MAX_LEASE_TTL_MS);
+    assert!(
+        s.live_lease(&POOL, now + MAX_LEASE_TTL_MS + 2).is_none(),
+        "expires"
+    );
+    // A clock near the end of time saturates instead of wrapping.
+    let mut s = ClusterState::default();
+    let Response::Granted { expires_ms, .. } = s.apply(&acquire("a", u64::MAX - 5, 100)) else {
+        panic!("not granted");
+    };
+    assert_eq!(expires_ms, u64::MAX);
+}
+
 /// A reader whose clock lags the cluster's doesn't see a lease the
 /// cluster has expired as live (`ClusterState::clock_ms`).
 #[test]
@@ -1209,6 +1238,62 @@ async fn a_transfer_in_doubt_isnt_fresh() {
         assert!(l.transfer("b", to()).await.is_err());
         assert_eq!(l.fresh(), fresh_after, "{:?}", reply);
     }
+}
+
+/// I-15: once a renewal is refused (the lease was taken or released), the
+/// holder isn't `fresh`, even though its last renewal is recent.
+#[tokio::test]
+async fn a_lost_lease_isnt_fresh() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let (url, _) = fake_json_server(Some(answer(Response::Lost)), std::time::Duration::ZERO).await;
+    let l = std::sync::Arc::new(HeldLease::adopt(
+        LeaseClient::new(vec![url]),
+        POOL,
+        "o",
+        ep(3),
+        // Late enough that `hold` renews at once.
+        std::time::Instant::now() - lease::LEASE_TTL / 2,
+    ));
+    assert!(l.fresh());
+    let lost = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    l.hold(move |_| flag.store(true, SeqCst));
+    assert!(wait_until(2, || lost.load(SeqCst)).await, "on_lost ran");
+    assert!(!l.fresh(), "fresh after the lease was lost");
+    assert!(
+        l.transfer("b", crate::types::Holder::default())
+            .await
+            .is_err()
+    );
+}
+
+/// I-15: a lease released while a renewal is failing isn't reported lost
+/// when the renewals run out: it was let go of, not lost.
+#[tokio::test]
+async fn a_released_lease_isnt_reported_lost() {
+    use crate::test_util::fake_json_server;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::time::Duration;
+    // Nothing answers in time.
+    let (url, hits) = fake_json_server(Some(answer(Response::Lost)), Duration::from_secs(5)).await;
+    let l = std::sync::Arc::new(HeldLease::adopt(
+        LeaseClient::new(vec![url]),
+        POOL,
+        "o",
+        ep(3),
+        // The renewal sent at once is the last one there's time for.
+        std::time::Instant::now() - (lease::LEASE_TTL * 4 / 5 - Duration::from_millis(400)),
+    ));
+    let lost = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    l.hold(move |_| flag.store(true, SeqCst));
+    assert!(wait_until(2, || hits.load(SeqCst) > 0).await, "renewing");
+    let r = l.clone();
+    tokio::spawn(async move { r.release().await });
+    // Past the renewal's deadline.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!lost.load(SeqCst), "on_lost ran for a released lease");
 }
 
 /// R3a: a lease adopted well into its TTL is renewed at once, not a third

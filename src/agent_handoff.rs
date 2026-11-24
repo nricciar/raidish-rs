@@ -145,7 +145,8 @@ impl Shared {
 /// Take volume `name` over on this node's writer `w`, holding its lease as
 /// `owner` at `epoch` (granted no earlier than `asked`): attach the
 /// dataset and serve the export locally, the paused proxied one if there
-/// is one (`proxy`, `paused`), else a new one over `transport`.
+/// is one (`proxy`, `paused`), else a new one over `transport`. `from`:
+/// the epoch of the writer handing it over.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn take_over(
     leases: &LeaseClient,
@@ -155,6 +156,7 @@ pub(super) async fn take_over(
     owner: &str,
     epoch: Epoch,
     asked: Instant,
+    from: Epoch,
     proxy: Option<(&Proxy, &mut OwnedPaused)>,
 ) -> Result<(Arc<HeldLease>, Lost), String> {
     let lease = Arc::new(HeldLease::adopt(
@@ -183,8 +185,10 @@ pub(super) async fn take_over(
         Some((p, paused)) => {
             // Taken over cleanly from its writer, which made what it
             // acknowledged durable; but writes an earlier, unclean writer
-            // change lost are still owed a failed flush (audit A2).
-            if p.peer.lost() {
+            // change lost are still owed a failed flush (audit A2), and so
+            // are writes an earlier writer acknowledged that this proxy,
+            // idle since, never found out about (I-22).
+            if p.peer.owed_on_handoff(from) {
                 p.io.poison();
             }
             paused.set(Arc::new(LocalIo::new(w.fs.clone(), name)));
@@ -323,6 +327,7 @@ impl PeerVolumes for Shared {
             &owner,
             new_epoch,
             asked,
+            epoch,
             pair,
         )
         .await;

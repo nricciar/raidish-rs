@@ -73,6 +73,19 @@ impl MetaslabGrant {
 /// A change to the cluster state. Callers propose these (see
 /// `crate::cluster::Cluster::propose`); the leader stamps them into a
 /// [`Request`].
+/// The longest lease a [`LeaseOp`] can ask for. Leases are renewed every
+/// third of `LEASE_TTL` (10 s), so this is far more than any real holder
+/// asks for. It bounds what a client can send: an unbounded `ttl_ms` would
+/// overflow `now_ms + ttl_ms` in `apply`, on every node and on every replay
+/// of the log (structural triage I-16).
+pub const MAX_LEASE_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// When a lease granted or renewed at `now_ms` for `ttl_ms` expires.
+/// `ttl_ms` is clamped to [`MAX_LEASE_TTL_MS`], so this never overflows.
+pub fn lease_expiry(now_ms: u64, ttl_ms: u64) -> u64 {
+    now_ms.saturating_add(ttl_ms.min(MAX_LEASE_TTL_MS))
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum LeaseOp {
     Acquire {
@@ -411,7 +424,7 @@ impl ClusterState {
                 holder,
                 ttl_ms,
             } => {
-                let expires_ms = now_ms + ttl_ms;
+                let expires_ms = lease_expiry(now_ms, *ttl_ms);
                 match self.leases.get_mut(resource) {
                     Some(l) if l.is_live(now_ms) && l.owner != *owner => Response::Held {
                         owner: l.owner.clone(),
@@ -454,7 +467,7 @@ impl ClusterState {
                 // lease in between: the epoch is unchanged, so nobody else
                 // can have written.
                 Some(l) if l.owner == holder.owner && l.epoch == holder.epoch && !l.released => {
-                    l.expires_ms = l.expires_ms.max(now_ms + ttl_ms);
+                    l.expires_ms = l.expires_ms.max(lease_expiry(now_ms, *ttl_ms));
                     Response::Granted {
                         epoch: l.epoch,
                         expires_ms: l.expires_ms,
@@ -481,7 +494,7 @@ impl ClusterState {
                 }
                 if self.holds(resource, from, now_ms) {
                     self.epoch = self.epoch.next();
-                    let expires_ms = now_ms + ttl_ms;
+                    let expires_ms = lease_expiry(now_ms, *ttl_ms);
                     self.leases.insert(
                         resource.clone(),
                         Lease {

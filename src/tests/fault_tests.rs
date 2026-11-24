@@ -1744,3 +1744,326 @@ async fn d6c_a_bad_superblock_copy_on_one_mirror_member_doesnt_fail_the_import()
         }
     }
 }
+
+/// I-2: an uberblock write that fails once its copies have started may
+/// have left that TXG on disk. Retrying would rewrite, for the same TXG,
+/// the space-map slots it names. The pool commits nothing more until it's
+/// reopened, and reopened it's whole.
+#[tokio::test]
+async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+        .await
+        .unwrap();
+    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.sync().await.unwrap();
+
+    // Writes to the uberblock ring fail, on both members.
+    let ring = fs.header.uberblock_start + DISK_LABEL_BLOCKS;
+    let ring = ring..ring + fs.header.uberblock_blocks();
+    for d in 0..2 {
+        fp.disk(d).target_blocks(Some(ring.clone()));
+        fp.disk(d).fail_writes(Some(FaultError::Io));
+    }
+    fs.block_write("a", 0, &pattern(MB, 2)).await.unwrap();
+    assert!(fs.sync().await.is_err());
+    assert!(fs.uberblock_in_doubt());
+    fp.heal();
+    // Healed, it still refuses: what's on disk is unknown.
+    fs.block_write("a", MB as u64, &pattern(MB, 3))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            fs.sync().await,
+            Err(crate::fs::FileSystemError::Unavailable(_))
+        ),
+        "committed again after a partial uberblock write"
+    );
+    drop(fs);
+
+    let fs = fp.load().await;
+    assert!(!fs.uberblock_in_doubt());
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+    fs.block_write("a", 0, &pattern(MB, 4)).await.unwrap();
+    fs.sync().await.unwrap();
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// I-2: a commit that fails before any uberblock copy is written (here,
+/// its flush) leaves nothing an import would read, and the next commit
+/// goes ahead.
+#[tokio::test]
+async fn i2_a_commit_failing_before_its_uberblock_can_be_retried() {
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+        .await
+        .unwrap();
+    fs.sync().await.unwrap();
+    for d in 0..2 {
+        fp.disk(d).fail_flushes(Some(FaultError::Io));
+    }
+    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    assert!(fs.sync().await.is_err());
+    assert!(!fs.uberblock_in_doubt());
+    fp.heal();
+    fs.sync().await.unwrap();
+    drop(fs);
+    let fs = fp.load().await;
+    let report = fs.fsck(false).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+}
+
+/// Free blocks across every metaslab, as allocation sees them now.
+async fn free_now(fs: &FileSystem<Pool>) -> u64 {
+    let mut n = 0;
+    for ms in fs.metaslabs.iter() {
+        n += ms.read().await.free_blocks();
+    }
+    n
+}
+
+/// I-3: a record whose write failed may still land later (a disk-server
+/// write past the client's timeout, a blocking write thread). Its space
+/// isn't reusable at once, where a new record written there could be
+/// overwritten by it. A committer defers it like any free; it's back after
+/// the usual wait.
+#[tokio::test]
+async fn i3_a_failed_writes_space_isnt_reused_at_once() {
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.sync().await.unwrap();
+    let before = free_now(&fs).await;
+    for d in 0..2 {
+        fp.disk(d).fail_writes(Some(FaultError::Timeout));
+    }
+    assert!(fs.write_record(&pattern(64 * 1024, 1)).await.is_err());
+    fp.heal();
+    assert!(
+        free_now(&fs).await < before,
+        "the failed write's space was free again at once"
+    );
+    for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
+        fs.sync().await.unwrap();
+    }
+    assert_eq!(free_now(&fs).await, before, "deferred, not leaked");
+}
+
+/// I-3, on a writer: it can't defer frees (the committer does), so the
+/// space stays unused here.
+#[tokio::test]
+async fn i3_a_writers_failed_write_keeps_its_space() {
+    let s = zil_setup().await;
+    let w = ZilWriter::start(&s).await;
+    // Lend the writer some space first.
+    w.fs.block_write("a", 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    w.fs.flush().await.unwrap();
+    let before = free_now(&w.fs).await;
+    assert!(before > 0);
+    for d in 0..2 {
+        s.fp.disk(d).fail_writes(Some(FaultError::Timeout));
+    }
+    assert!(w.fs.write_record(&pattern(64 * 1024, 2)).await.is_err());
+    s.fp.heal();
+    assert!(
+        free_now(&w.fs).await < before,
+        "the failed write's space was free again at once"
+    );
+}
+
+/// I-4: an intent-log slot that can't be read is not the end of the log.
+/// Read past the last record, the log ends; read with the disks gone, it's
+/// an error, so replay keeps the log instead of committing a prefix and
+/// freeing the regions under acked writes.
+#[tokio::test]
+async fn i4_an_unreadable_log_record_is_an_error_not_the_end() {
+    let s = zil_setup().await;
+    let w = ZilWriter::start(&s).await;
+    w.fs.block_write("a", 0, &pattern(300_000, 1))
+        .await
+        .unwrap();
+    w.fs.flush().await.unwrap(); // commits: registers the log
+    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    w.fs.flush().await.unwrap(); // logged
+    let region = w.cursor().region;
+    let fs = s.committer.fs();
+    let records = fs.region_records(&region, 0).await.unwrap();
+    assert!(!records.is_empty(), "the logged write");
+
+    for d in 0..2 {
+        s.fp.disk(d).set_offline(true);
+    }
+    let r = fs.region_records(&region, 0).await;
+    assert!(
+        r.is_err(),
+        "unreadable read as the end of the log: {:?}",
+        r.map(|v| v.len())
+    );
+    s.fp.heal();
+    assert_eq!(
+        fs.region_records(&region, 0).await.unwrap().len(),
+        records.len()
+    );
+}
+
+/// I-5: a file writer's record is pinned in its lent metaslab before it's
+/// written, not after: returning metaslabs while the write is still on its
+/// way must keep the one under it. Pinned only afterwards, the metaslab
+/// went back to the committer with the file's uncommitted record in it.
+#[tokio::test]
+async fn i5_a_file_writers_record_is_pinned_before_its_written() {
+    let s = zil_setup().await;
+    let w = ZilWriter::start(&s).await;
+    let ws = w.fs.writer.clone().unwrap();
+    let mut f =
+        w.fs.file_writer(std::path::Path::new("f"), None)
+            .await
+            .unwrap();
+    // A first record borrows the space.
+    let data = pattern(MB, 5);
+    f.write(&data).await.unwrap();
+    f.finish().await.unwrap();
+    ws.pinned.lock().unwrap().clear();
+
+    let mut f =
+        w.fs.file_writer(std::path::Path::new("g"), None)
+            .await
+            .unwrap();
+    for d in 0..2 {
+        s.fp.disk(d).hold_writes(true);
+    }
+    let check = async {
+        while s.fp.disk(0).held() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let pinned: Vec<_> = ws.pinned.lock().unwrap().keys().copied().collect();
+        // Give back everything not pinned, mid-write.
+        w.fs.return_metaslabs().await;
+        let lent = ws.lent.lock().unwrap().clone();
+        for d in 0..2 {
+            s.fp.disk(d).hold_writes(false);
+            s.fp.disk(d).release_all();
+        }
+        (pinned, lent)
+    };
+    let (written, (pinned, lent)) = tokio::join!(f.write(&data), check);
+    written.unwrap();
+    assert!(
+        !pinned.is_empty(),
+        "nothing pinned while the record was written"
+    );
+    for idx in &pinned {
+        assert!(
+            lent.contains(idx),
+            "metaslab {} given back under the record",
+            idx
+        );
+    }
+    f.finish().await.unwrap();
+}
+
+/// I-5, cancelled: a `FileWriter::write` dropped while its record is being
+/// written leaves no pin behind. The pin taken with the space was in the
+/// scope only, never handed to the `FileWriter`, so nothing else would
+/// ever undo it, and the metaslab could never be given back.
+#[tokio::test]
+async fn i5_a_dropped_file_write_leaves_no_pin() {
+    let s = zil_setup().await;
+    let w = ZilWriter::start(&s).await;
+    let ws = w.fs.writer.clone().unwrap();
+    let mut f =
+        w.fs.file_writer(std::path::Path::new("f"), None)
+            .await
+            .unwrap();
+    let data = pattern(MB, 5);
+    f.write(&data).await.unwrap();
+    f.finish().await.unwrap();
+    ws.pinned.lock().unwrap().clear();
+
+    let mut f =
+        w.fs.file_writer(std::path::Path::new("g"), None)
+            .await
+            .unwrap();
+    for d in 0..2 {
+        s.fp.disk(d).hold_writes(true);
+    }
+    {
+        let write = f.write(&data);
+        tokio::pin!(write);
+        tokio::select! {
+            _ = &mut write => panic!("the write finished with its writes held"),
+            _ = async {
+                while s.fp.disk(0).held() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        assert!(
+            !ws.pinned.lock().unwrap().is_empty(),
+            "pinned while written"
+        );
+    }
+    // Dropped: and `f` itself still alive, so `FileWriter::drop` hasn't run.
+    assert!(
+        ws.pinned.lock().unwrap().is_empty(),
+        "a dropped write left {:?} pinned",
+        ws.pinned.lock().unwrap()
+    );
+    for d in 0..2 {
+        s.fp.disk(d).hold_writes(false);
+        s.fp.disk(d).release_all();
+    }
+    drop(f);
+}
+
+/// I-6: a commit dropped while it syncs an open file (an NBD or NVMe
+/// connection going away mid-flush) gives the file's writes back: it still
+/// needs a sync, and the next one commits them. Without the guard they
+/// stayed taken, and the file looked clean for good.
+#[tokio::test]
+async fn i6_a_dropped_commit_gives_an_open_files_writes_back() {
+    use std::path::Path;
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.write_file(Path::new("/f"), &pattern(300_000, 1))
+        .await
+        .unwrap();
+    let f = fs.open_file(Path::new("/f"), None).await.unwrap();
+    let new = pattern(200_000, 2);
+    fs.file_write(&f, 0, &new).await.unwrap();
+    assert!(f.needs_sync());
+
+    for d in 0..2 {
+        fp.disk(d).hold_writes(true);
+    }
+    {
+        let sync = fs.sync();
+        tokio::pin!(sync);
+        tokio::select! {
+            _ = &mut sync => panic!("the sync finished with its writes held"),
+            _ = async {
+                while fp.disk(0).held() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        // Dropped here, mid-write.
+    }
+    for d in 0..2 {
+        fp.disk(d).hold_writes(false);
+        fp.disk(d).release_all();
+    }
+    assert!(f.needs_sync(), "the dropped sync's writes look committed");
+    fs.file_sync(&f).await.unwrap();
+    drop(f);
+    drop(fs);
+    let fs = fp.load().await;
+    let got = fs.read_file(Path::new("/f")).await.unwrap();
+    assert_eq!(&got[..new.len()], &new[..]);
+}

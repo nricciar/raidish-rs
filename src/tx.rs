@@ -190,20 +190,31 @@ impl Drop for Allocs<'_> {
 
 /// An extent allocated and not written yet: given back if dropped armed
 /// (a write whose future was dropped), so a cancelled write leaks nothing.
+/// The write may still land, so it's given back as unsettled
+/// (`MetaslabState::abandon`), never straight to the free map.
 pub(crate) struct Unwritten {
     start: u64,
     len: u64,
     metaslabs: Metaslabs,
     layout: MetaslabLayout,
+    /// On a volume writer (see `MetaslabState::abandon`).
+    writer: bool,
 }
 
 impl Unwritten {
-    pub(crate) fn new(start: u64, len: u64, metaslabs: Metaslabs, layout: MetaslabLayout) -> Self {
+    pub(crate) fn new(
+        start: u64,
+        len: u64,
+        metaslabs: Metaslabs,
+        layout: MetaslabLayout,
+        writer: bool,
+    ) -> Self {
         Unwritten {
             start,
             len,
             metaslabs,
             layout,
+            writer,
         }
     }
 
@@ -215,7 +226,7 @@ impl Unwritten {
 
 impl Drop for Unwritten {
     fn drop(&mut self) {
-        let (start, len) = (self.start, self.len);
+        let (start, len, writer) = (self.start, self.len, self.writer);
         if len == 0 {
             return;
         }
@@ -225,12 +236,12 @@ impl Drop for Unwritten {
         // Now if the metaslab is free (the caller's tx, if any, is still
         // held: it drops after this), else as soon as it is.
         if let Ok(mut m) = ms.try_write() {
-            m.unallocate(start, len);
+            m.abandon(start, len, writer);
             return;
         }
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
-                h.spawn(async move { ms.write().await.unallocate(start, len) });
+                h.spawn(async move { ms.write().await.abandon(start, len, writer) });
             }
             Err(_) => eprintln!("unwritten {{{}:{}}}: dropped outside a runtime", start, len),
         }

@@ -204,15 +204,21 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         Ok(())
     }
 
-    fn pin(&mut self, ptrs: &[BlockPtr]) {
-        if let Some(w) = &self.fs.writer {
-            for p in ptrs {
-                if let Some(idx) = self.fs.layout.metaslab_for_block(p.lba) {
-                    w.pin(idx);
-                    self.pinned.push(idx);
-                }
-            }
-        }
+    /// Run `f` with every lent metaslab it allocates from pinned as the
+    /// space is taken (see `crate::metaslab::PIN_ALLOCS`), and keep those
+    /// pins. A pin for space `f` then gave back (a failed write) is kept
+    /// too, until this writer is done: that only delays a return.
+    async fn pinning<T>(&mut self, f: impl Future<Output = T>) -> T {
+        // Dropped part way, the scope unpins what it took (`PinScope`).
+        let scope = crate::metaslab::PinScope::new(self.fs.writer.clone());
+        let (out, pins) = crate::metaslab::PIN_ALLOCS
+            .scope(scope, async {
+                let out = f.await;
+                (out, crate::metaslab::PIN_ALLOCS.with(|p| p.take()))
+            })
+            .await;
+        self.pinned.extend(pins);
+        out
     }
 
     async fn write_record(&mut self, chunk: &[u8]) -> Result<(), FileSystemError> {
@@ -221,7 +227,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
         let mut attempt = 0;
         let ptr = loop {
             self.reserve(blocks).await?;
-            match fs.write_record(chunk).await {
+            match self.pinning(fs.write_record(chunk)).await {
                 Err(FileSystemError::NoSpace(_))
                     if fs.writer.is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
                 {
@@ -230,7 +236,6 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
                 r => break r?,
             }
         };
-        self.pin(std::slice::from_ref(&ptr));
         self.size += chunk.len() as u64;
         self.leaves.push(ptr);
         Ok(())
@@ -244,9 +249,11 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
             self.reserve(fs.fresh_indirect_blocks(self.leaves.len() as u64))
                 .await?;
             let mut indirects = Vec::new();
-            match fs.fresh_tree(&self.leaves, &mut indirects).await {
+            let leaves = std::mem::take(&mut self.leaves);
+            let built = self.pinning(fs.fresh_tree(&leaves, &mut indirects)).await;
+            self.leaves = leaves;
+            match built {
                 Ok(tree) => {
-                    self.pin(&indirects);
                     self.indirects = indirects;
                     return Ok(tree);
                 }

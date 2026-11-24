@@ -245,10 +245,30 @@ impl VmRuntime {
         })
     }
 
-    /// `d`, if this node started it.
-    pub async fn our_vm(&self, d: Domain) -> Option<LocalVm> {
-        let me = self.ident()?;
-        self.virsh.local_vm(d).await.filter(|v| me.owns(&v.meta))
+    /// `d`, if this node started it. Err: that's unknown (the pool's GUID
+    /// isn't known yet, or libvirt couldn't say whose it is).
+    pub async fn our_vm(&self, d: Domain) -> Result<Option<LocalVm>, String> {
+        let me = self
+            .ident()
+            .ok_or("the pool isn't open here yet: which domains are this node's is unknown")?;
+        Ok(self
+            .virsh
+            .local_vm(d)
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|v| me.owns(&v.meta)))
+    }
+
+    /// Of `volumes`, those running domain `name`'s disks reach through
+    /// this node's NBD export (`self.nbd`), from its live XML: what a
+    /// domain whose metadata can't be read is known to use here (I-25).
+    pub async fn exported_volumes_of(
+        &self,
+        name: &str,
+        volumes: &[String],
+    ) -> Result<Vec<String>, VmError> {
+        let xml = self.virsh.dumpxml_live(name).await?;
+        exported_volumes(&xml, (&self.nbd.0, self.nbd.1), volumes)
     }
 
     /// Every domain this node started. Err: libvirt can't be asked, or
@@ -484,6 +504,50 @@ fn parse_domain(xml: &str) -> Result<El, VmError> {
         return invalid(format!("expected a <domain>, found <{}>", root.name));
     }
     Ok(root)
+}
+
+/// Whether virsh's `reason` for a failed `metadata` says there is none to
+/// read: the domain has no raidish metadata, or is gone. Anything else
+/// (libvirt down, a timeout) leaves it unknown.
+fn no_such_meta(reason: &str) -> bool {
+    [
+        "metadata not found",
+        "Domain not found",
+        "failed to get domain",
+    ]
+    .iter()
+    .any(|m| reason.contains(m))
+}
+
+/// Of `volumes`, those whose NBD disk in domain `xml` points at the export
+/// at `nbd` (host, port).
+pub fn exported_volumes(
+    xml: &str,
+    nbd: (&str, u16),
+    volumes: &[String],
+) -> Result<Vec<String>, VmError> {
+    let root = parse_domain(xml)?;
+    let Some(devices) = root.child("devices") else {
+        return Ok(Vec::new());
+    };
+    let port = nbd.1.to_string();
+    let mut out = Vec::new();
+    for d in devices.elements().filter(|e| e.name == "disk") {
+        let Some(src) = d.child("source") else {
+            continue;
+        };
+        if src.attr("protocol") != Some("nbd") {
+            continue;
+        }
+        let Some(v) = src.attr("name") else { continue };
+        let here = src.elements().any(|h| {
+            h.name == "host" && h.attr("name") == Some(nbd.0) && h.attr("port") == Some(&port)
+        });
+        if here && volumes.iter().any(|x| x == v) && !out.iter().any(|x| x == v) {
+            out.push(v.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// The raidish volume a `<disk>` uses, if it is one.
@@ -1167,10 +1231,16 @@ impl Virsh {
         Ok(parse_list(&self.run(&["list", "--all"]).await?))
     }
 
-    /// raidish's metadata on `name`; None: not one of ours.
-    pub async fn meta(&self, name: &str) -> Option<DomMeta> {
-        let xml = self.run(&["metadata", name, "--uri", META_NS]).await.ok()?;
-        parse_meta(&xml)
+    /// raidish's metadata on `name`. None: not one of ours (it has none,
+    /// or isn't there any more). Err: libvirt couldn't say (I-25), so
+    /// whose it is is unknown: callers fail safe, never take it for "not
+    /// ours".
+    pub async fn meta(&self, name: &str) -> Result<Option<DomMeta>, VmError> {
+        match self.run(&["metadata", name, "--uri", META_NS]).await {
+            Ok(xml) => Ok(parse_meta(&xml)),
+            Err(VmError::Virsh { reason, .. }) if no_such_meta(&reason) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Start `xml` as a transient domain.
@@ -1360,9 +1430,11 @@ impl Virsh {
     }
 
     /// The domain with its details, if raidish started it (any node, any
-    /// pool: see `VmRuntime::our_vm`).
-    pub async fn local_vm(&self, d: Domain) -> Option<LocalVm> {
-        let meta = self.meta(&d.name).await?;
+    /// pool: see `VmRuntime::our_vm`). Err: whether it did is unknown.
+    pub async fn local_vm(&self, d: Domain) -> Result<Option<LocalVm>, VmError> {
+        let Some(meta) = self.meta(&d.name).await? else {
+            return Ok(None);
+        };
         let info = self.run(&["dominfo", &d.name]).await.unwrap_or_default();
         let field = |k: &str| {
             info.lines()
@@ -1373,7 +1445,7 @@ impl Virsh {
         } else {
             None
         };
-        Some(LocalVm {
+        Ok(Some(LocalVm {
             vcpus: field("CPU(s):").and_then(|v| v.parse().ok()),
             // `2097152 KiB`
             memory: field("Used memory:")
@@ -1386,7 +1458,7 @@ impl Virsh {
             vnc_port,
             domain: d,
             meta,
-        })
+        }))
     }
 
     /// Every domain raidish started on this libvirt (any node's, any
@@ -1394,7 +1466,7 @@ impl Virsh {
     pub async fn local_vms(&self) -> Result<Vec<LocalVm>, VmError> {
         let mut out = Vec::new();
         for d in self.list().await? {
-            if let Some(v) = self.local_vm(d).await {
+            if let Some(v) = self.local_vm(d).await? {
                 out.push(v);
             }
         }

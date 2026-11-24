@@ -357,3 +357,26 @@ async fn a_flush_after_an_unclean_writer_change_fails() {
     assert!(p.flush().await.is_err());
     assert!(!p.lost() && !p.unflushed());
 }
+
+/// I-22: an idle proxy whose last writer went before it reconnected never
+/// judged those writes (`reached` runs on a connection), so `lost` is
+/// still false. A clean handoff from a later writer, which never
+/// acknowledged them, must still owe them a failed flush; one from the
+/// writer that acknowledged them doesn't.
+#[tokio::test]
+async fn a_handoff_from_another_writer_owes_an_idle_proxys_writes() {
+    let s = setup().await;
+    let p = Arc::new(s.proxy(epoch(7)));
+    p.write(0, &[1u8; 4096]).await.unwrap();
+    assert!(p.unflushed() && !p.lost());
+    // The writer at 7 crashes; one at 8 takes the volume and hands it to
+    // this node cleanly, the proxy idle all along.
+    assert!(
+        p.owed_on_handoff(Epoch::from_raw(8)),
+        "writes acknowledged at 7, handed off by 8"
+    );
+    assert!(
+        !p.owed_on_handoff(Epoch::from_raw(7)),
+        "the writer that acknowledged them handed them off"
+    );
+}
