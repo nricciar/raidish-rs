@@ -340,3 +340,27 @@ async fn a_dead_letter_move_ends_the_last_receipt() {
     .unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 0);
 }
+
+/// I-34: the retention and receive-count arithmetic saturates, whatever a
+/// message's history says. A `sent_ms` near `u64::MAX` used to overflow
+/// `sent_ms + retention` (a panic in a debug build; in release, a wrap
+/// that read as long expired), and a count at `u32::MAX` wrapped to 0.
+#[tokio::test]
+async fn a_message_history_at_the_limits_doesnt_overflow() {
+    let pool = TestPool::new().await;
+    let (_fs, q) = queue(&pool).await;
+    q.send(vec![NewMsg {
+        sent_ms: Some(u64::MAX - 10),
+        receive_count: u32::MAX,
+        ..msg("edge")
+    }])
+    .await
+    .unwrap()
+    .remove(0)
+    .unwrap();
+    q.sweep().await.unwrap();
+    assert_eq!(q.meta().await.unwrap().messages, 1, "swept as expired");
+    let (got, _) = q.receive(1, Some(0)).await.unwrap();
+    assert_eq!(got[0].msg.body, "edge");
+    assert_eq!(got[0].msg.receive_count, u32::MAX);
+}

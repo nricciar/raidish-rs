@@ -271,7 +271,10 @@ async fn a_commit_rotates_the_log_and_the_space_adds_up() {
     assert_clean(&s).await;
 
     w.fs.detach_dataset("a").await.unwrap();
-    assert!(cursor(&w.fs).await.is_none());
+    // Gone from the writer, log cursor and all: it can't even be opened
+    // there any more (structural triage I-23).
+    assert!(w.fs.open_dataset("a").await.is_err());
+    assert!(!w.fs.open_datasets.lock().unwrap().contains_key("a"));
     assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     w.fs.return_metaslabs().await;
     assert_clean(&s).await;

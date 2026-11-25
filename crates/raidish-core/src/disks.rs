@@ -25,6 +25,12 @@ pub struct DiskSet {
     disks: Arc<Vec<Caddy>>,
     fenced: AtomicU64,
     misses: Vec<AtomicU64>,
+    /// Per disk: the miss count as of the last time it was found in sync
+    /// (`caught_up`). Any miss since may have left it without some write.
+    synced_misses: Vec<AtomicU64>,
+    /// The pool's record of which disks lack writes from which TXG on:
+    /// `FileSystem::degraded` is this, shared, so vdevs read it live.
+    pub(crate) degraded: Arc<std::sync::Mutex<Vec<Option<crate::types::Txg>>>>,
     /// Per disk: repair writes (`repair_shards`) made, ever.
     repairs: Vec<AtomicU64>,
     /// Per disk: how many of `repairs` a finished flush of that disk has
@@ -131,6 +137,8 @@ impl DiskSet {
         DiskSet {
             fence: Default::default(),
             misses: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
+            synced_misses: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
+            degraded: Arc::new(std::sync::Mutex::new(vec![None; disks.len()])),
             repairs: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
             repairs_flushed: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
             repairs_lost: Default::default(),
@@ -155,6 +163,26 @@ impl DiskSet {
     /// Failed writes/flushes on `disk` so far (monotonic).
     pub fn miss_count(&self, disk: usize) -> u64 {
         self.misses[disk].load(Ordering::SeqCst)
+    }
+
+    /// `disk` may lack writes the pool made: it's degraded, or a write or
+    /// flush failed on it since it was last found in sync. Its shards are
+    /// fine to read when a checksum vouches for them, but not where nothing
+    /// does (raidz read-modify-write: structural triage I-20).
+    pub fn may_lag(&self, disk: usize) -> bool {
+        self.miss_count(disk) != self.synced_misses[disk].load(Ordering::SeqCst)
+            || self
+                .degraded
+                .lock()
+                .unwrap()
+                .get(disk)
+                .is_some_and(|d| d.is_some())
+    }
+
+    /// A resilver found `disk` in sync as of `misses` (its miss count when
+    /// the resilver began): misses since still count.
+    pub(crate) fn caught_up(&self, disk: usize, misses: u64) {
+        self.synced_misses[disk].fetch_max(misses, Ordering::SeqCst);
     }
 
     pub fn is_online(&self, disk: usize) -> bool {

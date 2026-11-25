@@ -104,35 +104,27 @@ impl BlockDevice for RaidZ {
             if stripe_buf.retired || (stripe_buf.flushed && !stripe_buf.dirty) {
                 continue;
             }
+            // Nothing was written into it (a full-stripe write's, left by
+            // its cancellation): nothing to write.
+            if !stripe_buf.dirty {
+                stripe_buf.retired = true;
+                drop(stripe_buf);
+                self.writes
+                    .remove_if(&stripe_id, |_, v| Arc::ptr_eq(v, &stripe_buf_arc));
+                continue;
+            }
 
             if !stripe_buf.is_complete() {
-                let missing_indices: Vec<usize> = (0..self.data)
+                let missing: Vec<usize> = (0..self.data)
                     .filter(|&i| !stripe_buf.has_shard(i))
                     .collect();
                 stripe_buf.ensure_data();
-
-                let mut read_tasks = FuturesUnordered::new();
-                for i in missing_indices {
-                    read_tasks.push(async move {
-                        let mut buf = [0u8; BLOCK_SIZE];
-                        // A missing disk shouldn't block the write: rebuild
-                        // the shard from the rest of the stripe instead.
-                        if self
-                            .read_shard(i, stripe_id, std::slice::from_mut(&mut buf))
-                            .await
-                            .is_err()
-                        {
-                            self.reconstruct_from_stripe(stripe_id, i, &mut buf)
-                                .await
-                                .map_err(io_err)?;
-                        }
-                        Ok::<_, DiskError>((i, buf))
-                    });
-                }
-
-                while let Some(result) = read_tasks.next().await {
-                    let (shard_idx, buf) = result?;
-                    stripe_buf.fill_shard(shard_idx, &buf);
+                for (i, buf) in self
+                    .rmw_shards(stripe_id, &missing)
+                    .await
+                    .map_err(write_err)?
+                {
+                    stripe_buf.fill_shard(i, &buf);
                 }
             }
 
@@ -450,6 +442,73 @@ impl RaidZ {
         self.disks.read_shards(self.members[i], stripe, buf).await
     }
 
+    /// The data shards `missing` of stripe `stripe` as on disk, for a
+    /// read-modify-write. Nothing vouches for a shard read here (no record
+    /// checksum covers a stripe's other blocks), and new parity is computed
+    /// from it: a stale shard would make the stripe's parity encode stale
+    /// data, losing what that disk missed for good. So a member that may
+    /// lack writes (`DiskSet::may_lag`: degraded, or a write failed on it)
+    /// isn't read; its shard is rebuilt from the members that don't lag,
+    /// like an unreadable one's (structural triage I-20). Too few of them,
+    /// and the stripe can't be rewritten yet (it stays buffered).
+    async fn rmw_shards(
+        &self,
+        stripe: u64,
+        missing: &[usize],
+    ) -> Result<Vec<(usize, Shard)>, RaidZError> {
+        let n = self.members.len();
+        let lag: Vec<bool> = self
+            .members
+            .iter()
+            .map(|&d| self.disks.may_lag(d))
+            .collect();
+        let lag = &lag;
+        let read = |i: usize| async move {
+            let mut b = [0u8; BLOCK_SIZE];
+            if lag[i] {
+                return (i, None);
+            }
+            let r = self
+                .read_shard(i, stripe, std::slice::from_mut(&mut b))
+                .await;
+            (i, r.ok().map(|_| b))
+        };
+        let mut out = Vec::with_capacity(missing.len());
+        let mut need = Vec::new();
+        for (i, b) in futures::future::join_all(missing.iter().map(|&i| read(i))).await {
+            match b {
+                Some(b) => out.push((i, b)),
+                None => need.push(i),
+            }
+        }
+        if need.is_empty() {
+            return Ok(out);
+        }
+
+        let mut shards = vec![[0u8; BLOCK_SIZE]; n];
+        let mut present = vec![false; n];
+        for (i, b) in &out {
+            shards[*i] = *b;
+            present[*i] = true;
+        }
+        let rest = (0..n).filter(|&i| !lag[i] && !present[i] && !missing.contains(&i));
+        for (i, b) in futures::future::join_all(rest.map(read)).await {
+            if let Some(b) = b {
+                shards[i] = b;
+                present[i] = true;
+            }
+        }
+        if present.iter().filter(|&&p| p).count() < self.data {
+            return Err(RaidZError::IncompleteStripe(stripe));
+        }
+        for i in need {
+            let mut b = [0u8; BLOCK_SIZE];
+            self.reconstruct_shard(&shards, &present, i, &mut b)?;
+            out.push((i, b));
+        }
+        Ok(out)
+    }
+
     /// Reconstruct a block from other disks in the stripe
     async fn reconstruct_from_stripe(
         &self,
@@ -506,22 +565,54 @@ impl RaidZ {
 
     /// Encode and write `data` (a whole number of stripes) starting at
     /// `first_stripe`, issuing one contiguous write per disk.
+    ///
+    /// Every stripe's buffer (a fresh, empty one where none was) is held
+    /// locked across the write, so nothing reaches those stripes meanwhile:
+    /// a partial write to another block of one waits, then starts a new
+    /// buffer whose read-modify-write reads what this wrote, not what was
+    /// there before (which its flush would otherwise write back over this).
+    /// Only once the write succeeded are they retired, since it replaces
+    /// them wholesale; on failure the partial writes buffered before it are
+    /// kept for a later flush (structural triage I-21).
     async fn write_full_stripes(&self, first_stripe: u64, data: &[u8]) -> Result<(), RaidZError> {
         let stripes = data.len() / (self.data * BLOCK_SIZE);
 
-        // These stripes are being replaced wholesale; drop any buffered
-        // partial writes so a later flush can't resurrect stale data.
+        // In stripe order, like any other taker of more than one (none
+        // does: a flush or a write holds one at a time).
+        let mut held = Vec::with_capacity(stripes);
         for s in first_stripe..first_stripe + stripes as u64 {
-            if let Some((_, buffered)) = self.writes.remove(&s) {
-                let mut buffered = buffered.lock().await;
-                buffered.retired = true;
-                if let Some(b) = buffered.take_buffer() {
-                    let _ = self.stripe_pool.push(b);
+            loop {
+                let buf = self
+                    .writes
+                    .entry(s)
+                    .or_insert_with(|| Arc::new(Mutex::new(StripeBuffer::new(self.data))))
+                    .value()
+                    .clone();
+                let guard = buf.clone().lock_owned().await;
+                if guard.retired {
+                    // Flushed since we found it: take a new one.
+                    drop(guard);
+                    self.writes.remove_if(&s, |_, v| Arc::ptr_eq(v, &buf));
+                    continue;
                 }
+                held.push((s, buf, guard));
+                break;
             }
         }
 
-        self.write_encoded(first_stripe, data).await
+        let written = self.write_encoded(first_stripe, data).await;
+        for (s, buf, mut guard) in held {
+            // A buffer of our own (nothing written into it) goes either way.
+            if written.is_ok() || !guard.dirty {
+                guard.retired = true;
+                if let Some(b) = guard.take_buffer() {
+                    let _ = self.stripe_pool.push(b);
+                }
+                drop(guard);
+                self.writes.remove_if(&s, |_, v| Arc::ptr_eq(v, &buf));
+            }
+        }
+        written
     }
 
     /// Encode whole stripes of `data` and write every shard. Succeeds if
@@ -642,14 +733,16 @@ impl RaidZ {
     /// with `score` (per data block: `Some(txg)` for a valid label) and the
     /// best (most valid labels, then newest) is taken as the truth and
     /// checked/repaired with `verify_stripes`. Returns None if no rebuild
-    /// produced a single valid label.
+    /// produced a single valid label, and whether stale members' shards
+    /// voted with some member unread, or outvoted a current shard (see
+    /// `LabelScan::stale_votes`): then nothing is repaired.
     pub async fn verify_label_stripe(
         &self,
         stripe: u64,
         repair: bool,
         score: LabelScore<'_>,
         stale: &[bool],
-    ) -> Result<Option<StripeCheck>, RaidZError> {
+    ) -> Result<(Option<StripeCheck>, bool), RaidZError> {
         let n = self.members.len();
         let mut shards = vec![[0u8; BLOCK_SIZE]; n];
         let mut present = vec![false; n];
@@ -673,13 +766,21 @@ impl RaidZ {
         // stripe alone: they're rebuilt (and repaired) like missing ones.
         let is_stale = |i: usize| stale.get(self.members[i]).copied().unwrap_or(false);
         let current = (0..n).filter(|&i| present[i] && !is_stale(i)).count();
-        if current >= self.data {
+        let stale_help = if current >= self.data {
             for (i, p) in present.iter_mut().enumerate() {
                 if is_stale(i) {
                     *p = false;
                 }
             }
-        }
+            false
+        } else {
+            (0..n).any(|i| present[i] && is_stale(i))
+        };
+        let current_shards: Vec<usize> = (0..n)
+            .filter(|&i| present[i] && !is_stale(i))
+            .map(|i| self.members[i])
+            .collect();
+        let mut stale_voted = stale_help && present.iter().any(|p| !p);
 
         // Decoding and re-encoding every subset of the shards is the heavy
         // part: off the async thread.
@@ -690,7 +791,7 @@ impl RaidZ {
                 .map_err(|e| RaidZError::DiskError(io_err(e)))??;
         let Some(candidates) = candidates else {
             // Consistent as read (and fully readable): nothing to decide.
-            return Ok(Some(StripeCheck::new(self.disks.len(), 1)));
+            return Ok((Some(StripeCheck::new(self.disks.len(), 1)), stale_voted));
         };
 
         // Rank the candidates. Every block of a label stripe is written in the
@@ -714,10 +815,31 @@ impl RaidZ {
                 best = Some((rank, data));
             }
         }
-        match best {
-            Some((_, data)) => Ok(Some(self.verify_stripes(stripe, &data, repair).await?)),
-            None => Ok(None),
+        let Some((_, data)) = best else {
+            return Ok((None, stale_voted));
+        };
+        if stale_help {
+            // Stale shards helped decide, so the truth may be an older
+            // version they agree on (a uniform stale rebuild outranks a mixed
+            // one). It must not overwrite a current shard: one it contradicts
+            // means stale won over current, and nothing is repaired. Nor is
+            // anything repaired with some member unread, whose copy may be
+            // the newer one (structural triage I-19 review).
+            let dry = self.verify_stripes(stripe, &data, false).await?;
+            if current_shards
+                .iter()
+                .any(|&d| dry.mismatched.get(d).is_some_and(|&m| m > 0))
+            {
+                stale_voted = true;
+            }
+            if stale_voted {
+                return Ok((Some(dry), true));
+            }
         }
+        Ok((
+            Some(self.verify_stripes(stripe, &data, repair).await?),
+            stale_voted,
+        ))
     }
 
     /// Never written: every readable current shard is zeros, and enough
@@ -791,10 +913,13 @@ impl Vdev for RaidZ {
         };
         for stripe in lba / d..(lba + blocks).div_ceil(d) {
             scan.units += 1;
-            match self
+            let (check, stale_voted) = self
                 .verify_label_stripe(stripe, repair, score, stale)
-                .await?
-            {
+                .await?;
+            if stale_voted {
+                scan.stale_votes.push(stripe * d);
+            }
+            match check {
                 Some(check) => scan.check.add(&check),
                 // Never-written space map slots are all zeros and fine. A
                 // stale member's leftovers there don't count against that;

@@ -261,12 +261,21 @@ impl Vdev for Mirror {
             scan.units += 1;
             let mut copies = self.read_all_raw(b, 1).await?;
             // A stale member's copy doesn't vote while a current one is here.
+            // Without one, the stale copies decide; with some member unread
+            // (it may hold the newer copy) nothing is repaired from them and
+            // nothing cleared (structural triage I-19).
+            let mut repair = repair;
             if (0..copies.len()).any(|i| copies[i].is_some() && !is_stale(i)) {
                 for (i, c) in copies.iter_mut().enumerate() {
                     if is_stale(i) {
                         *c = None;
                     }
                 }
+            } else if copies.iter().any(Option::is_none)
+                && (0..copies.len()).any(|i| copies[i].is_some() && is_stale(i))
+            {
+                scan.stale_votes.push(b);
+                repair = false;
             }
             let present: Vec<&[u8]> = copies.iter().flatten().map(|c| c.as_flattened()).collect();
             if present.is_empty() {

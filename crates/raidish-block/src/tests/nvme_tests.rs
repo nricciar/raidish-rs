@@ -157,6 +157,12 @@ impl Host {
     }
 
     async fn fabrics_connect(&mut self, qid: u16, cntlid: u16, subnqn: &str) -> Rsp {
+        let cid = self.send_connect(qid, cntlid, subnqn).await;
+        self.wait(cid, &[]).await
+    }
+
+    /// Send a Connect without waiting for its answer; its cid.
+    async fn send_connect(&mut self, qid: u16, cntlid: u16, subnqn: &str) -> u16 {
         let cid = self.cid();
         let mut s = sqe(OPC_FABRICS, cid, 0);
         s[4] = FCT_CONNECT;
@@ -169,7 +175,40 @@ impl Host {
         data[512..512 + HOSTNQN.len()].copy_from_slice(HOSTNQN.as_bytes());
         sgl_inline(&mut s, data.len());
         self.send_capsule(&s, &data).await;
-        self.wait(cid, &[]).await
+        cid
+    }
+
+    /// Send an I/O command without waiting for its answer: data in the
+    /// capsule (`inline`), or `len` bytes asked for by R2T. Its cid.
+    async fn send_io(&mut self, opcode: u8, slba: u64, nlb: u32, len: usize, inline: &[u8]) -> u16 {
+        let cid = self.cid();
+        let mut s = sqe(opcode, cid, 1);
+        set_cdw(&mut s, 10, slba as u32);
+        set_cdw(&mut s, 11, (slba >> 32) as u32);
+        set_cdw(&mut s, 12, nlb.saturating_sub(1));
+        if inline.is_empty() {
+            sgl_transport(&mut s, len);
+        } else {
+            sgl_inline(&mut s, inline.len());
+        }
+        self.send_capsule(&s, inline).await;
+        cid
+    }
+
+    /// Send one H2C data PDU.
+    async fn send_h2c(&mut self, cid: u16, ttag: u16, off: usize, data: &[u8], last: bool) {
+        let mut h = vec![0u8; 24];
+        h[0] = PDU_H2C_DATA;
+        h[1] = if last { PDU_FLAG_LAST } else { 0 };
+        h[2] = 24;
+        h[3] = 24;
+        h[4..8].copy_from_slice(&((24 + data.len()) as u32).to_le_bytes());
+        h[8..10].copy_from_slice(&cid.to_le_bytes());
+        h[10..12].copy_from_slice(&ttag.to_le_bytes());
+        h[12..16].copy_from_slice(&(off as u32).to_le_bytes());
+        h[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        h.extend_from_slice(data);
+        self.wr.write_all(&h).await.unwrap();
     }
 
     async fn prop_get(&mut self, offset: u32, eight: bool) -> u64 {
@@ -801,4 +840,294 @@ async fn admin_lengths_and_counts_are_bounded() {
         .await;
     assert!(r.ok(), "status {:#x}", r.status);
     assert!(r.data.len() <= 4096, "{} bytes", r.data.len());
+}
+
+/// I-24 review: a controller shut down (CC.SHN) makes what it wrote
+/// durable, but its error goes only to the log. It must not take the
+/// export's lost-writes poison with it: the next host's flush is owed it.
+#[tokio::test]
+async fn a_shutdown_leaves_lost_writes_for_the_next_hosts_flush() {
+    let pool = TestPool::new().await;
+    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    admin.bring_up_admin(1).await;
+    server.export_io("vol").unwrap().poison();
+    // SHN=normal. The sync fails (writes were lost), so the shutdown isn't
+    // reported complete: it used to be (SHST=2) whatever the sync said.
+    let cid = admin.cid();
+    let mut s = sqe(OPC_FABRICS, cid, 0);
+    s[4] = FCT_PROP_SET;
+    s[44..48].copy_from_slice(&PROP_CC.to_le_bytes());
+    s[48..52].copy_from_slice(&0x0046_4001u32.to_le_bytes());
+    admin.send_capsule(&s, &[]).await;
+    assert!(
+        !admin.wait(cid, &[]).await.ok(),
+        "a failed sync reported as done"
+    );
+    assert_eq!(
+        (admin.prop_get(PROP_CSTS, false).await >> 2) & 0x3,
+        0,
+        "SHST"
+    );
+
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    assert!(
+        !q.io(IO_FLUSH, 0, 0, &[], 0, false).await.ok(),
+        "the shutdown took the poison"
+    );
+    assert!(q.io(IO_FLUSH, 0, 0, &[], 0, false).await.ok());
+}
+
+/// I-26: H2C data PDUs must come in order. One sent twice used to count
+/// twice, so the write ran with the tail it never got (zeros) in it.
+#[tokio::test]
+async fn overlapping_h2c_data_is_refused_not_written() {
+    let pool = TestPool::new().await;
+    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let old = pattern(4096, 9);
+    assert!(q.io(IO_WRITE, 1, 1, &old, 0, true).await.ok());
+
+    // 8 KiB at LBA 0 by R2T, its first half sent twice.
+    let cid = q.send_io(IO_WRITE, 0, 2, 8192, &[]).await;
+    let r2t = read_pdu(&mut q.rd).await.unwrap();
+    assert_eq!(r2t[0], PDU_R2T);
+    let ttag = le16(&r2t, 10);
+    let new = pattern(8192, 1);
+    q.send_h2c(cid, ttag, 0, &new[..4096], false).await;
+    q.send_h2c(cid, ttag, 0, &new[..4096], false).await;
+    assert_hung_up(&mut q).await;
+
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let r = q.io(IO_READ, 1, 1, &[], 4096, false).await;
+    assert!(r.data == old, "the unreceived half was written");
+}
+
+/// Two Connects pipelined on one queue: one controller, the second
+/// refused. (The race this guards, two threads each seeing no queue yet
+/// and each making a controller, is a few instructions wide; this test
+/// doesn't catch it, but `fabrics` now checks and sets under one lock.)
+#[tokio::test]
+async fn a_second_connect_on_a_queue_is_refused() {
+    let pool = TestPool::new().await;
+    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut h = Host::connect(addr).await;
+    let a = h.send_connect(0, 0xffff, VOL_NQN).await;
+    let b = h.send_connect(0, 0xffff, VOL_NQN).await;
+    let mut ok = 0;
+    for _ in 0..2 {
+        let pdu = read_pdu(&mut h.rd).await.unwrap();
+        assert_eq!(pdu[0], PDU_RSP);
+        assert!([a, b].contains(&le16(&pdu, 20)));
+        if le16(&pdu, 22) >> 1 == 0 {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 1, "both Connects made a controller");
+    assert_eq!(server.target.ctrls.lock().unwrap().len(), 1);
+}
+
+/// Controller IDs wrap within the dynamic range and skip live ones. They
+/// used to count on into the reserved IDs, and onto live ones.
+#[tokio::test]
+async fn controller_ids_skip_live_and_reserved_ones() {
+    let pool = TestPool::new().await;
+    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut first = Host::connect(addr).await;
+    assert_eq!(first.bring_up_admin(1).await, 1);
+    server
+        .target
+        .next_cntlid
+        .store(MAX_CNTLID, Ordering::Relaxed);
+    let mut last = Host::connect(addr).await;
+    assert_eq!(last.bring_up_admin(1).await, MAX_CNTLID);
+    let mut next = Host::connect(addr).await;
+    assert_eq!(next.bring_up_admin(1).await, 2, "1 is live");
+
+    let next = AtomicU16::new(7);
+    assert_eq!(alloc_cntlid(&next, |_| true), None, "all taken");
+}
+
+/// A controller's I/O queues close with its admin queue. They used to go
+/// on serving a controller that was gone.
+#[tokio::test]
+async fn closing_the_admin_queue_closes_its_io_queues() {
+    let pool = TestPool::new().await;
+    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(2).await;
+    let mut q1 = Host::connect(addr).await;
+    assert!(q1.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let mut q2 = Host::connect(addr).await;
+    assert!(q2.fabrics_connect(2, cntlid, VOL_NQN).await.ok());
+    assert!(q1.io(IO_FLUSH, 0, 0, &[], 0, false).await.ok());
+    drop(admin);
+    assert_hung_up(&mut q1).await;
+    assert_hung_up(&mut q2).await;
+}
+
+/// Writes by R2T ask for at most `R2T_BUDGET` of data at a time; the rest
+/// wait for their R2T. Every one used to get its R2T, and a buffer for its
+/// data, at once (up to 64 Ki of them, 1 MiB each).
+#[tokio::test]
+async fn r2ts_ask_for_at_most_the_budget_at_once() {
+    let pool = TestPool::new().await;
+    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 64 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+
+    let n = 32;
+    let len = MAX_TRANSFER;
+    let mut data = HashMap::new();
+    for i in 0..n {
+        let cid = q
+            .send_io(
+                IO_WRITE,
+                (i * len) as u64 / LBA_SIZE,
+                (len as u64 / LBA_SIZE) as u32,
+                len,
+                &[],
+            )
+            .await;
+        data.insert(cid, pattern(len, i as u8));
+    }
+    let mut r2ts = Vec::new();
+    while let Ok(pdu) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), read_pdu(&mut q.rd)).await
+    {
+        let pdu = pdu.unwrap();
+        assert_eq!(pdu[0], PDU_R2T);
+        r2ts.push(pdu);
+    }
+    assert_eq!(r2ts.len(), R2T_BUDGET / len, "R2Ts before any data came");
+
+    // Answer each R2T, and the ones that follow, until every write is done.
+    let mut done = 0;
+    while done < n {
+        for r2t in std::mem::take(&mut r2ts) {
+            let (cid, ttag) = (le16(&r2t, 8), le16(&r2t, 10));
+            let d = data[&cid].clone();
+            for (k, chunk) in d.chunks(q.maxh2cdata as usize).enumerate() {
+                let off = k * q.maxh2cdata as usize;
+                q.send_h2c(cid, ttag, off, chunk, off + chunk.len() == d.len())
+                    .await;
+            }
+        }
+        let pdu = read_pdu(&mut q.rd).await.unwrap();
+        match pdu[0] {
+            PDU_R2T => r2ts.push(pdu),
+            PDU_RSP => {
+                assert_eq!(le16(&pdu, 22) >> 1, 0, "write failed");
+                done += 1;
+            }
+            t => panic!("unexpected PDU {t:#x}"),
+        }
+    }
+    let r = q
+        .io(IO_READ, (5 * len) as u64 / LBA_SIZE, 1, &[], 4096, false)
+        .await;
+    assert!(r.data[..] == pattern(len, 5)[..4096]);
+}
+
+/// Holds every command until opened, counting how many got in.
+struct Gate {
+    inner: Arc<dyn VolumeIo>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    open: Arc<watch::Sender<bool>>,
+}
+
+impl Gate {
+    async fn wait(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.open.subscribe().wait_for(|o| *o).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl VolumeIo for Gate {
+    async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
+        self.wait().await;
+        self.inner.read(offset, buf).await
+    }
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
+        self.wait().await;
+        self.inner.write(offset, data).await
+    }
+    async fn zero(&self, offset: u64, len: usize) -> Result<(), FileSystemError> {
+        self.wait().await;
+        self.inner.zero(offset, len).await
+    }
+    async fn flush(&self) -> Result<(), FileSystemError> {
+        self.wait().await;
+        self.inner.flush().await
+    }
+    async fn sync(&self) -> Result<(), FileSystemError> {
+        self.inner.sync().await
+    }
+}
+
+/// A host sending past the queue's depth gets `QUEUE_ENTRIES` commands
+/// running at once; the rest wait unread. Every command used to get a
+/// task at once.
+#[tokio::test]
+async fn a_queue_has_at_most_its_depth_of_commands_running() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open = Arc::new(watch::Sender::new(false));
+    server
+        .export_io("vol")
+        .unwrap()
+        .switch(Arc::new(Gate {
+            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+            entered: entered.clone(),
+            open: open.clone(),
+        }))
+        .await;
+
+    let n = QUEUE_ENTRIES as usize + 50;
+    let Host { mut rd, mut wr, .. } = q;
+    let send = tokio::spawn(async move {
+        for i in 0..n {
+            let cid = i as u16 + 100;
+            let mut s = sqe(IO_WRITE, cid, 1);
+            set_cdw(&mut s, 10, i as u32);
+            sgl_inline(&mut s, 4096);
+            let mut pdu = vec![0u8; 72];
+            pdu[0] = PDU_CMD;
+            pdu[2] = 72;
+            pdu[3] = 72;
+            pdu[8..72].copy_from_slice(&s);
+            pdu.extend_from_slice(&pattern(4096, i as u8));
+            let plen = pdu.len() as u32;
+            pdu[4..8].copy_from_slice(&plen.to_le_bytes());
+            wr.write_all(&pdu).await.unwrap();
+        }
+        wr
+    });
+    assert_eq!(
+        crate::nbd::tests::settled(&entered).await,
+        QUEUE_ENTRIES as usize
+    );
+    open.send_replace(true);
+    for _ in 0..n {
+        let pdu = read_pdu(&mut rd).await.unwrap();
+        assert_eq!(pdu[0], PDU_RSP);
+        assert_eq!(le16(&pdu, 22) >> 1, 0, "write failed");
+    }
+    let _wr = send.await.unwrap();
 }

@@ -304,3 +304,34 @@ fn restored_operations_go_back_ahead_of_newer_ones() {
     d.restore_unlogged(BTreeMap::new(), taken);
     assert_eq!(d.ops, vec![(2, op("c"))]);
 }
+
+/// I-1: an `Unsettled::all` dropped partway through its list (a commit
+/// given up on while freeing what the new table replaced) gives back
+/// what's left of it, however much was popped. Before, it guarded only
+/// what was pushed after it was made: nothing (all of it leaked), or,
+/// once one was popped, a drain out of range (a panic in `Drop`).
+#[tokio::test]
+async fn an_unsettled_list_dropped_partway_gives_back_the_rest() {
+    let pool = TestPool::new().await;
+    let fs = pool.format().await;
+    for popped in [0, 1] {
+        let mut ptrs = Vec::new();
+        for i in 0..3 {
+            ptrs.push(fs.write_record(&pattern(BLOCK_SIZE, i)).await.unwrap());
+        }
+        let left: u64 = ptrs[..3 - popped].iter().map(|p| p.asize as u64).sum();
+        let before = allocated(&fs).await;
+        {
+            let g = Unsettled::all(&fs, &mut ptrs);
+            for _ in 0..popped {
+                g.ptrs.pop();
+            }
+        }
+        assert!(
+            ptrs.is_empty(),
+            "popped {popped}: {} left in the list",
+            ptrs.len()
+        );
+        assert_eq!(before - allocated(&fs).await, left, "popped {popped}");
+    }
+}

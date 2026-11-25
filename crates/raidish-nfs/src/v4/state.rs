@@ -558,7 +558,11 @@ impl StateTable {
     }
 
     /// Forget clients whose lease ran out (with some slack), and all they
-    /// held. Returns their owner strings (to forget).
+    /// held. Returns the owner strings no confirmed client has any more
+    /// (their records to forget). An unconfirmed client never had one
+    /// recorded, and its owner may well be a confirmed client's (a reboot
+    /// that never confirmed): it used to take that client's record with
+    /// it, so a failover's grace period wouldn't let it reclaim.
     pub fn expire(&self) -> Vec<Vec<u8>> {
         let mut inner = self.inner.lock().unwrap();
         let limit = Duration::from_secs(LEASE_SECS as u64 + 15);
@@ -570,11 +574,14 @@ impl StateTable {
             .collect();
         let mut owners = Vec::new();
         for id in &gone {
-            if let Some(c) = inner.clients.get(id) {
+            if let Some(c) = inner.clients.get(id)
+                && c.confirmed
+            {
                 owners.push(c.owner.clone());
             }
             inner.drop_client(*id);
         }
+        owners.retain(|o| !inner.clients.values().any(|c| c.confirmed && &c.owner == o));
         owners
     }
 
@@ -1163,6 +1170,42 @@ mod tests {
 
     fn r(a: u64, b: u64) -> Range {
         Range { start: a, end: b }
+    }
+
+    /// I-32: an unconfirmed client that lapses (a reboot that never
+    /// confirmed) doesn't take the record of the confirmed client with the
+    /// same owner with it: that one may still have to reclaim.
+    #[test]
+    fn an_unconfirmed_client_lapsing_keeps_the_confirmed_ones_record() {
+        let t = StateTable::new();
+        let x = t.exchange_id(b"c", [2; 8], false).unwrap();
+        t.create_session(x.clientid, x.sequenceid, 4, |_| Vec::new())
+            .unwrap();
+        let y = t.exchange_id(b"c", [3; 8], false).unwrap();
+        assert!(!y.confirmed);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(LEASE_SECS as u64 + 60))
+            .unwrap();
+        t.inner
+            .lock()
+            .unwrap()
+            .clients
+            .get_mut(&y.clientid)
+            .unwrap()
+            .renewed = long_ago;
+        assert!(t.expire().is_empty(), "the confirmed client's record went");
+        assert!(t.inner.lock().unwrap().clients.contains_key(&x.clientid));
+        assert!(!t.inner.lock().unwrap().clients.contains_key(&y.clientid));
+
+        // The confirmed one lapsing does forget it.
+        t.inner
+            .lock()
+            .unwrap()
+            .clients
+            .get_mut(&x.clientid)
+            .unwrap()
+            .renewed = long_ago;
+        assert_eq!(t.expire(), vec![b"c".to_vec()]);
     }
 
     #[test]

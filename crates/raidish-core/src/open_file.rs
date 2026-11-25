@@ -392,14 +392,23 @@ impl<D: BlockDevice> FileSystem<D> {
         dnode.tree = tree.clone();
         dnode.size = size;
         dnode.attrs.touch();
+        // Given up on before the dnode points at it, the new tree is
+        // given back (structural triage I-1).
+        let mut unsettled = crate::object::Unsettled::all(self, &mut allocated);
         if let Err(e) = self.write_dnode(tx, f.id, Some(dnode)).await {
-            self.release_ptrs(&allocated).await;
+            unsettled.disarm();
+            self.release_ptrs(unsettled.ptrs).await;
             return Err(e);
         }
+        unsettled.disarm();
         f.obj.set_root(tree);
-        for p in &replaced {
+        // As in `sync_table`: the rest freed all the same if given up on.
+        let mut left = crate::object::Unsettled::all(self, &mut replaced);
+        while let Some(p) = left.ptrs.last().cloned() {
             self.free(tx, p.lba, p.asize as u64).await?;
+            left.ptrs.pop();
         }
+        left.disarm();
         Ok(())
     }
 

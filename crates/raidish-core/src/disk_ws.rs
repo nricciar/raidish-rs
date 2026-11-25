@@ -375,19 +375,32 @@ impl RemoteDisk {
 
     /// Make `conn` the live connection and start reconnecting as soon as it
     /// dies, whether or not anyone is issuing requests at the time.
+    ///
+    /// Only the installed connection's death reconnects. One that was
+    /// replaced closes when dropped, and reconnecting then would replace
+    /// the live one, whose drop would do the same, and so on.
     fn install(self: &Arc<Self>, conn: Arc<WsConn>) {
         let mut closed = conn.closed_signal();
+        let this = Arc::downgrade(&conn);
         *self.conn.write().unwrap() = Some(conn);
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let _ = closed.wait_for(|c| *c).await;
-            if let Some(disk) = weak.upgrade() {
+            let Some(disk) = weak.upgrade() else { return };
+            let installed = disk
+                .conn
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| std::ptr::eq(Arc::as_ptr(c), this.as_ptr()));
+            if installed {
                 eprintln!("disk {} ({}): connection lost", disk.disk_id, disk.url);
                 disk.ensure_reconnect();
             }
         });
     }
 
+    /// Reconnect in the background, unless that's already under way.
     fn ensure_reconnect(self: &Arc<Self>) {
         if self.reconnecting.swap(true, Ordering::SeqCst) {
             return;
@@ -399,16 +412,42 @@ impl RemoteDisk {
             loop {
                 tokio::time::sleep(delay).await;
                 let Some(disk) = weak.upgrade() else { return };
+                // Connected meanwhile (by a loop that started just before
+                // this one): keep that connection.
+                if disk.current().is_some() {
+                    disk.reconnected();
+                    return;
+                }
                 if let Ok(conn) = WsConn::connect(&disk.url, disk.opts).await {
-                    disk.reconnecting.store(false, Ordering::SeqCst);
+                    // Installed before the flag clears: while it's clear and
+                    // nothing live is installed, a request starts another
+                    // loop, which would connect again and replace this one.
                     disk.install(conn);
                     disk.generation.send_modify(|g| *g += 1);
                     eprintln!("disk {} ({}): reconnected", disk.disk_id, disk.url);
+                    disk.reconnected();
                     return;
                 }
                 delay = (delay * 2).min(max);
             }
         });
+    }
+
+    /// The reconnect loop is done. A connection that died before the flag
+    /// cleared found a loop under way and left the reconnect to it, so
+    /// look again.
+    fn reconnected(self: &Arc<Self>) {
+        self.reconnecting.store(false, Ordering::SeqCst);
+        if self.current().is_none() {
+            self.ensure_reconnect();
+        }
+    }
+
+    /// Start a reconnect loop as if the connection had just been found
+    /// dead (tests: a second loop racing a live connection).
+    #[cfg(any(test, feature = "testutil"))]
+    pub(super) fn force_reconnect(self: &Arc<Self>) {
+        self.ensure_reconnect();
     }
 
     pub(super) fn is_online(&self) -> bool {

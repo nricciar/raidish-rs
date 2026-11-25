@@ -43,6 +43,9 @@ pub struct ScanReport {
     pub label_stripes: u64,
     /// Label units (first block of each) for which no valid contents could be found.
     pub label_unrecoverable: Vec<u64>,
+    /// Label units decided with stale (degraded) members' copies voting:
+    /// see `LabelScan::stale_votes`.
+    pub label_stale_votes: Vec<u64>,
     /// Records that could not be read or verified, with their location.
     pub errors: Vec<String>,
     /// Disks brought back in sync (no longer degraded).
@@ -54,6 +57,14 @@ pub struct ScanReport {
 impl ScanReport {
     pub fn is_clean(&self) -> bool {
         self.errors.is_empty() && self.label_unrecoverable.is_empty() && self.aborted.is_none()
+    }
+
+    /// Clean, and good enough to vouch for degraded disks: nothing skipped
+    /// as being written (structural triage I-21) and no label decided by a
+    /// stale member's own copy (I-19). Otherwise a disk could be cleared
+    /// with something on it that nothing checked.
+    pub fn certifies(&self) -> bool {
+        self.is_clean() && self.shards.skipped == 0 && self.label_stale_votes.is_empty()
     }
 
     pub fn repaired(&self) -> u64 {
@@ -139,6 +150,13 @@ impl std::fmt::Display for ScanReport {
         }
         for s in &self.label_unrecoverable {
             writeln!(f, "  error: label block {} unrecoverable", s)?;
+        }
+        if !self.label_stale_votes.is_empty() {
+            writeln!(
+                f,
+                "  {} label units checked against degraded disks only (no disk cleared)",
+                self.label_stale_votes.len()
+            )?;
         }
         if let Some(why) = &self.aborted {
             writeln!(f, "  aborted: {}", why)?;
@@ -272,7 +290,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         }
         if repair
-            && report.is_clean()
+            && report.certifies()
             && let Some(pool) = pool
         {
             // Under the tx: no commit can write a label or fold a miss in
@@ -298,7 +316,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     }
                     pool.disks().set_fenced(d, false);
                 }
-                if self.clear_degraded(&tx, d, marks_at_start[d]) {
+                if self.clear_degraded(&tx, d, marks_at_start[d], misses_at_start[d]) {
                     report.cleared.push(d);
                 }
             }
@@ -535,8 +553,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 .filter(|&t| t <= committed)
         };
         // Degraded members missed label writes: their copies don't vote
-        // (audit D3), they're what gets repaired.
-        let stale: Vec<bool> = self.degraded_disks().iter().map(|d| d.is_some()).collect();
+        // (audit D3), they're what gets repaired. So may a disk with a
+        // write failed since the snapshot, not yet folded into `degraded`.
+        let stale: Vec<bool> = (0..pool.disks().len())
+            .map(|d| pool.disks().may_lag(d))
+            .collect();
         let header = (0, self.header.spacemap_start);
         let spacemaps = (
             self.layout.spacemap_start,
@@ -552,6 +573,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     report.label_stripes += scan.units;
                     report.shards.add(&scan.check);
                     report.label_unrecoverable.extend(scan.unrecoverable);
+                    report.label_stale_votes.extend(scan.stale_votes);
                 }
                 Err(e) => {
                     report

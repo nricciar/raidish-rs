@@ -405,3 +405,131 @@ async fn crash_at_every_point_of_a_workload() {
 fn faults_remaining(f: &crate::test_util::FaultSwitch) -> i64 {
     f.remaining()
 }
+
+/// Reopen `pool` and check it: nothing referenced is free, nothing leaked.
+async fn reopened_clean(pool: &TestPool) -> FileSystem<crate::vdev::Pool> {
+    let fs = FileSystem::load(pool.dev().await).await.unwrap();
+    let fsck = fs.fsck(false).await.unwrap();
+    assert!(fsck.is_clean(), "{fsck}");
+    fs
+}
+
+/// Structural triage I-1: a commit given up on while writing its space
+/// maps (an export flush whose client hung up) puts back what the sync
+/// took, so the next commit writes those metaslabs again. Before, they
+/// were left clean in memory: the next commit's uberblock named blocks
+/// its space maps had free.
+#[tokio::test]
+async fn a_commit_dropped_in_its_space_map_writes_keeps_them_dirty() {
+    let pool = TestPool::new().await;
+    let (fs, faults) = pool.format_faulty().await;
+    fs.mkdir(Path::new("/d")).await.unwrap();
+    faults.stall_writes(Some(fs.layout.spacemap_start..fs.layout.data_start));
+    {
+        let write = fs.write_file(Path::new("/d/a"), &[7u8; 50_000]);
+        tokio::pin!(write);
+        tokio::select! {
+            r = &mut write => panic!("wrote through the stall: {r:?}"),
+            _ = faults.wait_stalled(1) => {}
+        }
+    }
+    faults.stall_writes(None);
+    fs.commit_txg().await.unwrap();
+    drop(fs);
+    let fs = reopened_clean(&pool).await;
+    assert_eq!(
+        fs.read_file(Path::new("/d/a")).await.unwrap(),
+        [7u8; 50_000]
+    );
+}
+
+/// I-1: a commit given up on after its uberblock landed, while settling,
+/// still advances to it: each metaslab's active slot moves to the one
+/// just written, and what the commit freed is deferred (before, those
+/// frees were lost: leaked).
+#[tokio::test]
+async fn a_commit_dropped_after_its_uberblock_landed_still_advances() {
+    let pool = TestPool::new().await;
+    let (fs, faults) = pool.format_faulty().await;
+    fs.mkdir(Path::new("/d")).await.unwrap();
+    fs.write_file(Path::new("/d/a"), &[1u8; 50_000])
+        .await
+        .unwrap();
+    let before = fs.uberblock().await.unwrap().txg;
+    let ring = fs.header.uberblock_start..fs.header.uberblock_start + fs.header.uberblock_blocks();
+    faults.stall_writes(Some(ring));
+    {
+        // Rewriting `a` frees its old blocks in this commit.
+        let write = fs.write_file(Path::new("/d/a"), &[2u8; 50_000]);
+        tokio::pin!(write);
+        tokio::select! {
+            r = &mut write => panic!("wrote through the stall: {r:?}"),
+            _ = faults.wait_stalled(1) => {}
+        }
+        // The space maps are written: hold the metaslabs, so settling
+        // waits on them once the uberblock lands.
+        let mut held = Vec::new();
+        for ms in fs.metaslabs.iter() {
+            held.push(ms.read().await);
+        }
+        faults.stall_writes(None);
+        tokio::select! {
+            r = &mut write => panic!("settled through held metaslabs: {r:?}"),
+            _ = async {
+                while fs.uberblock().await.map(|u| u.txg) == Some(before) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            } => {}
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+    }
+    fs.write_file(Path::new("/d/b"), &[3u8; 50_000])
+        .await
+        .unwrap();
+    // Past the frees' deferral, so they're released and fsck sees them free.
+    for _ in 0..crate::metaslab::TXG_DEFER_SIZE + 1 {
+        fs.commit_txg().await.unwrap();
+    }
+    drop(fs);
+    let fs = reopened_clean(&pool).await;
+    assert_eq!(
+        fs.read_file(Path::new("/d/a")).await.unwrap(),
+        [2u8; 50_000]
+    );
+    assert_eq!(
+        fs.read_file(Path::new("/d/b")).await.unwrap(),
+        [3u8; 50_000]
+    );
+}
+
+/// I-1: a commit given up on while writing the object table puts the
+/// table's records back to dirty, for the next commit. Before, they were
+/// lost with the sync: what the operation did never reached the disk.
+#[tokio::test]
+async fn a_commit_dropped_in_its_table_writes_keeps_the_records() {
+    let pool = TestPool::new().await;
+    let (fs, faults) = pool.format_faulty().await;
+    fs.mkdir(Path::new("/d")).await.unwrap();
+    // Made, not committed: the next commit's table sync takes its records.
+    let mut tx = fs.begin_tx().await;
+    let r = fs.mkdir_locked(&mut tx, Path::new("/d/e")).await;
+    tx.check(r).await.unwrap();
+    drop(tx);
+    faults.stall_writes(Some(fs.layout.data_start..u64::MAX));
+    {
+        let commit = fs.commit_txg();
+        tokio::pin!(commit);
+        tokio::select! {
+            r = &mut commit => panic!("wrote through the stall: {r:?}"),
+            _ = faults.wait_stalled(1) => {}
+        }
+    }
+    faults.stall_writes(None);
+    fs.commit_txg().await.unwrap();
+    drop(fs);
+    let fs = reopened_clean(&pool).await;
+    assert!(fs.ls(Path::new("/d/e")).await.is_ok());
+}

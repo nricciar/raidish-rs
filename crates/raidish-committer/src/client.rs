@@ -83,16 +83,29 @@ impl CommitClient {
             if let Some(b) = body {
                 req = req.json(b);
             }
-            match req.send().await {
-                Ok(resp) => match resp.json::<Result<T, CommitError>>().await {
-                    Ok(Err(CommitError::Retry(m))) => why.push(format!("{}: {}", ep, m)),
-                    // The committer's answer, refusals included.
-                    Ok(r) => {
-                        self.committer.store(i, Ordering::Relaxed);
-                        return r;
-                    }
-                    Err(e) => why.push(format!("{}: {}", ep, e)),
-                },
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    why.push(format!("{}: {}", ep, e));
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                match refusal(ep, status, &body) {
+                    Some(e) => return Err(e),
+                    None => why.push(format!("{}: {} {}", ep, status, body.trim())),
+                }
+                continue;
+            }
+            match resp.json::<Result<T, CommitError>>().await {
+                Ok(Err(CommitError::Retry(m))) => why.push(format!("{}: {}", ep, m)),
+                // The committer's answer, refusals included.
+                Ok(r) => {
+                    self.committer.store(i, Ordering::Relaxed);
+                    return r;
+                }
                 Err(e) => why.push(format!("{}: {}", ep, e)),
             }
         }
@@ -177,10 +190,35 @@ impl CommitClient {
             .send()
             .await
             .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(refusal(&ep, status, &body).unwrap_or_else(|| {
+                CommitError::Retry(format!("{}: {} {}", ep, status, body.trim()))
+            }));
+        }
         resp.json::<Result<StreamReport, CommitError>>()
             .await
             .map_err(|e| CommitError::Retry(format!("{}: {}", ep, e)))?
     }
+}
+
+/// An HTTP status that refuses a request for good. The request didn't get
+/// past the route's guards (auth or the body), so it wasn't applied, and
+/// sending it again, to this node or any other, won't help. Without this,
+/// a bad certificate or an oversized commit looked like "no committer" and
+/// a flush resent it forever. Anything else (a 5xx: perhaps applied, a 404
+/// from a node without the route, a 429) is worth another try.
+fn refusal(ep: &str, status: reqwest::StatusCode, body: &str) -> Option<CommitError> {
+    let kind = match status.as_u16() {
+        401 | 403 => ErrorKind::Forbidden,
+        400 | 413 | 422 => ErrorKind::Invalid,
+        _ => return None,
+    };
+    Some(CommitError::refused(
+        kind,
+        format!("{}: {} {}", ep, status, body.trim()),
+    ))
 }
 
 #[async_trait]

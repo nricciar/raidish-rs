@@ -686,18 +686,18 @@ async fn delete_bucket(fe: &Arc<Frontend>, bk: &Arc<Bucket<Pool>>) -> Result<Res
     if !bk.is_empty().await? {
         return Err(not_empty());
     }
-    bk.close();
+    // Reopened when this ends, whichever way (I-35), unless deleted.
+    let closed = bk.close();
     if !bk.is_empty().await? {
-        bk.reopen();
         return Err(not_empty());
     }
     match fe.delete_service(&bk.tree.name).await {
-        Ok(true) => Ok(ok_empty(StatusCode::NO_CONTENT)),
-        Ok(false) => Err(no_bucket()),
-        Err(m) => {
-            bk.reopen();
-            Err(e3(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", m))
+        Ok(true) => {
+            closed.keep();
+            Ok(ok_empty(StatusCode::NO_CONTENT))
         }
+        Ok(false) => Err(no_bucket()),
+        Err(m) => Err(e3(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", m)),
     }
 }
 

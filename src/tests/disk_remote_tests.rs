@@ -80,6 +80,40 @@ async fn remote_disk_fails_fast_and_reconnects() {
     assert_eq!(buf, vec![7u8; BLOCK_SIZE]);
 }
 
+/// A reconnect loop that finds a live connection keeps it. It used to
+/// connect again and replace it, and the replaced connection's close then
+/// started another loop, which replaced that one, and so on, for good.
+/// Such a loop starts when a request finds the disk offline just as a
+/// reconnect completes (the flag cleared before the new connection was
+/// installed): `force_reconnect` starts one outright.
+#[tokio::test]
+async fn a_second_reconnect_loop_keeps_the_live_connection() {
+    let pool = TestPool::new().await;
+    let server = TestDiskServer::start(&pool.paths).await;
+    let disk = remote_disk(&server, 0).await;
+    let reconnects = disk.reconnects().unwrap();
+    let gen0 = *reconnects.borrow();
+
+    disk.force_reconnect();
+    // Many reconnect delays (`fast_disk_options`: 20 ms up to 200 ms).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(disk.is_online());
+    assert_eq!(*reconnects.borrow(), gen0, "replaced a live connection");
+
+    // The real thing still reconnects.
+    server.stop();
+    assert!(wait_until(2, || !disk.is_online()).await);
+    server.restart().await;
+    assert!(
+        wait_until(5, || disk.is_online()).await,
+        "never reconnected"
+    );
+    let after = *reconnects.borrow();
+    assert!(after > gen0);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(*reconnects.borrow(), after, "kept reconnecting");
+}
+
 #[tokio::test]
 async fn remote_disk_times_out_on_a_silent_server() {
     let pool = TestPool::new().await;

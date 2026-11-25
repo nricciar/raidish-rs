@@ -418,6 +418,15 @@ impl Disk {
         }
     }
 
+    /// Tests: start a remote disk's reconnect loop as if its connection had
+    /// just died (it is still live).
+    #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
+    pub fn force_reconnect(&self) {
+        if let DiskBackend::WebSocket(r) = &self.backend {
+            r.force_reconnect();
+        }
+    }
+
     /// Changes every time a remote disk reconnects. None for local disks.
     pub fn reconnects(&self) -> Option<watch::Receiver<u64>> {
         match &self.backend {
@@ -605,7 +614,7 @@ impl BlockDevice for Disk {
                 Ok(())
             }
             #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
-            DiskBackend::Fault(f) => f.read(start, buf),
+            DiskBackend::Fault(f) => f.read(start, buf).await,
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
                 let reads = buf.chunks_mut(chunk).enumerate().map(|(i, out)| {

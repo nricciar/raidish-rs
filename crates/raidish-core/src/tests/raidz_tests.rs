@@ -481,3 +481,172 @@ fn a_read_waiting_on_a_buffered_stripe_doesnt_block_the_map() {
         "deadlocked: the read held the map's shard while waiting"
     );
 }
+
+/// raidz`parity` over `n` small disks, each behind a fault switch.
+fn fault_raidz(
+    n: usize,
+    parity: usize,
+) -> (
+    Arc<RaidZ>,
+    Vec<crate::test_util::FaultHandle>,
+    Vec<NamedTempFile>,
+) {
+    let files: Vec<NamedTempFile> = (0..n)
+        .map(|_| {
+            let f = NamedTempFile::new().unwrap();
+            f.as_file().set_len(16 * 1024 * 1024).unwrap();
+            f
+        })
+        .collect();
+    let handles: Vec<_> = files
+        .iter()
+        .map(|f| crate::test_util::FaultDisk::open(f.path()).unwrap())
+        .collect();
+    let caddies = handles
+        .iter()
+        .map(|h| {
+            crate::disks::Caddy::Healthy(
+                h.path().to_string_lossy().into_owned(),
+                crate::disk::Disk::faulty(h.clone()),
+            )
+        })
+        .collect();
+    let disks = Arc::new(crate::disks::DiskSet::from_caddies(caddies));
+    (
+        Arc::new(RaidZ::new(disks, (0..n).collect(), parity)),
+        handles,
+        files,
+    )
+}
+
+/// I-21: a partial write to one block of a stripe that a full-stripe write
+/// is replacing, racing it. The partial write's flush reads the stripe's
+/// other blocks to rebuild parity; read before the full write landed, they
+/// were the old contents, written back over the full write's: its other
+/// blocks lost. It must wait for the full write and read what that wrote.
+#[tokio::test]
+async fn a_partial_write_racing_a_full_stripe_write_keeps_its_neighbours() {
+    let (raidz, handles, _f) = fault_raidz(3, 1);
+    let full = pattern(2, 7); // stripe 0: blocks 0 and 1
+    for h in &handles {
+        h.hold_writes(true);
+    }
+    let whole = tokio::spawn({
+        let raidz = raidz.clone();
+        let full = full.clone();
+        async move {
+            raidz
+                .write_blocks(0, crate::disk::as_blocks(&full).unwrap())
+                .await
+        }
+    });
+    for h in &handles {
+        h.wait_held(1).await;
+    }
+    // Block 1 again (overlapping the full write there), then flushed.
+    let partial = tokio::spawn({
+        let raidz = raidz.clone();
+        async move {
+            raidz.write_block(1, &[9u8; BLOCK_SIZE]).await?;
+            raidz.flush().await
+        }
+    });
+    // Let it get as far as it can (to its own held writes, before).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for h in &handles {
+        h.hold_writes(false);
+        h.release_all();
+    }
+    whole.await.unwrap().unwrap();
+    partial.await.unwrap().unwrap();
+    for h in &handles {
+        h.release_all();
+    }
+    raidz.flush().await.unwrap();
+
+    let mut b0 = [0u8; BLOCK_SIZE];
+    raidz.read_block(0, &mut b0).await.unwrap();
+    assert_eq!(&b0[..], &full[..BLOCK_SIZE], "block 0 lost the full write");
+    let mut b1 = [0u8; BLOCK_SIZE];
+    raidz.read_block(1, &mut b1).await.unwrap();
+    assert!(b1.iter().all(|&b| b == 9), "block 1: the later write");
+}
+
+/// I-21: a full-stripe write that fails (too few disks took it) must not
+/// throw away the partial writes buffered for that stripe before it: they
+/// were acknowledged, and a later flush still writes them.
+#[tokio::test]
+async fn a_failed_full_stripe_write_keeps_the_buffered_partial() {
+    let (raidz, handles, _f) = fault_raidz(3, 1);
+    raidz.write_block(0, &[5u8; BLOCK_SIZE]).await.unwrap();
+    for h in &handles[1..] {
+        h.fail_writes(Some(crate::test_util::FaultError::Io));
+    }
+    let full = pattern(2, 3);
+    assert!(
+        raidz
+            .write_blocks(0, crate::disk::as_blocks(&full).unwrap())
+            .await
+            .is_err()
+    );
+    for h in &handles {
+        h.heal();
+    }
+    // Disks 1 and 2 missed it, so they lag (I-20) and leave too few
+    // members to complete the stripe from: that flush must wait.
+    assert!(raidz.flush().await.is_err());
+    // Once they're found in sync again (what a resilver does), it goes.
+    for d in 1..3 {
+        raidz.disks.caught_up(d, raidz.disks.miss_count(d));
+    }
+    raidz.flush().await.unwrap();
+    let mut b0 = [0u8; BLOCK_SIZE];
+    raidz.read_block(0, &mut b0).await.unwrap();
+    assert!(
+        b0.iter().all(|&b| b == 5),
+        "the buffered write was dropped with the failed full write"
+    );
+}
+
+/// I-20: a member missed a full-stripe write (its shard is the one from
+/// before) and is back. A partial write to another block of that stripe
+/// rebuilds parity from the stripe's other shards as on disk: read from
+/// the stale member, the old block went into the new parity and the one
+/// it missed was lost for good. It must be rebuilt from the members that
+/// have it instead.
+#[tokio::test]
+async fn read_modify_write_doesnt_read_a_member_that_missed_writes() {
+    let (raidz, handles, _f) = fault_raidz(3, 1);
+    let old = pattern(2, 1);
+    raidz
+        .write_blocks(0, crate::disk::as_blocks(&old).unwrap())
+        .await
+        .unwrap();
+    raidz.flush().await.unwrap();
+
+    // Disk 1 (block 1's) misses the next version of the stripe.
+    handles[1].fail_writes(Some(crate::test_util::FaultError::Io));
+    let new = pattern(2, 2);
+    raidz
+        .write_blocks(0, crate::disk::as_blocks(&new).unwrap())
+        .await
+        .unwrap();
+    raidz.flush().await.unwrap();
+    handles[1].heal();
+    assert!(raidz.disks.may_lag(1));
+
+    raidz.write_block(0, &[7u8; BLOCK_SIZE]).await.unwrap();
+    raidz.flush().await.unwrap();
+    let mut b1 = [0u8; BLOCK_SIZE];
+    raidz.read_block(1, &mut b1).await.unwrap();
+    assert_eq!(
+        &b1[..],
+        &new[BLOCK_SIZE..],
+        "block 1 went back to what the stale member had"
+    );
+    // And the stripe's parity agrees (block 1 rebuilt without disk 1).
+    let c = raidz.reconstruct_candidates(1).await.unwrap();
+    for r in c.rebuilt.iter().flatten() {
+        assert_eq!(&r[..], &new[BLOCK_SIZE..]);
+    }
+}

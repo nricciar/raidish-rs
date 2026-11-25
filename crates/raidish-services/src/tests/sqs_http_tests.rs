@@ -387,3 +387,42 @@ async fn dead_letters_and_errors() {
     assert_eq!((st, kind.as_str()), (403, "com.amazonaws.sqs#AccessDenied"));
     ro.key = ro.fx.key(Role::Admin);
 }
+
+/// I-34: a message's history (`RaidishMoved`) is a dead-letter move's
+/// alone. A client's SendMessage carrying one is sent as any other (sent
+/// now, never received); `u64::MAX` there used to overflow the retention
+/// arithmetic, and `u32::MAX` receives the count. The move's own action
+/// is refused to a client's key, admin or not.
+#[tokio::test]
+async fn a_clients_message_history_is_ignored() {
+    let pool = TestPool::new().await;
+    let s = server(&pool).await;
+    let q = s.url("q");
+    let forged = json!({
+        "QueueUrl": q,
+        "MessageBody": "forged",
+        "RaidishMoved": {"SentMs": u64::MAX, "ReceiveCount": u32::MAX, "From": "elsewhere"},
+    });
+    s.ok("SendMessage", forged.clone()).await;
+    let (st, kind) = s.err(super::MOVE_MESSAGE, forged).await;
+    assert_eq!(st, 403);
+    assert!(kind.ends_with("AccessDenied"), "{}", kind);
+
+    let before = crate::types::now_ms();
+    let v = s
+        .ok(
+            "ReceiveMessage",
+            json!({"QueueUrl": q, "AttributeNames": ["All"]}),
+        )
+        .await;
+    let m = &v["Messages"][0];
+    assert_eq!(m["Body"], "forged");
+    assert_eq!(m["Attributes"]["ApproximateReceiveCount"], "1");
+    let sent: u64 = m["Attributes"]["SentTimestamp"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(sent <= before, "sent at {}", sent);
+    assert!(m["Attributes"].get("DeadLetterQueueSourceArn").is_none());
+}

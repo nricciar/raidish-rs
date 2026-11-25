@@ -43,8 +43,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
-/// How long the receiving end waits for the writer to finish its part.
+/// How long either end waits on the other for a reply that needs no work
+/// (READY, DONE).
 pub(super) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the writer handing a volume over may take from the
+/// receiver's READY to transferring the lease: its clients' drain
+/// (`DRAIN_TIMEOUT`, 30 s) and the last syncs. Past it, the writer gives up
+/// instead (the volume synced, its lease released).
+pub(super) const SENDER_BUDGET: Duration = Duration::from_secs(60);
+/// How long the receiver waits for TRANSFERRED: the sender's budget, then
+/// the transfer itself (two lease calls of at most 5 s) with room to spare.
+/// Waiting less, the receiver could give up first and the lease be handed
+/// to an owner nobody renews: the volume down until it expired (structural
+/// triage I-27).
+pub(super) const TRANSFER_WAIT: Duration = Duration::from_secs(SENDER_BUDGET.as_secs() + 30);
 /// How long a proxied request keeps retrying (the writer failing over
 /// takes a lease TTL or so).
 pub(super) const PROXY_RETRY: Duration = Duration::from_secs(20);
@@ -90,6 +102,22 @@ pub(super) struct Proxy {
     pub device: Option<String>,
 }
 
+impl Proxy {
+    /// Take its export down for good (`device`, if any, detached first by
+    /// whoever can): retired, so requests stuck retrying a writer that's
+    /// gone let go, with no replacement to wait for, so they and the
+    /// export's last sync fail at once instead of stalling the caller.
+    pub(super) async fn take_down(&self, volume: &str, w: Option<&WriterParts>) {
+        self.io.no_replacement();
+        self.peer.retire();
+        if let Some(w) = w
+            && let Err(e) = w.remove_export(volume, self.transport).await
+        {
+            eprintln!("agent: unexporting proxied '{}': {}", volume, e);
+        }
+    }
+}
+
 /// What this node has of a volume it doesn't (yet) run as its writer.
 pub(super) enum Slot {
     Proxy(Proxy),
@@ -132,13 +160,32 @@ impl Shared {
         }
     }
 
-    /// Put back what a failed takeover took: the proxy, or nothing.
-    fn restore(&self, volume: &str, proxy: Option<Proxy>) {
-        let mut slots = self.slots.lock().unwrap();
-        match proxy {
-            Some(p) => slots.insert(volume.to_string(), Slot::Proxy(p)),
-            None => slots.remove(volume),
+    /// Put back what a failed takeover on writer `w` took: its claim on
+    /// the slot, and the proxy if it had one. Only while the claim still
+    /// stands and `w` is still this node's writer: a writer dropped meanwhile
+    /// (`drop_proxies`) took the claim with it, and its proxies are dead.
+    /// Such a proxy isn't put back (it would serve again, to nobody) but
+    /// taken down here, where it's still at hand (structural triage I-27).
+    pub(super) async fn restore(&self, volume: &str, proxy: Option<Proxy>, w: &WriterParts) {
+        let dead = {
+            let cur = self.writer.lock().unwrap();
+            let live = cur.as_ref().is_some_and(|c| Arc::ptr_eq(&c.fs, &w.fs));
+            let mut slots = self.slots.lock().unwrap();
+            let ours = matches!(slots.get(volume), Some(Slot::TakingOver));
+            if ours {
+                slots.remove(volume);
+            }
+            match proxy {
+                Some(p) if ours && live => {
+                    slots.insert(volume.to_string(), Slot::Proxy(p));
+                    None
+                }
+                p => p,
+            }
         };
+        if let Some(p) = dead {
+            p.take_down(volume, Some(w)).await;
+        }
     }
 }
 
@@ -278,8 +325,17 @@ impl PeerVolumes for Shared {
             }
         };
         let Ok(proxy) = claimed else { refuse!("busy") };
+        if let Some(p) = &proxy
+            && p.transport != transport
+        {
+            // Taken over, it would be served over the proxy's transport
+            // while recorded as `transport`, and its export never removed.
+            let t = p.transport;
+            self.restore(volume, proxy, &w).await;
+            refuse!("exported here over {}, not {}", t, transport);
+        }
         if self.writing.lock().unwrap().contains_key(volume) {
-            self.restore(volume, proxy);
+            self.restore(volume, proxy, &w).await;
             refuse!("already written here");
         }
         // Requests in flight finish (the writer still serves them); new
@@ -296,10 +352,12 @@ impl PeerVolumes for Shared {
             .is_err()
             || wr.flush().await.is_err()
         {
-            self.restore(volume, proxy);
+            // Unpaused first: taking a dead proxy down syncs through it.
+            drop(paused);
+            self.restore(volume, proxy, &w).await;
             return;
         }
-        let line = tokio::time::timeout(HANDOFF_TIMEOUT, read_line(&mut rd)).await;
+        let line = tokio::time::timeout(TRANSFER_WAIT, read_line(&mut rd)).await;
         let new_epoch = match line {
             Ok(Ok(l)) => l
                 .strip_prefix("TRANSFERRED ")
@@ -308,7 +366,7 @@ impl PeerVolumes for Shared {
         };
         let Some(new_epoch) = new_epoch else {
             drop(paused);
-            self.restore(volume, proxy);
+            self.restore(volume, proxy, &w).await;
             eprintln!(
                 "agent: the handoff of '{}' (epoch {}) was called off",
                 volume, epoch
@@ -375,7 +433,7 @@ impl PeerVolumes for Shared {
                     }
                     w.fs.abandon_dataset(volume);
                     lease.release().await;
-                    self.restore(volume, None);
+                    self.restore(volume, None, &w).await;
                     refuse!("this node's writer went away meanwhile")
                 }
                 drop(paused);
@@ -385,7 +443,7 @@ impl PeerVolumes for Shared {
             }
             Err(e) => {
                 drop(paused);
-                self.restore(volume, proxy);
+                self.restore(volume, proxy, &w).await;
                 refuse!("{}", e)
             }
         }

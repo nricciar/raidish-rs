@@ -625,7 +625,8 @@ pub struct FileSystem<D: BlockDevice> {
     /// Opened for inspection: never writes (no commits, no self-heal repairs),
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
-    /// See `Uberblock::degraded`; persisted with every commit.
+    /// See `Uberblock::degraded`; persisted with every commit. The pool's
+    /// `DiskSet::degraded`, shared.
     pub degraded: Arc<std::sync::Mutex<Vec<Option<Txg>>>>,
     /// Per disk: how many times it has been marked degraded (this process).
     /// A resilver clears a disk only if no mark came while it scanned: one
@@ -663,6 +664,10 @@ impl<D: BlockDevice> FileSystem<D> {
     fn empty(dev: D) -> Self {
         let align = dev.pool().map_or(1, |p| p.align());
         let disks = dev.pool().map_or(0, |p| p.disks().len());
+        let degraded = dev.pool().map_or_else(
+            || Arc::new(std::sync::Mutex::new(Vec::new())),
+            |p| p.disks().degraded.clone(),
+        );
         FileSystem {
             dev,
             superblock: Arc::new(RwLock::new(None)),
@@ -688,7 +693,7 @@ impl<D: BlockDevice> FileSystem<D> {
             uberblock_in_doubt: Arc::new(AtomicBool::new(false)),
             clean_at: Default::default(),
             read_only: false,
-            degraded: Arc::new(std::sync::Mutex::new(vec![None; disks])),
+            degraded,
             degraded_marks: Arc::new(std::sync::Mutex::new(vec![0; disks])),
             miss_seen: Arc::new(std::sync::Mutex::new(vec![0; disks])),
             align,
@@ -1316,6 +1321,18 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Remove entry `name` of `dir` (a directory must be empty).
     pub async fn remove_at(&self, dir: FileId, name: &str) -> Result<FileId, FileSystemError> {
+        self.remove_at_leased(dir, name, None).await
+    }
+
+    /// `remove_at`, on a writer under the file's `obj/<id>` lease if the
+    /// caller holds it: without it, the committer refuses to remove a file
+    /// someone holds that lease on, the caller included.
+    pub async fn remove_at_leased(
+        &self,
+        dir: FileId,
+        name: &str,
+        lease: Option<crate::writer::ObjLease>,
+    ) -> Result<FileId, FileSystemError> {
         if let Some(w) = self.writer.clone() {
             let _tx = self.begin_tx().await;
             self.reload_root_index().await?;
@@ -1330,7 +1347,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 name: name.to_string(),
                 id,
             };
-            self.writer_commit_fs(&w, op, None).await?;
+            self.writer_commit_fs(&w, op, lease).await?;
             return Ok(id);
         }
         let mut tx = self.begin_tx().await;
@@ -1366,6 +1383,20 @@ impl<D: BlockDevice> FileSystem<D> {
         to_dir: FileId,
         to_name: &str,
     ) -> Result<FileId, FileSystemError> {
+        self.rename_at_leased(from_dir, from_name, to_dir, to_name, None)
+            .await
+    }
+
+    /// `rename_at`, on a writer under the `obj/<id>` lease of the file it
+    /// replaces, if the caller holds it (see `remove_at_leased`).
+    pub async fn rename_at_leased(
+        &self,
+        from_dir: FileId,
+        from_name: &str,
+        to_dir: FileId,
+        to_name: &str,
+        lease: Option<crate::writer::ObjLease>,
+    ) -> Result<FileId, FileSystemError> {
         if let Some(w) = self.writer.clone() {
             let _tx = self.begin_tx().await;
             self.reload_root_index().await?;
@@ -1382,7 +1413,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 to_name: to_name.to_string(),
                 id,
             };
-            self.writer_commit_fs(&w, op, None).await?;
+            self.writer_commit_fs(&w, op, lease).await?;
             return Ok(id);
         }
         let mut tx = self.begin_tx().await;
@@ -1522,6 +1553,8 @@ impl<D: BlockDevice> FileSystem<D> {
             self.objects.clone(),
             self.metaslabs.clone(),
             self.layout,
+            self.scan_hold.clone(),
+            self.uberblock.clone(),
         )
         .await
     }
@@ -1532,6 +1565,8 @@ impl<D: BlockDevice> FileSystem<D> {
         debug_assert!(tx.is_of(&self.commit_lock), "another pool's tx");
         tx.begin_commit();
         let r = self.commit_in(tx).await;
+        // Normally settled already; a defensive no-op otherwise.
+        tx.settle_commit().await;
         tx.end_commit();
         r
     }
@@ -1583,7 +1618,9 @@ impl<D: BlockDevice> FileSystem<D> {
         span.mark("table");
         let root = self.objects.root();
 
-        let synced = self.sync_metaslabs(txg).await?;
+        // From here what the commit takes is carried in `tx` (I-1): given
+        // up on, the tx settles it before the commit lock goes.
+        self.sync_metaslabs(tx, txg).await?;
         span.mark("metaslabs");
 
         // The uberblock-carrying flush below is the last write of this TXG;
@@ -1593,8 +1630,8 @@ impl<D: BlockDevice> FileSystem<D> {
         span.mark("uberblock");
         match written {
             Ok(uberblock) => {
-                *self.uberblock.lock().await = Some(uberblock);
-                self.finish_metaslab_sync(txg, synced).await;
+                tx.landed(uberblock);
+                tx.settle_commit().await;
                 self.note_clean(id, &clean);
                 span.mark("finish");
                 if volumes.is_ok() {
@@ -1603,7 +1640,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 volumes.map(|_| txg)
             }
             Err(e) => {
-                self.abort_metaslab_sync(synced).await;
+                tx.settle_commit().await;
                 Err(e)
             }
         }
@@ -1621,22 +1658,35 @@ impl<D: BlockDevice> FileSystem<D> {
         let Some(taken) = self.objects.begin_sync() else {
             return Ok(());
         };
+        // Given up on before the new root is in, the records go back to
+        // dirty, not lost with the sync (I-1).
+        let mut unfinished = crate::dataset::EndSyncOnDrop {
+            obj: &self.objects,
+            taken: Some(taken.clone()),
+        };
         let (mut allocated, mut replaced) = (Vec::new(), Vec::new());
         match self
             .build_tree(&self.objects, &taken, &mut allocated, &mut replaced)
             .await
         {
             Ok(root) => {
+                unfinished.taken = None;
                 self.objects.set_root(root);
                 self.objects.end_sync(&taken, Some(&taken));
-                for p in &replaced {
+                // What the new table no longer references is freed, the
+                // rest of it as unsettled if this is given up on partway:
+                // on a pool that commits, the same thing (I-1).
+                let mut left = crate::object::Unsettled::all(self, &mut replaced);
+                while let Some(p) = left.ptrs.last().cloned() {
                     self.free(tx, p.lba, p.asize as u64).await?;
+                    left.ptrs.pop();
                 }
+                left.disarm();
                 Ok(())
             }
             Err(e) => {
                 self.release_ptrs(&allocated).await;
-                self.objects.end_sync(&taken, None);
+                drop(unfinished);
                 Err(e)
             }
         }
@@ -1670,13 +1720,23 @@ impl<D: BlockDevice> FileSystem<D> {
     /// between the check that allowed it and the clear, and only if `disk`
     /// hasn't been marked since `mark` (`degraded_mark`, taken when the scan
     /// began): a mark since is a miss the scan didn't see, such as a
-    /// writer's (audit D4). Whether it was cleared.
-    pub(crate) fn clear_degraded(&self, _tx: &crate::tx::Tx, disk: usize, mark: u64) -> bool {
+    /// writer's (audit D4). `misses`: its miss count then (see
+    /// `DiskSet::caught_up`). Whether it was cleared.
+    pub(crate) fn clear_degraded(
+        &self,
+        _tx: &crate::tx::Tx,
+        disk: usize,
+        mark: u64,
+        misses: u64,
+    ) -> bool {
         let mut degraded = self.degraded.lock().unwrap();
         if self.degraded_marks.lock().unwrap()[disk] != mark {
             return false;
         }
         degraded[disk] = None;
+        if let Some(pool) = self.dev.pool() {
+            pool.disks().caught_up(disk, misses);
+        }
         true
     }
 

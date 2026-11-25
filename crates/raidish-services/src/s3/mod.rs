@@ -35,7 +35,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -215,7 +215,8 @@ pub struct Bucket<D: BlockDevice> {
     readers: Mutex<HashMap<u64, usize>>,
     gc: Arc<tokio::sync::Notify>,
     /// Refusing writes (being deleted).
-    closing: AtomicBool,
+    /// DeleteBuckets in progress (`close`): writes are refused while any is.
+    closing: AtomicUsize,
 }
 
 /// Holds bodies against deletion while they're read.
@@ -238,6 +239,27 @@ impl<D: BlockDevice + 'static> Drop for Reading<D> {
     }
 }
 
+/// Writes to a bucket refused while held (see `Bucket::close`).
+pub struct Closed<'a> {
+    closing: &'a AtomicUsize,
+    keep: bool,
+}
+
+impl Closed<'_> {
+    /// The bucket was deleted: leave it closed.
+    pub fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for Closed<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.closing.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 impl<D: BlockDevice + 'static> Bucket<D> {
     /// Serve bucket `name` of `fs`. Bodies left half-written by an earlier
     /// server are dropped.
@@ -249,7 +271,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
             tree: ServiceTree::open(fs, name, DatasetFormat::S3).await?,
             readers: Mutex::new(HashMap::new()),
             gc: Default::default(),
-            closing: AtomicBool::new(false),
+            closing: AtomicUsize::new(0),
         });
         // Half-written bodies: nothing points at them.
         b.write(|t| {
@@ -309,17 +331,21 @@ impl<D: BlockDevice + 'static> Bucket<D> {
         self.tree.read(f).await
     }
 
-    /// Refuse writes from now on (a DeleteBucket in progress).
-    pub fn close(&self) {
-        self.closing.store(true, Ordering::SeqCst);
-    }
-
-    pub fn reopen(&self) {
-        self.closing.store(false, Ordering::SeqCst);
+    /// Refuse writes while the guard lives (a DeleteBucket in progress).
+    /// Writes are allowed again when it's dropped, however the delete ends
+    /// (an error, or the request cancelled), unless `Closed::keep` says
+    /// the bucket is gone. A flag set here and cleared by hand used to stay
+    /// set when the delete ended any other way, refusing writes for good.
+    pub fn close(&self) -> Closed<'_> {
+        self.closing.fetch_add(1, Ordering::SeqCst);
+        Closed {
+            closing: &self.closing,
+            keep: false,
+        }
     }
 
     fn check_writable(&self) -> Result<()> {
-        if self.closing.load(Ordering::SeqCst) {
+        if self.closing.load(Ordering::SeqCst) > 0 {
             return Err(S3Error::Unavailable);
         }
         Ok(())

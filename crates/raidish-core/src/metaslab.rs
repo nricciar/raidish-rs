@@ -586,6 +586,50 @@ pub(crate) struct SyncedMetaslab {
     freeing: Vec<Extent>,
 }
 
+/// Settle a commit's tail (see `crate::tx::CommitTail`): if its uberblock
+/// landed, advance to it (the uberblock in memory, each synced metaslab's
+/// active slot, its frees deferred, expired deferrals released); if not,
+/// put back what the space-map sync took (each metaslab dirty again, its
+/// frees pending again). Cancel safe: each step leaves the tail only once
+/// applied, with no await between, so a settle given up on partway leaves
+/// the rest in the tail for `Tx`'s drop to finish.
+pub(crate) async fn settle_tail(
+    tail: &mut crate::tx::CommitTail,
+    metaslabs: &[std::sync::Arc<tokio::sync::RwLock<MetaslabState>>],
+    scan_hold: &std::sync::atomic::AtomicUsize,
+    uberblock: &tokio::sync::Mutex<Option<crate::fs::Uberblock>>,
+) {
+    let txg = tail.txg;
+    if tail.uberblock.is_some() {
+        let mut ub = uberblock.lock().await;
+        *ub = tail.uberblock.take();
+    }
+    while let Some(idx) = tail.synced.last().map(|s| s.ms_idx) {
+        let mut ms = metaslabs[idx].write().await;
+        let s = tail.synced.pop().expect("checked non-empty");
+        if tail.landed {
+            ms.active_slot = Some(s.slot);
+            ms.synced_txg = txg;
+            if !s.freeing.is_empty() {
+                ms.deferred
+                    .push_back((txg.after(TXG_DEFER_SIZE), s.freeing));
+            }
+        } else {
+            let mut freeing = s.freeing;
+            freeing.append(&mut ms.freeing);
+            ms.freeing = freeing;
+            ms.dirty = true;
+        }
+    }
+    // Releasing again what's already released is a no-op, so a settle
+    // given up on here can simply run this again.
+    if tail.landed && scan_hold.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        for ms in metaslabs {
+            ms.write().await.release_deferred(txg);
+        }
+    }
+}
+
 impl<D: BlockDevice> FileSystem<D> {
     /// Free an extent. The space is not reusable until `TXG_DEFER_SIZE` TXGs
     /// after the TXG in which the free is committed.
@@ -780,13 +824,17 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Write every dirty metaslab into its inactive slot, tagged with `txg`.
-    /// Must be followed by `finish_metaslab_sync` once the uberblock for `txg`
-    /// is durable, or `abort_metaslab_sync` if it is not.
+    /// What it takes from each (its `freeing`, its `dirty` flag) goes into
+    /// `tx`'s commit tail as it's taken, so from here on a commit given up
+    /// on is still settled, before the commit lock goes (structural triage
+    /// I-1, see `crate::tx::CommitTail`). The caller settles the tail once
+    /// the uberblock for `txg` is durable or has failed; a slot write error
+    /// settles it (as not landed) here.
     pub(crate) async fn sync_metaslabs(
         &self,
+        tx: &mut crate::tx::Tx,
         txg: Txg,
-    ) -> Result<Vec<SyncedMetaslab>, FileSystemError> {
-        let mut synced = Vec::new();
+    ) -> Result<(), FileSystemError> {
         let mut payloads = Vec::new();
 
         for (ms_idx, ms) in self.metaslabs.iter().enumerate() {
@@ -801,7 +849,7 @@ impl<D: BlockDevice> FileSystem<D> {
             payloads.push((self.layout.slot_lba(ms_idx, slot), ms.encode()));
             let freeing = std::mem::take(&mut ms.freeing);
             ms.dirty = false;
-            synced.push(SyncedMetaslab {
+            tx.commit_tail(txg).synced.push(SyncedMetaslab {
                 ms_idx,
                 slot,
                 freeing,
@@ -810,12 +858,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
         for (lba, bytes) in payloads {
             if let Err(e) = self.write_slot(lba, txg, &bytes).await {
-                self.abort_metaslab_sync(synced).await;
+                tx.settle_commit().await;
                 return Err(e);
             }
         }
 
-        Ok(synced)
+        Ok(())
     }
 
     async fn write_slot(&self, lba: u64, txg: Txg, bytes: &[u8]) -> Result<(), FileSystemError> {
@@ -825,23 +873,6 @@ impl<D: BlockDevice> FileSystem<D> {
             self.write_raw_block_txg(lba + b, txg, chunk).await?;
         }
         Ok(())
-    }
-
-    pub(crate) async fn finish_metaslab_sync(&self, txg: Txg, synced: Vec<SyncedMetaslab>) {
-        for s in synced {
-            let mut ms = self.metaslabs[s.ms_idx].write().await;
-            ms.active_slot = Some(s.slot);
-            ms.synced_txg = txg;
-            if !s.freeing.is_empty() {
-                ms.deferred
-                    .push_back((txg.after(TXG_DEFER_SIZE), s.freeing));
-            }
-        }
-        if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            for ms in self.metaslabs.iter() {
-                ms.write().await.release_deferred(txg);
-            }
-        }
     }
 
     /// Release the deferred frees a scan held back (call after the hold is
@@ -856,16 +887,6 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         for ms in self.metaslabs.iter() {
             ms.write().await.release_deferred(txg);
-        }
-    }
-
-    pub(crate) async fn abort_metaslab_sync(&self, synced: Vec<SyncedMetaslab>) {
-        for s in synced {
-            let mut ms = self.metaslabs[s.ms_idx].write().await;
-            let mut freeing = s.freeing;
-            freeing.append(&mut ms.freeing);
-            ms.freeing = freeing;
-            ms.dirty = true;
         }
     }
 

@@ -704,7 +704,17 @@ impl<D: BlockDevice + 'static> Backend<D> {
         let f = self.writable(&fs, id).await?;
         fs.file_write(&f, offset, data).await.map_err(err)?;
         if stable {
-            fs.file_sync(&f).await.map_err(err)?;
+            match fs.file_sync(&f).await {
+                Ok(()) => {}
+                // The pool dropped the file's unsynced writes, the unstable
+                // ones acknowledged before this among them: as in
+                // `commit_local`, they're owed a new verifier (I-33).
+                Err(FileSystemError::Conflict(m)) => {
+                    self.lost_writes(id, &format!("unsynced writes dropped: {}", m));
+                    return Err(status::JUKEBOX);
+                }
+                Err(e) => return Err(err(e)),
+            }
         } else if let Some(h) = self.held.lock().await.get_mut(&id) {
             h.dirty_since.get_or_insert_with(Instant::now);
         }
@@ -890,9 +900,15 @@ impl<D: BlockDevice + 'static> Backend<D> {
         if d.is_directory() && !fs.read_dir(&d).await.map_err(err)?.files.is_empty() {
             return Err(status::NOTEMPTY);
         }
-        // Our own open copy (and lease) go first: they'd be dropped anyway.
+        // Under our own lease on it, if we hold one: the committer refuses
+        // a remove made under none while anyone holds it, us included. It
+        // goes only once the file has (I-33): dropped first, a remove that
+        // then failed left the file, and our dirty copy of it, unleased.
+        // Holding `closing` keeps `tidy` from letting it go meanwhile.
+        let _closing = self.closing.read().await;
+        let lease = self.lease_of(id).await;
+        fs.remove_at_leased(dir, name, lease).await.map_err(err)?;
         self.forget(id).await;
-        fs.remove_at(dir, name).await.map_err(err)?;
         Ok(())
     }
 
@@ -911,6 +927,7 @@ impl<D: BlockDevice + 'static> Backend<D> {
             Some(x) => x,
             None => return Err(status::NOENT),
         };
+        let mut replaced = None;
         if let Some((tid, target)) = fs.lookup_in(to_dir, to).await.map_err(err)? {
             match (moved.1.is_directory(), target.is_directory()) {
                 (true, false) => return Err(status::NOTDIR),
@@ -921,14 +938,33 @@ impl<D: BlockDevice + 'static> Backend<D> {
                 _ => {}
             }
             if tid != moved.0 {
-                self.forget(tid).await;
+                replaced = Some(tid);
             }
         }
-        // The moved file stays open here if it is: its number doesn't change.
-        fs.rename_at(from_dir, from, to_dir, to)
+        // As for `remove`: under our lease on the file it replaces, which
+        // goes only once it's replaced. The moved file stays open here if
+        // it is: its number doesn't change.
+        let _closing = self.closing.read().await;
+        let lease = match replaced {
+            Some(tid) => self.lease_of(tid).await,
+            None => None,
+        };
+        fs.rename_at_leased(from_dir, from, to_dir, to, lease)
             .await
             .map_err(err)?;
+        if let Some(tid) = replaced {
+            self.forget(tid).await;
+        }
         Ok(())
+    }
+
+    /// The `obj/<id>` lease this node holds on `id`, if any.
+    async fn lease_of(&self, id: FileId) -> Option<raidish_core::writer::ObjLease> {
+        self.held
+            .lock()
+            .await
+            .get(&id)
+            .and_then(|h| h.guard.as_ref().map(|g| g.lease()))
     }
 
     /// Drop file `id` from what this node writes, without committing.
@@ -963,8 +999,13 @@ impl<D: BlockDevice + 'static> Backend<D> {
             }
         }
         for f in to_sync {
-            if let Err(e) = fs.file_sync(&f).await {
-                eprintln!("nfs: committing object {}: {}", f.id, e);
+            match fs.file_sync(&f).await {
+                Ok(()) => {}
+                // Dropped: writes acknowledged unstable are gone (I-33).
+                Err(FileSystemError::Conflict(m)) => {
+                    self.lost_writes(f.id, &format!("unsynced writes dropped: {}", m));
+                }
+                Err(e) => eprintln!("nfs: committing object {}: {}", f.id, e),
             }
         }
         for id in to_close {

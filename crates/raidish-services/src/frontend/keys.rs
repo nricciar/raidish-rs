@@ -6,7 +6,7 @@
 //! (`raidish token s3-key`, `POST /api/v1/services/keys`):
 //!
 //! ```text
-//!   access key id  RDK1 <hex: token id (8 bytes), role (1), expiry (u32 secs, 0: never)>
+//!   access key id  RDK1 <hex: token id (8 bytes), role (1; top bit: internal), expiry (u32 secs, 0: never)>
 //!   secret         base64url(HMAC-SHA256(service key, "raidish-service-key-v1\n" + access key id))
 //! ```
 //!
@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 const PREFIX: &str = "RDK1";
 const CONTEXT: &[u8] = b"raidish-service-key-v1\n";
+/// The role byte's flag for an internal key (`AccessKey::internal`).
+const INTERNAL: u8 = 0x80;
 
 /// Where the cluster's service key comes from (live, from the replicated
 /// state; None: not made yet).
@@ -41,6 +43,10 @@ pub struct AccessKey {
     pub role: Role,
     /// Unix seconds; None: never.
     pub exp: Option<i64>,
+    /// Minted by a node for asking another (`ServiceAuth::internal`), not
+    /// traded for a token: only such a key may run the internal actions
+    /// (an SQS dead-letter move). Covered by the secret like the rest.
+    pub internal: bool,
 }
 
 impl AccessKey {
@@ -53,7 +59,7 @@ impl AccessKey {
             Role::Readonly => 1u8,
             Role::Admin => 2,
             Role::Node => return Err("access keys can't carry the node role".into()),
-        };
+        } | if self.internal { INTERNAL } else { 0 };
         let exp = match self.exp {
             None => 0u32,
             Some(e) => u32::try_from(e.max(1)).map_err(|_| "expiry out of range")?,
@@ -69,7 +75,7 @@ impl AccessKey {
         if b.len() != 13 {
             return None;
         }
-        let role = match b[8] {
+        let role = match b[8] & !INTERNAL {
             1 => Role::Readonly,
             2 => Role::Admin,
             _ => return None,
@@ -79,6 +85,7 @@ impl AccessKey {
             id: hex::encode(&b[..8]),
             role,
             exp: (exp != 0).then_some(exp as i64),
+            internal: b[8] & INTERNAL != 0,
         })
     }
 }
@@ -130,6 +137,12 @@ impl ServiceAuth {
         AccessKey::parse(access_key).map_or(Role::Readonly, |k| k.role)
     }
 
+    /// Whether a (verified) request's access key is one a node minted to
+    /// ask another (`internal`).
+    pub fn is_internal(&self, access_key: &str) -> bool {
+        AccessKey::parse(access_key).is_some_and(|k| k.internal)
+    }
+
     /// A short-lived admin key for one node asking another.
     pub fn internal(&self) -> Result<(String, String), AuthError> {
         let k = (self.key)().ok_or(AuthError::UnknownKey)?;
@@ -139,6 +152,7 @@ impl ServiceAuth {
                 id: random_id(),
                 role: Role::Admin,
                 exp: Some(now() + 3600),
+                internal: true,
             },
         )
         .map_err(AuthError::Malformed)

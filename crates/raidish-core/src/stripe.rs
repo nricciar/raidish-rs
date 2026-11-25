@@ -177,7 +177,11 @@ impl Vdev for Stripe {
             let mut part = self.children[s.child]
                 .verify_labels(s.local, s.len, repair, score, stale)
                 .await?;
-            for b in part.unrecoverable.iter_mut() {
+            for b in part
+                .unrecoverable
+                .iter_mut()
+                .chain(part.stale_votes.iter_mut())
+            {
                 *b = self.global(s.child, *b);
             }
             scan.add(part);

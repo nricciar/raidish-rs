@@ -564,6 +564,14 @@ impl Frontend {
             enabled: false,
             ..props.clone()
         };
+        // Enabled again unless deleted, however this ends: disabled and
+        // left so (an error, or the request cancelled), it stayed down for
+        // good (I-35).
+        let mut reenable = Reenable {
+            committer: self.committer.clone(),
+            name: name.to_string(),
+            props: Some(props.clone()),
+        };
         self.committer
             .set_props(name, &disabled)
             .await
@@ -578,6 +586,7 @@ impl Frontend {
                 Ok(()) => {
                     // Gone from this node's routes now (the agents' next
                     // round says so everywhere).
+                    reenable.props = None;
                     self.routing.write().unwrap().routes.remove(name);
                     self.changed.notify_waiters();
                     return Ok(true);
@@ -585,6 +594,7 @@ impl Frontend {
                 Err(e) => last = e.to_string(),
             }
         }
+        reenable.props = None;
         let _ = self.committer.set_props(name, &props).await;
         Err(format!("deleting {}: {}", name, last))
     }
@@ -605,6 +615,32 @@ impl Frontend {
                 return cond(&self.routing.read().unwrap().routes);
             }
         }
+    }
+}
+
+/// Puts a service's props back (enabling it again) when dropped with
+/// `props` set: `delete_service` disabled it and didn't get to delete it.
+struct Reenable {
+    committer: crate::committer::Admin,
+    name: String,
+    props: Option<crate::inode::DatasetProps>,
+}
+
+impl Drop for Reenable {
+    fn drop(&mut self) {
+        let Some(props) = self.props.take() else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!("services: '{}' left disabled (no runtime)", self.name);
+            return;
+        };
+        let (committer, name) = (self.committer.clone(), self.name.clone());
+        rt.spawn(async move {
+            if let Err(e) = committer.set_props(&name, &props).await {
+                eprintln!("services: enabling '{}' again: {}", name, e);
+            }
+        });
     }
 }
 
@@ -748,6 +784,11 @@ pub mod testing {
         }
 
         pub fn frontend(&self) -> Arc<Frontend> {
+            self.frontend_with(Default::default())
+        }
+
+        /// `frontend`, with `slot` as its committer.
+        pub fn frontend_with(&self, slot: crate::committer::CommitterSlot) -> Arc<Frontend> {
             let config = ServicesConfig {
                 advertise: Some("127.0.0.1".into()),
                 ..Default::default()
@@ -763,10 +804,7 @@ pub mod testing {
                 config,
                 auth,
                 ServiceTls::new(&self.tls).unwrap(),
-                crate::committer::Admin::new(
-                    Default::default(),
-                    crate::committer::CommitClient::new(vec![]),
-                ),
+                crate::committer::Admin::new(slot, crate::committer::CommitClient::new(vec![])),
             )
         }
 
@@ -778,6 +816,7 @@ pub mod testing {
                     id: keys::random_id(),
                     role,
                     exp: None,
+                    internal: false,
                 },
             )
             .unwrap()

@@ -814,7 +814,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                                 continue;
                             };
                             let mut msg: Msg = bincode::deserialize(&raw)?;
-                            if msg.sent_ms + retention <= now {
+                            if msg.sent_ms.saturating_add(retention) <= now {
                                 t.delete(&q_key(seq)).await?;
                                 m.messages = m.messages.saturating_sub(1);
                                 continue;
@@ -831,7 +831,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                                 dead.push(Dead { seq, msg });
                                 continue;
                             }
-                            msg.receive_count += 1;
+                            msg.receive_count = msg.receive_count.saturating_add(1);
                             if msg.first_receive_ms == 0 {
                                 msg.first_receive_ms = now;
                             }
@@ -1091,7 +1091,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
                         let mut more = !page.is_empty();
                         for (k, raw) in &page {
                             let msg: Msg = bincode::deserialize(raw)?;
-                            if msg.sent_ms + retention > now {
+                            if msg.sent_ms.saturating_add(retention) > now {
                                 more = false;
                                 break;
                             }

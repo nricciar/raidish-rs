@@ -645,6 +645,149 @@ async fn d3_a_stale_majority_doesnt_win_label_repair() {
     assert!(report.is_clean(), "{}", report);
 }
 
+/// I-19: a degraded member whose labels are stale (here: rolled back to
+/// an image from several commits ago, missing nothing the resilver's walk
+/// would look at) loses its healthy peers right before a resilver. Its own
+/// label copies are then the only ones readable, so they decide; the
+/// resilver must not take that as the disk vouching for itself and clear
+/// it. On a mirror and on raidz (where too few current shards are left).
+#[tokio::test]
+async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
+    for (fp, peers) in [
+        (FaultPool::mirror(2).await, vec![0usize]),
+        (FaultPool::raidz(1, 3).await, vec![0usize]),
+    ] {
+        let fs = fp.format().await;
+        fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+            .await
+            .unwrap();
+        fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+        fs.sync().await.unwrap();
+        fp.disk(1).snapshot();
+        for i in 1..5u8 {
+            fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+                .await
+                .unwrap();
+            fs.sync().await.unwrap();
+        }
+        drop(fs);
+        // Disk 1 goes back to its old labels (and data) behind the pool's
+        // back; the pool knows it as degraded only from now on, so the
+        // walk has nothing to check and only the labels can tell.
+        fp.disk(1).restore();
+        let fs = fp.load().await;
+        let now = fs.uberblock().await.unwrap().txg;
+        fs.mark_degraded(1, now.next());
+
+        for &d in &peers {
+            fp.disk(d).set_offline(true);
+        }
+        let report = fs.resilver().await.unwrap();
+        assert!(
+            !report.label_stale_votes.is_empty() && report.cleared.is_empty(),
+            "{:?}: {}",
+            fp.pool.topology,
+            report
+        );
+        assert!(fs.degraded_disks()[1].is_some(), "{:?}", fp.pool.topology);
+
+        // With the peer back, the resilver repairs the labels and clears it.
+        fp.heal();
+        for &d in &peers {
+            fs.adopt_disk(d).await;
+        }
+        let report = fs.resilver().await.unwrap();
+        assert!(
+            report.certifies() && report.cleared.contains(&1),
+            "{:?}: {}",
+            fp.pool.topology,
+            report
+        );
+    }
+}
+
+/// raidz2 over 4 disks with `stale` rolled back to an image from four
+/// commits ago and marked degraded from then, loaded.
+async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, FileSystem<Pool>) {
+    let fp = FaultPool::raidz(2, 4).await;
+    let fs = fp.format().await;
+    fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+        .await
+        .unwrap();
+    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.sync().await.unwrap();
+    let since = fs.uberblock().await.unwrap().txg.next();
+    for &d in stale {
+        fp.disk(d).snapshot();
+    }
+    for i in 1..5u8 {
+        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+            .await
+            .unwrap();
+        fs.sync().await.unwrap();
+    }
+    drop(fs);
+    for &d in stale {
+        fp.disk(d).restore();
+    }
+    let fs = fp.load().await;
+    for &d in stale {
+        fs.mark_degraded(d, since);
+    }
+    (fp, fs)
+}
+
+/// I-19 review: on raidz2, two stale members and one current one left
+/// (the other is away) decide a label stripe together, and a rebuild from
+/// the two stale shards alone is a full set of valid (old) labels, which
+/// outranks any mix with the current shard. Repairing from it overwrote the
+/// one current shard there was: the newer labels gone for good. With the
+/// stale ones deciding, nothing may be repaired, and once the away member
+/// is back the stale ones are brought forward.
+#[tokio::test]
+async fn i19_stale_members_dont_overwrite_the_current_one() {
+    let (fp, fs) = i19_rolled_back(&[2, 3]).await;
+    fp.disk(0).set_offline(true);
+    let report = fs.resilver().await.unwrap();
+    assert!(
+        report.shards.repaired[1] == 0 && report.cleared.is_empty(),
+        "the current member was repaired from stale ones: {}",
+        report
+    );
+
+    fp.heal();
+    fs.adopt_disk(0).await;
+    for _ in 0..3 {
+        if !fs.needs_resilver() {
+            break;
+        }
+        fs.resilver().await.unwrap();
+    }
+    assert!(!fs.needs_resilver(), "{:?}", fs.degraded_disks());
+    drop(fs);
+    // Brought forward: the formerly stale pair alone has every commit.
+    fp.disk(0).set_offline(true);
+    fp.disk(1).set_offline(true);
+    let fs = fp.load().await;
+    d2_check(&fs, 5).await;
+}
+
+/// The same with every member readable: one current shard and three stale
+/// ones. The stale rebuild still outranks the mix, so with every copy read
+/// it must still not overwrite the current shard.
+#[tokio::test]
+async fn i19_stale_members_dont_overwrite_the_current_one_when_all_are_read() {
+    let (_fp, fs) = i19_rolled_back(&[1, 2, 3]).await;
+    let report = fs.resilver().await.unwrap();
+    assert!(
+        report.shards.repaired[0] == 0
+            && report.cleared.is_empty()
+            && !report.label_stale_votes.is_empty(),
+        "the current member was repaired from stale ones: {}",
+        report
+    );
+}
+
 // ---- ZIL ----
 
 async fn lease(auth: &LocalAuthority, resource: impl std::fmt::Display, owner: &str) -> Epoch {
@@ -1103,6 +1246,622 @@ async fn r4d_lost_answers_to_a_lend_or_return_dont_wedge_the_metaslab() {
         crate::fence::Stamp::Returned(back),
         "taken back as returned"
     );
+}
+
+/// Holds back the answer to the first `Return` (or `Reclaim`, what
+/// `reclaim` sends) once armed, after it's applied: a return that went
+/// through, its committer not told yet.
+struct HeldReturnAuthority {
+    inner: Arc<LocalAuthority>,
+    arm: std::sync::atomic::AtomicBool,
+    /// Set while an answer is held; cleared to let it through.
+    held: tokio::sync::watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl Authority for HeldReturnAuthority {
+    async fn propose(&self, op: LeaseOp) -> Result<Response, String> {
+        let is_return = matches!(op, LeaseOp::Return { .. } | LeaseOp::Reclaim { .. });
+        let r = self.inner.propose(op).await;
+        if is_return && self.arm.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let mut rx = self.held.subscribe();
+            self.held.send_replace(true);
+            let _ = rx.wait_for(|&h| !h).await;
+        }
+        r
+    }
+    fn state(&self) -> crate::cluster::state::ClusterState {
+        self.inner.state()
+    }
+}
+
+/// Structural triage I-12: two returns of one metaslab at once (a give back
+/// and a reclaim, or a resent give back) are answered with the same epoch
+/// (R4d). Before, the second ran while the first waited on its answer, the
+/// metaslab was lent again, and the first, finishing late, removed the new
+/// lend from the committer's books and put the metaslab back in its own
+/// use: under the new writer. Now each transition holds the metaslab, so
+/// the second finds it back and does nothing, and the new lend stands.
+#[tokio::test]
+async fn i12_a_late_return_doesnt_undo_the_next_lend() {
+    use crate::cluster::state::MetaslabGrant;
+    let fp = FaultPool::mirror(2).await;
+    drop(fp.format().await);
+    let inner = Arc::new(LocalAuthority::default());
+    let epoch = lease(&inner, &POOL, "c").await;
+    let auth = Arc::new(HeldReturnAuthority {
+        inner: inner.clone(),
+        arm: Default::default(),
+        held: tokio::sync::watch::Sender::new(false),
+    });
+    let fs = Arc::new(fp.load().await);
+    let c = Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
+    let w1 = LeaseRef::new(
+        crate::types::res("writer/1"),
+        lease(&inner, "writer/1", "1").await,
+    );
+    let w2 = LeaseRef::new(
+        crate::types::res("writer/2"),
+        lease(&inner, "writer/2", "2").await,
+    );
+
+    let idx = c.lend(&w1, 64).await.unwrap().idx;
+    auth.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = tokio::spawn({
+        let (c, w1) = (c.clone(), w1.clone());
+        async move { c.give_back(&w1, idx).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        auth.held.subscribe().wait_for(|&h| h),
+    )
+    .await
+    .expect("no return was held")
+    .unwrap();
+    let second = tokio::spawn({
+        let (c, w1) = (c.clone(), w1.clone());
+        async move { c.give_back(&w1, idx).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Lend to w2 until it has `idx` (if it's free to lend) or none is left.
+    let mut w2_has = false;
+    while let Ok(l) = c.lend(&w2, 64).await {
+        if l.idx == idx {
+            w2_has = true;
+            break;
+        }
+    }
+    auth.held.send_replace(false);
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    if !w2_has {
+        assert_eq!(c.lend(&w2, 64).await.unwrap().idx, idx, "the only one left");
+    }
+
+    assert!(
+        matches!(inner.state().metaslabs.get(&idx), Some(MetaslabGrant::Lent { writer, .. }) if *writer == w2),
+        "lent to w2"
+    );
+    assert!(
+        c.fs().lent_metaslabs().await.contains(&idx.get()),
+        "out of the committer's use while w2 has it"
+    );
+    // And the committer's books have it as w2's: it goes back for real.
+    c.give_back(&w2, idx).await.unwrap();
+    assert!(
+        matches!(
+            inner.state().metaslabs.get(&idx),
+            Some(MetaslabGrant::Returned { .. })
+        ),
+        "given back by w2"
+    );
+}
+
+/// I-12 review: `reclaim` judges a lend by the cluster as of when it looks
+/// at that lend (under its slot), not as of when it started. Two released
+/// writers' metaslabs are reclaimed; while the first return waits on its
+/// answer, the other writer's resource is acquired again (a new epoch), its
+/// old metaslab given back and lent to the new holder. Before, `reclaim`
+/// went on with its old view (the resource released) and took the new
+/// holder's metaslab away.
+#[tokio::test]
+async fn i12_reclaim_judges_a_lend_by_the_state_it_finds() {
+    use crate::cluster::state::MetaslabGrant;
+    let fp = FaultPool::mirror(2).await;
+    drop(fp.format().await);
+    let inner = Arc::new(LocalAuthority::default());
+    let epoch = lease(&inner, &POOL, "c").await;
+    let auth = Arc::new(HeldReturnAuthority {
+        inner: inner.clone(),
+        arm: Default::default(),
+        held: tokio::sync::watch::Sender::new(false),
+    });
+    let fs = Arc::new(fp.load().await);
+    let c = Arc::new(Committer::new(fs, auth.clone(), "c".into(), epoch, "n0".into()).await);
+    let mut lent = Vec::new();
+    for name in ["writer/a", "writer/b"] {
+        let e = lease(&inner, name, name).await;
+        let w = LeaseRef::new(crate::types::res(name), e);
+        let idx = c.lend(&w, 64).await.unwrap().idx;
+        release(&inner, name, name, e).await;
+        lent.push((name, w, idx));
+    }
+
+    auth.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+    let reclaim = tokio::spawn({
+        let c = c.clone();
+        async move { c.reclaim().await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        auth.held.subscribe().wait_for(|&h| h),
+    )
+    .await
+    .expect("no return was held")
+    .unwrap();
+    // The one whose return is held is first; the other is still to come.
+    let returned = |idx| {
+        matches!(
+            inner.state().metaslabs.get(&idx),
+            Some(MetaslabGrant::Returned { .. })
+        )
+    };
+    let (name, old, idx) = lent
+        .into_iter()
+        .find(|(_, _, idx)| !returned(*idx))
+        .expect("one not reclaimed yet");
+    c.give_back(&old, idx).await.unwrap();
+    c.fs().commit_txg().await.unwrap();
+    let new = LeaseRef::new(crate::types::res(name), lease(&inner, name, name).await);
+    assert!(new.epoch > old.epoch);
+    let mut has = false;
+    while let Ok(l) = c.lend(&new, 64).await {
+        if l.idx == idx {
+            has = true;
+            break;
+        }
+    }
+    assert!(has, "lent {} to the new holder", idx);
+
+    auth.held.send_replace(false);
+    reclaim.await.unwrap();
+    assert!(
+        matches!(inner.state().metaslabs.get(&idx), Some(MetaslabGrant::Lent { writer, .. }) if *writer == new),
+        "still the new holder's"
+    );
+    assert!(c.fs().lent_metaslabs().await.contains(&idx.get()));
+
+    // A view that lags the lend (it has an older grant of the resource, or
+    // none) doesn't make the writer gone; a newer grant does.
+    let state = inner.state();
+    let ahead = LeaseRef::new(new.resource.clone(), new.epoch.next());
+    assert!(!crate::committer::writer_gone(
+        &state,
+        &ahead,
+        crate::cluster::now_ms()
+    ));
+    assert!(crate::committer::writer_gone(
+        &state,
+        &old,
+        crate::cluster::now_ms()
+    ));
+    assert!(!crate::committer::writer_gone(
+        &state,
+        &new,
+        crate::cluster::now_ms()
+    ));
+}
+
+/// The cluster as `inner` has it, but seen by the committer through
+/// `patch`: a view that lags (a committer on a Raft follower).
+struct StaleView {
+    inner: Arc<LocalAuthority>,
+    patch: std::sync::Mutex<Option<Box<dyn Fn(&mut crate::cluster::state::ClusterState) + Send>>>,
+    /// Answers to lose (after applying) from now on.
+    lose: std::sync::atomic::AtomicUsize,
+}
+
+impl StaleView {
+    fn new(inner: Arc<LocalAuthority>) -> Arc<Self> {
+        Arc::new(StaleView {
+            inner,
+            patch: Default::default(),
+            lose: Default::default(),
+        })
+    }
+    fn lag(&self, f: impl Fn(&mut crate::cluster::state::ClusterState) + Send + 'static) {
+        *self.patch.lock().unwrap() = Some(Box::new(f));
+    }
+    fn catch_up(&self) {
+        *self.patch.lock().unwrap() = None;
+    }
+}
+
+#[async_trait::async_trait]
+impl Authority for StaleView {
+    async fn propose(&self, op: LeaseOp) -> Result<Response, String> {
+        let r = self.inner.propose(op).await;
+        use std::sync::atomic::Ordering::SeqCst;
+        if self
+            .lose
+            .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err("answer lost".into());
+        }
+        r
+    }
+    fn state(&self) -> crate::cluster::state::ClusterState {
+        let mut s = self.inner.state();
+        if let Some(f) = self.patch.lock().unwrap().as_ref() {
+            f(&mut s);
+        }
+        s
+    }
+}
+
+/// A committer over a fresh pool with volume "a", seeing the cluster
+/// through a `StaleView`.
+async fn stale_setup() -> (
+    FaultPool,
+    Arc<LocalAuthority>,
+    Arc<StaleView>,
+    Arc<Committer<Pool>>,
+) {
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.create_block("a", 8 * MB as u64, fs.default_volblocksize())
+        .await
+        .unwrap();
+    drop(fs);
+    let inner = Arc::new(LocalAuthority::default());
+    let epoch = lease(&inner, &POOL, "c").await;
+    let view = StaleView::new(inner.clone());
+    let fs = Arc::new(fp.load().await);
+    let c = Arc::new(Committer::new(fs, view.clone(), "c".into(), epoch, "n0".into()).await);
+    (fp, inner, view, c)
+}
+
+/// A commit by `w` of `allocs` (in its lent space) to volume "a" under
+/// `ds`, with intent log `log`: the tree unchanged.
+async fn commit_allocs(
+    c: &Committer<Pool>,
+    w: &LeaseRef,
+    ds: &Holding,
+    allocs: Vec<crate::types::Extent>,
+    log: Option<crate::inode::DatasetLog>,
+) -> Result<(), crate::writer::CommitError> {
+    let root = c.fs().open_dataset("a").await.unwrap().obj.root_ptr();
+    let commit = crate::writer::DatasetCommit {
+        dataset: "a".into(),
+        writer: w.clone(),
+        ds: ds.clone(),
+        base_root: root.clone(),
+        new_root: root,
+        allocs,
+        frees: vec![],
+        free_births: vec![],
+        missed: vec![],
+        birth_txg: c.fs().open_txg().await.unwrap(),
+        log,
+        min_birth: None,
+    };
+    c.commit(&commit).await.map(|_| ())
+}
+
+/// A log in `w`'s lent space at `at`, written under `ds`.
+fn log_at(at: u64, w: &LeaseRef, ds: &Holding) -> crate::inode::DatasetLog {
+    crate::inode::DatasetLog {
+        regions: vec![crate::inode::LogRegion {
+            start: at,
+            len: 8,
+            guid: 7,
+        }],
+        from_seq: 0,
+        writer: w.clone(),
+        ds: ds.clone(),
+    }
+}
+
+/// Structural triage I-13: the cluster admits a `Reclaim` only if the
+/// lend's writer lease isn't live: refused while it is, admitted once it's
+/// released, or superseded (the writer restarted at a new epoch, live
+/// again: expiry alone would refuse that forever). Resent, it's answered
+/// as the first time.
+#[tokio::test]
+async fn i13_the_cluster_admits_a_reclaim_only_of_a_gone_writer() {
+    let (_fp, inner, _view, c) = stale_setup().await;
+    let pool = Holding::new("c", inner.state().leases[&crate::types::res(POOL)].epoch);
+    let reclaim = |idx, lend| LeaseOp::Reclaim {
+        idx,
+        pool: pool.clone(),
+        lend,
+    };
+    let e1 = lease(&inner, "writer/1", "1").await;
+    let w1 = LeaseRef::new(crate::types::res("writer/1"), e1);
+    let lent = c.lend(&w1, 64).await.unwrap();
+    let r = inner.propose(reclaim(lent.idx, lent.epoch)).await.unwrap();
+    assert!(
+        matches!(&r, Response::Refused(m) if m.contains("live")),
+        "{r:?}"
+    );
+
+    // Restarted: released, and acquired again at a new epoch.
+    release(&inner, "writer/1", "1", e1).await;
+    assert!(lease(&inner, "writer/1", "1").await > e1);
+    let r = inner.propose(reclaim(lent.idx, lent.epoch)).await.unwrap();
+    let Response::Fenced { epoch } = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(
+        inner.propose(reclaim(lent.idx, lent.epoch)).await.unwrap(),
+        Response::Fenced { epoch }
+    );
+}
+
+/// I-13: a committer whose view has a live writer as lapsed reclaims its
+/// metaslab with a `Reclaim`, which the cluster refuses: the metaslab
+/// stays lent, and the writer can go on committing into it. Before, it
+/// sent a `Return`, admitted whatever the writer's state.
+#[tokio::test]
+async fn i13_a_lagging_view_cant_take_a_live_writers_metaslab() {
+    let (_fp, inner, view, c) = stale_setup().await;
+    let e1 = lease(&inner, "writer/1", "1").await;
+    let w1 = LeaseRef::new(crate::types::res("writer/1"), e1);
+    let ds = Holding::new("o1", lease(&inner, &dataset_resource("a"), "o1").await);
+    let lent = c.lend(&w1, 64).await.unwrap();
+    let free = *lent.free.iter().max_by_key(|e| e.len).unwrap();
+
+    let res = w1.resource.clone();
+    view.lag(move |s| s.leases.get_mut(&res).unwrap().expires_ms = 0);
+    c.reclaim().await;
+    view.catch_up();
+    assert!(
+        matches!(
+            inner.state().metaslabs.get(&lent.idx),
+            Some(crate::cluster::state::MetaslabGrant::Lent { writer, .. }) if *writer == w1
+        ),
+        "still lent to w1"
+    );
+    assert!(c.fs().lent_metaslabs().await.contains(&lent.idx.get()));
+    commit_allocs(
+        &c,
+        &w1,
+        &ds,
+        vec![crate::types::Extent::new(free.start, 4)],
+        None,
+    )
+    .await
+    .expect("still w1's to commit into");
+}
+
+/// I-13: a writer gone with an intent log still standing (its dataset's
+/// holder still live, so the log isn't replayed yet) keeps its metaslabs:
+/// the log's records are in them. Before, `reclaim` took them back, and
+/// the committer could allocate over a log it hadn't replayed.
+#[tokio::test]
+async fn i13_a_gone_writers_metaslabs_stay_while_its_log_stands() {
+    let (_fp, inner, _view, c) = stale_setup().await;
+    let e1 = lease(&inner, "writer/1", "1").await;
+    let w1 = LeaseRef::new(crate::types::res("writer/1"), e1);
+    let ds = Holding::new("o1", lease(&inner, &dataset_resource("a"), "o1").await);
+    let lent = c.lend(&w1, 64).await.unwrap();
+    let free = *lent.free.iter().max_by_key(|e| e.len).unwrap();
+    let log = log_at(free.start, &w1, &ds);
+    let region = log.regions[0].clone();
+    commit_allocs(
+        &c,
+        &w1,
+        &ds,
+        vec![crate::zil::region_alloc(&region)],
+        Some(log),
+    )
+    .await
+    .unwrap();
+    release(&inner, "writer/1", "1", e1).await;
+
+    c.reclaim().await;
+    assert!(
+        matches!(
+            inner.state().metaslabs.get(&lent.idx),
+            Some(crate::cluster::state::MetaslabGrant::Lent { .. })
+        ),
+        "kept while the log stands"
+    );
+    assert!(c.fs().lent_metaslabs().await.contains(&lent.idx.get()));
+}
+
+/// I-13 review: `reclaim` asks whether a writer's intent log stands when
+/// it gets to that writer's metaslab, not once before its loop. Here it's
+/// held on the first metaslab's reclaim while the second's writer logs
+/// into its space and then goes: the second stays.
+#[tokio::test]
+async fn i13_reclaim_sees_a_log_written_while_it_ran() {
+    use crate::cluster::state::MetaslabGrant;
+    let (_fp, inner, _view, c0) = stale_setup().await;
+    drop(c0);
+    let auth = Arc::new(HeldReturnAuthority {
+        inner: inner.clone(),
+        arm: Default::default(),
+        held: tokio::sync::watch::Sender::new(false),
+    });
+    let pool = inner.state().leases[&crate::types::res(POOL)].epoch;
+    let fs = Arc::new(_fp.load().await);
+    let c = Arc::new(Committer::new(fs, auth.clone(), "c".into(), pool, "n0".into()).await);
+    let ds = Holding::new("o1", lease(&inner, &dataset_resource("a"), "o1").await);
+    let mut lent = Vec::new();
+    for (name, owner) in [("writer/a", "a"), ("writer/b", "b")] {
+        let w = LeaseRef::new(crate::types::res(name), lease(&inner, name, owner).await);
+        let l = c.lend(&w, 64).await.unwrap();
+        lent.push((owner, w, l));
+    }
+    // `reclaim` goes in metaslab order: the first one's writer goes first.
+    lent.sort_by_key(|(_, _, l)| l.idx);
+    let [(o1, w1, _), (o2, w2, l2)] = <[_; 2]>::try_from(lent).ok().unwrap();
+    release(&inner, &w1.resource, o1, w1.epoch).await;
+
+    auth.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+    let reclaim = tokio::spawn({
+        let c = c.clone();
+        async move { c.reclaim().await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        auth.held.subscribe().wait_for(|&h| h),
+    )
+    .await
+    .expect("no reclaim was held")
+    .unwrap();
+    let free = *l2.free.iter().max_by_key(|e| e.len).unwrap();
+    let log = log_at(free.start, &w2, &ds);
+    let region = log.regions[0].clone();
+    commit_allocs(
+        &c,
+        &w2,
+        &ds,
+        vec![crate::zil::region_alloc(&region)],
+        Some(log),
+    )
+    .await
+    .unwrap();
+    release(&inner, &w2.resource, o2, w2.epoch).await;
+    auth.held.send_replace(false);
+    reclaim.await.unwrap();
+
+    assert!(
+        matches!(
+            inner.state().metaslabs.get(&l2.idx),
+            Some(MetaslabGrant::Lent { .. })
+        ),
+        "kept: its writer's log stands"
+    );
+}
+
+/// I-13 review: a reclaim whose answer was lost is sent again only if no
+/// log of its writer stands by then, as a first one would be. Here the
+/// first was refused (the writer was live; only this view had it lapsed),
+/// the answer lost; the writer then logs (into its other metaslab) and
+/// goes. Before, a reclaim being resent skipped the log check.
+#[tokio::test]
+async fn i13_a_resent_reclaim_minds_the_log_too() {
+    use crate::cluster::state::MetaslabGrant;
+    let (_fp, inner, view, c) = stale_setup().await;
+    let e1 = lease(&inner, "writer/1", "1").await;
+    let w1 = LeaseRef::new(crate::types::res("writer/1"), e1);
+    let ds = Holding::new("o1", lease(&inner, &dataset_resource("a"), "o1").await);
+    let mut lent = [
+        c.lend(&w1, 64).await.unwrap(),
+        c.lend(&w1, 64).await.unwrap(),
+    ];
+    lent.sort_by_key(|l| l.idx);
+    let [first, second] = lent;
+
+    let res = w1.resource.clone();
+    view.lag(move |s| s.leases.get_mut(&res).unwrap().expires_ms = 0);
+    // The first reclaim's answer (a refusal) is lost: it stays `Returning`;
+    // the second's refusal arrives, so it's `Active` again.
+    view.lose.store(1, std::sync::atomic::Ordering::SeqCst);
+    c.reclaim().await;
+    view.catch_up();
+
+    let free = *second.free.iter().max_by_key(|e| e.len).unwrap();
+    let log = log_at(free.start, &w1, &ds);
+    let region = log.regions[0].clone();
+    commit_allocs(
+        &c,
+        &w1,
+        &ds,
+        vec![crate::zil::region_alloc(&region)],
+        Some(log),
+    )
+    .await
+    .unwrap();
+    release(&inner, "writer/1", "1", e1).await;
+    c.reclaim().await;
+
+    for l in [&first, &second] {
+        assert!(
+            matches!(
+                inner.state().metaslabs.get(&l.idx),
+                Some(MetaslabGrant::Lent { .. })
+            ),
+            "metaslab {} kept: its writer's log stands",
+            l.idx
+        );
+    }
+}
+
+/// I-14a: a late `claim_dataset` from a superseded holder (its check passed
+/// on a view that lags) doesn't replay the newer holder's log. Before, any
+/// log not its own (`!=`) was replayed: a live writer's log, dropped.
+#[tokio::test]
+async fn i14a_a_late_claim_doesnt_replay_a_newer_holders_log() {
+    let (_fp, inner, view, c) = stale_setup().await;
+    let e1 = lease(&inner, "writer/1", "1").await;
+    let w1 = LeaseRef::new(crate::types::res("writer/1"), e1);
+    let old = Holding::new("o1", lease(&inner, &dataset_resource("a"), "o1").await);
+    release(&inner, &dataset_resource("a"), "o1", old.epoch).await;
+    let new = Holding::new("o2", lease(&inner, &dataset_resource("a"), "o2").await);
+    let lent = c.lend(&w1, 64).await.unwrap();
+    let free = *lent.free.iter().max_by_key(|e| e.len).unwrap();
+    let log = log_at(free.start, &w1, &new);
+    let region = log.regions[0].clone();
+    commit_allocs(
+        &c,
+        &w1,
+        &new,
+        vec![crate::zil::region_alloc(&region)],
+        Some(log.clone()),
+    )
+    .await
+    .unwrap();
+
+    // The view still has the old holder holding it.
+    let (res, held) = (dataset_resource("a"), old.clone());
+    view.lag(move |s| {
+        let l = s.leases.get_mut(&res).unwrap();
+        l.owner = held.owner.clone();
+        l.epoch = held.epoch;
+        l.released = false;
+    });
+    let r = c.claim_dataset("a", &old).await;
+    view.catch_up();
+    assert!(r.is_err(), "the late claim was taken");
+    let vol = c.fs().open_dataset("a").await.unwrap();
+    assert_eq!(
+        *vol.log.lock().unwrap(),
+        Some(log),
+        "the newer holder's log stays"
+    );
+}
+
+/// I-14b: an admin op that destroys a volume takes its `ds/` lease through
+/// the cluster, so it's refused while the volume runs even when this
+/// committer's view doesn't show it running yet. Before, it went by the
+/// view (`in_use`), and deleted a volume an agent had just started.
+#[tokio::test]
+async fn i14b_a_delete_on_a_lagging_view_is_refused() {
+    let (_fp, inner, view, c) = stale_setup().await;
+    lease(&inner, &dataset_resource("a"), "agent").await;
+    let res = dataset_resource("a");
+    view.lag(move |s| {
+        s.leases.remove(&res);
+    });
+    let r = c.delete_volume("a").await;
+    assert!(
+        matches!(&r, Err(crate::fs::FileSystemError::InvalidArgument(m)) if m.contains("running")),
+        "{r:?}"
+    );
+    let r = c.rollback("a").await;
+    assert!(r.is_err(), "rollback: {r:?}");
+    view.catch_up();
+    assert!(c.fs().open_dataset("a").await.is_ok(), "still there");
+    // Once it isn't running, it goes, and the lease is let go after.
+    let held = inner.state().leases[&dataset_resource("a")].clone();
+    release(&inner, &dataset_resource("a"), "agent", held.epoch).await;
+    c.delete_volume("a").await.unwrap();
+    assert!(c.fs().open_dataset("a").await.is_err());
+    assert!(inner.state().leases[&dataset_resource("a")].released);
 }
 
 /// S6a: a commit whose dataset lease is lost while it waits for the tx is

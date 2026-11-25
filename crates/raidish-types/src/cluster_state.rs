@@ -146,6 +146,16 @@ pub enum LeaseOp {
         #[serde(default)]
         lend: Epoch,
     },
+    /// `Return`, but on the committer's own initiative (its writer looked
+    /// gone): admitted only if the lend's writer lease isn't live as of the
+    /// cluster's clock, so a committer whose view lags (or whose clock
+    /// runs ahead) can't take a live writer's metaslab (structural triage
+    /// I-13). Idempotent like `Return`.
+    Reclaim {
+        idx: MetaslabIdx,
+        pool: Holding,
+        lend: Epoch,
+    },
     /// Whether VM `name` should be running (see `crate::vm`). Only the
     /// intent: what actually runs is whatever libvirt says on the node that
     /// holds the VM's disk.
@@ -391,11 +401,22 @@ impl ClusterState {
                 );
                 Response::Fenced { epoch: self.epoch }
             }
-            LeaseOp::Return { idx, pool, lend } => {
+            LeaseOp::Return { idx, pool, lend } | LeaseOp::Reclaim { idx, pool, lend } => {
                 if !self.holds(&POOL, pool, now_ms) {
                     return Response::Refused("not the committer".into());
                 }
+                let reclaim = matches!(req.op, LeaseOp::Reclaim { .. });
                 match self.metaslabs.get(idx) {
+                    // Its exact lease: expired, released, or superseded
+                    // (a writer restarted at a new epoch) all count as gone.
+                    Some(MetaslabGrant::Lent { epoch, writer, .. })
+                        if epoch == lend && reclaim && self.is_live(writer, now_ms) =>
+                    {
+                        return Response::Refused(format!(
+                            "metaslab {}'s writer {} is live",
+                            idx, writer
+                        ));
+                    }
                     Some(MetaslabGrant::Lent { epoch, .. }) if epoch == lend => {}
                     // This very return, sent again.
                     Some(MetaslabGrant::Returned { epoch, from }) if from == lend => {

@@ -92,6 +92,8 @@ pub struct SwitchableIo {
     backend: Arc<RwLock<Arc<dyn VolumeIo>>>,
     /// The next flush fails (see `poison`).
     lost: std::sync::atomic::AtomicBool,
+    /// Nothing will replace the backend (see `no_replacement`).
+    last: std::sync::atomic::AtomicBool,
 }
 
 /// Requests are held back while this lives; see [`SwitchableIo::pause`].
@@ -117,7 +119,22 @@ impl SwitchableIo {
         SwitchableIo {
             backend: Arc::new(RwLock::new(io)),
             lost: Default::default(),
+            last: Default::default(),
         }
+    }
+
+    /// The backend is the last this export has (it's being taken down):
+    /// once it's retired, its errors are final rather than waited out for
+    /// a replacement for up to `REPLACE_WAIT`. Taking a dead proxy's export
+    /// down otherwise stalled whoever did it that long.
+    pub fn no_replacement(&self) {
+        self.last.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn waits_for_replacement(&self, io: &dyn VolumeIo, since: std::time::Instant) -> bool {
+        io.retired()
+            && !self.last.load(std::sync::atomic::Ordering::SeqCst)
+            && since.elapsed() <= REPLACE_WAIT
     }
 
     /// Writes this export acknowledged may be lost (the backend that took
@@ -130,11 +147,23 @@ impl SwitchableIo {
 
     fn take_lost(&self) -> Result<(), FileSystemError> {
         if self.lost.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err(FileSystemError::Unavailable(
-                "writes acknowledged by the volume's previous writer were lost with it".into(),
-            ));
+            return Err(Self::lost_error());
         }
         Ok(())
+    }
+
+    /// `take_lost`, leaving the poison for a flush to take.
+    fn peek_lost(&self) -> Result<(), FileSystemError> {
+        if self.lost.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Self::lost_error());
+        }
+        Ok(())
+    }
+
+    fn lost_error() -> FileSystemError {
+        FileSystemError::Unavailable(
+            "writes acknowledged by the volume's previous writer were lost with it".into(),
+        )
     }
 
     /// Hold new requests back once those in flight have finished.
@@ -186,7 +215,7 @@ impl SwitchableIo {
             let backend = self.backend.read().await;
             let io = backend.clone();
             let r = op(io.clone()).await;
-            if r.is_ok() || !io.retired() || since.elapsed() > REPLACE_WAIT {
+            if r.is_ok() || !self.waits_for_replacement(&*io, since) {
                 return r;
             }
             drop(backend);
@@ -208,7 +237,7 @@ impl VolumeIo for SwitchableIo {
             let backend = self.backend.read().await;
             let io = backend.clone();
             let r = io.read(offset, buf).await;
-            if r.is_ok() || !io.retired() || since.elapsed() > REPLACE_WAIT {
+            if r.is_ok() || !self.waits_for_replacement(&*io, since) {
                 return r;
             }
             drop(backend);
@@ -230,10 +259,15 @@ impl VolumeIo for SwitchableIo {
             .await?;
         self.take_lost()
     }
+    /// Reports the poison but leaves it: only a client's FLUSH learns it
+    /// for good. A sync is what a client hanging up (`NBD_CMD_DISC`) or an
+    /// export going away does, whose error nobody relying on the writes
+    /// sees: taken there, the next client's flush would succeed over the
+    /// lost writes (structural triage I-24).
     async fn sync(&self) -> Result<(), FileSystemError> {
         self.run(|io| Box::pin(async move { io.sync().await }))
             .await?;
-        self.take_lost()
+        self.peek_lost()
     }
 }
 
