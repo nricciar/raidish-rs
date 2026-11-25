@@ -1,7 +1,10 @@
 //! The volumes on this node: the ones it writes, exports and attaches, the
 //! ones it exports proxied to a writer elsewhere, and handing them between
-//! nodes (`handoff`). What it has of each is one table (`table`).
+//! nodes (`handoff`). What it has of each is one table (`table`); the slow
+//! work (a handoff from here, a clean stop) runs in the background
+//! (`background`).
 
+pub(crate) mod background;
 pub(crate) mod handoff;
 pub(crate) mod plan;
 mod table;
@@ -53,6 +56,7 @@ impl VolumeView for Volumes {
     }
 }
 
+use crate::attach::Attacher;
 use crate::cluster::lease::HeldLease;
 use crate::committer::PoolAdmin;
 use crate::committer::dataset_resource;
@@ -62,6 +66,7 @@ use crate::placement::Placement;
 use crate::types::DatasetName;
 use crate::volume::VolumeInfo;
 use crate::{Agent, Attach, StartError, hold, peer_host};
+use background::Work;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,37 +78,36 @@ impl Agent {
     /// transport) once no VM here uses it, handing it over where it can
     /// be; start what belongs here.
     pub(crate) async fn reconcile_volumes(&mut self, p: &Placement) {
-        let actions = plan::plan_volumes(p, &self.shared.volumes);
+        let actions = plan::plan_volumes(p, &*self.shared.volumes);
         self.act_on_volumes(p, actions).await;
     }
 
     /// Exports of volumes attached here and written elsewhere.
     pub(crate) async fn reconcile_proxies(&mut self, p: &Placement) {
-        let actions = plan::plan_proxies(p, &self.shared.volumes);
+        let actions = plan::plan_proxies(p, &*self.shared.volumes);
         self.act_on_volumes(p, actions).await;
     }
 
     /// Carry out what a plan decided. What a step finds when it runs (a
     /// handoff that can't be done, a volume busy being handed) is handled
     /// here; the rest was decided.
+    /// A volume with work under way in the background is left alone until
+    /// it's done.
     pub(crate) async fn act_on_volumes(&mut self, p: &Placement, actions: Vec<plan::VolumeAction>) {
         for a in actions {
+            if self.bg.busy(a.name()) {
+                continue;
+            }
             match a {
                 plan::VolumeAction::HandOff { name, to } => {
-                    match self.hand_off(&name, &to).await {
-                        Ok(true) => continue,
-                        Ok(false) => {}
-                        Err(e) => {
-                            eprintln!("agent: handing '{}' to {}: {}", name, to, e);
-                            continue; // still the writer: again next tick
-                        }
-                    }
-                    // Not handed over: stop it here, if it's still written here.
-                    if self.shared.volumes.writes(&name) {
-                        self.stop_volume(&name).await;
+                    if self.peer.is_none() {
+                        // No peer I/O: no handoff, a stop instead.
+                        self.stop_volume(&name);
+                    } else if let Err(e) = self.hand_off(&name, &to) {
+                        eprintln!("agent: handing '{}' to {}: {}", name, to, e);
                     }
                 }
-                plan::VolumeAction::Stop(name) => self.stop_volume(&name).await,
+                plan::VolumeAction::Stop(name) => self.stop_volume(&name),
                 plan::VolumeAction::Start {
                     name,
                     transport,
@@ -145,16 +149,67 @@ impl Agent {
         }
     }
 
-    /// Stop volume `name` here, and say so.
-    async fn stop_volume(&mut self, name: &DatasetName) {
+    /// What the background work needs of the agent.
+    pub(crate) fn ctx(&self) -> background::Ctx {
+        background::Ctx {
+            node: self.node.clone(),
+            shared: self.shared.clone(),
+            attacher: self.attacher.clone(),
+            events: self.events.clone(),
+        }
+    }
+
+    /// Stop volume `name` here, cleanly, in the background (it says so
+    /// when it's done).
+    fn stop_volume(&mut self, name: &DatasetName) {
+        let Some(w) = self.sup.writer() else {
+            return;
+        };
+        let (parts, lost) = (w.parts.clone(), w.lost.clone());
+        let Some((v, marker)) = self.shared.volumes.begin_stop(name, parts.wgen) else {
+            return;
+        };
         println!("agent: stopping volume '{}' here", name);
-        self.stop(name, true).await;
-        self.note(
-            Level::Info,
-            EventKind::VolumeStopped,
-            Subject::volume(name),
-            format!("Volume '{}' stopped on {}", name, self.node),
-        );
+        let wgen = parts.wgen;
+        let f = background::stop_clean(self.ctx(), parts, lost, name.clone(), v, marker);
+        self.bg.spawn(name, wgen, Work::Stop, f);
+    }
+
+    /// Hand volume `name`, written here, to node `to`, in the background
+    /// (see `handoff`). Err: it couldn't start (still run here).
+    fn hand_off(&mut self, name: &DatasetName, to: &str) -> Result<(), String> {
+        let p = self.peer.as_ref().ok_or("no peer I/O")?;
+        let (connector, port) = (p.connector.clone(), p.port);
+        let addr = self.peer_addr(to)?;
+        let w = self.sup.writer().ok_or("no writer here")?;
+        let h = handoff::HandOff {
+            cx: self.ctx(),
+            w: w.parts.clone(),
+            writer_lost: w.lost.clone(),
+            connector,
+            addr,
+            port,
+            name: name.clone(),
+            to: to.to_string(),
+        };
+        let work = Work::HandOff { to: to.to_string() };
+        self.bg.spawn(name, w.wgen, work, h.run());
+        Ok(())
+    }
+
+    /// Say how the background work that finished went. A handoff that
+    /// didn't happen is planned again next tick, if the volume's still
+    /// written here.
+    pub(crate) async fn collect_background(&mut self) {
+        for (name, work, r) in self.bg.collect().await {
+            let Err(e) = r else {
+                continue;
+            };
+            match work {
+                Work::HandOff { to } => eprintln!("agent: handing '{}' to {}: {}", name, to, e),
+                Work::Stop => eprintln!("agent: stopping '{}': {}", name, e),
+            }
+        }
     }
 
     /// Run volume `v` here, exported over `transport`; `attach` the
@@ -166,6 +221,7 @@ impl Agent {
         attach: bool,
     ) -> Result<(), StartError> {
         let parts = self
+            .sup
             .ensure_writer()
             .await
             .map_err(StartError::Failed)?
@@ -198,7 +254,7 @@ impl Agent {
                     return Err(StartError::Busy(e));
                 }
             };
-        let lost = hold(&lease, None);
+        let lost = hold(&lease, None, self.wake());
         let started: Result<(Export, Option<Attach>), String> = async {
             let l = lease.clone();
             parts
@@ -258,7 +314,7 @@ impl Agent {
         };
         // Written here from now on (peers may proxy to it); the device next.
         if let Err(vol) = guard.finish(vol, Took::Running) {
-            self.wind_down(&v.name, vol, true).await;
+            wind_down(&*self.attacher, Some(&parts), &v.name, vol, true).await;
             return Err(StartError::Busy("this node's writer went away".into()));
         }
         let attached = if needs_attach {
@@ -321,41 +377,14 @@ impl Agent {
         }
     }
 
-    /// Stop running `name`: detach, unexport, and (`clean`) sync and release
-    /// the lease; otherwise (lease lost) drop it without writing.
-    pub(crate) async fn stop(&mut self, name: &DatasetName, clean: bool) {
+    /// Stop running `name`, whose lease is lost: detach, unexport, and
+    /// drop it without writing.
+    pub(crate) async fn stop_lost(&mut self, name: &DatasetName) {
         let Some(v) = self.shared.volumes.take_owned(name) else {
             return;
         };
-        self.wind_down(name, v, clean).await;
-    }
-
-    /// Stop volume `name`, out of `Volumes` already (see `stop`). Takes
-    /// only `&self`, so several can go at once.
-    pub(crate) async fn wind_down(&self, name: &DatasetName, v: Owned, clean: bool) {
-        if v.attach.device().is_some()
-            && let Err(e) = self.attacher.detach(name, v.export.transport).await
-        {
-            eprintln!("agent: detaching '{}': {}", name, e);
-        }
-        let removed = v.export.close().await;
-        if let Some(w) = &self.writer {
-            if clean {
-                if let Err(e) = removed {
-                    eprintln!("agent: unexporting '{}': {}", name, e);
-                }
-                if let Err(e) = w.fs.detach_dataset(name).await {
-                    // Its intent log is replayed once the lease is released.
-                    eprintln!("agent: last sync of '{}': {}", name, e);
-                    w.fs.abandon_dataset(name);
-                }
-            } else {
-                w.fs.abandon_dataset(name);
-            }
-        }
-        if clean {
-            v.lease.release().await;
-        }
+        let w = self.sup.writer().map(|w| &w.parts);
+        wind_down(&*self.attacher, w, name, v, false).await;
     }
 
     /// Where node `node`'s peer I/O is: the host of its disk URLs (the
@@ -422,7 +451,7 @@ impl Agent {
             return Ok(());
         };
         let (connector, port) = (p.connector.clone(), p.port);
-        let parts = self.ensure_writer().await?.parts.clone();
+        let parts = self.sup.ensure_writer().await?.parts.clone();
         let locate = self.locator(&v.name, port);
         let peer = Arc::new(
             crate::peer_io::PeerIo::new(&v.name, connector, locate).retry_for(handoff::PROXY_RETRY),
@@ -486,5 +515,41 @@ impl Agent {
             eprintln!("agent: detaching proxied '{}': {}", name, e);
         }
         proxy.take_down(name).await;
+    }
+}
+
+/// Stop volume `name` (`v`, out of the table already) on writer `w`:
+/// detach its device, unexport it, and (`clean`) sync it and release the
+/// lease; otherwise (its lease or the writer's lost) drop it without
+/// writing. Inline: the background's is `background::stop_clean`.
+pub(crate) async fn wind_down(
+    attacher: &dyn Attacher,
+    w: Option<&WriterParts>,
+    name: &DatasetName,
+    v: Owned,
+    clean: bool,
+) {
+    if v.attach.device().is_some()
+        && let Err(e) = attacher.detach(name, v.export.transport).await
+    {
+        eprintln!("agent: detaching '{}': {}", name, e);
+    }
+    let removed = v.export.close().await;
+    if let Some(w) = w {
+        if clean {
+            if let Err(e) = removed {
+                eprintln!("agent: unexporting '{}': {}", name, e);
+            }
+            if let Err(e) = w.fs.detach_dataset(name).await {
+                // Its intent log is replayed once the lease is released.
+                eprintln!("agent: last sync of '{}': {}", name, e);
+                w.fs.abandon_dataset(name);
+            }
+        } else {
+            w.fs.abandon_dataset(name);
+        }
+    }
+    if clean {
+        v.lease.release().await;
     }
 }

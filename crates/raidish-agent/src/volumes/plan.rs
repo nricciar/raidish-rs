@@ -33,6 +33,18 @@ pub(crate) enum VolumeAction {
     RemoveProxy(DatasetName),
 }
 
+impl VolumeAction {
+    /// The volume it's done to.
+    pub(crate) fn name(&self) -> &DatasetName {
+        match self {
+            VolumeAction::HandOff { name, .. }
+            | VolumeAction::Start { name, .. }
+            | VolumeAction::AddProxy { name, .. } => name,
+            VolumeAction::Stop(name) | VolumeAction::RemoveProxy(name) => name,
+        }
+    }
+}
+
 /// The volumes written here that shouldn't be (handed over or stopped),
 /// then those to start here.
 ///

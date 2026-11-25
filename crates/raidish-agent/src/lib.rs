@@ -10,15 +10,18 @@
 //! `ds/<name>` lease, so two agents that both think a volume is theirs
 //! can't both run it.
 //!
-//! One loop ([`Agent::run`]) does it all, every `TICK`, in this order:
+//! One loop ([`Agent::run`]) runs the volumes and VMs, every `TICK` or
+//! when something pokes it. The services have their own task
+//! (`ServiceController`), and the slow volume work (a handoff from here, a
+//! clean stop) runs in the background (`volumes::background`).
 //!
 //! | Module | What it does |
 //! |---|---|
-//! | `lib` | the loop, the node lease, letting go of what lost its lease |
-//! | `supervisor` | this node's writer (`NodeWriter`): its lease, the pool, the export servers |
+//! | `lib` | the loop, letting go of what lost its lease |
+//! | `supervisor` | the node lease and this node's writer (`NodeSupervisor`, `NodeWriter`): its lease, the pool, the export servers |
 //! | `placement` | where each volume belongs (`place*`, one tick's `Placement`) |
 //! | `volumes` | the volumes here: started, stopped, proxied, handed over (`handoff`), in one table (`table`) |
-//! | `services` | the S3, SQS and etcd datasets served here |
+//! | `services` | the S3, SQS and etcd datasets served here, in their own task |
 //! | `vms` | the VMs here: started, stopped, orphans, arrivals, live migration (`migrate`) |
 //! | `attach` | kernel devices for volumes, through the root helper |
 //! | `node_facts`, `vm_check` | this node's facts; whether a VM can move live |
@@ -33,8 +36,7 @@ mod vms;
 mod volumes;
 
 pub use placement::{place, place_attached, place_on};
-use services::Services;
-use supervisor::NodeWriter;
+use supervisor::NodeSupervisor;
 use vms::VmBook;
 
 pub(crate) use raidish_auth::{pki, tls};
@@ -55,13 +57,13 @@ use crate::committer::PoolAccess;
 use crate::committer::PoolAdmin;
 use crate::events::{EventKind, EventSink, Level, Subject};
 use crate::types::DatasetName;
-use crate::types::{Holder, HolderRole, LeaseResource};
+use crate::types::{Holder, HolderRole};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// This node's writer, once the agent has one.
 pub type WriterSlot = std::sync::Arc<
@@ -141,18 +143,19 @@ pub struct Agent {
     cluster: Arc<Cluster>,
     leases: LeaseClient,
     committer: crate::committer::Admin,
-    endpoints: Vec<String>,
-    access: PoolAccess,
     config: AutomountConfig,
     state: AgentState,
-    writer: Option<NodeWriter>,
-    /// Where this node's file API finds the writer.
-    files: WriterSlot,
+    /// The node lease and this node's writer.
+    sup: NodeSupervisor,
+    /// The volume work running in the background.
+    bg: volumes::background::Background,
     /// Running VMs here (None: this node runs none).
     vm: Option<Arc<crate::vm::VmRuntime>>,
     /// What it knows and has under way about VMs.
     vms: VmBook,
-    services: Services,
+    /// This node's service front ends (None: it serves none; see
+    /// `services`).
+    frontend: Option<Arc<crate::frontend::Frontend>>,
     /// What this agent does goes to the activity log (see `crate::events`).
     events: EventSink,
     /// Shared with the peer I/O listener (see `handoff`).
@@ -189,31 +192,39 @@ impl Agent {
         let events = EventSink::new(&node);
         let leases = LeaseClient::new(endpoints.clone());
         let attacher = Arc::new(attach::Helper::new(&config));
+        let shared = Arc::new(volumes::handoff::Shared::new(leases.clone()));
+        let sup = NodeSupervisor::new(supervisor::WriterConf {
+            node: node.clone(),
+            leases: leases.clone(),
+            endpoints,
+            access,
+            config: config.clone(),
+            files,
+            shared: shared.clone(),
+        });
         Agent {
             node,
             cluster,
-            shared: Arc::new(volumes::handoff::Shared::new(leases.clone())),
+            shared,
             peer: None,
             leases,
             committer,
-            endpoints,
-            access,
             config,
             state,
-            writer: None,
-            files,
+            sup,
+            bg: Default::default(),
             vm: None,
             vms: VmBook::default(),
             facts: Default::default(),
             attacher,
-            services: Services::default(),
+            frontend: None,
             events,
         }
     }
 
     /// Run service datasets too (see `crate::frontend`).
     pub fn with_frontend(mut self, fe: Arc<crate::frontend::Frontend>) -> Self {
-        self.services.frontend = Some(fe);
+        self.frontend = Some(fe);
         self
     }
 
@@ -257,18 +268,28 @@ impl Agent {
     }
 
     /// What this agent's leases say: who it is, and (if it serves) where
-    /// others reach it.
+    /// others reach it. Set once [`Agent::run`] starts (see `holder`).
     fn desc(&self) -> Holder {
+        self.shared.desc.lock().unwrap().clone()
+    }
+
+    /// What `desc` is: worked out once everything is configured.
+    fn holder(&self) -> Holder {
         let h = Holder::new(HolderRole::Agent, Some(&self.node));
-        match &self.services.frontend {
+        match &self.frontend {
             Some(fe) => h.with_addr(fe.addr()),
             None => h,
         }
     }
 
+    /// The loop's wake-up: poked when it should look again now.
+    fn wake(&self) -> &Arc<Notify> {
+        self.shared.volumes.wake()
+    }
+
     /// Keep `node/<name>` and run the placement loop, forever.
     pub async fn run(mut self) {
-        *self.shared.desc.lock().unwrap() = self.desc();
+        *self.shared.desc.lock().unwrap() = self.holder();
         if let Some(p) = &self.peer {
             let addr = (self.config.peer_bind(), p.port);
             match tokio::net::TcpListener::bind((addr.0.as_str(), addr.1)).await {
@@ -286,63 +307,43 @@ impl Agent {
                 }
             }
         }
-        let mut node_lease: Option<(Arc<HeldLease>, Lost)> = None;
+        if let Some(fe) = self.frontend.clone() {
+            let c = services::ServiceController::new(&self, fe);
+            tokio::spawn(c.run());
+        }
+        let wake = self.wake().clone();
         loop {
-            if node_lease.as_ref().is_none_or(|(_, lost)| lost.is_lost()) {
-                node_lease = match HeldLease::acquire(
-                    self.leases.clone(),
-                    LeaseResource::node(&self.node),
-                    self.desc(),
-                )
-                .await
-                {
-                    Ok(l) => {
-                        let l = Arc::new(l);
-                        Some((l.clone(), hold(&l, None)))
-                    }
-                    Err(e) => {
-                        eprintln!("agent: {}", e);
-                        None
-                    }
-                };
-            }
-            if node_lease.is_some() {
+            if self.sup.ensure_node_lease().await {
                 self.tick().await;
             } else {
                 // Cut off from the cluster (no node lease): place nothing,
-                // but still let go of every volume, service and VM whose
-                // lease lapsed. The rest of the cluster starts them
-                // elsewhere once it does.
+                // but still let go of every volume and VM whose lease
+                // lapsed (the services do the same in their task). The
+                // rest of the cluster starts them elsewhere once it does.
                 self.drop_lost().await;
             }
             self.publish();
-            match self.vm.clone() {
-                Some(vm) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(TICK) => {}
-                        _ = vm.poked() => {}
-                    }
+            let vm = self.vm.clone();
+            let poked = async {
+                match &vm {
+                    Some(vm) => vm.poked().await,
+                    None => std::future::pending().await,
                 }
-                None => tokio::time::sleep(TICK).await,
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(TICK) => {}
+                _ = wake.notified() => {}
+                _ = poked => {}
             }
         }
     }
 
-    /// Say what happened, once: in this process's log (`agent: <message>`;
-    /// info to stdout, warnings and errors to stderr) and in the activity
-    /// log (see `events`).
+    /// Say what happened, once (see [`note`]).
     pub(crate) fn note(&self, level: Level, kind: EventKind, subject: Subject, message: String) {
-        log(level, &message);
-        match level {
-            Level::Info => self.events.info(kind, subject, message),
-            Level::Warn => self.events.warn(kind, subject, message),
-            Level::Error => self.events.error(kind, subject, message),
-        }
+        note(&self.events, level, kind, subject, message)
     }
 
-    /// The same for a condition that's retried (a volume or VM that won't
-    /// start, every tick): noted once, and again only when its message
-    /// changes or `subject` is cleared (`EventSink::once`).
+    /// The same for a condition that's retried (see [`note_once`]).
     pub(crate) fn note_once(
         &self,
         level: Level,
@@ -350,9 +351,7 @@ impl Agent {
         subject: Subject,
         message: String,
     ) {
-        if self.events.once(level, kind, subject, message.clone()) {
-            log(level, &message);
-        }
+        note_once(&self.events, level, kind, subject, message)
     }
 
     fn publish(&self) {
@@ -364,6 +363,7 @@ impl Agent {
     /// pool and the cluster say.
     async fn tick(&mut self) {
         self.drop_lost().await;
+        self.collect_background().await;
         self.poll_migrations().await;
 
         let Ok(volumes) = self.committer.volumes().await else {
@@ -371,7 +371,7 @@ impl Agent {
         };
         // The file API writes through this node's writer: have one whether
         // or not a volume runs here.
-        if let Err(e) = self.ensure_writer().await {
+        if let Err(e) = self.sup.ensure_writer().await {
             eprintln!("agent: opening the pool as a writer: {}", e);
         }
         self.refresh_vms().await;
@@ -390,8 +390,6 @@ impl Agent {
             self.reconcile_proxies(&place).await;
         }
         self.retry_attach().await;
-        self.tick_services(&place.state, place.now, &place.live)
-            .await;
 
         if let (Some(vm), Ok(listed)) = (self.vm.clone(), &doms.listed) {
             self.stop_unwanted_vms(&vm, &place, &doms.ours).await;
@@ -399,13 +397,14 @@ impl Agent {
         }
     }
 
-    /// Volumes, services or the whole writer whose lease is gone: stop
-    /// serving them at once, and kill any VM using them first (its writes
-    /// are fenced already; this keeps it from running on with I/O errors
-    /// while another node starts it).
+    /// Volumes or the whole writer whose lease is gone: stop serving them
+    /// at once, and kill any VM using them first (its writes are fenced
+    /// already; this keeps it from running on with I/O errors while another
+    /// node starts it). The services do the same in their own task.
     async fn drop_lost(&mut self) {
         // Handed over but not picked up yet counts too: their exports and
-        // VMs must go once their lease does (audit A1).
+        // VMs must go once their lease does (audit A1). Those handed off or
+        // stopped in the background see it themselves.
         let lost = self.shared.volumes.lost();
         if !lost.is_empty() {
             self.destroy_vms_using(&lost).await;
@@ -420,78 +419,82 @@ impl Agent {
                     name, self.node
                 ),
             );
-            self.stop(&name, false).await;
+            self.stop_lost(&name).await;
         }
-        let lost: Vec<DatasetName> = self
-            .services
-            .running
-            .iter()
-            .filter(|(_, r)| r.lost.is_lost())
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in lost {
-            let f = self.service_format(&name);
-            let label = crate::events::label_of(f);
-            self.note(
-                Level::Error,
-                EventKind::DatasetLost,
-                Subject::dataset(f, &name),
-                format!(
-                    "{} '{}' stopped on {}: its lease was lost",
-                    label, name, self.node
-                ),
-            );
-            self.stop_service(&name, false).await;
-        }
-        if self.writer.as_ref().is_some_and(|w| w.lost.is_lost()) {
-            self.note(
-                Level::Error,
-                EventKind::NodeWriterLost,
-                Subject::node(&self.node),
-                format!(
-                    "{} lost its writer lease: everything it ran was stopped",
-                    self.node
-                ),
-            );
-            // Everything that ran on it, handed over or not: no takeover
-            // may finish onto this writer from here on (it checks under the
-            // same lock, and undoes itself), and those that did are taken
-            // with the rest (audit A1).
-            let wgen = self.writer.as_ref().map(|w| w.wgen);
-            let dropped = match wgen {
-                Some(g) => self.shared.volumes.drop_writer(g),
-                None => volumes::Dropped {
-                    owned: Vec::new(),
-                    proxies: Vec::new(),
-                },
-            };
-            let names: Vec<DatasetName> = dropped.owned.iter().map(|(n, _)| n.clone()).collect();
-            self.destroy_vms_using(&names).await;
-            // All at once: each waits out its clients' drain (I-27).
-            let me = &*self;
-            futures::future::join_all(
-                dropped
-                    .owned
-                    .into_iter()
-                    .map(|(n, v)| async move { me.wind_down(&n, v, false).await }),
-            )
-            .await;
-            let names: Vec<DatasetName> = self.services.running.keys().cloned().collect();
-            for name in names {
-                self.stop_service(&name, false).await;
-            }
-            // Its proxied exports too, devices and all.
-            let me = &*self;
-            futures::future::join_all(
-                dropped
-                    .proxies
-                    .into_iter()
-                    .map(|(n, p)| async move { me.take_down_proxy(&n, p).await }),
-            )
-            .await;
-            self.writer = None;
-            *self.files.write().unwrap() = None;
-        }
+        // The writer is let go of here: nothing is started on a new one
+        // before all that ran on this one is down.
+        let Some(w) = self.sup.take_lost_writer() else {
+            return;
+        };
+        self.note(
+            Level::Error,
+            EventKind::NodeWriterLost,
+            Subject::node(&self.node),
+            format!(
+                "{} lost its writer lease: everything it ran was stopped",
+                self.node
+            ),
+        );
+        // Everything that ran on it, handed over or not: no takeover may
+        // finish onto this writer from here on (it checks under the same
+        // lock, and undoes itself), and those that did are taken with the
+        // rest (audit A1).
+        let dropped = self.shared.volumes.drop_writer(w.wgen);
+        let names: Vec<DatasetName> = dropped.owned.iter().map(|(n, _)| n.clone()).collect();
+        self.destroy_vms_using(&names).await;
+        // All at once: each waits out its clients' drain (I-27).
+        let attacher = &*self.attacher;
+        futures::future::join_all(dropped.owned.into_iter().map(|(n, v)| {
+            let w = &w.parts;
+            async move { volumes::wind_down(attacher, Some(w), &n, v, false).await }
+        }))
+        .await;
+        // Its proxied exports too, devices and all.
+        let me = &*self;
+        futures::future::join_all(
+            dropped
+                .proxies
+                .into_iter()
+                .map(|(n, p)| async move { me.take_down_proxy(&n, p).await }),
+        )
+        .await;
+        // And what it handed off or stopped in the background: they end
+        // at once on its lost lease, their markers with them.
+        self.bg.join(w.wgen).await;
+        drop(w);
+    }
+}
+
+/// Say what happened, once: in this process's log (`agent: <message>`;
+/// info to stdout, warnings and errors to stderr) and in the activity log
+/// (`events`).
+pub(crate) fn note(
+    events: &EventSink,
+    level: Level,
+    kind: EventKind,
+    subject: Subject,
+    message: String,
+) {
+    log(level, &message);
+    match level {
+        Level::Info => events.info(kind, subject, message),
+        Level::Warn => events.warn(kind, subject, message),
+        Level::Error => events.error(kind, subject, message),
+    }
+}
+
+/// The same for a condition that's retried (a volume or VM that won't
+/// start, every tick): noted once, and again only when its message changes
+/// or `subject` is cleared (`EventSink::once`).
+pub(crate) fn note_once(
+    events: &EventSink,
+    level: Level,
+    kind: EventKind,
+    subject: Subject,
+    message: String,
+) {
+    if events.once(level, kind, subject, message.clone()) {
+        log(level, &message);
     }
 }
 
@@ -514,6 +517,21 @@ impl Lost {
     fn watch(&self) -> watch::Receiver<bool> {
         self.0.subscribe()
     }
+    /// Until it's lost.
+    async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        // The sender is ours: it can't close under us.
+        let _ = rx.wait_for(|lost| *lost).await;
+    }
+}
+
+/// `f`, unless `a` or `b` is lost first (None).
+async fn or_lost<F: std::future::Future>(f: F, a: &Lost, b: &Lost) -> Option<F::Output> {
+    tokio::select! {
+        r = f => Some(r),
+        _ = a.wait() => None,
+        _ = b.wait() => None,
+    }
 }
 
 pub use vms::migrate::ask_live as migrate_ask_live;
@@ -535,16 +553,19 @@ fn peer_host(peers: &BTreeMap<crate::types::NodeId, String>, node: &str) -> Opti
 }
 
 /// Renew `lease` in the background. Once it's lost the returned flag is
-/// set, and so is `cancel` (a commit client's, to stop its retries).
-fn hold(lease: &Arc<HeldLease>, cancel: Option<Arc<AtomicBool>>) -> Lost {
+/// set, so is `cancel` (a commit client's, to stop its retries), and
+/// `wake` is poked: whoever acts on it does so at once.
+fn hold(lease: &Arc<HeldLease>, cancel: Option<Arc<AtomicBool>>, wake: &Arc<Notify>) -> Lost {
     let lost = Lost(Arc::new(watch::Sender::new(false)));
     let flag = lost.clone();
+    let wake = wake.clone();
     lease.hold(move |msg| {
         eprintln!("agent: {}", msg);
         if let Some(c) = cancel {
             c.store(true, Ordering::SeqCst);
         }
         flag.0.send_replace(true);
+        wake.notify_one();
     });
     lost
 }

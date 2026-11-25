@@ -298,7 +298,7 @@ fn writer_on(fs: Arc<crate::fs::FileSystem<crate::vdev::Pool>>) -> WriterParts {
 }
 
 impl Node {
-    fn vols(&self) -> &volumes::Volumes {
+    fn vols(&self) -> &Arc<volumes::Volumes> {
         &self.shared.volumes
     }
 
@@ -503,7 +503,7 @@ async fn takeovers_are_checked_against_the_writer_and_the_slot() {
 /// A handoff from here holds the volume whole while it runs: peers aren't
 /// pointed at it, nothing claims it. Called off, it runs here again as it
 /// was, device and all; with its writer gone meanwhile, it's the caller's
-/// to stop instead.
+/// to stop instead. Its marker outlives the writer until the handoff ends.
 #[tokio::test]
 async fn an_aborted_handoff_puts_the_volume_back_whole() {
     let n = node().await;
@@ -519,7 +519,7 @@ async fn an_aborted_handoff_puts_the_volume_back_whole() {
     assert!(at(5).is_ok());
     assert!(at(4).is_err(), "answered for another epoch");
 
-    let o = n.vols().begin_handoff(&vol(), w).unwrap();
+    let (o, m) = n.vols().begin_handoff(&vol(), w).unwrap();
     assert_eq!(n.state(), Some("handing off"));
     assert!(
         at(5).is_err(),
@@ -529,17 +529,150 @@ async fn an_aborted_handoff_puts_the_volume_back_whole() {
         n.vols().begin_takeover(&vol(), w, Transport::Nbd),
         Err(Claim::Busy)
     ));
-    assert!(n.vols().abort_handoff(&vol(), w, o).is_ok());
+    assert!(m.abort_handoff(o).is_ok());
     assert_eq!(n.state(), Some("running"));
     assert_eq!(n.vols().owned(&vol(), |o| o.attach.clone()), Some(dev));
     assert!(at(5).is_ok());
 
-    let o = n.vols().begin_handoff(&vol(), w).unwrap();
-    n.vols().drop_writer(w);
-    let back = n.vols().abort_handoff(&vol(), w, o);
+    let (o, m) = n.vols().begin_handoff(&vol(), w).unwrap();
+    let dropped = n.vols().drop_writer(w);
+    assert!(dropped.owned.is_empty());
+    assert_eq!(n.state(), Some("handing off"), "the marker went first");
+    let back = m.abort_handoff(o);
     assert!(back.is_err(), "put back onto a dropped writer");
     assert_eq!(n.state(), None);
     back.err().unwrap().export.close().await.unwrap();
+}
+
+/// A clean stop in the background holds the volume's slot (`Stopping`)
+/// until it ends: not written here any more, not claimed by a takeover
+/// (the listener's or the loop's), not dropped with its writer, so a new
+/// writer can't start it while the old task still detaches it. However
+/// the task ends, the marker goes, and the loop is poked.
+#[tokio::test]
+async fn a_stop_marker_outlives_its_writer_until_the_stop_ends() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    n.run(5, Attach::Exported).await;
+    let wake = n.vols().wake().clone();
+    assert!(n.vols().begin_stop(&vol(), WriterGen::next()).is_none());
+    let (o, m) = n.vols().begin_stop(&vol(), w).unwrap();
+    assert_eq!(n.state(), Some("stopping"));
+    assert!(n.vols().has(&vol()));
+    assert!(!n.vols().writes(&vol()));
+    assert!(n.vols().published().is_empty());
+    assert!(n.vols().lost().is_empty());
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+
+    // Its writer dropped and replaced: still there, still refused.
+    let dropped = n.vols().drop_writer(w);
+    assert!(dropped.owned.is_empty() && dropped.proxies.is_empty());
+    assert_eq!(n.state(), Some("stopping"));
+    let w2 = writer_on(n.parts.fs.clone());
+    n.vols().set_writer(w2.clone());
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w2.wgen, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+
+    // The task ends (here: dropped, as by a panic or an abort).
+    o.export.close().await.unwrap();
+    drop(m);
+    assert_eq!(n.state(), None);
+    tokio::time::timeout(Duration::from_secs(1), wake.notified())
+        .await
+        .expect("the loop wasn't poked");
+    assert!(
+        n.vols()
+            .begin_takeover(&vol(), w2.wgen, Transport::Nbd)
+            .is_ok()
+    );
+}
+
+/// A volume handed over to this node pokes the loop: its device is
+/// attached at once, not a tick later.
+#[tokio::test]
+async fn a_finished_handoff_to_here_pokes_the_loop() {
+    let n = node().await;
+    let wake = n.vols().wake().clone();
+    let g = n
+        .vols()
+        .begin_takeover(&vol(), n.parts.wgen, Transport::Nbd)
+        .unwrap();
+    let o = n.owned(6, Attach::Exported).await;
+    assert!(g.finish(o, Took::Adopted).is_ok());
+    tokio::time::timeout(Duration::from_secs(1), wake.notified())
+        .await
+        .expect("the loop wasn't poked");
+    for (_, o) in n.vols().drop_writer(n.parts.wgen).owned {
+        o.export.close().await.unwrap();
+    }
+}
+
+/// The background work: a volume's busy while its task runs; the fence
+/// waits for the dropped writer's tasks only; finished ones are collected
+/// once, a panicked one as an error.
+#[tokio::test]
+async fn background_work_is_collected_and_joined_by_writer() {
+    use crate::volumes::background::{Background, Work};
+    let (a, b) = (dsn("a"), dsn("b"));
+    let (w1, w2) = (WriterGen::next(), WriterGen::next());
+    let mut bg = Background::default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    bg.spawn(&a, w1, Work::Stop, async { Ok(()) });
+    bg.spawn(&b, w2, Work::Stop, async move {
+        let _ = rx.await;
+        Err("late".into())
+    });
+    assert!(bg.busy(&a) && bg.busy(&b));
+    bg.join(w1).await;
+    assert!(!bg.busy(&a) && bg.busy(&b));
+    assert!(bg.collect().await.is_empty(), "b isn't done");
+    tx.send(()).unwrap();
+    let t = std::time::Instant::now();
+    let done = loop {
+        let d = bg.collect().await;
+        if !d.is_empty() {
+            break d;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(done, vec![(b.clone(), Work::Stop, Err("late".into()))]);
+    assert!(!bg.busy(&b));
+    bg.spawn(&a, w1, Work::Stop, async { panic!("boom") });
+    bg.join(w1).await;
+    bg.spawn(&a, w1, Work::Stop, async { panic!("boom") });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let done = bg.collect().await;
+    assert!(matches!(&done[..], [(_, Work::Stop, Err(e))] if e.contains("failed")));
+}
+
+/// What a background task waits on ends once either lease is lost, and
+/// not before.
+#[tokio::test]
+async fn waits_end_on_either_lost_lease() {
+    let (a, b) = (
+        Lost(Arc::new(watch::Sender::new(false))),
+        Lost(Arc::new(watch::Sender::new(false))),
+    );
+    assert_eq!(or_lost(async { 7 }, &a, &b).await, Some(7));
+    let b2 = b.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        b2.0.send_replace(true);
+    });
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        or_lost(std::future::pending::<()>(), &a, &b),
+    )
+    .await;
+    assert_eq!(r, Ok(None));
+    // Lost already: at once.
+    assert_eq!(or_lost(std::future::pending::<()>(), &b, &a).await, None);
 }
 
 /// What was handed over is written here at once (peers proxy to it, with
@@ -857,4 +990,86 @@ fn the_safety_net_skips_recorded_migrations() {
     assert_eq!(leaked(&vols, false, attached), vec![other.clone()]);
     assert!(leaked(&vols, true, attached).is_empty());
     assert!(leaked(&vols, false, |_| false).is_empty());
+}
+
+/// A frontend with nothing to serve, for `Served`.
+fn frontend(pki: &raidish_auth::testing::Pki) -> Arc<crate::frontend::Frontend> {
+    use crate::frontend::{Frontend, ServiceTls, ServicesConfig, keys::ServiceAuth};
+    let auth = ServiceAuth::new(
+        "us-east-1".into(),
+        pki.verifier.clone(),
+        Arc::new(|| Some(vec![7; 32])),
+    );
+    Frontend::new(
+        "node-0".into(),
+        ServicesConfig::default(),
+        auth,
+        ServiceTls::new(&pki.tls).unwrap(),
+        crate::committer::Admin::new(
+            Default::default(),
+            crate::committer::CommitClient::new(vec![]),
+        ),
+    )
+}
+
+/// The services follow the writer by its generation: a writer dropped and
+/// opened again between two looks (a `watch` shows only the newest, never
+/// the None between) still takes down what ran on the old one first. The
+/// same writer, looked at again, leaves them be.
+#[tokio::test]
+async fn services_go_with_their_writers_generation() {
+    use crate::services::{RunningService, Served};
+    let n = node().await;
+    let mut s = Served {
+        node: "node-0".into(),
+        frontend: frontend(&n.pki),
+        events: crate::events::EventSink::new("node-0"),
+        ran_on: None,
+        running: Default::default(),
+    };
+    let w1 = n.parts.clone();
+    s.follow(Some(w1.clone())).await;
+    let lease = |e| {
+        Arc::new(HeldLease::adopt(
+            LeaseClient::new(vec![]),
+            dataset_resource(&dsn("b")),
+            "owner",
+            crate::types::Epoch::from_raw(e),
+            std::time::Instant::now(),
+        ))
+    };
+    let running = |e| RunningService {
+        lease: lease(e),
+        lost: Lost(Arc::new(watch::Sender::new(false))),
+        format: crate::dataset::DatasetFormat::S3,
+    };
+    s.running.insert(dsn("b"), running(1));
+    s.follow(Some(w1.clone())).await;
+    assert_eq!(s.running.len(), 1, "the same writer: kept");
+
+    let w2 = writer_on(n.parts.fs.clone());
+    s.follow(Some(w2.clone())).await;
+    assert!(
+        s.running.is_empty(),
+        "ran on the old writer, kept on the new"
+    );
+    assert_eq!(s.ran_on.as_ref().map(|w| w.wgen), Some(w2.wgen));
+
+    s.running.insert(dsn("b"), running(2));
+    s.follow(None).await;
+    assert!(s.running.is_empty());
+    assert!(s.ran_on.is_none());
+
+    // Its own lease lost: stopped, the rest kept.
+    s.follow(Some(w2.clone())).await;
+    let r = running(3);
+    let lost = r.lost.clone();
+    s.running.insert(dsn("b"), r);
+    s.running.insert(dsn("c"), running(4));
+    lost.0.send_replace(true);
+    s.drop_lost().await;
+    assert_eq!(
+        s.running.keys().cloned().collect::<Vec<_>>(),
+        vec![dsn("c")]
+    );
 }

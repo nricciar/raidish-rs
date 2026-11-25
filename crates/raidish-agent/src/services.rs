@@ -1,57 +1,181 @@
 //! The service datasets (S3, SQS, etcd) this node serves (see
-//! `raidish_services::frontend`): placing, starting and stopping them.
+//! `raidish_services::frontend`): placing, starting and stopping them, in
+//! their own task ([`ServiceController`]), apart from the volumes and VMs.
+//!
+//! They run on this node's writer, which the task watches (`NodeSupervisor::
+//! writers`): what ran on one writer goes with it, by its generation (a
+//! writer dropped and opened again between two looks shows only as a new
+//! generation, never as None), before anything starts on the next.
 
-use crate::cluster::lease::HeldLease;
+use crate::cluster::Cluster;
+use crate::cluster::lease::{HeldLease, LeaseClient};
 use crate::committer::PoolAdmin;
 use crate::committer::dataset_resource;
-use crate::events::{EventKind, Level, Subject};
+use crate::events::{EventKind, EventSink, Level, Subject};
+use crate::frontend::Frontend;
 use crate::placement::place_on;
-use crate::types::DatasetName;
-use crate::types::LeaseResource;
-use crate::{Agent, Lost, StartError, hold};
+use crate::types::{DatasetName, Holder, LeaseResource};
+use crate::volumes::WriterParts;
+use crate::{Agent, Lost, StartError, TICK, hold, note, note_once};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tokio::sync::{Notify, watch};
 
-/// A service dataset this agent runs (see `crate::frontend`).
+/// A service dataset this node runs (see `crate::frontend`).
 pub(crate) struct RunningService {
     pub(crate) lease: Arc<HeldLease>,
     pub(crate) lost: Lost,
     pub(crate) format: crate::dataset::DatasetFormat,
 }
 
-/// The services (S3, SQS, etcd datasets) this node serves.
-#[derive(Default)]
-pub(crate) struct Services {
-    /// This node's service front ends (None: it serves none).
-    pub(crate) frontend: Option<Arc<crate::frontend::Frontend>>,
+/// What runs here, and on which writer.
+pub(crate) struct Served {
+    pub(crate) node: String,
+    pub(crate) frontend: Arc<Frontend>,
+    pub(crate) events: EventSink,
+    /// The writer what runs here runs on.
+    pub(crate) ran_on: Option<WriterParts>,
     pub(crate) running: BTreeMap<DatasetName, RunningService>,
 }
 
-impl Agent {
-    /// Place, start and stop the service datasets (see `crate::frontend`),
-    /// and tell the front ends where each runs.
-    pub(crate) async fn tick_services(
-        &mut self,
-        state: &crate::cluster::state::ClusterState,
-        now: u64,
-        live: &BTreeSet<String>,
-    ) {
-        let Some(fe) = self.services.frontend.clone() else {
+/// The services' task: see the module docs.
+pub(crate) struct ServiceController {
+    served: Served,
+    cluster: Arc<Cluster>,
+    leases: LeaseClient,
+    committer: crate::committer::Admin,
+    /// What this node's leases say of it.
+    desc: Holder,
+    writers: watch::Receiver<Option<WriterParts>>,
+    /// Whether this node holds its node lease (it places nothing without).
+    placing: watch::Receiver<bool>,
+    /// Poked when a service's lease is lost.
+    wake: Arc<Notify>,
+}
+
+impl std::ops::Deref for ServiceController {
+    type Target = Served;
+    fn deref(&self) -> &Served {
+        &self.served
+    }
+}
+
+impl std::ops::DerefMut for ServiceController {
+    fn deref_mut(&mut self) -> &mut Served {
+        &mut self.served
+    }
+}
+
+impl ServiceController {
+    pub(crate) fn new(agent: &Agent, frontend: Arc<Frontend>) -> Self {
+        ServiceController {
+            served: Served {
+                node: agent.node.clone(),
+                frontend,
+                events: agent.events.clone(),
+                ran_on: None,
+                running: BTreeMap::new(),
+            },
+            cluster: agent.cluster.clone(),
+            leases: agent.leases.clone(),
+            committer: agent.committer.clone(),
+            desc: agent.desc(),
+            writers: agent.sup.writers(),
+            placing: agent.sup.placing(),
+            wake: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Every `TICK`, or once the writer changes or a lease is lost.
+    pub(crate) async fn run(mut self) {
+        loop {
+            self.tick().await;
+            tokio::select! {
+                _ = tokio::time::sleep(TICK) => {}
+                _ = self.wake.notified() => {}
+                changed = self.writers.changed() => {
+                    if changed.is_err() {
+                        return; // the agent is gone
+                    }
+                }
+            }
+        }
+    }
+
+    async fn tick(&mut self) {
+        let writer = self.writers.borrow_and_update().clone();
+        self.served.follow(writer).await;
+        self.served.drop_lost().await;
+        if *self.placing.borrow() {
+            self.place().await;
+        }
+    }
+}
+
+impl Served {
+    /// What runs here follows this node's writer (`writer`): once it's
+    /// another generation, or none, what ran on the old one goes first
+    /// (unclean: that writer's lease is lost, it can't write).
+    pub(crate) async fn follow(&mut self, writer: Option<WriterParts>) {
+        let wgen = |w: &Option<WriterParts>| w.as_ref().map(|w| w.wgen);
+        if wgen(&writer) == wgen(&self.ran_on) {
             return;
+        }
+        let names: Vec<DatasetName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.stop(&name, false).await;
+        }
+        self.ran_on = writer;
+    }
+
+    /// Stop serving what lost its lease.
+    pub(crate) async fn drop_lost(&mut self) {
+        let lost: Vec<DatasetName> = self
+            .running
+            .iter()
+            .filter(|(_, r)| r.lost.is_lost())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in lost {
+            let f = self.format(&name);
+            let label = crate::events::label_of(f);
+            note(
+                &self.events,
+                Level::Error,
+                EventKind::DatasetLost,
+                Subject::dataset(f, &name),
+                format!(
+                    "{} '{}' stopped on {}: its lease was lost",
+                    label, name, self.node
+                ),
+            );
+            self.stop(&name, false).await;
+        }
+    }
+}
+
+impl ServiceController {
+    /// Place, start and stop the service datasets, and tell the front
+    /// ends where each runs.
+    async fn place(&mut self) {
+        let Some(w) = self.ran_on.clone() else {
+            return; // no writer to run them on (yet)
         };
         let Ok(datasets) = self.committer.datasets().await else {
             return;
         };
+        let state = self.cluster.status().state;
+        let now = crate::cluster::now_ms();
         // The live nodes that serve, and where.
-        let nodes: BTreeMap<String, String> = live
-            .iter()
-            .filter_map(|n| {
+        let nodes: BTreeMap<String, String> = state
+            .live_nodes(now)
+            .filter_map(|(n, _)| {
                 let addr = state
                     .live_lease(&LeaseResource::node(n), now)?
                     .holder
                     .addr
                     .clone()?;
-                Some((n.clone(), addr))
+                Some((n.to_string(), addr))
             })
             .collect();
         let serving: BTreeSet<String> = nodes.keys().cloned().collect();
@@ -81,9 +205,8 @@ impl Agent {
                 wanted.insert(d.name.clone(), (d.format, holder.is_some()));
             }
         }
-        fe.set_routes(routes, nodes);
+        self.frontend.set_routes(routes, nodes);
         let stop: Vec<DatasetName> = self
-            .services
             .running
             .keys()
             .filter(|n| !wanted.contains_key(*n))
@@ -91,10 +214,11 @@ impl Agent {
             .collect();
         for name in stop {
             println!("agent: stopping dataset '{}' here", name);
-            let f = self.service_format(&name);
+            let f = self.format(&name);
             let label = crate::events::label_of(f);
-            self.stop_service(&name, true).await;
-            self.note(
+            self.stop(&name, true).await;
+            note(
+                &self.events,
                 Level::Info,
                 EventKind::DatasetStopped,
                 Subject::dataset(f, &name),
@@ -102,15 +226,16 @@ impl Agent {
             );
         }
         for (name, (format, held)) in wanted {
-            if self.services.running.contains_key(&name) || held {
+            if self.running.contains_key(&name) || held {
                 continue; // running, or someone still has it
             }
             let label = crate::events::format_label(format);
             let subject = Subject::dataset(Some(format), &name);
-            match self.start_service(&fe, &name, format).await {
+            match self.start(&w, &name, format).await {
                 Ok(()) => {
                     self.events.clear(&subject);
-                    self.note(
+                    note(
+                        &self.events,
                         Level::Info,
                         EventKind::DatasetStarted,
                         subject,
@@ -121,7 +246,8 @@ impl Agent {
                     eprintln!("agent: starting dataset '{}': {}", name, e);
                 }
                 Err(StartError::Failed(e)) => {
-                    self.note_once(
+                    note_once(
+                        &self.events,
                         Level::Error,
                         EventKind::DatasetStartFailed,
                         subject,
@@ -135,20 +261,24 @@ impl Agent {
         }
     }
 
-    pub(crate) async fn start_service(
+    /// Serve `name` here, on writer `w`.
+    async fn start(
         &mut self,
-        fe: &Arc<crate::frontend::Frontend>,
+        w: &WriterParts,
         name: &DatasetName,
         format: crate::dataset::DatasetFormat,
     ) -> Result<(), StartError> {
         let lease = Arc::new(
-            HeldLease::acquire(self.leases.clone(), dataset_resource(name), self.desc())
-                .await
-                .map_err(StartError::Busy)?,
+            HeldLease::acquire(
+                self.leases.clone(),
+                dataset_resource(name),
+                self.desc.clone(),
+            )
+            .await
+            .map_err(StartError::Busy)?,
         );
-        let lost = hold(&lease, None);
+        let lost = hold(&lease, None, &self.wake);
         let started = async {
-            let w = self.ensure_writer().await?;
             let l = lease.clone();
             w.fs.attach_dataset_leased(
                 name,
@@ -158,20 +288,19 @@ impl Agent {
             )
             .await
             .map_err(|e| e.to_string())?;
-            fe.serve_local(name, format, w.fs.clone(), lease.epoch)
+            self.frontend
+                .serve_local(name, format, w.fs.clone(), lease.epoch)
                 .await
                 .map_err(|e| e.to_string())
         }
         .await;
         if let Err(e) = started {
-            fe.stop_local(name);
-            if let Some(w) = &self.writer {
-                w.fs.abandon_dataset(name);
-            }
+            self.frontend.stop_local(name);
+            w.fs.abandon_dataset(name);
             lease.release().await;
             return Err(StartError::Failed(e));
         }
-        self.services.running.insert(
+        self.running.insert(
             name.clone(),
             RunningService {
                 lease,
@@ -181,25 +310,23 @@ impl Agent {
         );
         Ok(())
     }
+}
 
+impl Served {
     /// Service dataset `name`'s format, if it runs here.
-    pub(crate) fn service_format(
-        &self,
-        name: &DatasetName,
-    ) -> Option<crate::dataset::DatasetFormat> {
-        self.services.running.get(name).map(|r| r.format)
+    fn format(&self, name: &DatasetName) -> Option<crate::dataset::DatasetFormat> {
+        self.running.get(name).map(|r| r.format)
     }
 
-    /// Stop serving service dataset `name`; `clean`: sync it and give its
-    /// lease back (otherwise the lease is lost: drop it, writing nothing).
-    pub(crate) async fn stop_service(&mut self, name: &DatasetName, clean: bool) {
-        let Some(r) = self.services.running.remove(name) else {
+    /// Stop serving `name`; `clean`: sync it and give its lease back
+    /// (otherwise the lease, or the writer's, is lost: drop it, writing
+    /// nothing).
+    async fn stop(&mut self, name: &DatasetName, clean: bool) {
+        let Some(r) = self.running.remove(name) else {
             return;
         };
-        if let Some(fe) = &self.services.frontend {
-            fe.stop_local(name);
-        }
-        if let Some(w) = &self.writer {
+        self.frontend.stop_local(name);
+        if let Some(w) = &self.ran_on {
             if clean {
                 if let Err(e) = w.fs.detach_dataset(name).await {
                     // Its intent log is replayed once the lease is released.

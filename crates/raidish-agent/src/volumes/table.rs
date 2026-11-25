@@ -7,6 +7,13 @@
 //! hands the slow work (closing an export, releasing a lease) back to the
 //! caller to do on values moved out of the map.
 //!
+//! The slow ones (a handoff from here, a clean stop) run in the
+//! background: their slot is a marker meanwhile (`HandingOff`,
+//! `Stopping`), held by a [`Marker`] that removes it when the task ends,
+//! however it ends. A dropped writer leaves the markers where they are:
+//! the next writer can't start a volume an old task still detaches. Each
+//! change the loop should act on at once pokes [`Volumes::wake`].
+//!
 //! Before this, the same was kept in four maps (the agent's running
 //! volumes, the listener's slots, the epochs written here, the epochs
 //! handed from), plus the export servers' tables, kept in step by
@@ -30,6 +37,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Which of this node's writers (see `NodeWriter`) something was made
 /// under: a new one each time it's opened. What a writer ran goes with it,
@@ -151,6 +159,9 @@ pub(crate) enum VolumeSlot {
     /// Being handed from this node: the handoff holds what it was
     /// (`Owned`), and puts it back if the handoff is called off.
     HandingOff { wgen: WriterGen },
+    /// Being stopped cleanly (its clients drain, the last sync): the stop
+    /// holds what it was.
+    Stopping { wgen: WriterGen },
     /// Exported here, written by a peer.
     Proxied { wgen: WriterGen, proxy: Proxied },
     /// Being taken over by this node (a handoff to it, or started here):
@@ -164,6 +175,7 @@ impl VolumeSlot {
             VolumeSlot::Running { wgen, .. }
             | VolumeSlot::Adopted { wgen, .. }
             | VolumeSlot::HandingOff { wgen, .. }
+            | VolumeSlot::Stopping { wgen, .. }
             | VolumeSlot::Proxied { wgen, .. }
             | VolumeSlot::TakingOver { wgen, .. } => *wgen,
         }
@@ -185,7 +197,7 @@ pub(crate) enum Claim {
     StaleWriter,
     /// Written here already.
     Written,
-    /// A handoff to or from here is under way.
+    /// A handoff to or from here, or a stop, is under way.
     Busy,
     /// Proxied here over another transport: taken over, it'd be served
     /// over one while recorded as the other (I-27).
@@ -197,7 +209,7 @@ impl std::fmt::Display for Claim {
         match self {
             Claim::StaleWriter => write!(f, "no writer here (or it was replaced)"),
             Claim::Written => write!(f, "already written here"),
-            Claim::Busy => write!(f, "a handoff is under way"),
+            Claim::Busy => write!(f, "a handoff or a stop is under way"),
             Claim::Transport(t) => write!(f, "exported here over {}", t),
         }
     }
@@ -215,20 +227,32 @@ struct Inner {
 }
 
 /// See the module docs.
-pub(crate) struct Volumes(Mutex<Inner>);
+pub(crate) struct Volumes {
+    inner: Mutex<Inner>,
+    wake: Arc<Notify>,
+}
 
 impl Default for Volumes {
     fn default() -> Self {
-        Volumes(Mutex::new(Inner {
-            writer: None,
-            slots: BTreeMap::new(),
-        }))
+        Volumes {
+            inner: Mutex::new(Inner {
+                writer: None,
+                slots: BTreeMap::new(),
+            }),
+            wake: Arc::new(Notify::new()),
+        }
     }
 }
 
 impl Volumes {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.0.lock().unwrap()
+        self.inner.lock().unwrap()
+    }
+
+    /// Poked when the agent loop should look again now, not a tick later:
+    /// a volume handed over, a lease lost, a background task done.
+    pub fn wake(&self) -> &Arc<Notify> {
+        &self.wake
     }
 
     // ---- the writer ----
@@ -244,8 +268,10 @@ impl Volumes {
 
     /// Writer `wgen` is gone: so is all that ran on it. From here on nothing
     /// can be made under it (a takeover finishing late is turned away, see
-    /// [`TakeoverGuard::finish`]). What it ran is handed back to stop; the
-    /// handoffs under way find their slot gone and undo themselves.
+    /// [`TakeoverGuard::finish`]). What it ran is handed back to stop. The
+    /// markers of handoffs and stops under way stay until their tasks end
+    /// (a new writer mustn't start a volume one of them still detaches);
+    /// put back, they're refused (`abort_handoff`).
     pub fn drop_writer(&self, wgen: WriterGen) -> Dropped {
         let mut inner = self.lock();
         if inner.writer.as_ref().is_some_and(|w| w.wgen == wgen) {
@@ -254,7 +280,13 @@ impl Volumes {
         let names: Vec<DatasetName> = inner
             .slots
             .iter()
-            .filter(|(_, s)| s.wgen() == wgen)
+            .filter(|(_, s)| {
+                s.wgen() == wgen
+                    && !matches!(
+                        s,
+                        VolumeSlot::HandingOff { .. } | VolumeSlot::Stopping { .. }
+                    )
+            })
             .map(|(n, _)| n.clone())
             .collect();
         let mut out = Dropped {
@@ -406,6 +438,7 @@ impl Volumes {
             VolumeSlot::Running { .. } => "running",
             VolumeSlot::Adopted { .. } => "adopted",
             VolumeSlot::HandingOff { .. } => "handing off",
+            VolumeSlot::Stopping { .. } => "stopping",
             VolumeSlot::Proxied { .. } => "proxied",
             VolumeSlot::TakingOver { .. } => "taking over",
         })
@@ -490,15 +523,47 @@ impl Volumes {
 
     /// Hand running `name` from here: what it is moves to the caller, a
     /// marker stays (peers are no longer pointed at it, nothing else claims
-    /// it). Ends in [`Volumes::finish_handoff`] or [`Volumes::abort_handoff`].
-    pub fn begin_handoff(&self, name: &DatasetName, wgen: WriterGen) -> Option<Owned> {
+    /// it). Ends with the [`Marker`] dropped (handed over, or stopped:
+    /// nothing of it is left) or [`Marker::abort_handoff`].
+    pub fn begin_handoff(
+        self: &Arc<Self>,
+        name: &DatasetName,
+        wgen: WriterGen,
+    ) -> Option<(Owned, Marker)> {
+        self.mark(name, wgen, VolumeSlot::HandingOff { wgen })
+    }
+
+    /// Stop running `name` cleanly, in the background: what it is moves to
+    /// the caller, a marker stays until the [`Marker`] is dropped.
+    pub fn begin_stop(
+        self: &Arc<Self>,
+        name: &DatasetName,
+        wgen: WriterGen,
+    ) -> Option<(Owned, Marker)> {
+        self.mark(name, wgen, VolumeSlot::Stopping { wgen })
+    }
+
+    /// Running `name` (on writer `wgen`) out to the caller, `marker` in
+    /// its place.
+    fn mark(
+        self: &Arc<Self>,
+        name: &DatasetName,
+        wgen: WriterGen,
+        marker: VolumeSlot,
+    ) -> Option<(Owned, Marker)> {
         let mut inner = self.lock();
         match inner.slots.remove(name) {
             Some(VolumeSlot::Running { wgen: g, vol }) if g == wgen => {
-                inner
-                    .slots
-                    .insert(name.clone(), VolumeSlot::HandingOff { wgen });
-                Some(vol)
+                inner.slots.insert(name.clone(), marker);
+                Some((
+                    vol,
+                    Marker {
+                        volumes: self.clone(),
+                        name: name.clone(),
+                        wgen,
+                        armed: true,
+                    },
+                ))
             }
             Some(other) => {
                 inner.slots.insert(name.clone(), other);
@@ -508,36 +573,12 @@ impl Volumes {
         }
     }
 
-    /// The handoff of `name` was called off: it runs here again, as it was
-    /// (`vol`). Err: its writer went meanwhile, so `vol` is the caller's
-    /// to stop.
-    pub fn abort_handoff(
-        &self,
-        name: &DatasetName,
-        wgen: WriterGen,
-        vol: Owned,
-    ) -> Result<(), Owned> {
-        let mut inner = self.lock();
-        let ours = matches!(inner.slots.get(name), Some(VolumeSlot::HandingOff { wgen: g, .. }) if *g == wgen);
-        if !ours || !current(&inner, wgen) {
-            if ours {
-                inner.slots.remove(name);
-            }
-            return Err(vol);
-        }
-        inner
-            .slots
-            .insert(name.clone(), VolumeSlot::Running { wgen, vol });
-        Ok(())
-    }
-
-    /// `name` was handed from here: nothing of it is left.
-    pub fn finish_handoff(&self, name: &DatasetName, wgen: WriterGen) {
-        let mut inner = self.lock();
-        if matches!(inner.slots.get(name), Some(VolumeSlot::HandingOff { wgen: g, .. }) if *g == wgen)
-        {
-            inner.slots.remove(name);
-        }
+    /// Whether `slot` is a marker made under `wgen`.
+    fn is_marker(slot: Option<&VolumeSlot>, wgen: WriterGen) -> bool {
+        matches!(
+            slot,
+            Some(VolumeSlot::HandingOff { wgen: g } | VolumeSlot::Stopping { wgen: g }) if *g == wgen
+        )
     }
 
     /// Claim `name` to take it over on writer `wgen`, to be served over
@@ -565,7 +606,11 @@ impl Volumes {
             Some(VolumeSlot::Running { .. } | VolumeSlot::Adopted { .. }) => {
                 return Err(Claim::Written);
             }
-            Some(VolumeSlot::HandingOff { .. } | VolumeSlot::TakingOver { .. }) => {
+            Some(
+                VolumeSlot::HandingOff { .. }
+                | VolumeSlot::Stopping { .. }
+                | VolumeSlot::TakingOver { .. },
+            ) => {
                 return Err(Claim::Busy);
             }
         };
@@ -584,6 +629,54 @@ impl Volumes {
 
 fn current(inner: &Inner, wgen: WriterGen) -> bool {
     inner.writer.as_ref().is_some_and(|w| w.wgen == wgen)
+}
+
+/// A background task's marker on a volume ([`Volumes::begin_handoff`],
+/// [`Volumes::begin_stop`]). Dropped (the task ended, however: done, an
+/// error, a panic, aborted), the marker goes, nothing of the volume left
+/// here, and the agent loop is poked to look again.
+pub(crate) struct Marker {
+    volumes: Arc<Volumes>,
+    name: DatasetName,
+    wgen: WriterGen,
+    armed: bool,
+}
+
+impl Marker {
+    /// The handoff was called off: the volume runs here again, as it was
+    /// (`vol`). Err: its writer went meanwhile, so `vol` is the caller's
+    /// to stop.
+    pub fn abort_handoff(mut self, vol: Owned) -> Result<(), Owned> {
+        self.armed = false;
+        let mut inner = self.volumes.lock();
+        let ours = Volumes::is_marker(inner.slots.get(&self.name), self.wgen);
+        if !ours || !current(&inner, self.wgen) {
+            if ours {
+                inner.slots.remove(&self.name);
+            }
+            return Err(vol);
+        }
+        inner.slots.insert(
+            self.name.clone(),
+            VolumeSlot::Running {
+                wgen: self.wgen,
+                vol,
+            },
+        );
+        Ok(())
+    }
+}
+
+impl Drop for Marker {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut inner = self.volumes.lock();
+            if Volumes::is_marker(inner.slots.get(&self.name), self.wgen) {
+                inner.slots.remove(&self.name);
+            }
+        }
+        self.volumes.wake.notify_one();
+    }
 }
 
 /// Whether what was taken over is the loop's to pick up (a handoff to this
@@ -640,6 +733,10 @@ impl TakeoverGuard<'_> {
             Took::Running => VolumeSlot::Running { wgen, vol },
         };
         inner.slots.insert(self.name.clone(), slot);
+        if took == Took::Adopted {
+            // For the loop to pick it up (its device) now.
+            self.volumes.wake.notify_one();
+        }
         Ok(())
     }
 

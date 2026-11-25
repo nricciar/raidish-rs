@@ -121,7 +121,7 @@ impl VmBook {
 impl Agent {
     /// The volumes here, as the VM side sees them (read only).
     pub(crate) fn volumes_here(&self) -> &dyn VolumeView {
-        &self.shared.volumes
+        &*self.shared.volumes
     }
 
     /// What the VMs ask of `volumes`, as far as their definitions and the
@@ -184,7 +184,7 @@ impl Agent {
         let Some(vm) = &self.vm else {
             return;
         };
-        if let Some(w) = &self.writer
+        if let Some(w) = self.sup.writer()
             && let Some(sb) = w.fs.superblock().await
         {
             vm.set_pool(sb.pool_guid);
@@ -609,13 +609,21 @@ impl Agent {
             committer: self.committer.clone(),
         };
         println!("agent: moving VM '{}' to {} (live, if it can be)", name, to);
+        // Done, it pokes the loop: what follows (the volumes handed over,
+        // or the VM moved cold) starts at once.
+        let wake = self.wake().clone();
+        let task = tokio::spawn(async move {
+            let r = job.run().await;
+            wake.notify_one();
+            r
+        });
         self.vms.states.insert(
             name.clone(),
             VmState::Migrating(migrate::Migration {
                 to,
                 volumes: spec.volumes().to_vec(),
                 started: std::time::Instant::now(),
-                task: tokio::spawn(job.run()),
+                task,
             }),
         );
         true

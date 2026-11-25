@@ -4,7 +4,8 @@
 //!
 //! The agent loop (see `crate::Agent::tick`) decides what should happen:
 //! which volumes get a proxied export here, and when to hand one this node
-//! writes to another node. The receiving end of a handoff runs outside that
+//! writes to another node. The sending end runs in the background
+//! ([`HandOff`], see `background`). The receiving end runs outside that
 //! loop, in the peer I/O listener ([`Shared::handoff`]), so what it needs
 //! of this node lives in [`Shared`], and what it takes over is left in
 //! [`Volumes`] for the loop to pick up.
@@ -26,8 +27,8 @@
 //! of step 3; A never stops serving before B is paused and ready.
 
 use super::ATTACH_RETRY;
+use super::background::{Ctx, lost_on_the_way};
 use super::{Export, Owned, Took, Volumes, WriterParts};
-use crate::Agent;
 use crate::api_types::Attach;
 use crate::cluster::lease::{HeldLease, LeaseClient, owner_id};
 use crate::committer::dataset_resource;
@@ -37,7 +38,7 @@ use crate::peer_io::{PeerExport, PeerLines, PeerOut, PeerVolumes, read_line};
 use crate::types::Holder;
 use crate::types::{DatasetName, Epoch};
 use crate::volume_io::LocalIo;
-use crate::{Lost, hold};
+use crate::{Lost, hold, note, or_lost};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,7 +144,7 @@ pub(crate) struct Shared {
     /// What this node's leases say of it.
     pub desc: Mutex<crate::types::Holder>,
     /// This node's writer, and what it has of each volume.
-    pub volumes: Volumes,
+    pub volumes: Arc<Volumes>,
 }
 
 impl Shared {
@@ -151,16 +152,18 @@ impl Shared {
         Shared {
             leases,
             desc: Mutex::new(Default::default()),
-            volumes: Volumes::default(),
+            volumes: Arc::new(Volumes::default()),
         }
     }
 }
 
 /// Hold volume `name`'s lease as `owner` at `epoch` (granted no earlier
 /// than `asked`) and attach its dataset on writer `w`: the first half of
-/// taking it over (the export is the caller's).
+/// taking it over (the export is the caller's). Lost later, `wake` is
+/// poked.
 pub(crate) async fn take_lease(
     leases: &LeaseClient,
+    wake: &Arc<tokio::sync::Notify>,
     w: &WriterParts,
     name: &DatasetName,
     owner: &str,
@@ -174,7 +177,7 @@ pub(crate) async fn take_lease(
         epoch,
         asked,
     ));
-    let lost = hold(&lease, None);
+    let lost = hold(&lease, None, wake);
     let l = lease.clone();
     if let Err(e) =
         w.fs.attach_dataset_leased(
@@ -262,15 +265,24 @@ impl PeerVolumes for Shared {
             );
             return;
         };
-        let (lease, lost) =
-            match take_lease(&self.leases, &w, volume, &owner, new_epoch, asked).await {
-                Ok(l) => l,
-                Err(e) => {
-                    drop(paused);
-                    guard.abort().await;
-                    refuse!("{}", e)
-                }
-            };
+        let (lease, lost) = match take_lease(
+            &self.leases,
+            self.volumes.wake(),
+            &w,
+            volume,
+            &owner,
+            new_epoch,
+            asked,
+        )
+        .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                drop(paused);
+                guard.abort().await;
+                refuse!("{}", e)
+            }
+        };
         // Serve it from here: the paused proxied export switched to local
         // I/O (its clients keep their connections), or a new one.
         let had_proxy = guard.prior.is_some();
@@ -334,47 +346,68 @@ impl PeerVolumes for Shared {
     }
 }
 
-impl Agent {
-    /// Hand volume `name`, which this node writes, to node `to` (see
-    /// `handoff`). Ok(true): it's not run here any more (handed over, or
-    /// stopped cleanly when the handoff failed after this node let go);
-    /// Ok(false): no peer I/O, stop it instead; Err: still run here.
-    pub(crate) async fn hand_off(&mut self, name: &DatasetName, to: &str) -> Result<bool, String> {
+/// Handing volume `name`, which this node writes on `w`, to node `to`
+/// (see the module docs), in the background.
+pub(crate) struct HandOff {
+    pub cx: Ctx,
+    pub w: WriterParts,
+    /// The writer's lease: lost, the handoff ends at once.
+    pub writer_lost: Lost,
+    pub connector: tokio_rustls::TlsConnector,
+    /// `to`'s peer I/O.
+    pub addr: String,
+    pub port: u16,
+    pub name: DatasetName,
+    pub to: String,
+}
+
+impl HandOff {
+    /// Ok: it's not run here any more (handed over; or stopped, cleanly
+    /// when the handoff failed after this node let go, or not, its lease
+    /// or the writer's lost meanwhile). Err: still run here, or stopped
+    /// after a failed last sync (it says which).
+    pub(crate) async fn run(self) -> Result<(), String> {
         use tokio::io::BufReader;
-        let Some(p) = &self.peer else {
-            return Ok(false);
-        };
-        let (connector, port) = (p.connector.clone(), p.port);
-        let addr = self.peer_addr(to)?;
-        let (epoch, transport) = self
-            .shared
-            .volumes
-            .owned(name, |o| (o.lease.epoch, o.export.transport))
+        let HandOff {
+            cx,
+            w,
+            writer_lost,
+            connector,
+            addr,
+            port,
+            name,
+            to,
+        } = self;
+        let volumes = &cx.shared.volumes;
+        let (epoch, transport, lost) = volumes
+            .owned(&name, |o| {
+                (o.lease.epoch, o.export.transport, o.lost.clone())
+            })
             .ok_or("not running here")?;
-        let parts = self
-            .writer
-            .as_ref()
-            .map(|w| w.parts.clone())
-            .ok_or("no writer here")?;
-        let tls = crate::peer_io::dial(&connector, &addr, port).await?;
-        let (rd, mut wr) = tokio::io::split(tls);
-        let mut rd = BufReader::new(rd);
-        wr.write_all(ask(name, epoch, transport).as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        wr.flush().await.map_err(|e| e.to_string())?;
-        let answer = tokio::time::timeout(HANDOFF_TIMEOUT, crate::peer_io::read_line(&mut rd))
-            .await
-            .map_err(|_| format!("{} didn't answer", to))?
-            .map_err(|e| format!("{}: {}", to, e))?;
-        let (owner, desc) = match Msg::parse(&answer) {
-            Ok(Msg::Ready { owner, holder }) => (owner, holder),
-            Ok(_) => return Err(format!("{} said: {}", to, answer)),
-            Err(e) => return Err(format!("{}: {}", to, e)),
+        let ready = async {
+            let tls = crate::peer_io::dial(&connector, &addr, port).await?;
+            let (rd, mut wr) = tokio::io::split(tls);
+            let mut rd = BufReader::new(rd);
+            wr.write_all(ask(&name, epoch, transport).as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            wr.flush().await.map_err(|e| e.to_string())?;
+            let answer = tokio::time::timeout(HANDOFF_TIMEOUT, read_line(&mut rd))
+                .await
+                .map_err(|_| format!("{} didn't answer", to))?
+                .map_err(|e| format!("{}: {}", to, e))?;
+            match Msg::parse(&answer) {
+                Ok(Msg::Ready { owner, holder }) => Ok((rd, wr, owner, holder)),
+                Ok(_) => Err(format!("{} said: {}", to, answer)),
+                Err(e) => Err(format!("{}: {}", to, e)),
+            }
         };
+        let (mut rd, mut wr, owner, desc) = or_lost(ready, &lost, &writer_lost)
+            .await
+            .ok_or("its lease, or the writer's, was lost")??;
         // From here it's the handoff's: peers aren't pointed at it any more,
         // nothing else claims it, and it comes back whole if called off.
-        let Some(vol) = self.shared.volumes.begin_handoff(name, parts.wgen) else {
+        let Some((vol, marker)) = volumes.begin_handoff(&name, w.wgen) else {
             return Err("not running here any more".into());
         };
         println!("agent: handing volume '{}' to {}", name, to);
@@ -391,24 +424,41 @@ impl Agent {
             attach_tried,
         } = vol;
         if attach.device().is_some()
-            && let Err(e) = self.attacher.detach(name, transport).await
+            && let Err(e) = cx.attacher.detach(&name, transport).await
         {
             eprintln!("agent: detaching '{}': {}", name, e);
         }
-        if let Err(e) = export.close().await {
-            eprintln!("agent: unexporting '{}': {}", name, e);
+        // Lost on the way: let go without writing (cut short, the export
+        // drains in the background), and the peer stops waiting.
+        macro_rules! gone {
+            () => {{
+                let _ = Msg::Abort.send(&mut wr).await;
+                w.fs.abandon_dataset(&name);
+                lost_on_the_way(&cx, &name, &lost);
+                drop(marker);
+                return Ok(());
+            }};
         }
-        if let Err(e) = parts.fs.detach_dataset(name).await {
+        match or_lost(export.close(), &lost, &writer_lost).await {
+            Some(Err(e)) => eprintln!("agent: unexporting '{}': {}", name, e),
+            Some(Ok(())) => {}
+            None => gone!(),
+        }
+        let synced = match or_lost(w.fs.detach_dataset(&name), &lost, &writer_lost).await {
+            Some(r) => r,
+            None => gone!(),
+        };
+        if let Err(e) = synced {
             // Not all of it is committed: keep it, call the handoff off.
             let _ = Msg::Abort.send(&mut wr).await;
-            let export = match parts.add_export(name, transport).await {
+            let export = match w.add_export(&name, transport).await {
                 Ok(x) => x,
                 Err(e2) => {
                     // Not served, it can't run here: let go, and whoever's
                     // next replays its intent log.
-                    parts.fs.abandon_dataset(name);
+                    w.fs.abandon_dataset(&name);
                     lease.release().await;
-                    self.shared.volumes.finish_handoff(name, parts.wgen);
+                    drop(marker);
                     return Err(format!(
                         "last sync: {}; exporting it again: {}; stopped here",
                         e, e2
@@ -435,12 +485,13 @@ impl Agent {
                 attach,
                 attach_tried,
             };
-            if let Err(vol) = self.shared.volumes.abort_handoff(name, parts.wgen, vol) {
-                self.wind_down(name, vol, true).await;
+            if let Err(vol) = marker.abort_handoff(vol) {
+                super::wind_down(&*cx.attacher, Some(&w), &name, vol, true).await;
             }
             return Err(format!("last sync: {}", e));
         }
-        self.shared.volumes.finish_handoff(name, parts.wgen);
+        // Nothing of it is left here.
+        drop(marker);
 
         if started.elapsed() > SENDER_BUDGET {
             // The receiver stops waiting not long after: transferred now,
@@ -448,19 +499,20 @@ impl Agent {
             // go of it instead: whoever's next starts it (I-27).
             let _ = Msg::Abort.send(&mut wr).await;
             lease.release().await;
-            self.note(
+            note(
+                &cx.events,
                 Level::Warn,
                 EventKind::VolumeHandoffFailed,
-                Subject::volume(name),
+                Subject::volume(&name),
                 format!(
                     "Volume '{}' took too long to hand from {} to {} ({:?}); stopped here instead",
                     name,
-                    self.node,
+                    cx.node,
                     to,
                     started.elapsed()
                 ),
             );
-            return Ok(true);
+            return Ok(());
         }
         let mut transferred = lease.transfer(&owner, desc.clone()).await;
         if let Err(crate::cluster::lease::TransferError::NoAnswer(_)) = &transferred {
@@ -474,30 +526,36 @@ impl Agent {
                 // Synced and let go of: whoever's next starts it.
                 let _ = Msg::Abort.send(&mut wr).await;
                 lease.release().await;
-                self.note(
+                note(
+                    &cx.events,
                     Level::Warn,
                     EventKind::VolumeHandoffFailed,
-                    Subject::volume(name),
+                    Subject::volume(&name),
                     format!(
                         "Volume '{}' couldn't be handed from {} to {} ({}); stopped here instead",
-                        name, self.node, to, e
+                        name, cx.node, to, e
                     ),
                 );
-                return Ok(true);
+                return Ok(());
             }
         };
         let _ = Msg::Transferred(new_epoch).send(&mut wr).await;
-        let done = tokio::time::timeout(HANDOFF_TIMEOUT, crate::peer_io::read_line(&mut rd)).await;
+        // The lease is theirs now: only a dead writer cuts the wait short.
+        let done = tokio::select! {
+            d = tokio::time::timeout(HANDOFF_TIMEOUT, read_line(&mut rd)) => Some(d),
+            _ = writer_lost.wait() => None,
+        };
         match done {
-            Ok(Ok(l)) if Msg::parse(&l) == Ok(Msg::Done) => {
-                self.note(
+            Some(Ok(Ok(l))) if Msg::parse(&l) == Ok(Msg::Done) => {
+                note(
+                    &cx.events,
                     Level::Info,
                     EventKind::VolumeHandedOff,
-                    Subject::volume(name),
+                    Subject::volume(&name),
                     format!(
                         "Volume '{}' was handed from {} to {} in {:.1}s",
                         name,
-                        self.node,
+                        cx.node,
                         to,
                         started.elapsed().as_secs_f64()
                     ),
@@ -512,6 +570,6 @@ impl Agent {
                 );
             }
         }
-        Ok(true)
+        Ok(())
     }
 }
