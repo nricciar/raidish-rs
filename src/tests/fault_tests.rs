@@ -10,6 +10,7 @@ use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset
 use crate::disk::{BLOCK_SIZE, Block, BlockDevice, Disk};
 use crate::disks::DISK_LABEL_BLOCKS;
 use crate::fs::FileSystem;
+use crate::test_util::dsn;
 use crate::test_util::{FaultDisk, FaultError, FaultPool, FaultStats, TestPool};
 use crate::types::{Epoch, Holding, LeaseRef};
 use crate::vdev::Pool;
@@ -228,10 +229,12 @@ async fn snapshot_and_restore_roll_the_image_back() {
 async fn a_fault_pool_reopens_with_its_faults_in_place() {
     for fp in [FaultPool::mirror(2).await, FaultPool::raidz(1, 3).await] {
         let fs = fp.format().await;
-        fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+        fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
             .await
             .unwrap();
-        fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+        fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+            .await
+            .unwrap();
         fs.sync().await.unwrap();
         drop(fs);
 
@@ -241,7 +244,7 @@ async fn a_fault_pool_reopens_with_its_faults_in_place() {
         let fs = fp.load().await;
         assert!(!fs.dev.disks().is_online(0));
         let mut buf = vec![0u8; 100_000];
-        fs.block_read("a", 0, &mut buf).await.unwrap();
+        fs.block_read(&dsn("a"), 0, &mut buf).await.unwrap();
         assert_eq!(buf, pattern(100_000, 1));
         assert!(fp.disk(1).stats().reads > 0);
         drop(fs);
@@ -361,7 +364,7 @@ async fn d1_raidz_flush_needs_data_many_durable_shards() {
 async fn d1_acked_sync_survives_a_power_cut() {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     fs.sync().await.unwrap();
@@ -370,7 +373,7 @@ async fn d1_acked_sync_survives_a_power_cut() {
     fp.disk(0).fail_writes(Some(FaultError::Io));
     fp.disk(1).fail_flushes(Some(FaultError::Io));
     let data = pattern(200_000, 9);
-    fs.block_write("a", 0, &data).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &data).await.unwrap();
     let acked = fs.sync().await.is_ok();
     drop(fs);
     fp.disk(1).power_cut();
@@ -380,7 +383,7 @@ async fn d1_acked_sync_survives_a_power_cut() {
     if acked {
         let fs = fp.load().await;
         let mut buf = vec![0u8; data.len()];
-        let r = fs.block_read("a", 0, &mut buf).await;
+        let r = fs.block_read(&dsn("a"), 0, &mut buf).await;
         assert!(
             r.is_ok() && buf == data,
             "sync acked data no disk persisted ({:?})",
@@ -472,7 +475,9 @@ async fn r2a_a_fenced_repair_fails_the_scrub() {
 async fn d2_check(fs: &FileSystem<Pool>, upto: u8) {
     for i in 0..upto {
         let mut buf = vec![0u8; MB];
-        let r = fs.block_read("a", i as u64 * MB as u64, &mut buf).await;
+        let r = fs
+            .block_read(&dsn("a"), i as u64 * MB as u64, &mut buf)
+            .await;
         assert!(
             r.is_ok() && buf == pattern(MB, i + 1),
             "MiB {} after the stale disk returned ({:?})",
@@ -495,10 +500,10 @@ async fn d2_check(fs: &FileSystem<Pool>, upto: u8) {
 async fn d2_a_stale_returning_mirror_disk_is_not_read_for_metadata() {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 16 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 16 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
     drop(fs);
 
@@ -506,7 +511,7 @@ async fn d2_a_stale_returning_mirror_disk_is_not_read_for_metadata() {
     fp.disk(1).set_offline(true);
     let fs = fp.load().await;
     for i in 1..6u8 {
-        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+        fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
             .await
             .unwrap();
         fs.sync().await.unwrap();
@@ -529,7 +534,7 @@ async fn d2_a_stale_returning_mirror_disk_is_not_read_for_metadata() {
 
     // More commits on top: a stale space map would hand out live blocks.
     for i in 6..12u8 {
-        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+        fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
             .await
             .unwrap();
         fs.sync().await.unwrap();
@@ -557,11 +562,11 @@ async fn d2_stale_slots_that_parse_dont_win() {
     for stale in 0..2usize {
         let fp = FaultPool::mirror(2).await;
         let fs = fp.format().await;
-        fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+        fs.create_block(&dsn("a"), 32 * MB as u64, fs.default_volblocksize())
             .await
             .unwrap();
         for i in 0..4u8 {
-            fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+            fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
                 .await
                 .unwrap();
             fs.sync().await.unwrap();
@@ -572,7 +577,7 @@ async fn d2_stale_slots_that_parse_dont_win() {
         fp.disk(stale).set_offline(true);
         let fs = fp.load().await;
         for i in 4..10u8 {
-            fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+            fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
                 .await
                 .unwrap();
             fs.sync().await.unwrap();
@@ -583,7 +588,7 @@ async fn d2_stale_slots_that_parse_dont_win() {
 
         let fs = fp.load().await;
         for i in 10..20u8 {
-            fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+            fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
                 .await
                 .unwrap();
             fs.sync().await.unwrap();
@@ -602,11 +607,11 @@ async fn d2_stale_slots_that_parse_dont_win() {
 async fn d3_a_stale_majority_doesnt_win_label_repair() {
     let fp = FaultPool::mirror(3).await;
     let fs = fp.format().await;
-    fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 32 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     for i in 0..3u8 {
-        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+        fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
             .await
             .unwrap();
         fs.sync().await.unwrap();
@@ -619,7 +624,7 @@ async fn d3_a_stale_majority_doesnt_win_label_repair() {
     }
     let fs = fp.load().await;
     for i in 3..8u8 {
-        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+        fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
             .await
             .unwrap();
         fs.sync().await.unwrap();
@@ -658,14 +663,14 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
         (FaultPool::raidz(1, 3).await, vec![0usize]),
     ] {
         let fs = fp.format().await;
-        fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+        fs.create_block(&dsn("a"), 32 * MB as u64, fs.default_volblocksize())
             .await
             .unwrap();
-        fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+        fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
         fs.sync().await.unwrap();
         fp.disk(1).snapshot();
         for i in 1..5u8 {
-            fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+            fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
                 .await
                 .unwrap();
             fs.sync().await.unwrap();
@@ -711,17 +716,17 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
 async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, FileSystem<Pool>) {
     let fp = FaultPool::raidz(2, 4).await;
     let fs = fp.format().await;
-    fs.create_block("a", 32 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 32 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
     let since = fs.uberblock().await.unwrap().txg.next();
     for &d in stale {
         fp.disk(d).snapshot();
     }
     for i in 1..5u8 {
-        fs.block_write("a", i as u64 * MB as u64, &pattern(MB, i + 1))
+        fs.block_write(&dsn("a"), i as u64 * MB as u64, &pattern(MB, i + 1))
             .await
             .unwrap();
         fs.sync().await.unwrap();
@@ -822,7 +827,7 @@ struct ZilSetup {
 async fn zil_setup() -> ZilSetup {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 8 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 8 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     drop(fs);
@@ -853,7 +858,7 @@ impl ZilWriter {
         });
         let fs = FileSystem::load_writer(s.fp.dev(), sink).await.unwrap();
         let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-        fs.attach_dataset_leased("a", Holding::new("o1", ds_epoch), None, None)
+        fs.attach_dataset_leased(&dsn("a"), Holding::new("o1", ds_epoch), None, None)
             .await
             .unwrap();
         ZilWriter {
@@ -899,9 +904,9 @@ async fn committer_claims_are_exact_and_log_only_resends_are_acked() {
     let lent = c.lend(&w1, 64).await.unwrap();
     let free = *lent.free.iter().max_by_key(|e| e.len).unwrap();
     assert!(free.len >= 16, "{:?}", lent.free);
-    let root = c.fs().open_dataset("a").await.unwrap().obj.root_ptr();
+    let root = c.fs().open_dataset(&dsn("a")).await.unwrap().obj.root_ptr();
     let commit = |allocs: Vec<Extent>, log: Option<DatasetLog>| DatasetCommit {
-        dataset: "a".into(),
+        dataset: dsn("a"),
         writer: w1.clone(),
         ds: ds.clone(),
         base_root: root.clone(),
@@ -941,7 +946,7 @@ async fn committer_claims_are_exact_and_log_only_resends_are_acked() {
     c.commit(&log_only).await.unwrap();
     // Its answer lost, the writer resends it: already applied.
     c.commit(&log_only).await.unwrap();
-    let vol = c.fs().open_dataset("a").await.unwrap();
+    let vol = c.fs().open_dataset(&dsn("a")).await.unwrap();
     assert_eq!(*vol.log.lock().unwrap(), Some(log));
 }
 
@@ -956,18 +961,22 @@ async fn s4a_a_commit_fallback_writes_no_unflushed_log_records() {
     let s = zil_setup().await;
     s.committer
         .fs()
-        .create_block("b", 8 * MB as u64, s.committer.fs().default_volblocksize())
+        .create_block(
+            &dsn("b"),
+            8 * MB as u64,
+            s.committer.fs().default_volblocksize(),
+        )
         .await
         .unwrap();
     let w = ZilWriter::start(&s).await;
     let ds_b = lease(&s.auth, &dataset_resource("b"), "o1").await;
-    w.fs.attach_dataset_leased("b", Holding::new("o1", ds_b), None, None)
+    w.fs.attach_dataset_leased(&dsn("b"), Holding::new("o1", ds_b), None, None)
         .await
         .unwrap();
-    w.fs.block_write("a", 0, &pattern(100_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
-    w.fs.flush_for("a").await.unwrap(); // a's log is registered
+    w.fs.flush_for(&dsn("a")).await.unwrap(); // a's log is registered
     let c = w.cursor();
 
     // Watch a's next log slot (writes there are counted as dropped).
@@ -977,9 +986,13 @@ async fn s4a_a_commit_fallback_writes_no_unflushed_log_records() {
             .target_blocks(Some(start..start + c.region.len - c.used));
         s.fp.disk(d).drop_writes(true);
     }
-    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
-    w.fs.block_write("b", 0, &pattern(50_000, 3)).await.unwrap();
-    w.fs.flush_for("b").await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
+    w.fs.block_write(&dsn("b"), 0, &pattern(50_000, 3))
+        .await
+        .unwrap();
+    w.fs.flush_for(&dsn("b")).await.unwrap();
     for d in 0..2 {
         assert_eq!(
             s.fp.disk(d).stats().dropped_writes,
@@ -989,7 +1002,7 @@ async fn s4a_a_commit_fallback_writes_no_unflushed_log_records() {
         );
     }
     s.fp.heal();
-    w.fs.flush_for("a").await.unwrap();
+    w.fs.flush_for(&dsn("a")).await.unwrap();
     let mut want = pattern(100_000, 1);
     want[..50_000].copy_from_slice(&pattern(50_000, 2));
     assert_eq!(read_a(&w.fs, want.len()).await, want);
@@ -1001,7 +1014,7 @@ async fn txg(s: &ZilSetup) -> u64 {
 
 async fn read_a(fs: &FileSystem<Pool>, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
-    let n = fs.block_read("a", 0, &mut buf).await.unwrap();
+    let n = fs.block_read(&dsn("a"), 0, &mut buf).await.unwrap();
     buf.truncate(n);
     buf
 }
@@ -1012,7 +1025,7 @@ async fn read_a(fs: &FileSystem<Pool>, len: usize) -> Vec<u8> {
 async fn zil_a_record_one_member_lost_is_replayed_from_the_other() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap(); // commits: registers the log
@@ -1024,7 +1037,9 @@ async fn zil_a_record_one_member_lost_is_replayed_from_the_other() {
         .target_blocks(Some(start..start + c.region.len - c.used));
     s.fp.disk(0).drop_writes(true);
     let before = txg(&s).await;
-    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     assert_eq!(txg(&s).await, before, "acked from the log");
     assert!(s.fp.disk(0).stats().dropped_writes > 0);
@@ -1057,16 +1072,20 @@ async fn zil_a_record_one_member_lost_is_replayed_from_the_other() {
 async fn zil_an_in_flight_log_write_landing_after_replay_clobbers_nothing() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap(); // commits: registers the log
-    w.fs.block_write("a", 0, &pattern(10_000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(10_000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap(); // logged
 
     // The next record's write to disk 0 hangs; the writer crashes waiting.
     s.fp.disk(0).hold_writes(true);
-    w.fs.block_write("a", 0, &pattern(10_000, 3)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(10_000, 3))
+        .await
+        .unwrap();
     let w = Arc::new(w);
     let flusher = {
         let w = w.clone();
@@ -1087,7 +1106,7 @@ async fn zil_an_in_flight_log_write_landing_after_replay_clobbers_nothing() {
     for i in 0..8u8 {
         let at = (i as usize) * 400_000;
         let data = pattern(400_000, 10 + i);
-        w.fs.block_write("a", at as u64, &data).await.unwrap();
+        w.fs.block_write(&dsn("a"), at as u64, &data).await.unwrap();
         w.fs.sync().await.unwrap();
         want[at..at + data.len()].copy_from_slice(&data);
     }
@@ -1108,11 +1127,13 @@ async fn zil_an_in_flight_log_write_landing_after_replay_clobbers_nothing() {
 async fn raidz_survives_one_member_failing_every_write() {
     let fp = TestPool::raidz(1, 3).await.faulty();
     let fs = fp.format().await;
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     fp.disk(2).fail_writes(Some(FaultError::Io));
-    fs.block_write("a", 0, &pattern(200_000, 4)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(200_000, 4))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     assert!(fs.degraded_disks()[2].is_some());
     drop(fs);
@@ -1510,7 +1531,7 @@ async fn stale_setup() -> (
 ) {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 8 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 8 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     drop(fs);
@@ -1531,9 +1552,9 @@ async fn commit_allocs(
     allocs: Vec<crate::types::Extent>,
     log: Option<crate::inode::DatasetLog>,
 ) -> Result<(), crate::writer::CommitError> {
-    let root = c.fs().open_dataset("a").await.unwrap().obj.root_ptr();
+    let root = c.fs().open_dataset(&dsn("a")).await.unwrap().obj.root_ptr();
     let commit = crate::writer::DatasetCommit {
-        dataset: "a".into(),
+        dataset: dsn("a"),
         writer: w.clone(),
         ds: ds.clone(),
         base_root: root.clone(),
@@ -1824,10 +1845,10 @@ async fn i14a_a_late_claim_doesnt_replay_a_newer_holders_log() {
         l.epoch = held.epoch;
         l.released = false;
     });
-    let r = c.claim_dataset("a", &old).await;
+    let r = c.claim_dataset(&dsn("a"), &old).await;
     view.catch_up();
     assert!(r.is_err(), "the late claim was taken");
-    let vol = c.fs().open_dataset("a").await.unwrap();
+    let vol = c.fs().open_dataset(&dsn("a")).await.unwrap();
     assert_eq!(
         *vol.log.lock().unwrap(),
         Some(log),
@@ -1847,20 +1868,20 @@ async fn i14b_a_delete_on_a_lagging_view_is_refused() {
     view.lag(move |s| {
         s.leases.remove(&res);
     });
-    let r = c.delete_volume("a").await;
+    let r = c.delete_volume(&dsn("a")).await;
     assert!(
         matches!(&r, Err(crate::fs::FileSystemError::InvalidArgument(m)) if m.contains("running")),
         "{r:?}"
     );
-    let r = c.rollback("a").await;
+    let r = c.rollback(&dsn("a")).await;
     assert!(r.is_err(), "rollback: {r:?}");
     view.catch_up();
-    assert!(c.fs().open_dataset("a").await.is_ok(), "still there");
+    assert!(c.fs().open_dataset(&dsn("a")).await.is_ok(), "still there");
     // Once it isn't running, it goes, and the lease is let go after.
     let held = inner.state().leases[&dataset_resource("a")].clone();
     release(&inner, &dataset_resource("a"), "agent", held.epoch).await;
-    c.delete_volume("a").await.unwrap();
-    assert!(c.fs().open_dataset("a").await.is_err());
+    c.delete_volume(&dsn("a")).await.unwrap();
+    assert!(c.fs().open_dataset(&dsn("a")).await.is_err());
     assert!(inner.state().leases[&dataset_resource("a")].released);
 }
 
@@ -1878,14 +1899,14 @@ async fn s6a_a_lease_lost_while_waiting_for_the_tx_refuses_the_commit() {
     let ds = Holding::new("o1", ds_epoch);
     let lent = c.lend(&w1, 64).await.unwrap();
     let free = *lent.free.iter().max_by_key(|e| e.len).unwrap();
-    let root = c.fs().open_dataset("a").await.unwrap().obj.root_ptr();
+    let root = c.fs().open_dataset(&dsn("a")).await.unwrap().obj.root_ptr();
     let region = LogRegion {
         start: free.start,
         len: 8,
         guid: 9,
     };
     let commit = DatasetCommit {
-        dataset: "a".into(),
+        dataset: dsn("a"),
         writer: w1.clone(),
         ds: ds.clone(),
         base_root: root.clone(),
@@ -1916,7 +1937,13 @@ async fn s6a_a_lease_lost_while_waiting_for_the_tx_refuses_the_commit() {
     let r = pending.await.unwrap();
     assert!(matches!(r, Err(CommitError::Refused { .. })), "{:?}", r);
     assert_eq!(
-        *c.fs().open_dataset("a").await.unwrap().log.lock().unwrap(),
+        *c.fs()
+            .open_dataset(&dsn("a"))
+            .await
+            .unwrap()
+            .log
+            .lock()
+            .unwrap(),
         None
     );
 }
@@ -1998,10 +2025,12 @@ async fn s5_pool() -> (FaultPool, FileSystem<Pool>) {
         .await
         .unwrap();
     fs.mkdir("/d/e".as_ref()).await.unwrap();
-    fs.create_block("vol", 4 * MB as u64, crate::test_util::VOLBLOCK_ALIGN)
+    fs.create_block(&dsn("vol"), 4 * MB as u64, crate::test_util::VOLBLOCK_ALIGN)
         .await
         .unwrap();
-    fs.block_write("vol", 0, &pattern(MB, 3)).await.unwrap();
+    fs.block_write(&dsn("vol"), 0, &pattern(MB, 3))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     (fp, fs)
 }
@@ -2096,7 +2125,7 @@ async fn s5b_a_failed_dataset_delete_leaves_it() {
     s5_every_failure_point(
         &fp,
         &fs,
-        s5_op!(|fs, tx| fs.delete_dataset_locked(tx, "vol").await),
+        s5_op!(|fs, tx| fs.delete_dataset_locked(tx, &dsn("vol")).await),
     )
     .await;
 }
@@ -2200,13 +2229,13 @@ async fn s5a_a_cancelled_rollback_is_finished_by_the_drop() {
 async fn d4_a_miss_reported_during_the_scan_keeps_the_disk_degraded() {
     let fp = FaultPool::mirror(2).await;
     let fs = Arc::new(fp.format().await);
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     fs.sync().await.unwrap();
     // Disk 1 misses a commit's writes: degraded, with records to rebuild.
     fp.disk(1).fail_writes(Some(FaultError::Io));
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
     fp.heal();
     let since = fs.degraded_disks()[1].expect("disk 1 degraded");
@@ -2257,7 +2286,7 @@ fn raw_block(fp: &FaultPool, disk: usize, b: u64) -> Vec<u8> {
 async fn d4_a_scrub_rewrites_a_live_log_record_a_disk_lost() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap(); // commits: registers the log
@@ -2268,7 +2297,9 @@ async fn d4_a_scrub_rewrites_a_live_log_record_a_disk_lost() {
         .target_blocks(Some(start..start + c.region.len - c.used));
     s.fp.disk(0).drop_writes(true);
     let before = txg(&s).await;
-    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     assert_eq!(txg(&s).await, before, "acked from the log");
     s.fp.heal();
@@ -2295,7 +2326,7 @@ async fn d4_a_scrub_rewrites_a_live_log_record_a_disk_lost() {
 async fn d4_misses_a_refused_commit_carried_are_reported_again() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    w.fs.block_write("a", 0, &pattern(100_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w.fs.sync().await.unwrap();
@@ -2304,7 +2335,7 @@ async fn d4_misses_a_refused_commit_carried_are_reported_again() {
     release(&s.auth, &dataset_resource("a"), "o1", w.ds_epoch).await;
     lease(&s.auth, &dataset_resource("a"), "o2").await;
     s.fp.disk(1).fail_writes(Some(FaultError::Io));
-    w.fs.block_write("a", 0, &pattern(100_000, 2))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 2))
         .await
         .unwrap();
     let r = w.fs.sync().await;
@@ -2393,12 +2424,12 @@ async fn a_cancelled_resilver_releases_its_free_hold() {
     use std::sync::atomic::Ordering;
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     fs.sync().await.unwrap();
     fp.disk(1).fail_writes(Some(FaultError::Io));
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
     fp.heal();
 
@@ -2437,12 +2468,12 @@ async fn a_stale_members_leftovers_in_a_blank_label_slot_are_zeroed() {
         (FaultPool::raidz(1, 3).await, 2),
     ] {
         let fs = fp.format().await;
-        fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+        fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
             .await
             .unwrap();
         fs.sync().await.unwrap();
         fp.disk(1).fail_writes(Some(FaultError::Io));
-        fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+        fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
         fs.sync().await.unwrap();
         fp.heal();
         assert!(fs.degraded_disks()[1].is_some());
@@ -2512,10 +2543,10 @@ async fn d6c_a_bad_superblock_copy_on_one_mirror_member_doesnt_fail_the_import()
 async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
 
     // Writes to the uberblock ring fail, on both members.
@@ -2525,12 +2556,12 @@ async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
         fp.disk(d).target_blocks(Some(ring.clone()));
         fp.disk(d).fail_writes(Some(FaultError::Io));
     }
-    fs.block_write("a", 0, &pattern(MB, 2)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 2)).await.unwrap();
     assert!(fs.sync().await.is_err());
     assert!(fs.uberblock_in_doubt());
     fp.heal();
     // Healed, it still refuses: what's on disk is unknown.
-    fs.block_write("a", MB as u64, &pattern(MB, 3))
+    fs.block_write(&dsn("a"), MB as u64, &pattern(MB, 3))
         .await
         .unwrap();
     assert!(
@@ -2546,7 +2577,7 @@ async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
     assert!(!fs.uberblock_in_doubt());
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
-    fs.block_write("a", 0, &pattern(MB, 4)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 4)).await.unwrap();
     fs.sync().await.unwrap();
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
@@ -2559,14 +2590,14 @@ async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
 async fn i2_a_commit_failing_before_its_uberblock_can_be_retried() {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
-    fs.create_block("a", 4 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 4 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     fs.sync().await.unwrap();
     for d in 0..2 {
         fp.disk(d).fail_flushes(Some(FaultError::Io));
     }
-    fs.block_write("a", 0, &pattern(MB, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     assert!(fs.sync().await.is_err());
     assert!(!fs.uberblock_in_doubt());
     fp.heal();
@@ -2619,7 +2650,7 @@ async fn i3_a_writers_failed_write_keeps_its_space() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
     // Lend the writer some space first.
-    w.fs.block_write("a", 0, &pattern(100_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
@@ -2644,11 +2675,13 @@ async fn i3_a_writers_failed_write_keeps_its_space() {
 async fn i4_an_unreadable_log_record_is_an_error_not_the_end() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap(); // commits: registers the log
-    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap(); // logged
     let region = w.cursor().region;
     let fs = s.committer.fs();

@@ -513,7 +513,7 @@ impl VmView {
 /// A stored definition.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VmDef {
-    pub name: String,
+    pub name: crate::types::VmName,
     pub xml: String,
     pub change: u64,
 }
@@ -701,7 +701,7 @@ use crate::types::Transport;
 /// A volume this agent runs, as reported by its status.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RunningVolume {
-    pub name: String,
+    pub name: crate::types::DatasetName,
     pub transport: Transport,
     /// Its kernel device here.
     pub attach: Attach,

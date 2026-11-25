@@ -1,6 +1,7 @@
 use super::*;
 use crate::inode::{ObjType, SetAttrs};
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::vdev::Pool;
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -199,7 +200,7 @@ async fn rename_refuses_what_it_must() {
     fs.mkdir(Path::new("/full")).await.unwrap();
     fs.write_file(Path::new("/full/x"), b"x").await.unwrap();
     fs.write_file(Path::new("/f"), b"f").await.unwrap();
-    fs.create_block("vol", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
     let refused = |r: Result<FileId, FileSystemError>| assert!(r.is_err(), "{:?}", r);

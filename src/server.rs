@@ -34,7 +34,7 @@ pub async fn listen(
         .cluster_members(port)
         .map_err(|e| format!("cluster: {}", e))?;
     // The node's name comes from its id: the pool position of its first disk.
-    let name = cluster::members::node_name(members.me);
+    let name = members.me.name();
     let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
         Some(d) => expand_tilde(d).join(&name),
         None => cluster::default_data_dir(&name),

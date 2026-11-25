@@ -3,6 +3,7 @@
 use super::*;
 use crate::fs::FileSystem;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::types::MetaslabIdx;
 use std::path::Path;
 
@@ -120,15 +121,15 @@ async fn files_and_volumes_round_trip_on_every_layout() {
             write_set(&fs, "f", 1).await;
             let vbs = fs.default_volblocksize();
             assert!(vbs.is_multiple_of(fs.volblock_align()), "{}", what);
-            fs.create_block("vol", 8 << 20, vbs).await.unwrap();
+            fs.create_block(&ds("vol"), 8 << 20, vbs).await.unwrap();
             let data = pattern(3 * vbs as usize + 1234, 9);
-            fs.block_write("vol", 5000, &data).await.unwrap();
+            fs.block_write(&ds("vol"), 5000, &data).await.unwrap();
             fs.sync().await.unwrap();
         }
         let fs = pool.load().await;
         check_set(&fs, "f", 1, &what).await;
         let mut buf = vec![0u8; 3 * fs.default_volblocksize() as usize + 1234];
-        fs.block_read("vol", 5000, &mut buf).await.unwrap();
+        fs.block_read(&ds("vol"), 5000, &mut buf).await.unwrap();
         assert!(buf == pattern(buf.len(), 9), "{}: volume differs", what);
 
         let report = fs.scrub(true).await.unwrap();

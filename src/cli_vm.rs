@@ -13,32 +13,32 @@ pub enum VmCommands {
     /// file='raidish:VOLUME'/>`. It's checked as it's stored: every disk
     /// a raidish volume no other VM uses, nothing that reaches the host.
     Import {
-        name: String,
+        name: crate::types::VmName,
         xml: String,
         /// Replace VM `name`'s definition (default: refuse if there is one).
         #[arg(long)]
         replace: bool,
     },
     /// Print VM `name`'s definition (the XML).
-    Show { name: String },
+    Show { name: crate::types::VmName },
     /// Delete VM `name`'s definition (and stop it). Its volumes stay.
-    Delete { name: String },
+    Delete { name: crate::types::VmName },
     /// It should run: the node with its disks starts it.
-    Start { name: String },
+    Start { name: crate::types::VmName },
     /// It should not run: shut it down (destroyed after the timeout).
-    Stop { name: String },
+    Stop { name: crate::types::VmName },
     /// Stop it at once (no guest shutdown).
-    Kill { name: String },
+    Kill { name: crate::types::VmName },
     /// Shut it down and start it again from its current XML.
-    Restart { name: String },
+    Restart { name: crate::types::VmName },
     /// Reboot the guest (same domain, same XML).
-    Reboot { name: String },
+    Reboot { name: crate::types::VmName },
     /// Hard reset.
-    Reset { name: String },
+    Reset { name: crate::types::VmName },
     /// Move it (its disks) to `node`: migrated live if both nodes can,
     /// else shut down here and started there (`vm check` says which).
     Move {
-        name: String,
+        name: crate::types::VmName,
         node: String,
         /// Refuse unless it can move live.
         #[arg(long)]
@@ -46,7 +46,10 @@ pub enum VmCommands {
     },
     /// Where it can move, and how: live, cold (shut down, started there),
     /// or not at all, and why (every other node, or just `node`).
-    Check { name: String, node: Option<String> },
+    Check {
+        name: crate::types::VmName,
+        node: Option<String>,
+    },
     /// A CPU every node (or each of `--nodes`) can give a guest, to paste
     /// into a domain's XML so it can move live between them.
     CpuBaseline {
@@ -133,8 +136,6 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
             println!("VM '{}' deleted (its volumes stay)", name);
         }
         VmCommands::Import { name, xml, replace } => {
-            crate::types::VmName::try_from(name.as_str()).map_err(|e| e.to_string())?;
-
             let body = std::fs::read_to_string(xml).map_err(|e| format!("{}: {}", xml, e))?;
             let spec = crate::vm::parse_spec(name, &body, 0);
             if let Some(e) = spec.error() {
@@ -153,7 +154,7 @@ pub async fn run(command: &VmCommands, endpoints: Vec<String>) -> Result<(), Str
                 "VM '{}' defined (change {}): anchor volume '{}', volumes {}",
                 name,
                 def.change,
-                spec.anchor().unwrap_or_default(),
+                spec.anchor().map_or("", |a| a.as_str()),
                 spec.volumes().join(", ")
             );
             println!(

@@ -12,7 +12,6 @@ use crate::session::{now_ms, tab_hidden};
 use crate::vms::{Console, ConsolePreview, REFRESH_MS, confirm, state, state_tag};
 use gloo_timers::callback::Interval;
 use raidish_types::api_types::Mode;
-use raidish_types::types::NodeId;
 use std::collections::VecDeque;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
@@ -151,7 +150,7 @@ impl Component for VmPage {
                 match r {
                     Ok(vms) => {
                         self.error = None;
-                        self.vm = vms.into_iter().find(|v| v.spec.name == name);
+                        self.vm = vms.into_iter().find(|v| v.spec.name.as_str() == name);
                         self.missing = self.vm.is_none();
                         // Where it can move: again once it's somewhere else
                         // (or started, or stopped).
@@ -446,12 +445,7 @@ impl VmPage {
             .props()
             .cluster
             .as_ref()
-            .map(|c| {
-                c.members
-                    .iter()
-                    .map(|m| NodeId::from_raw(m.id).name())
-                    .collect()
-            })
+            .map(|c| c.members.iter().map(|m| m.id.name()).collect())
             .unwrap_or_default();
         nodes.sort_by_key(|n| (n.len(), n.clone()));
         nodes
@@ -588,7 +582,7 @@ impl VmPage {
                     <span class={classes!("dot", "big", class)}></span>
                     <div>
                         <div class="vm-title">
-                            <h1>{ &vm.spec.name }</h1>
+                            <h1>{ vm.spec.name.to_string() }</h1>
                             { state_tag(vm) }
                             if vm.restart_pending {
                                 <span class="tag warn" title="its definition changed since it started">{ "RESTART PENDING" }</span>
@@ -706,7 +700,7 @@ impl VmPage {
                         }
                     </div>
                 } else {
-                    <ConsolePreview name={vm.spec.name.clone()} on_open={link.callback(|_| Msg::Console(true))} />
+                    <ConsolePreview name={vm.spec.name.to_string()} on_open={link.callback(|_| Msg::Console(true))} />
                 }
             </section>
         }

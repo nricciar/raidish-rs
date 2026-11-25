@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use std::path::Path;
 
 fn span(start: u64, len: u64, kind: BlockKind, owner: Option<u32>) -> Span {
@@ -77,10 +78,10 @@ async fn reports_a_formatted_pool() {
     fs.write_file(Path::new("/dir/hello"), &vec![7u8; 100_000])
         .await
         .unwrap();
-    fs.create_block("vol", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    fs.block_write("vol", 0, &vec![1u8; 64 * 1024])
+    fs.block_write(&ds("vol"), 0, &vec![1u8; 64 * 1024])
         .await
         .unwrap();
     fs.sync().await.unwrap();
@@ -134,7 +135,7 @@ async fn reports_a_formatted_pool() {
             .any(|s| s.owner == Some(owner) && s.kind == BlockKind::Data)
     );
 
-    let (records, _) = fs.volume_fragmentation("/vol").await.unwrap();
+    let (records, _) = fs.volume_fragmentation(&ds("vol")).await.unwrap();
     assert!(records > 0);
 }
 

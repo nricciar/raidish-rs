@@ -1,6 +1,7 @@
 use super::*;
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{LoadOptions, Rewind};
+use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
 use crate::types::Txg;
 use crate::vdev::Pool;
@@ -56,13 +57,13 @@ async fn workload(fs: &FileSystem<Pool>) {
         .await
         .unwrap();
     fs.delete(Path::new("/d/f2")).await.unwrap();
-    fs.create_block("vol", 4 << 20, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 4 << 20, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
-    fs.block_write("vol", 0, &content("vol", 1, 1 << 20))
+    fs.block_write(&ds("vol"), 0, &content("vol", 1, 1 << 20))
         .await
         .unwrap();
-    fs.block_write("vol", 3 << 20, &content("vol", 2, 300_000))
+    fs.block_write(&ds("vol"), 3 << 20, &content("vol", 2, 300_000))
         .await
         .unwrap();
     fs.sync().await.unwrap();
@@ -398,10 +399,10 @@ async fn salvage_copies_what_is_readable() {
     fs.mkdir(Path::new("/d")).await.unwrap();
     fs.write_file(Path::new("/big"), &big).await.unwrap();
     fs.write_file(Path::new("/d/small"), &small).await.unwrap();
-    fs.create_block("vol", 2 << 20, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 2 << 20, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
-    fs.block_write("vol", 512 << 10, &vol).await.unwrap();
+    fs.block_write(&ds("vol"), 512 << 10, &vol).await.unwrap();
     fs.sync().await.unwrap();
     let blocks = file_blocks(&fs, "/big").await;
     assert!(blocks.len() > 2);
@@ -498,13 +499,13 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
     let fs = pool.format().await;
     let vbs = DEFAULT_VOLBLOCKSIZE as usize;
     let records = 64;
-    fs.create_block("vol", (records * vbs) as u64, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), (records * vbs) as u64, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let data = content("vol", 3, records * vbs);
-    fs.block_write("vol", 0, &data).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &data).await.unwrap();
     fs.sync().await.unwrap();
-    let frag = fs.fragmentation("vol").await.unwrap();
+    let frag = fs.fragmentation(&ds("vol")).await.unwrap();
     assert_eq!(frag.records, records as u64);
     assert_eq!(frag.breaks, 0, "{}", frag);
     drop(fs);
@@ -517,10 +518,10 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
         reads: reads.clone(),
     };
     let fs = FileSystem::load(dev).await.unwrap();
-    fs.open_dataset("vol").await.unwrap();
+    fs.open_dataset(&ds("vol")).await.unwrap();
     reads.store(0, Ordering::SeqCst);
     let mut buf = vec![0u8; 21 * vbs];
-    fs.block_read("vol", 0, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), 0, &mut buf).await.unwrap();
     assert_eq!(buf, data[..21 * vbs]);
     assert!(
         reads.load(Ordering::SeqCst) <= 2,
@@ -532,14 +533,14 @@ async fn sequential_volume_writes_are_contiguous_and_read_coalesced() {
     // A corrupt record inside a coalesced read still self-heals.
     let ptr = {
         let fs = pool.load().await;
-        let vol = fs.open_dataset("vol").await.unwrap();
+        let vol = fs.open_dataset(&ds("vol")).await.unwrap();
         fs.tree_leaves(&vol.obj.root()).await.unwrap()[30].1.clone()
     };
     let (disk, offset) = TestPool::locate(ptr.lba + 1);
     pool.corrupt(disk, offset);
     let fs = pool.load().await;
     let mut buf = vec![0u8; 21 * vbs];
-    fs.block_read("vol", 21 * vbs as u64, &mut buf)
+    fs.block_read(&ds("vol"), 21 * vbs as u64, &mut buf)
         .await
         .unwrap();
     assert_eq!(buf, data[21 * vbs..42 * vbs]);
@@ -551,7 +552,7 @@ async fn defrag_makes_a_volume_contiguous() {
     let fs = pool.format().await;
     let vbs = DEFAULT_VOLBLOCKSIZE as usize;
     let records = 64u64;
-    fs.create_block("vol", records * vbs as u64, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), records * vbs as u64, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     // Write records in a scrambled order, one commit each, with some files
@@ -561,7 +562,9 @@ async fn defrag_makes_a_volume_contiguous() {
         let idx = (k * 37) % records;
         let rec = content(&format!("r{idx}"), k as u8, vbs);
         expect[idx as usize * vbs..(idx as usize + 1) * vbs].copy_from_slice(&rec);
-        fs.block_write("vol", idx * vbs as u64, &rec).await.unwrap();
+        fs.block_write(&ds("vol"), idx * vbs as u64, &rec)
+            .await
+            .unwrap();
         fs.sync().await.unwrap();
         if k % 8 == 0 {
             let name = format!("/f{k}");
@@ -570,25 +573,25 @@ async fn defrag_makes_a_volume_contiguous() {
                 .unwrap();
         }
     }
-    let before = fs.fragmentation("vol").await.unwrap();
+    let before = fs.fragmentation(&ds("vol")).await.unwrap();
     assert!(before.breaks > 10, "{}", before);
 
-    let (b, after) = fs.defrag("vol", 4096).await.unwrap();
+    let (b, after) = fs.defrag(&ds("vol"), 4096).await.unwrap();
     assert_eq!(b, before);
     assert_eq!(after.records, records);
     assert_eq!(after.breaks, 0, "{}", after);
     let mut buf = vec![0u8; expect.len()];
-    fs.block_read("vol", 0, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), 0, &mut buf).await.unwrap();
     assert_eq!(buf, expect);
     assert!(fs.fsck(false).await.unwrap().is_clean());
 
     // Already contiguous: nothing to do.
-    let (_, again) = fs.defrag("vol", 4096).await.unwrap();
+    let (_, again) = fs.defrag(&ds("vol"), 4096).await.unwrap();
     assert_eq!(again, after);
     drop(fs);
     let fs = pool.load().await;
     let mut buf = vec![0u8; expect.len()];
-    fs.block_read("vol", 0, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), 0, &mut buf).await.unwrap();
     assert_eq!(buf, expect);
 }
 

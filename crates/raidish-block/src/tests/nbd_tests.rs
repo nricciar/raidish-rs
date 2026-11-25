@@ -4,6 +4,7 @@ use super::*;
 use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -115,6 +116,7 @@ async fn serve_many(
     let fs = Arc::new(pool.format().await);
     let server = Arc::new(NbdServer::with_bind(fs.clone(), DEFAULT_BIND, 0));
     for &(name, size) in volumes {
+        let name = &ds(name);
         fs.create_block(name, size, DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
@@ -158,9 +160,9 @@ async fn two_exports_on_one_server() {
     assert!(a.cmd(NBD_CMD_READ, 4096, 8192, &[]).await.1 == da);
     assert!(b.cmd(NBD_CMD_READ, 4096, 8192, &[]).await.1 == db);
     let mut buf = vec![0u8; 8192];
-    fs.block_read("alpha", 4096, &mut buf).await.unwrap();
+    fs.block_read(&ds("alpha"), 4096, &mut buf).await.unwrap();
     assert!(buf == da);
-    fs.block_read("beta", 4096, &mut buf).await.unwrap();
+    fs.block_read(&ds("beta"), 4096, &mut buf).await.unwrap();
     assert!(buf == db);
 
     // Unknown names, and the empty name with more than one export, are
@@ -212,11 +214,12 @@ async fn add_export_validation() {
     let pool = TestPool::new().await;
     let (_fs, server, _addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     assert!(matches!(
-        server.add_export("vol").await,
+        server.add_export(&ds("vol")).await,
         Err(FileSystemError::AlreadyExists)
     ));
-    assert!(server.add_export("missing").await.is_err());
-    assert!(server.add_export("").await.is_err());
+    assert!(server.add_export(&ds("missing")).await.is_err());
+    // An empty name doesn't get this far: it doesn't parse.
+    assert!(crate::types::DatasetName::try_from("").is_err());
     assert_eq!(server.exports(), vec!["vol"]);
 }
 
@@ -230,7 +233,7 @@ async fn remove_export_flushes_and_closes_its_connections() {
     assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
     assert!(fs.has_dirty_datasets(), "write not yet committed");
 
-    assert!(server.remove_export("alpha").await.unwrap());
+    assert!(server.remove_export(&ds("alpha")).await.unwrap());
     assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut a.s).await;
     assert_eq!(server.exports(), vec!["beta"]);
@@ -246,17 +249,17 @@ async fn remove_export_flushes_and_closes_its_connections() {
     let (_, size) = Client::connect(addr).await;
     assert_eq!(size, 16 * MB);
 
-    assert!(!server.remove_export("alpha").await.unwrap());
+    assert!(!server.remove_export(&ds("alpha")).await.unwrap());
 
     // The committed write survives a reload, and the volume can come back.
     let mut buf = vec![0u8; 4096];
     pool.load()
         .await
-        .block_read("alpha", 0, &mut buf)
+        .block_read(&ds("alpha"), 0, &mut buf)
         .await
         .unwrap();
     assert!(buf == data);
-    server.add_export("alpha").await.unwrap();
+    server.add_export(&ds("alpha")).await.unwrap();
     let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
     assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
 }
@@ -319,7 +322,7 @@ async fn trim_and_write_zeroes_accept_huge_ranges() {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
-    let vol = fs.open_dataset("vol").await.unwrap();
+    let vol = fs.open_dataset(&ds("vol")).await.unwrap();
     let used: u64 = fs
         .tree_extents(&vol.obj.root())
         .await
@@ -405,10 +408,10 @@ async fn an_exports_backend_switches_under_a_live_connection() {
     let before = vec![1u8; 8192];
     assert_eq!(c.cmd(NBD_CMD_WRITE, 0, 8192, &before).await.0, 0);
 
-    let io = server.export_io("vol").unwrap();
+    let io = server.export_io(&ds("vol")).unwrap();
     let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     io.switch(Arc::new(Counting {
-        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), &ds("vol"))),
         n: n.clone(),
     }))
     .await;
@@ -501,10 +504,10 @@ async fn a_connection_has_at_most_so_many_requests_in_flight() {
     let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let open = Arc::new(tokio::sync::watch::Sender::new(false));
     server
-        .export_io("vol")
+        .export_io(&ds("vol"))
         .unwrap()
         .switch(Arc::new(Gate {
-            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), &ds("vol"))),
             entered: entered.clone(),
             open: open.clone(),
         }))

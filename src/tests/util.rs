@@ -176,3 +176,9 @@ impl DiskUrls for TestDiskServer {
         TestDiskServer::url(self, disk)
     }
 }
+
+/// Dataset name `s`, which a test knows is valid.
+#[track_caller]
+pub fn dsn(s: &str) -> crate::types::DatasetName {
+    s.parse().unwrap()
+}

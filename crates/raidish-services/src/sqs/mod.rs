@@ -31,6 +31,7 @@ use crate::dataset::DatasetFormat;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
+use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -571,7 +572,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
     /// Serve queue `name` of `fs`.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
-        name: &str,
+        name: &DatasetName,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
         let q = Arc::new(Queue {
             tree: ServiceTree::open(fs, name, DatasetFormat::Queue).await?,

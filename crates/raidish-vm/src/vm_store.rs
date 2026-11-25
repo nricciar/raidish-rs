@@ -23,6 +23,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::types::{DatasetName, VmName};
 use crate::vm_def::VmSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -57,7 +58,7 @@ struct Meta {
     change: u64,
 }
 
-fn key(name: &str) -> Vec<u8> {
+fn key(name: &VmName) -> Vec<u8> {
     let mut k = b"V".to_vec();
     k.extend(name.as_bytes());
     k
@@ -84,7 +85,12 @@ pub struct VmStore<D: BlockDevice> {
 impl<D: BlockDevice> VmStore<D> {
     /// Open the pool's store, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
-        let ds = crate::service_tree::ensure_btree(&fs, VMS_DATASET, DatasetFormat::Vms).await?;
+        let ds = crate::service_tree::ensure_btree(
+            &fs,
+            &crate::types::DatasetName::from_static(VMS_DATASET),
+            DatasetFormat::Vms,
+        )
+        .await?;
         Ok(Arc::new(VmStore {
             fs,
             ds,
@@ -92,7 +98,7 @@ impl<D: BlockDevice> VmStore<D> {
         }))
     }
 
-    async fn all(t: &Txn<'_, D>) -> Result<BTreeMap<String, VmDef>, FileSystemError> {
+    async fn all(t: &Txn<'_, D>) -> Result<BTreeMap<VmName, VmDef>, FileSystemError> {
         t.range(Bound::Included(b"V"), Bound::Excluded(b"W"), MAX_VMS)
             .await?
             .iter()
@@ -101,7 +107,7 @@ impl<D: BlockDevice> VmStore<D> {
     }
 
     /// Every definition, by name.
-    pub async fn list(&self) -> Result<BTreeMap<String, VmDef>, FileSystemError> {
+    pub async fn list(&self) -> Result<BTreeMap<VmName, VmDef>, FileSystemError> {
         let _r = self.ds.ops.read().await;
         let t = Txn::begin(&self.fs, &self.ds.obj).await?;
         Self::all(&t).await
@@ -141,7 +147,7 @@ impl<D: BlockDevice> VmStore<D> {
     }
 
     /// The VM using `volume`, if one does.
-    pub async fn user_of(&self, volume: &str) -> Result<Option<String>, FileSystemError> {
+    pub async fn user_of(&self, volume: &DatasetName) -> Result<Option<VmName>, FileSystemError> {
         Ok(self
             .list()
             .await?
@@ -155,14 +161,11 @@ impl<D: BlockDevice> VmStore<D> {
     /// unless the one there is that change (it was changed since).
     pub async fn put(
         &self,
-        name: &str,
+        name: &VmName,
         xml: &str,
         create: bool,
         change: Option<u64>,
     ) -> Result<VmDef, FileSystemError> {
-        if let Err(e) = crate::types::VmName::try_from(name) {
-            return Err(bad(e.to_string()));
-        }
         if xml.len() > MAX_XML {
             return Err(bad(format!("a VM definition is at most {} bytes", MAX_XML)));
         }
@@ -208,7 +211,7 @@ impl<D: BlockDevice> VmStore<D> {
                 }
                 _ => {}
             }
-            for other in all.values().filter(|d| d.name != name) {
+            for other in all.values().filter(|d| &d.name != name) {
                 let other = other.spec();
                 let theirs = other.volumes();
                 if let Some(v) = spec.volumes().iter().find(|v| theirs.contains(v)) {
@@ -224,7 +227,7 @@ impl<D: BlockDevice> VmStore<D> {
             };
             meta.change += 1;
             let def = VmDef {
-                name: name.to_string(),
+                name: name.clone(),
                 xml: xml.to_string(),
                 change: meta.change,
             };
@@ -238,7 +241,7 @@ impl<D: BlockDevice> VmStore<D> {
     }
 
     /// Delete VM `name`'s definition (`change`: only if it's that one).
-    pub async fn delete(&self, name: &str, change: Option<u64>) -> Result<(), FileSystemError> {
+    pub async fn delete(&self, name: &VmName, change: Option<u64>) -> Result<(), FileSystemError> {
         let _one = self.write.lock().await;
         {
             let _w = self.ds.ops.write().await;

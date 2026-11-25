@@ -10,6 +10,7 @@ use crate::committer::{Authority, Committer, DirectSink, LocalAuthority};
 use crate::fs::FileSystem;
 use crate::object_lease::{ObjectGuard, ObjectLeases};
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::types::{Epoch, Holding, LeaseRef};
 use crate::vdev::Pool;
 use crate::writer::ObjLease;
@@ -512,7 +513,7 @@ async fn readdir_pages_through_a_big_directory() {
         c.make(&d, n, false, 0).await.unwrap();
     }
     // Volumes in the root aren't NFS objects.
-    fs.create_block("vol", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
     want.insert(0, "..".into());
@@ -996,7 +997,7 @@ impl crate::writer::CommitSink for FlakySink {
     }
     async fn claim_dataset(
         &self,
-        volume: &str,
+        volume: &crate::types::DatasetName,
         ds: &Holding,
     ) -> Result<(), crate::writer::CommitError> {
         self.inner.claim_dataset(volume, ds).await

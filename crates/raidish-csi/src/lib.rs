@@ -199,13 +199,23 @@ impl Driver {
     }
 
     /// The nodes `name` is attached to (see `ClusterState::attached`).
-    async fn attached(&self, name: &str) -> Result<Vec<String>, Status> {
+    async fn attached(&self, name: &crate::types::DatasetName) -> Result<Vec<String>, Status> {
         let status = self.leases().status().await.map_err(Status::unavailable)?;
-        Ok(status.state.attached.get(name).cloned().unwrap_or_default())
+        Ok(status
+            .state
+            .attached
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Attach `name` to `node` too, or no longer.
-    async fn attach(&self, name: &str, node: &str, on: bool) -> Result<(), Status> {
+    async fn attach(
+        &self,
+        name: &crate::types::DatasetName,
+        node: &str,
+        on: bool,
+    ) -> Result<(), Status> {
         let op = crate::cluster::LeaseOp::Attach {
             volume: name.to_string(),
             node: node.to_string(),
@@ -253,20 +263,23 @@ impl Driver {
             props.move_to = None;
             println!("csi: publishing volume '{}' to {}", v.name, node);
             self.committer
-                .set_props(&v.name, &props)
+                .set_props(&valid_name(&v.name)?, &props)
                 .await
                 .map_err(commit_status)?;
         }
         Ok(())
     }
 
-    async fn volume(&self, name: &str) -> Result<Option<crate::volume::VolumeInfo>, Status> {
+    async fn volume(
+        &self,
+        name: &crate::types::DatasetName,
+    ) -> Result<Option<crate::volume::VolumeInfo>, Status> {
         let vols = self.committer.volumes().await.map_err(commit_status)?;
-        Ok(vols.into_iter().find(|v| v.name == name))
+        Ok(vols.into_iter().find(|v| &v.name == name))
     }
 
     /// Who runs `name` now (its live `ds/` lease's node), if anyone.
-    async fn holder(&self, name: &str) -> Result<Option<String>, Status> {
+    async fn holder(&self, name: &crate::types::DatasetName) -> Result<Option<String>, Status> {
         let status = crate::cluster::lease::LeaseClient::new(self.endpoints.clone())
             .status()
             .await
@@ -277,7 +290,7 @@ impl Driver {
 
     /// The kernel device this node's agent attached `name` on, or why
     /// there isn't one (yet).
-    async fn local_device(&self, name: &str) -> Result<String, String> {
+    async fn local_device(&self, name: &crate::types::DatasetName) -> Result<String, String> {
         let status: crate::api_types::AgentStatus = self
             .http
             .get(format!("{}/api/v1/agent/status", self.agent))
@@ -287,7 +300,7 @@ impl Driver {
             .json()
             .await
             .map_err(|e| format!("asking the local agent: {}", e))?;
-        let Some(v) = status.volumes.into_iter().find(|v| v.name == name) else {
+        let Some(v) = status.volumes.into_iter().find(|v| &v.name == name) else {
             return Err("not running on this node yet".into());
         };
         use crate::api_types::Attach;
@@ -301,7 +314,7 @@ impl Driver {
         }
     }
 
-    async fn wait_device(&self, name: &str) -> Result<String, Status> {
+    async fn wait_device(&self, name: &crate::types::DatasetName) -> Result<String, Status> {
         let start = Instant::now();
         let mut last = String::new();
         while start.elapsed() < ATTACH_WAIT {
@@ -386,7 +399,7 @@ impl Controller for Driver {
                 required, limit
             )));
         }
-        match self.volume(&req.name).await? {
+        match self.volume(&name).await? {
             // Retried request: same volume.
             Some(v) if v.size_bytes >= required && (limit == 0 || v.size_bytes <= limit) => {
                 size = v.size_bytes;
@@ -419,11 +432,11 @@ impl Controller for Driver {
         req: Request<pb::DeleteVolumeRequest>,
     ) -> Rpc<pb::DeleteVolumeResponse> {
         let id = req.into_inner().volume_id;
-        valid_name(&id)?;
-        if self.volume(&id).await?.is_some() {
+        let name = valid_name(&id)?;
+        if self.volume(&name).await?.is_some() {
             println!("csi: deleting volume '{}'", id);
             self.committer
-                .delete_volume(&id)
+                .delete_volume(&name)
                 .await
                 .map_err(commit_status)?;
         }
@@ -435,21 +448,21 @@ impl Controller for Driver {
         req: Request<pb::ControllerPublishVolumeRequest>,
     ) -> Rpc<pb::ControllerPublishVolumeResponse> {
         let req = req.into_inner();
-        valid_name(&req.volume_id)?;
+        let volume = valid_name(&req.volume_id)?;
         if req.node_id.is_empty() {
             return Err(Status::invalid_argument("no node id"));
         }
         if let Some(cap) = &req.volume_capability {
             supported(cap).map_err(Status::invalid_argument)?;
         }
-        let Some(v) = self.volume(&req.volume_id).await? else {
+        let Some(v) = self.volume(&volume).await? else {
             return Err(Status::not_found(format!("no volume '{}'", req.volume_id)));
         };
         if req.volume_capability.as_ref().is_some_and(multi_node) {
             self.publish_shared(&v, &req.node_id).await?;
             return Ok(Response::new(Default::default()));
         }
-        let attached = self.attached(&req.volume_id).await?;
+        let attached = self.attached(&volume).await?;
         if !attached.is_empty() && attached != [req.node_id.clone()] {
             return Err(Status::failed_precondition(format!(
                 "volume '{}' is published to {}",
@@ -482,7 +495,7 @@ impl Controller for Driver {
             req.volume_id, req.node_id
         );
         self.committer
-            .set_props(&req.volume_id, &props)
+            .set_props(&volume, &props)
             .await
             .map_err(commit_status)?;
         Ok(Response::new(Default::default()))
@@ -493,11 +506,11 @@ impl Controller for Driver {
         req: Request<pb::ControllerUnpublishVolumeRequest>,
     ) -> Rpc<pb::ControllerUnpublishVolumeResponse> {
         let req = req.into_inner();
-        valid_name(&req.volume_id)?;
-        let Some(v) = self.volume(&req.volume_id).await? else {
+        let volume = valid_name(&req.volume_id)?;
+        let Some(v) = self.volume(&volume).await? else {
             return Ok(Response::new(Default::default())); // gone: nothing to undo
         };
-        let attached = self.attached(&req.volume_id).await?;
+        let attached = self.attached(&volume).await?;
         let shared = attached.contains(&req.node_id);
         // Unpublished from the last of several nodes, or from its one node.
         let last = match shared {
@@ -517,7 +530,7 @@ impl Controller for Driver {
                 req.volume_id, req.node_id
             );
             self.committer
-                .set_props(&req.volume_id, &props)
+                .set_props(&volume, &props)
                 .await
                 .map_err(commit_status)?;
         }
@@ -528,12 +541,12 @@ impl Controller for Driver {
                 "csi: detaching volume '{}' from {}",
                 req.volume_id, req.node_id
             );
-            self.attach(&req.volume_id, &req.node_id, false).await?;
+            self.attach(&volume, &req.node_id, false).await?;
         }
         // Done once nobody (or not that node) runs it any more.
         let start = Instant::now();
         loop {
-            match self.holder(&req.volume_id).await? {
+            match self.holder(&volume).await? {
                 None => break,
                 Some(h) if !req.node_id.is_empty() && h != req.node_id => break,
                 Some(h) if start.elapsed() > RELEASE_WAIT => {
@@ -553,8 +566,8 @@ impl Controller for Driver {
         req: Request<pb::ValidateVolumeCapabilitiesRequest>,
     ) -> Rpc<pb::ValidateVolumeCapabilitiesResponse> {
         let req = req.into_inner();
-        valid_name(&req.volume_id)?;
-        if self.volume(&req.volume_id).await?.is_none() {
+        let volume = valid_name(&req.volume_id)?;
+        if self.volume(&volume).await?.is_none() {
             return Err(Status::not_found(format!("no volume '{}'", req.volume_id)));
         }
         if let Some(e) = req
@@ -678,7 +691,7 @@ impl Node for Driver {
         req: Request<pb::NodeStageVolumeRequest>,
     ) -> Rpc<pb::NodeStageVolumeResponse> {
         let req = req.into_inner();
-        valid_name(&req.volume_id)?;
+        let volume = valid_name(&req.volume_id)?;
         let cap = req
             .volume_capability
             .ok_or_else(|| Status::invalid_argument("no volume capability"))?;
@@ -687,7 +700,7 @@ impl Node for Driver {
         if target.is_empty() {
             return Err(Status::invalid_argument("no staging path"));
         }
-        let dev = self.wait_device(&req.volume_id).await?;
+        let dev = self.wait_device(&volume).await?;
         // A raw block volume is used straight from the device (NodePublish).
         let Some(AccessType::Mount(m)) = &cap.access_type else {
             return Ok(Response::new(pb::NodeStageVolumeResponse {}));
@@ -785,7 +798,7 @@ impl Node for Driver {
         req: Request<pb::NodePublishVolumeRequest>,
     ) -> Rpc<pb::NodePublishVolumeResponse> {
         let req = req.into_inner();
-        valid_name(&req.volume_id)?;
+        let volume = valid_name(&req.volume_id)?;
         let cap = req
             .volume_capability
             .ok_or_else(|| Status::invalid_argument("no volume capability"))?;
@@ -799,7 +812,7 @@ impl Node for Driver {
         }
         let source = match &cap.access_type {
             Some(AccessType::Block(_)) => {
-                let dev = self.wait_device(&req.volume_id).await?;
+                let dev = self.wait_device(&volume).await?;
                 if let Some(p) = Path::new(target).parent() {
                     std::fs::create_dir_all(p).map_err(|e| Status::internal(e.to_string()))?;
                 }

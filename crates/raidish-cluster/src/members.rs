@@ -14,48 +14,42 @@
 //! config, and nobody has to know its own address as the others see it.
 
 use crate::net::disk_server_base;
+use crate::types::NodeId;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Members {
     /// This node's id.
-    pub me: u64,
+    pub me: NodeId,
     /// The other nodes: id → base URL.
-    pub peers: BTreeMap<u64, String>,
+    pub peers: BTreeMap<NodeId, String>,
     /// Pool disk positions of every node (this one too).
-    pub disks: BTreeMap<u64, Vec<usize>>,
+    pub disks: BTreeMap<NodeId, Vec<usize>>,
     /// Identifies the layout. Nodes whose configs disagree (different order,
     /// different grouping) have different fingerprints and refuse each other.
     pub fingerprint: String,
-}
-
-/// A node's name: from its id (the pool position of its first disk), so
-/// every node knows every name without being told. Addresses (the hosts in
-/// disk URLs) are where to reach a node, not what it's called.
-pub fn node_name(id: u64) -> String {
-    crate::types::NodeId::from_raw(id).name()
 }
 
 impl Members {
     /// A cluster of one (no pool configured).
     pub fn solo() -> Self {
         Members {
-            me: 0,
+            me: NodeId::from_raw(0),
             peers: BTreeMap::new(),
-            disks: BTreeMap::from([(0, vec![])]),
+            disks: BTreeMap::from([(NodeId::from_raw(0), vec![])]),
             fingerprint: "solo".into(),
         }
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+    pub fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.disks.keys().copied()
     }
 
     /// The base URL (no trailing `/`) of peer `node` (by name); None: not
     /// a peer (this node, or unknown).
     pub fn peer_url(&self, node: &str) -> Option<&str> {
-        let id: crate::types::NodeId = node.parse().ok()?;
-        self.peers.get(&id.get()).map(|u| u.trim_end_matches('/'))
+        let id: NodeId = node.parse().ok()?;
+        self.peers.get(&id).map(|u| u.trim_end_matches('/'))
     }
 }
 
@@ -84,7 +78,7 @@ pub fn derive(
                 .into(),
         );
     };
-    let me = mine[0] as u64;
+    let me = NodeId::from_raw(mine[0] as u64);
 
     let mut members = Members {
         me,
@@ -93,7 +87,7 @@ pub fn derive(
         fingerprint: String::new(),
     };
     for (owner, idx) in &disks {
-        let id = idx[0] as u64;
+        let id = NodeId::from_raw(idx[0] as u64);
         members.disks.insert(id, idx.clone());
         if let Some(base) = owner {
             members.peers.insert(id, base.to_string());

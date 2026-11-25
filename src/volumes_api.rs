@@ -19,6 +19,8 @@ use crate::api_error::ApiError;
 use crate::committer::PoolAdmin;
 use crate::committer::{Admin, CreateVolume, NewName};
 use crate::inode::DatasetProps;
+use crate::types::DatasetName;
+use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, post, put};
 
@@ -64,6 +66,7 @@ async fn remove(
     name: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
         .delete_volume(name)
@@ -79,6 +82,7 @@ async fn props(
     props: Json<DatasetProps>,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
         .set_props(name, &props)
@@ -94,6 +98,7 @@ async fn snapshot(
     req: Json<NewName>,
     st: &State<VolumesState>,
 ) -> Result<Json<crate::types::Txg>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
         .create_snapshot(name, &req.name)
@@ -109,6 +114,7 @@ async fn destroy_snapshot(
     snap: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
         .destroy_snapshot(name, snap)
@@ -125,9 +131,10 @@ async fn clone_snapshot(
     req: Json<NewName>,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
-        .clone_snapshot(name, snap, &req.name)
+        .clone_snapshot(name, snap, &dataset(&req.name)?)
         .await
         .map(Json)
         .map_err(ApiError::from)
@@ -139,6 +146,7 @@ async fn rollback(
     name: &str,
     st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &dataset(name)?;
     st.admin
         .on_behalf(&auth.0)
         .rollback(name)
@@ -158,4 +166,9 @@ pub fn routes() -> Vec<rocket::Route> {
         clone_snapshot,
         rollback
     ]
+}
+
+/// A dataset name from the request, or 400 saying why it isn't one.
+fn dataset(name: &str) -> Result<DatasetName, ApiError> {
+    DatasetName::try_from(name).map_err(|e| ApiError::new(Status::BadRequest, e.to_string()))
 }

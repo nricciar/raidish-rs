@@ -24,6 +24,7 @@ use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::object::TreeRoot;
+use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use crate::types::MetaslabIdx;
 use crate::types::Txg;
@@ -82,7 +83,7 @@ impl Drop for LogNowhereOnDrop<'_> {
 /// One volume sync, from a writer to the committer.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DatasetCommit {
-    pub dataset: String,
+    pub dataset: DatasetName,
     /// The writer lease (`writer/...`).
     pub writer: LeaseRef,
     /// The `ds/<name>` lease it's committed under.
@@ -325,7 +326,7 @@ pub trait CommitSink: Send + Sync {
     /// Get volume `volume` ready to run under its `ds/<name>` lease `ds`:
     /// if a previous holder left an intent log, the committer replays it
     /// first.
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError>;
+    async fn claim_dataset(&self, volume: &DatasetName, ds: &Holding) -> Result<(), CommitError>;
 }
 
 /// A volume a writer runs.
@@ -349,7 +350,7 @@ pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct WriterState {
     pub sink: Arc<dyn CommitSink>,
     /// Dataset name → its lease.
-    pub datasets: std::sync::Mutex<HashMap<String, Attached>>,
+    pub datasets: std::sync::Mutex<HashMap<DatasetName, Attached>>,
     /// Metaslabs lent to this writer.
     pub lent: std::sync::Mutex<Vec<MetaslabIdx>>,
     /// Lent metaslabs holding records of a file still being written (not
@@ -388,7 +389,7 @@ impl WriterState {
     }
 
     /// May a flush of volume `name` be acknowledged (see `Attached::fresh`)?
-    pub(crate) fn lease_fresh(&self, name: &str) -> bool {
+    pub(crate) fn lease_fresh(&self, name: &DatasetName) -> bool {
         self.datasets.lock().unwrap().get(name).is_some_and(|a| {
             !a.lost.as_ref().is_some_and(|l| *l.borrow()) && a.fresh.as_ref().is_none_or(|f| f())
         })
@@ -438,7 +439,11 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Start running volume `name` under its `ds/<name>` lease.
-    pub async fn attach_dataset(&self, name: &str, ds: Holding) -> Result<(), FileSystemError> {
+    pub async fn attach_dataset(
+        &self,
+        name: &DatasetName,
+        ds: Holding,
+    ) -> Result<(), FileSystemError> {
         self.attach_dataset_until(name, ds, None).await
     }
 
@@ -448,7 +453,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// forever, and the sync would never return.
     pub async fn attach_dataset_until(
         &self,
-        name: &str,
+        name: &DatasetName,
         ds: Holding,
         lost: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(), FileSystemError> {
@@ -459,7 +464,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// provably held (see `Attached::fresh`).
     pub async fn attach_dataset_leased(
         &self,
-        name: &str,
+        name: &DatasetName,
         ds: Holding,
         lost: Option<tokio::sync::watch::Receiver<bool>>,
         fresh: Option<LeaseCheck>,
@@ -478,7 +483,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.close_dataset(name);
         self.load_dataset(name).await?;
         w.datasets.lock().unwrap().insert(
-            name.to_string(),
+            name.clone(),
             Attached {
                 ds,
                 lost,
@@ -490,7 +495,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Stop running `name`: sync what's dirty, then forget it.
-    pub async fn detach_dataset(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn detach_dataset(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         if let Some(w) = &self.writer
             && let Some(a) = w.datasets.lock().unwrap().get_mut(name)
         {
@@ -535,7 +540,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Commit `name` unchanged but without its intent log (a detach).
-    async fn retire_log(&self, w: &WriterState, name: &str) -> Result<(), FileSystemError> {
+    async fn retire_log(&self, w: &WriterState, name: &DatasetName) -> Result<(), FileSystemError> {
         let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() else {
             return Ok(());
         };
@@ -560,7 +565,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let root = vol.obj.root();
         let misses = self.new_misses();
         let commit = DatasetCommit {
-            dataset: name.to_string(),
+            dataset: name.clone(),
             writer,
             ds,
             base_root: root.ptr.clone(),
@@ -653,7 +658,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Drop `name` without syncing (its lease is gone: nothing may be
     /// written). Its intent log is left for the committer to replay.
-    pub fn abandon_dataset(&self, name: &str) {
+    pub fn abandon_dataset(&self, name: &DatasetName) {
         if let Some(w) = &self.writer {
             if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
                 self.set_dataset_log(w, &vol, None);
@@ -823,7 +828,7 @@ impl<D: BlockDevice> FileSystem<D> {
         &self,
         tx: &mut crate::tx::Tx,
         w: &WriterState,
-    ) -> (Result<Txg, FileSystemError>, Vec<String>) {
+    ) -> (Result<Txg, FileSystemError>, Vec<DatasetName>) {
         // A sync stamped below the birth floor is rebuilt (with the TXG
         // the committer sent back) and sent again.
         let mut attempts = 0;
@@ -986,7 +991,7 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn send_commit(
         &self,
         w: &WriterState,
-        name: &str,
+        name: &DatasetName,
         commit: DatasetCommit,
     ) -> Result<Committed, CommitError> {
         let lost = w

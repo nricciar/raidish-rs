@@ -6,16 +6,17 @@ use super::store::{EtcdError, EtcdStore, KeyRange};
 use crate::dataset::DatasetFormat;
 use crate::fs::FileSystem;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::vdev::Pool;
 use pb::request_op::Request;
 use std::sync::Arc;
 
 async fn store(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<EtcdStore<Pool>>) {
     let fs = Arc::new(pool.format().await);
-    fs.create_service("e", DatasetFormat::Etcd, Default::default())
+    fs.create_service(&ds("e"), DatasetFormat::Etcd, Default::default())
         .await
         .unwrap();
-    let s = EtcdStore::open(fs.clone(), "e", 7, 1).await.unwrap();
+    let s = EtcdStore::open(fs.clone(), &ds("e"), 7, 1).await.unwrap();
     (fs, s)
 }
 
@@ -340,7 +341,7 @@ async fn transactions() {
 
 /// How many history entries the tree holds.
 async fn history_len(fs: &FileSystem<Pool>) -> usize {
-    let ds = fs.open_btree("e", DatasetFormat::Etcd).await.unwrap();
+    let ds = fs.open_btree(&ds("e"), DatasetFormat::Etcd).await.unwrap();
     let t = crate::btree::Txn::begin(fs, &ds.obj).await.unwrap();
     t.range_raw(
         std::ops::Bound::Included(&b"H"[..]),
@@ -534,15 +535,19 @@ async fn survives_a_reload() {
         s.stop();
     }
     let fs = Arc::new(pool.load().await);
-    let s = EtcdStore::open(fs.clone(), "e", 7, 2).await.unwrap();
+    let s = EtcdStore::open(fs.clone(), &ds("e"), 7, 2).await.unwrap();
     assert_eq!(s.range(prefix("k")).await.unwrap().count, 50);
     assert_eq!(s.revisions().await.unwrap().0, 51);
     assert_eq!(s.lease_keep_alive(5).await.unwrap().ttl, 100);
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
     // Only etcd datasets.
-    fs.create_kv("plain").await.unwrap();
-    assert!(EtcdStore::open(fs.clone(), "plain", 7, 2).await.is_err());
+    fs.create_kv(&ds("plain")).await.unwrap();
+    assert!(
+        EtcdStore::open(fs.clone(), &ds("plain"), 7, 2)
+            .await
+            .is_err()
+    );
 }
 
 /// Serve `s` over gRPC on a local port; its address.

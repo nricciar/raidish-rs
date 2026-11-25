@@ -24,6 +24,7 @@ use crate::fs::FileSystem;
 use crate::inode::{DatasetProps, Transport};
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
+use crate::types::DatasetName;
 use crate::types::{Holder, HolderRole, LeaseResource};
 use crate::vm_store::DefSpec;
 use crate::volume::VolumeInfo;
@@ -244,41 +245,45 @@ struct Placement {
     live: BTreeSet<String>,
     /// Peer I/O is on: volumes can be proxied and handed over.
     peer_on: bool,
-    volumes: BTreeMap<String, VolumeInfo>,
+    volumes: BTreeMap<DatasetName, VolumeInfo>,
     /// VM volumes: placed by their VM's anchor (its settings, over NBD, and
     /// its holder).
-    vm_place: BTreeMap<String, (DatasetProps, Option<String>)>,
+    vm_place: BTreeMap<DatasetName, (DatasetProps, Option<String>)>,
     /// Volumes of VMs migrating away from here: kept here until they're
     /// gone.
-    migrating: BTreeSet<String>,
+    migrating: BTreeSet<DatasetName>,
 }
 
 impl Placement {
-    fn volume(&self, name: &str) -> Option<&VolumeInfo> {
+    fn volume(&self, name: &DatasetName) -> Option<&VolumeInfo> {
         self.volumes.get(name)
     }
 
     /// The node whose lease on volume `name` is live, if any.
-    fn holder(&self, name: &str) -> Option<String> {
+    fn holder(&self, name: &DatasetName) -> Option<String> {
         self.state.dataset_node(name, self.now).map(str::to_string)
     }
 
     /// The nodes volume `name` is attached to (only with peer I/O: without
     /// it there's no proxying, so no point).
-    fn attached(&self, name: &str) -> &[String] {
+    fn attached(&self, name: &DatasetName) -> &[String] {
         match self.peer_on {
-            true => self.state.attached.get(name).map_or(&[], |v| v.as_slice()),
+            true => self
+                .state
+                .attached
+                .get(name.as_str())
+                .map_or(&[], |v| v.as_slice()),
             false => &[],
         }
     }
 
     /// Whether `name` is a VM's volume (exported for qemu, not attached).
-    fn for_vm(&self, name: &str) -> bool {
+    fn for_vm(&self, name: &DatasetName) -> bool {
         self.vm_place.contains_key(name)
     }
 
     /// The node volume `name` (with settings `own`) should run on.
-    fn target(&self, name: &str, own: &DatasetProps) -> Option<String> {
+    fn target(&self, name: &DatasetName, own: &DatasetProps) -> Option<String> {
         if self.migrating.contains(name) {
             return Some(self.me.clone());
         }
@@ -290,7 +295,7 @@ impl Placement {
     }
 
     /// How volume `name` (with settings `own`) is exported.
-    fn transport(&self, name: &str, own: &DatasetProps) -> Option<Transport> {
+    fn transport(&self, name: &DatasetName, own: &DatasetProps) -> Option<Transport> {
         match self.vm_place.get(name) {
             Some((p, _)) => p.automount,
             None => own.automount,
@@ -317,7 +322,7 @@ struct Domains {
 
 impl Domains {
     /// Volumes a VM of ours uses.
-    fn in_use(&self) -> BTreeSet<String> {
+    fn in_use(&self) -> BTreeSet<DatasetName> {
         self.ours
             .iter()
             .flat_map(|v| v.meta.volumes.iter().cloned())
@@ -337,7 +342,7 @@ pub struct Agent {
     writer: Option<NodeWriter>,
     /// Where this node's file API finds the writer.
     files: WriterSlot,
-    running: BTreeMap<String, Running>,
+    running: BTreeMap<DatasetName, Running>,
     /// Running VMs here (None: this node runs none).
     vm: Option<Arc<crate::vm::VmRuntime>>,
     /// What it knows and has under way about VMs.
@@ -358,18 +363,18 @@ pub struct Agent {
 #[derive(Default)]
 struct VmBook {
     /// The VM definitions as last read.
-    specs: BTreeMap<String, crate::vm::VmSpec>,
+    specs: BTreeMap<crate::types::VmName, crate::vm::VmSpec>,
     /// VMs asked to shut down here, and when.
-    stopping: BTreeMap<String, std::time::Instant>,
+    stopping: BTreeMap<crate::types::VmName, std::time::Instant>,
     /// Live migrations of VMs from here, under way (see `migrate`).
-    migrations: BTreeMap<String, migrate::Migration>,
+    migrations: BTreeMap<crate::types::VmName, migrate::Migration>,
     /// VMs migrated away whose volumes are being handed over.
-    migrated: BTreeMap<String, migrate::Migrated>,
+    migrated: BTreeMap<crate::types::VmName, migrate::Migrated>,
     /// VMs whose live migration to a node failed: they move there cold.
-    migrate_failed: BTreeMap<String, String>,
+    migrate_failed: BTreeMap<crate::types::VmName, String>,
     /// Failed live migrations whose guest's whereabouts aren't settled yet
     /// (see `Agent::settle_failed`).
-    unsettled: BTreeMap<String, migrate::Unsettled>,
+    unsettled: BTreeMap<crate::types::VmName, migrate::Unsettled>,
 }
 
 /// The services (S3, SQS, etcd datasets) this node serves.
@@ -377,7 +382,7 @@ struct VmBook {
 struct Services {
     /// This node's service front ends (None: it serves none).
     frontend: Option<Arc<crate::frontend::Frontend>>,
-    running: BTreeMap<String, RunningService>,
+    running: BTreeMap<DatasetName, RunningService>,
 }
 
 /// Peer I/O's TLS and address.
@@ -601,7 +606,7 @@ impl Agent {
     /// while another node starts it).
     async fn drop_lost(&mut self) {
         self.drop_lost_adopted().await;
-        let lost: Vec<String> = self
+        let lost: Vec<DatasetName> = self
             .running
             .iter()
             .filter(|(_, r)| r.lost.is_lost())
@@ -622,7 +627,7 @@ impl Agent {
             );
             self.stop(&name, false).await;
         }
-        let lost: Vec<String> = self
+        let lost: Vec<DatasetName> = self
             .services
             .running
             .iter()
@@ -658,10 +663,10 @@ impl Agent {
             // already are taken in with the rest (audit A1).
             let parts = self.shared.writer.lock().unwrap().take();
             self.drop_lost_adopted().await;
-            let names: Vec<String> = self.running.keys().cloned().collect();
+            let names: Vec<DatasetName> = self.running.keys().cloned().collect();
             self.destroy_vms_using(&names).await;
             // All at once: each waits out its clients' drain (I-27).
-            let taken: Vec<(String, Running)> = names
+            let taken: Vec<(DatasetName, Running)> = names
                 .into_iter()
                 .filter_map(|n| self.running.remove(&n).map(|r| (n, r)))
                 .collect();
@@ -672,7 +677,7 @@ impl Agent {
                     .map(|(n, r)| async move { me.wind_down(&n, r, false).await }),
             )
             .await;
-            let names: Vec<String> = self.services.running.keys().cloned().collect();
+            let names: Vec<DatasetName> = self.services.running.keys().cloned().collect();
             for name in names {
                 self.stop_service(&name, false).await;
             }
@@ -696,10 +701,10 @@ impl Agent {
             Some(w) if w.lost.is_lost() => WriterStanding::Lost,
             Some(_) => WriterStanding::Held,
         };
-        let taken: Vec<(String, handoff::Slot)> = {
+        let taken: Vec<(DatasetName, handoff::Slot)> = {
             let mut slots = self.shared.slots.lock().unwrap();
             let adopted = slots.iter().filter_map(|(n, s)| match s {
-                handoff::Slot::Adopted { lost, .. } => Some((n.as_str(), lost.is_lost())),
+                handoff::Slot::Adopted { lost, .. } => Some((n, lost.is_lost())),
                 _ => None,
             });
             adopted_to_drop(adopted, writer)
@@ -764,7 +769,7 @@ impl Agent {
         }
         match self.committer.vms().await {
             Ok(defs) => {
-                let mut specs: BTreeMap<String, crate::vm::VmSpec> =
+                let mut specs: BTreeMap<crate::types::VmName, crate::vm::VmSpec> =
                     defs.into_iter().map(|(n, d)| (n, d.spec())).collect();
                 crate::vm::mark_conflicts(&mut specs);
                 self.vms.specs = specs;
@@ -778,7 +783,7 @@ impl Agent {
         let state = self.cluster.status().state;
         let now = crate::cluster::now_ms();
         let live = state.live_nodes(now).map(|(n, _)| n.to_string()).collect();
-        let volumes: BTreeMap<String, VolumeInfo> =
+        let volumes: BTreeMap<DatasetName, VolumeInfo> =
             volumes.into_iter().map(|v| (v.name.clone(), v)).collect();
         // A VM's volumes are placed by its anchor's settings and holder, so
         // they all land on one node, exported over NBD for qemu (and not
@@ -865,7 +870,7 @@ impl Agent {
     /// be; start what belongs here.
     async fn reconcile_volumes(&mut self, p: &Placement, doms: &Domains) {
         let in_use = doms.in_use();
-        let stop: Vec<String> = self
+        let stop: Vec<DatasetName> = self
             .running
             .iter()
             .filter(|(name, r)| match p.volume(name) {
@@ -974,7 +979,7 @@ impl Agent {
                 self.remove_proxy(&v.name).await;
             }
         }
-        let gone: Vec<String> = self
+        let gone: Vec<DatasetName> = self
             .shared
             .slots
             .lock()
@@ -1008,7 +1013,7 @@ impl Agent {
                 .is_some_and(|a| a.props.move_to.as_deref() == Some(to.as_str()))
         });
         for v in ours {
-            let name = &v.domain.name;
+            let name = &v.name;
             if self.vms.migrations.contains_key(name) || self.vms.unsettled.contains_key(name) {
                 continue; // leaving: see `poll_migrations`
             }
@@ -1058,7 +1063,7 @@ impl Agent {
                 self.vms.stopping.remove(name);
                 continue;
             }
-            let wanted = p.state.vms.contains_key(name)
+            let wanted = p.state.vms.contains_key(name.as_str())
                 && !vm.restarting(name)
                 && self
                     .vms
@@ -1108,7 +1113,7 @@ impl Agent {
                 Some(_) => {}
             }
         }
-        let up = |n: &str| ours.iter().any(|v| v.domain.name == n);
+        let up = |n: &str| ours.iter().any(|v| v.name.as_str() == n);
         for n in self.vms.stopping.keys().filter(|n| !up(n)) {
             self.events.info(
                 EventKind::VmStopped,
@@ -1133,7 +1138,7 @@ impl Agent {
     ) {
         let mut errors = BTreeMap::new();
         for spec in self.vms.specs.values() {
-            if !p.state.vms.contains_key(&spec.name) || !p.anchor_here(spec) {
+            if !p.state.vms.contains_key(spec.name.as_str()) || !p.anchor_here(spec) {
                 continue;
             }
             // Leaving, or just left, by migration: it runs elsewhere even
@@ -1152,14 +1157,14 @@ impl Agent {
                     Subject::vm(&spec.name),
                     format!("VM '{}' can't start: {}", spec.name, e),
                 );
-                errors.insert(spec.name.clone(), e.to_string());
+                errors.insert(spec.name.to_string(), e.to_string());
                 continue;
             }
             if let Some(d) = listed
                 .iter()
-                .find(|d| d.name == spec.name && d.id.is_some())
+                .find(|d| d.name.as_str() == spec.name.as_str() && d.id.is_some())
             {
-                if !ours.iter().any(|v| v.domain.name == d.name) {
+                if !ours.iter().any(|v| v.name.as_str() == d.name) {
                     let e = format!(
                         "a domain '{}' this node didn't start is running on its libvirt",
                         d.name
@@ -1170,7 +1175,7 @@ impl Agent {
                         Subject::vm(&spec.name),
                         format!("VM '{}' can't start on {}: {}", spec.name, self.node, e),
                     );
-                    errors.insert(spec.name.clone(), e);
+                    errors.insert(spec.name.to_string(), e);
                 } else {
                     self.events.clear(&Subject::vm(&spec.name));
                 }
@@ -1210,7 +1215,7 @@ impl Agent {
                         Subject::vm(&spec.name),
                         format!("VM '{}' failed to start on {}: {}", spec.name, self.node, e),
                     );
-                    errors.insert(spec.name.clone(), e.to_string());
+                    errors.insert(spec.name.to_string(), e.to_string());
                 }
             }
         }
@@ -1219,7 +1224,7 @@ impl Agent {
 
     /// Destroy (no shutdown: there's no time) every VM of ours here using
     /// one of `volumes`.
-    async fn destroy_vms_using(&mut self, volumes: &[String]) {
+    async fn destroy_vms_using(&mut self, volumes: &[DatasetName]) {
         let Some(vm) = self.vm.clone() else {
             return;
         };
@@ -1270,7 +1275,7 @@ impl Agent {
             if let Err(e) = vm.virsh.destroy(&d.name).await {
                 eprintln!("agent: {}", e);
             }
-            self.vms.stopping.remove(&d.name);
+            self.vms.stopping.remove(d.name.as_str());
         }
     }
 
@@ -1515,7 +1520,7 @@ impl Agent {
     /// failed (the helper or a kernel module was missing, a transient
     /// error), so whatever waits for the device (see `crate::csi`) gets it.
     async fn retry_attach(&mut self) {
-        let due: Vec<(String, Transport)> = self
+        let due: Vec<(DatasetName, Transport)> = self
             .running
             .iter()
             .filter(|(_, r)| {
@@ -1577,7 +1582,7 @@ impl Agent {
                 })
             });
             routes.insert(
-                d.name.clone(),
+                d.name.to_string(),
                 crate::frontend::Route {
                     format: d.format,
                     port: d.props.port,
@@ -1591,7 +1596,7 @@ impl Agent {
             }
         }
         fe.set_routes(routes, nodes);
-        let stop: Vec<String> = self
+        let stop: Vec<DatasetName> = self
             .services
             .running
             .keys()
@@ -1647,7 +1652,7 @@ impl Agent {
     async fn start_service(
         &mut self,
         fe: &Arc<crate::frontend::Frontend>,
-        name: &str,
+        name: &DatasetName,
         format: crate::dataset::DatasetFormat,
     ) -> Result<(), StartError> {
         let lease = Arc::new(
@@ -1681,7 +1686,7 @@ impl Agent {
             return Err(StartError::Failed(e));
         }
         self.services.running.insert(
-            name.to_string(),
+            name.clone(),
             RunningService {
                 lease,
                 lost,
@@ -1693,13 +1698,13 @@ impl Agent {
 
     /// What service dataset `name` is ("Bucket"...), if it runs here.
     /// Service dataset `name`'s format, if it runs here.
-    fn service_format(&self, name: &str) -> Option<crate::dataset::DatasetFormat> {
+    fn service_format(&self, name: &DatasetName) -> Option<crate::dataset::DatasetFormat> {
         self.services.running.get(name).map(|r| r.format)
     }
 
     /// Stop serving service dataset `name`; `clean`: sync it and give its
     /// lease back (otherwise the lease is lost: drop it, writing nothing).
-    async fn stop_service(&mut self, name: &str, clean: bool) {
+    async fn stop_service(&mut self, name: &DatasetName, clean: bool) {
         let Some(r) = self.services.running.remove(name) else {
             return;
         };
@@ -1724,7 +1729,7 @@ impl Agent {
 
     /// Stop running `name`: detach, unexport, and (`clean`) sync and release
     /// the lease; otherwise (lease lost) drop it without writing.
-    async fn stop(&mut self, name: &str, clean: bool) {
+    async fn stop(&mut self, name: &DatasetName, clean: bool) {
         let Some(r) = self.running.remove(name) else {
             return;
         };
@@ -1733,7 +1738,7 @@ impl Agent {
 
     /// Stop volume `name` out of `running` already (see `stop`). Takes
     /// only `&self`, so several can go at once.
-    async fn wind_down(&self, name: &str, r: Running, clean: bool) {
+    async fn wind_down(&self, name: &DatasetName, r: Running, clean: bool) {
         self.shared.writing.lock().unwrap().remove(name);
         if r.info.attach.device().is_some()
             && let Err(e) = self.detach(name, r.info.transport).await
@@ -1768,7 +1773,7 @@ impl Agent {
     }
 
     /// Where volume `name`'s writer is, looked up live each time it's asked.
-    fn locator(&self, name: &str, port: u16) -> Arc<dyn crate::peer_io::Locate> {
+    fn locator(&self, name: &DatasetName, port: u16) -> Arc<dyn crate::peer_io::Locate> {
         let cluster = self.cluster.clone();
         let resource = dataset_resource(name);
         let me = self.node.clone();
@@ -1795,8 +1800,8 @@ impl Agent {
         v: &crate::vm::LocalVm,
         p: &Placement,
     ) -> bool {
-        let name = &v.domain.name;
-        if self.peer.is_none() || v.domain.state != crate::vm::DomState::Running {
+        let name = &v.name;
+        if self.peer.is_none() || v.state != crate::vm::DomState::Running {
             return false;
         }
         let Some(spec) = self.vms.specs.get(name).filter(|s| s.usable()) else {
@@ -1814,7 +1819,7 @@ impl Agent {
         if to == self.node
             || !p.live.contains(&to)
             || p.target(anchor_name, &anchor.props).as_deref() != Some(to.as_str())
-            || !p.state.vms.contains_key(name)
+            || !p.state.vms.contains_key(name.as_str())
             || vm.restarting(name)
             || !spec.volumes().iter().all(|x| self.running.contains_key(x))
             || self.vms.migrate_failed.get(name) == Some(&to)
@@ -1864,7 +1869,7 @@ impl Agent {
     /// volumes of a VM that left to where it went, or put a failed one's
     /// back, to move cold.
     async fn poll_migrations(&mut self) {
-        let done: Vec<String> = self
+        let done: Vec<crate::types::VmName> = self
             .vms
             .migrations
             .iter()
@@ -1940,7 +1945,7 @@ impl Agent {
         self.settle_failed().await;
         // Migrated: detach here (so each volume is handed over), then, once
         // none runs here, there too (back to their own placement).
-        let names: Vec<String> = self.vms.migrated.keys().cloned().collect();
+        let names: Vec<crate::types::VmName> = self.vms.migrated.keys().cloned().collect();
         for name in names {
             let mut m = self.vms.migrated.remove(&name).unwrap();
             if !m.detached {
@@ -1975,16 +1980,14 @@ impl Agent {
     /// Failed live migrations: where does the guest run now? It may have
     /// switched over before the failure (`migrate::Whereabouts`).
     async fn settle_failed(&mut self) {
-        let names: Vec<String> = self.vms.unsettled.keys().cloned().collect();
+        let names: Vec<crate::types::VmName> = self.vms.unsettled.keys().cloned().collect();
         for name in names {
             let mut u = self.vms.unsettled.remove(&name).unwrap();
             let here = match &self.vm {
-                Some(vm) => vm
-                    .virsh
-                    .list()
-                    .await
-                    .ok()
-                    .map(|l| l.iter().any(|d| d.name == name && d.id.is_some())),
+                Some(vm) => vm.virsh.list().await.ok().map(|l| {
+                    l.iter()
+                        .any(|d| d.name.as_str() == name.as_str() && d.id.is_some())
+                }),
                 None => Some(false),
             };
             // B only matters if it isn't here.
@@ -2072,7 +2075,7 @@ impl Agent {
     }
 
     /// Does `node` run VM `name`? None: it couldn't be asked.
-    async fn ask_runs_there(&self, node: &str, name: &str) -> Option<bool> {
+    async fn ask_runs_there(&self, node: &str, name: &crate::types::VmName) -> Option<bool> {
         let url = peer_url(&self.cluster.members.peers, node)?;
         let http = crate::tls::http_client(Some(Duration::from_secs(5))).ok()?;
         migrate::runs_there(&http, &url, name).await
@@ -2081,7 +2084,7 @@ impl Agent {
     /// VM `v` migrated here and its volumes run here now: make it this
     /// node's (its metadata names this node's lease owner).
     async fn arrived(&mut self, vm: &Arc<crate::vm::VmRuntime>, v: &crate::vm::LocalVm) {
-        let name = &v.domain.name;
+        let name = &v.name;
         let Some(r) = self.running.get(&v.meta.anchor) else {
             return;
         };
@@ -2105,9 +2108,9 @@ impl Agent {
 
     /// Put what was handed to this node (see `handoff`) with what it runs.
     async fn adopt_handed_over(&mut self, volumes: &[VolumeInfo]) {
-        let adopted: Vec<(String, handoff::Slot)> = {
+        let adopted: Vec<(DatasetName, handoff::Slot)> = {
             let mut slots = self.shared.slots.lock().unwrap();
-            let names: Vec<String> = slots
+            let names: Vec<DatasetName> = slots
                 .iter()
                 .filter(|(_, s)| matches!(s, handoff::Slot::Adopted { .. }))
                 .map(|(n, _)| n.clone())
@@ -2170,7 +2173,7 @@ impl Agent {
     /// `handoff`). Ok(true): it's not run here any more (handed over, or
     /// stopped cleanly when the handoff failed after this node let go);
     /// Ok(false): no peer I/O, stop it instead; Err: still run here.
-    async fn hand_off(&mut self, name: &str, to: &str) -> Result<bool, String> {
+    async fn hand_off(&mut self, name: &DatasetName, to: &str) -> Result<bool, String> {
         use tokio::io::{AsyncWriteExt, BufReader};
         let Some(p) = &self.peer else {
             return Ok(false);
@@ -2243,7 +2246,7 @@ impl Agent {
                 .writing
                 .lock()
                 .unwrap()
-                .insert(name.to_string(), epoch);
+                .insert(name.clone(), epoch);
             if let Some(r) = self.running.get_mut(name)
                 && r.info.attach.device().is_some()
             {
@@ -2399,13 +2402,13 @@ impl Agent {
     }
 
     /// Stop exporting the proxied volume `name` here.
-    async fn remove_proxy(&mut self, name: &str) {
+    async fn remove_proxy(&mut self, name: &DatasetName) {
         let proxy = {
             let mut slots = self.shared.slots.lock().unwrap();
             match slots.remove(name) {
                 Some(handoff::Slot::Proxy(p)) => p,
                 Some(other) => {
-                    slots.insert(name.to_string(), other);
+                    slots.insert(name.clone(), other);
                     return;
                 }
                 None => return,
@@ -2417,7 +2420,7 @@ impl Agent {
     }
 
     /// The transport volume `name` is proxied here over, if it is.
-    fn proxy_transport(&self, name: &str) -> Option<Transport> {
+    fn proxy_transport(&self, name: &DatasetName) -> Option<Transport> {
         match self.shared.slots.lock().unwrap().get(name) {
             Some(handoff::Slot::Proxy(p)) => Some(p.transport),
             _ => None,
@@ -2431,7 +2434,7 @@ impl Agent {
     /// them (structural triage, `remove_proxy`).
     async fn take_down_proxy(
         &self,
-        name: &str,
+        name: &DatasetName,
         proxy: handoff::Proxy,
         parts: Option<&handoff::WriterParts>,
     ) {
@@ -2450,9 +2453,9 @@ impl Agent {
     /// proxy; its claim goes here too, so it takes that proxy down itself
     /// when it fails (`Shared::restore`) rather than put it back.
     async fn drop_proxies(&mut self, parts: Option<handoff::WriterParts>) {
-        let proxies: Vec<(String, handoff::Proxy)> = {
+        let proxies: Vec<(DatasetName, handoff::Proxy)> = {
             let mut slots = self.shared.slots.lock().unwrap();
-            let names: Vec<String> = slots
+            let names: Vec<DatasetName> = slots
                 .iter()
                 .filter(|(_, s)| matches!(s, handoff::Slot::Proxy(_)))
                 .map(|(n, _)| n.clone())
@@ -2515,7 +2518,7 @@ impl Agent {
             .map(str::to_string))
     }
 
-    async fn attach(&self, name: &str, t: Transport) -> Result<Option<String>, String> {
+    async fn attach(&self, name: &DatasetName, t: Transport) -> Result<Option<String>, String> {
         let bind = self.config.bind();
         let port = match t {
             Transport::Nbd => self.config.nbd_port(),
@@ -2529,7 +2532,7 @@ impl Agent {
         self.helper(&[cmd, name, &bind, &port]).await
     }
 
-    async fn detach(&self, name: &str, t: Transport) -> Result<(), String> {
+    async fn detach(&self, name: &DatasetName, t: Transport) -> Result<(), String> {
         let cmd = match t {
             Transport::Nbd => "nbd-detach",
             Transport::Nvme => "nvme-detach",
@@ -2551,12 +2554,12 @@ enum WriterStanding {
 /// those to drop: every one once the writer is lost or gone (they ran
 /// under it), else those whose own lease is lost (audit A1).
 fn adopted_to_drop<'a>(
-    adopted: impl Iterator<Item = (&'a str, bool)>,
+    adopted: impl Iterator<Item = (&'a DatasetName, bool)>,
     writer: WriterStanding,
-) -> Vec<String> {
+) -> Vec<DatasetName> {
     adopted
         .filter(|&(_, lost)| lost || writer != WriterStanding::Held)
-        .map(|(n, _)| n.to_string())
+        .map(|(n, _)| n.clone())
         .collect()
 }
 
@@ -2584,14 +2587,14 @@ pub(crate) async fn migrate_ask_live(
     migrate::ask_live(http, url, cpu).await
 }
 
-fn peer_url(peers: &BTreeMap<u64, String>, node: &str) -> Option<String> {
+fn peer_url(peers: &BTreeMap<crate::types::NodeId, String>, node: &str) -> Option<String> {
     let id: crate::types::NodeId = node.parse().ok()?;
-    Some(peers.get(&id.get())?.trim_end_matches('/').to_string())
+    Some(peers.get(&id)?.trim_end_matches('/').to_string())
 }
 
-fn peer_host(peers: &BTreeMap<u64, String>, node: &str) -> Option<String> {
+fn peer_host(peers: &BTreeMap<crate::types::NodeId, String>, node: &str) -> Option<String> {
     let id: crate::types::NodeId = node.parse().ok()?;
-    let url = reqwest::Url::parse(peers.get(&id.get())?).ok()?;
+    let url = reqwest::Url::parse(peers.get(&id)?).ok()?;
 
     Some(url.host_str()?.trim_matches(['[', ']']).to_string())
 }

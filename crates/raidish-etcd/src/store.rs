@@ -361,7 +361,7 @@ struct Mark {
 /// One etcd keyspace, served from this node.
 pub struct EtcdStore<D: BlockDevice> {
     fs: Arc<FileSystem<D>>,
-    pub name: String,
+    pub name: crate::types::DatasetName,
     pub cluster_id: u64,
     pub member_id: u64,
     /// The `ds/<name>` lease's epoch: the "raft term" clients see.
@@ -398,7 +398,7 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
     /// committer in tests). Leases start afresh.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
-        name: &str,
+        name: &crate::types::DatasetName,
         member_id: u64,
         term: u64,
     ) -> Result<Arc<Self>> {
@@ -430,7 +430,7 @@ impl<D: BlockDevice + 'static> EtcdStore<D> {
         };
         let s = Arc::new(EtcdStore {
             fs,
-            name: name.to_string(),
+            name: name.clone(),
             cluster_id: entry.guid,
             member_id,
             term,

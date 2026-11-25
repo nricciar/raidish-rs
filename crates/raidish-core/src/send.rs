@@ -28,6 +28,7 @@ use crate::blkptr::BlockPtr;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
+use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::volume::DIRTY_LIMIT_BYTES;
 use serde::{Deserialize, Serialize};
@@ -152,7 +153,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Snapshot `name@snap` and its dnode's tree, size and record size.
     async fn snapshot_tree(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
     ) -> Result<(crate::inode::SnapRef, TreeRoot, u64, u32), FileSystemError> {
         let id = self.dataset_id(name).await?;
@@ -174,7 +175,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// None), or what changed since the older snapshot `name@from`.
     pub async fn send_snapshot<W: AsyncWrite + Unpin + Send>(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
         from: Option<&str>,
         w: &mut W,
@@ -380,7 +381,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// volume is left as it was (a full receive's volume is deleted).
     pub async fn recv_snapshot<R: AsyncRead + Unpin + Send>(
         &self,
-        name: &str,
+        name: &DatasetName,
         r: &mut R,
         force: bool,
     ) -> Result<StreamReport, FileSystemError> {
@@ -389,7 +390,6 @@ impl<D: BlockDevice> FileSystem<D> {
             hash: blake3::Hasher::new(),
         };
         let header = read_header(&mut inp).await?;
-        crate::types::DatasetName::try_from(name)?;
         crate::types::SnapshotName::try_from(header.snapshot.as_str())?;
         self.recv_begin(name, &header, force, true).await?;
         let result = self.recv_frames(name, &header, &mut inp).await;
@@ -427,11 +427,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// (changes nothing): what a client asks before sending the rest.
     pub async fn recv_check(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         force: bool,
     ) -> Result<(), FileSystemError> {
-        crate::types::DatasetName::try_from(name)?;
         crate::types::SnapshotName::try_from(header.snapshot.as_str())?;
         self.recv_begin(name, header, force, false).await
     }
@@ -440,7 +439,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// ready: create it, or roll it back with `force`.
     async fn recv_begin(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         force: bool,
         prepare: bool,
@@ -564,7 +563,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     async fn recv_frames<R: AsyncRead + Unpin + Send>(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         inp: &mut In<'_, R>,
     ) -> Result<StreamReport, FileSystemError> {

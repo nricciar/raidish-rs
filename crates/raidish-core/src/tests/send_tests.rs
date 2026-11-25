@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::types::{Holding, LeaseRef, ep};
 use crate::vdev::Pool;
@@ -16,8 +17,8 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 async fn read(fs: &FileSystem<Pool>, name: &str) -> Vec<u8> {
     let mut buf = vec![0xEEu8; VOL as usize];
     let n = match name.split_once('@') {
-        Some((v, s)) => fs.snapshot_read(v, s, 0, &mut buf).await.unwrap(),
-        None => fs.block_read(name, 0, &mut buf).await.unwrap(),
+        Some((v, s)) => fs.snapshot_read(&ds(v), s, 0, &mut buf).await.unwrap(),
+        None => fs.block_read(&ds(name), 0, &mut buf).await.unwrap(),
     };
     buf.truncate(n);
     buf
@@ -42,7 +43,9 @@ async fn allocated(fs: &FileSystem<Pool>) -> u64 {
 
 async fn send(fs: &FileSystem<Pool>, snap: &str, from: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
-    fs.send_snapshot("vol", snap, from, &mut out).await.unwrap();
+    fs.send_snapshot(&ds("vol"), snap, from, &mut out)
+        .await
+        .unwrap();
     out
 }
 
@@ -52,23 +55,29 @@ async fn send(fs: &FileSystem<Pool>, snap: &str, from: Option<&str>) -> Vec<u8> 
 async fn source() -> (TestPool, FileSystem<Pool>) {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", VOL, VOLBLOCK_ALIGN).await.unwrap();
-    fs.block_write("vol", 0, &pattern(6 * MB as usize, 1))
+    fs.create_block(&ds("vol"), VOL, VOLBLOCK_ALIGN)
         .await
         .unwrap();
-    fs.create_snapshot("vol", "s1").await.unwrap();
-    fs.block_write("vol", 500_000, &pattern(MB as usize, 2))
+    fs.block_write(&ds("vol"), 0, &pattern(6 * MB as usize, 1))
         .await
         .unwrap();
-    fs.block_write("vol", 7 * MB, &pattern(MB as usize / 2, 3))
+    fs.create_snapshot(&ds("vol"), "s1").await.unwrap();
+    fs.block_write(&ds("vol"), 500_000, &pattern(MB as usize, 2))
+        .await
+        .unwrap();
+    fs.block_write(&ds("vol"), 7 * MB, &pattern(MB as usize / 2, 3))
         .await
         .unwrap();
     // 512 records of 12 KiB = 6 MiB per level-1 subtree: this clears the
     // whole second one.
-    fs.block_zero("vol", 2 * MB, 4 * MB as usize).await.unwrap();
-    fs.create_snapshot("vol", "s2").await.unwrap();
+    fs.block_zero(&ds("vol"), 2 * MB, 4 * MB as usize)
+        .await
+        .unwrap();
+    fs.create_snapshot(&ds("vol"), "s2").await.unwrap();
     // And the head goes on (not part of any stream).
-    fs.block_write("vol", 0, &pattern(4096, 4)).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &pattern(4096, 4))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     (pool, fs)
 }
@@ -90,14 +99,14 @@ async fn full_then_incremental() {
     let dp = TestPool::new().await;
     let dst = dp.format().await;
     let r = dst
-        .recv_snapshot("vol", &mut full.as_slice(), false)
+        .recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert!(!r.incremental);
     assert_eq!(read(&dst, "vol@s1").await, read(&src, "vol@s1").await);
     assert_eq!(read(&dst, "vol").await, read(&src, "vol@s1").await);
     let r = dst
-        .recv_snapshot("vol", &mut incr.as_slice(), false)
+        .recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
         .await
         .unwrap();
     assert!(r.incremental && r.hole_records > 0, "{}", r);
@@ -107,19 +116,20 @@ async fn full_then_incremental() {
         l.into_iter().map(|s| (s.name, s.guid)).collect()
     };
     assert_eq!(
-        guids(dst.list_snapshots("vol").await.unwrap()),
-        guids(src.list_snapshots("vol").await.unwrap())
+        guids(dst.list_snapshots(&ds("vol")).await.unwrap()),
+        guids(src.list_snapshots(&ds("vol")).await.unwrap())
     );
     clean(&dst).await;
     clean(&src).await;
 
     // Again: already there.
     assert!(matches!(
-        dst.recv_snapshot("vol", &mut incr.as_slice(), false).await,
+        dst.recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
+            .await,
         Err(FileSystemError::AlreadyExists)
     ));
     // Into the same pool under another name: a copy.
-    src.recv_snapshot("copy", &mut full.as_slice(), false)
+    src.recv_snapshot(&ds("copy"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert_eq!(read(&src, "copy").await, read(&src, "vol@s1").await);
@@ -136,28 +146,30 @@ async fn incremental_needs_its_base() {
     let dp = TestPool::new().await;
     let dst = dp.format().await;
     assert!(
-        dst.recv_snapshot("vol", &mut incr.as_slice(), false)
+        dst.recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
             .await
             .is_err(),
         "no such volume"
     );
-    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+    dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert!(
-        dst.recv_snapshot("vol", &mut full.as_slice(), false)
+        dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
             .await
             .is_err(),
         "a full stream wants a new volume"
     );
-    dst.block_write("vol", 0, &pattern(4096, 9)).await.unwrap();
+    dst.block_write(&ds("vol"), 0, &pattern(4096, 9))
+        .await
+        .unwrap();
     assert!(
-        dst.recv_snapshot("vol", &mut incr.as_slice(), false)
+        dst.recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
             .await
             .is_err(),
         "written since s1"
     );
-    dst.recv_snapshot("vol", &mut incr.as_slice(), true)
+    dst.recv_snapshot(&ds("vol"), &mut incr.as_slice(), true)
         .await
         .unwrap();
     assert_eq!(read(&dst, "vol").await, read(&src, "vol@s2").await);
@@ -166,12 +178,12 @@ async fn incremental_needs_its_base() {
     let dp2 = TestPool::new().await;
     let other = dp2.format().await;
     other
-        .recv_snapshot("vol", &mut full.as_slice(), false)
+        .recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
-    other.create_snapshot("vol", "later").await.unwrap();
+    other.create_snapshot(&ds("vol"), "later").await.unwrap();
     let e = other
-        .recv_snapshot("vol", &mut incr.as_slice(), false)
+        .recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
         .await
         .unwrap_err();
     assert!(e.to_string().contains("newest"), "{}", e);
@@ -193,7 +205,7 @@ async fn bad_streams_leave_nothing_behind() {
     // Cut short, and corrupted in the data.
     let short = &full[..full.len() / 2];
     assert!(
-        dst.recv_snapshot("vol", &mut &short[..], false)
+        dst.recv_snapshot(&ds("vol"), &mut &short[..], false)
             .await
             .is_err()
     );
@@ -201,7 +213,7 @@ async fn bad_streams_leave_nothing_behind() {
     let at = flipped.len() / 2;
     flipped[at] ^= 0x40;
     assert!(
-        dst.recv_snapshot("vol", &mut flipped.as_slice(), false)
+        dst.recv_snapshot(&ds("vol"), &mut flipped.as_slice(), false)
             .await
             .is_err()
     );
@@ -209,7 +221,7 @@ async fn bad_streams_leave_nothing_behind() {
     assert_eq!(allocated(&dst).await, baseline);
     clean(&dst).await;
 
-    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+    dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     let before = read(&dst, "vol").await;
@@ -217,20 +229,20 @@ async fn bad_streams_leave_nothing_behind() {
     let at = flipped.len() - 100;
     flipped[at] ^= 1;
     assert!(
-        dst.recv_snapshot("vol", &mut flipped.as_slice(), false)
+        dst.recv_snapshot(&ds("vol"), &mut flipped.as_slice(), false)
             .await
             .is_err()
     );
     assert_eq!(read(&dst, "vol").await, before);
-    assert_eq!(dst.list_snapshots("vol").await.unwrap().len(), 1);
+    assert_eq!(dst.list_snapshots(&ds("vol")).await.unwrap().len(), 1);
     clean(&dst).await;
     // And the good one still goes on.
-    dst.recv_snapshot("vol", &mut incr.as_slice(), false)
+    dst.recv_snapshot(&ds("vol"), &mut incr.as_slice(), false)
         .await
         .unwrap();
     assert_eq!(read(&dst, "vol@s2").await, read(&src, "vol@s2").await);
     assert!(
-        dst.recv_snapshot("vol", &mut &b"not a stream at all"[..], false)
+        dst.recv_snapshot(&ds("vol"), &mut &b"not a stream at all"[..], false)
             .await
             .is_err()
     );
@@ -243,12 +255,12 @@ async fn send_checks_snapshots() {
     let (_sp, src) = source().await;
     let mut out = Vec::new();
     assert!(
-        src.send_snapshot("vol", "nope", None, &mut out)
+        src.send_snapshot(&ds("vol"), "nope", None, &mut out)
             .await
             .is_err()
     );
     assert!(
-        src.send_snapshot("vol", "s1", Some("s2"), &mut out)
+        src.send_snapshot(&ds("vol"), "s1", Some("s2"), &mut out)
             .await
             .is_err(),
         "the base must be older"
@@ -269,26 +281,40 @@ async fn recv_check_answers_without_changing_anything() {
 
     let dp = TestPool::new().await;
     let dst = dp.format().await;
-    dst.recv_check("vol", &header, false).await.unwrap();
+    dst.recv_check(&ds("vol"), &header, false).await.unwrap();
     assert!(
         dst.list_volumes().await.unwrap().is_empty(),
         "a check creates nothing"
     );
-    assert!(dst.recv_check("vol", &incr_header, false).await.is_err());
-    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+    assert!(
+        dst.recv_check(&ds("vol"), &incr_header, false)
+            .await
+            .is_err()
+    );
+    dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert!(
-        dst.recv_check("vol", &header, false).await.is_err(),
+        dst.recv_check(&ds("vol"), &header, false).await.is_err(),
         "exists"
     );
-    dst.recv_check("vol", &incr_header, false).await.unwrap();
-    dst.block_write("vol", 0, &pattern(4096, 9)).await.unwrap();
-    assert!(dst.recv_check("vol", &incr_header, false).await.is_err());
-    dst.recv_check("vol", &incr_header, true).await.unwrap();
+    dst.recv_check(&ds("vol"), &incr_header, false)
+        .await
+        .unwrap();
+    dst.block_write(&ds("vol"), 0, &pattern(4096, 9))
+        .await
+        .unwrap();
+    assert!(
+        dst.recv_check(&ds("vol"), &incr_header, false)
+            .await
+            .is_err()
+    );
+    dst.recv_check(&ds("vol"), &incr_header, true)
+        .await
+        .unwrap();
     // Still written to (not rolled back by the check).
     let mut b = vec![0u8; 4096];
-    dst.block_read("vol", 0, &mut b).await.unwrap();
+    dst.block_read(&ds("vol"), 0, &mut b).await.unwrap();
     assert_eq!(b, pattern(4096, 9));
 }
 
@@ -299,12 +325,12 @@ async fn received_snapshots_keep_their_dates() {
     let full = send(&src, "s1", None).await;
     let dp = TestPool::new().await;
     let dst = dp.format().await;
-    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+    dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert_eq!(
-        dst.list_snapshots("vol").await.unwrap()[0].created_ns,
-        src.list_snapshots("vol").await.unwrap()[0].created_ns
+        dst.list_snapshots(&ds("vol")).await.unwrap()[0].created_ns,
+        src.list_snapshots(&ds("vol")).await.unwrap()[0].created_ns
     );
 }
 
@@ -317,12 +343,12 @@ async fn no_incremental_over_a_pending_intent_log() {
     let incr = send(&src, "s2", Some("s1")).await;
     let dp = TestPool::new().await;
     let dst = dp.format().await;
-    dst.recv_snapshot("vol", &mut full.as_slice(), false)
+    dst.recv_snapshot(&ds("vol"), &mut full.as_slice(), false)
         .await
         .unwrap();
     // A writer ran it and went away, its log not replayed yet.
     {
-        let vol = dst.open_dataset("vol").await.unwrap();
+        let vol = dst.open_dataset(&ds("vol")).await.unwrap();
         *vol.log.lock().unwrap() = Some(crate::inode::DatasetLog {
             regions: Vec::new(),
             from_seq: 0,
@@ -338,7 +364,7 @@ async fn no_incremental_over_a_pending_intent_log() {
     dst.sync().await.unwrap();
     for force in [false, true] {
         let e = dst
-            .recv_snapshot("vol", &mut incr.as_slice(), force)
+            .recv_snapshot(&ds("vol"), &mut incr.as_slice(), force)
             .await
             .unwrap_err();
         assert!(e.to_string().contains("intent log"), "{}", e);

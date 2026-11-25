@@ -4,7 +4,9 @@ use super::*;
 use crate::export::BlockExporter;
 use crate::fs::FileSystem;
 use crate::nbd::NbdServer;
+use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
+use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::vdev::Pool;
 use std::sync::atomic::AtomicU64;
@@ -23,7 +25,7 @@ struct Writer {
 
 #[async_trait]
 impl PeerVolumes for Writer {
-    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String> {
+    fn export(&self, volume: &DatasetName, epoch: Epoch) -> Result<PeerExport, String> {
         let mine = self.epoch.load(Ordering::SeqCst);
         if epoch != mine {
             return Err(format!("not the writer of {} at epoch {}", volume, epoch));
@@ -48,11 +50,11 @@ struct Setup {
 async fn setup() -> Setup {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
-    fs.create_block("vol", 16 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 16 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let nbd = Arc::new(NbdServer::with_bind(fs.clone(), "127.0.0.1", 0));
-    nbd.add_export("vol").await.unwrap();
+    nbd.add_export(&ds("vol")).await.unwrap();
     let writer = Arc::new(Writer {
         fs,
         nbd,
@@ -89,7 +91,7 @@ impl Setup {
                 Epoch::from_raw(epoch.load(Ordering::SeqCst)),
             ))
         };
-        PeerIo::new("vol", connector, Arc::new(locate))
+        PeerIo::new(&ds("vol"), connector, Arc::new(locate))
     }
 }
 
@@ -136,7 +138,7 @@ async fn proxied_io_reaches_the_writer() {
     let mut direct = vec![0u8; 8192];
     s.writer
         .fs
-        .block_read("vol", 5 * 8192, &mut direct)
+        .block_read(&ds("vol"), 5 * 8192, &mut direct)
         .await
         .unwrap();
     assert!(direct == pattern(8192, 5));
@@ -160,7 +162,7 @@ async fn a_stale_epoch_is_refused_until_the_proxy_finds_the_writer() {
     e.store(7, Ordering::SeqCst);
     assert_eq!(write.await.unwrap().unwrap(), 4096);
     let mut b = [0u8; 4096];
-    s.writer.fs.block_read("vol", 0, &mut b).await.unwrap();
+    s.writer.fs.block_read(&ds("vol"), 0, &mut b).await.unwrap();
     assert_eq!(b, [9u8; 4096]);
 }
 
@@ -179,7 +181,7 @@ async fn only_nodes_may_proxy() {
     let err = p.write(0, &[1u8; 4096]).await.unwrap_err();
     assert!(matches!(err, FileSystemError::Unavailable(_)), "{}", err);
     let mut b = [0u8; 4096];
-    s.writer.fs.block_read("vol", 0, &mut b).await.unwrap();
+    s.writer.fs.block_read(&ds("vol"), 0, &mut b).await.unwrap();
     assert_eq!(b, [0u8; 4096], "an admin's write reached the volume");
 }
 
@@ -191,15 +193,18 @@ async fn a_closed_connection_is_reconnected() {
     let p = Arc::new(s.proxy(epoch(7)));
     p.write(0, &[1u8; 4096]).await.unwrap();
     // Removing the export drains the proxy's connection like any client's.
-    tokio::time::timeout(Duration::from_secs(5), s.writer.nbd.remove_export("vol"))
-        .await
-        .expect("the proxy's connection held the export open")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        s.writer.nbd.remove_export(&ds("vol")),
+    )
+    .await
+    .expect("the proxy's connection held the export open")
+    .unwrap();
     let w = p.clone();
     let mut write = tokio::spawn(async move { w.write(4096, &[2u8; 4096]).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!write.is_finished(), "a write went through with no export");
-    s.writer.nbd.add_export("vol").await.unwrap();
+    s.writer.nbd.add_export(&ds("vol")).await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), &mut write)
             .await
@@ -221,7 +226,7 @@ async fn retiring_moves_waiting_requests_to_the_next_backend() {
     let s = setup().await;
     let connector = TlsConnector::from(Arc::new(s.fixture.tls.client_config().unwrap()));
     let nowhere = || None::<(String, u16, Epoch)>;
-    let peer = Arc::new(PeerIo::new("vol", connector, Arc::new(nowhere)));
+    let peer = Arc::new(PeerIo::new(&ds("vol"), connector, Arc::new(nowhere)));
     let io = Arc::new(SwitchableIo::new(peer.clone()));
 
     let w = io.clone();
@@ -233,7 +238,7 @@ async fn retiring_moves_waiting_requests_to_the_next_backend() {
     peer.retire();
     io.switch(Arc::new(crate::volume_io::LocalIo::new(
         s.writer.fs.clone(),
-        "vol",
+        &ds("vol"),
     )))
     .await;
     assert_eq!(
@@ -245,7 +250,7 @@ async fn retiring_moves_waiting_requests_to_the_next_backend() {
         4096
     );
     let mut b = [0u8; 4096];
-    s.writer.fs.block_read("vol", 0, &mut b).await.unwrap();
+    s.writer.fs.block_read(&ds("vol"), 0, &mut b).await.unwrap();
     assert_eq!(b, [5u8; 4096]);
 }
 
@@ -317,11 +322,14 @@ async fn a_flush_after_an_unclean_writer_change_fails() {
         e.store(to, Ordering::SeqCst);
     };
     let reconnect = async |s: &Setup| {
-        tokio::time::timeout(Duration::from_secs(5), s.writer.nbd.remove_export("vol"))
-            .await
-            .unwrap()
-            .unwrap();
-        s.writer.nbd.add_export("vol").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            s.writer.nbd.remove_export(&ds("vol")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        s.writer.nbd.add_export(&ds("vol")).await.unwrap();
     };
 
     p.write(0, &[1u8; 4096]).await.unwrap();
@@ -368,11 +376,14 @@ async fn a_sync_leaves_lost_writes_for_the_next_flush() {
     let e = epoch(7);
     let p = Arc::new(s.proxy(e.clone()));
     p.write(0, &[1u8; 4096]).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), s.writer.nbd.remove_export("vol"))
-        .await
-        .unwrap()
-        .unwrap();
-    s.writer.nbd.add_export("vol").await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        s.writer.nbd.remove_export(&ds("vol")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    s.writer.nbd.add_export(&ds("vol")).await.unwrap();
     // A crash: the new writer started afresh, with that write unflushed.
     s.writer.epoch.store(8, Ordering::SeqCst);
     s.writer.from.store(0, Ordering::SeqCst);

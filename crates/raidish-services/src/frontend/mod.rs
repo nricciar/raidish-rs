@@ -37,6 +37,7 @@ use crate::etcd::server::{Caller, EtcdConn};
 use crate::etcd::store::EtcdStore;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::pki::Role;
+use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::vdev::Pool;
 use serde::Deserialize;
@@ -473,7 +474,7 @@ impl Frontend {
     /// it under its `ds/<name>` lease of epoch `epoch`).
     pub async fn serve_local(
         self: &Arc<Self>,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
         fs: Arc<FileSystem<Pool>>,
         epoch: Epoch,
@@ -539,8 +540,8 @@ impl Frontend {
     }
 
     /// Stop serving `name` here.
-    pub fn stop_local(&self, name: &str) {
-        if let Some(l) = self.local.write().unwrap().remove(name) {
+    pub fn stop_local(&self, name: &DatasetName) {
+        if let Some(l) = self.local.write().unwrap().remove(name.as_str()) {
             l.stop();
         }
     }
@@ -548,14 +549,14 @@ impl Frontend {
     /// Delete service dataset `name`: stopped everywhere (disabled, and
     /// waited for), then deleted. False: there's none. On failure it's
     /// served again.
-    pub async fn delete_service(&self, name: &str) -> Result<bool, String> {
+    pub async fn delete_service(&self, name: &DatasetName) -> Result<bool, String> {
         let Some(props) = self
             .committer
             .datasets()
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
-            .find(|d| d.name == name)
+            .find(|d| d.name == name.as_str())
             .map(|d| d.props)
         else {
             return Ok(false);
@@ -569,7 +570,7 @@ impl Frontend {
         // good (I-35).
         let mut reenable = Reenable {
             committer: self.committer.clone(),
-            name: name.to_string(),
+            name: name.clone(),
             props: Some(props.clone()),
         };
         self.committer
@@ -579,7 +580,7 @@ impl Frontend {
         let mut last = String::new();
         for _ in 0..30 {
             self.wait_routes(2, |routes| {
-                routes.get(name).is_none_or(|r| r.owner.is_none())
+                routes.get(name.as_str()).is_none_or(|r| r.owner.is_none())
             })
             .await;
             match self.committer.delete_dataset(name).await {
@@ -587,7 +588,7 @@ impl Frontend {
                     // Gone from this node's routes now (the agents' next
                     // round says so everywhere).
                     reenable.props = None;
-                    self.routing.write().unwrap().routes.remove(name);
+                    self.routing.write().unwrap().routes.remove(name.as_str());
                     self.changed.notify_waiters();
                     return Ok(true);
                 }
@@ -622,7 +623,7 @@ impl Frontend {
 /// `props` set: `delete_service` disabled it and didn't get to delete it.
 struct Reenable {
     committer: crate::committer::Admin,
-    name: String,
+    name: DatasetName,
     props: Option<crate::inode::DatasetProps>,
 }
 

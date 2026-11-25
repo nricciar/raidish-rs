@@ -2,7 +2,11 @@ use crate::cluster::lease::{HeldLease, LeaseClient};
 use crate::cluster::state::{ClusterState, LeaseOp, POOL, Request, Response};
 use crate::cluster::*;
 use crate::test_util::wait_until;
-use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep, ms};
+use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, NodeId, ep, ms};
+
+fn nid(i: u64) -> NodeId {
+    NodeId::from_raw(i)
+}
 use openraft::BasicNode;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -171,6 +175,37 @@ fn epochs_increase_across_resources() {
     ));
 }
 
+// ---- node ids on the wire ----
+
+#[test]
+fn to_header_is_the_bare_number() {
+    // Older nodes parse `X-Raidish-To` as a u64: `node-3` would be refused.
+    assert_eq!(to_header(nid(3)), "3");
+    assert_eq!(parse_to_header("3"), Some(nid(3)));
+    assert_eq!(parse_to_header("node-3"), None);
+}
+
+#[test]
+fn node_id_raft_state_encodes_as_before() {
+    // Raft's id type went from u64 to NodeId: the persisted vote, log ids
+    // and membership must read and write the same bytes.
+    let old = openraft::Vote::new_committed(7, 2u64);
+    let new = openraft::Vote::new_committed(7, nid(2));
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        serde_json::to_string(&new).unwrap()
+    );
+    let old: BTreeMap<u64, BasicNode> = BTreeMap::from([(0, BasicNode::default())]);
+    let new: BTreeMap<NodeId, BasicNode> = BTreeMap::from([(nid(0), BasicNode::default())]);
+    let (old, new) = (
+        serde_json::to_string(&old).unwrap(),
+        serde_json::to_string(&new).unwrap(),
+    );
+    assert_eq!(old, new);
+    let back: BTreeMap<NodeId, BasicNode> = serde_json::from_str(&old).unwrap();
+    assert!(back.contains_key(&nid(0)));
+}
+
 // ---- membership from the pool config ----
 
 use crate::cluster::members::{Members, derive, is_local_base};
@@ -194,14 +229,17 @@ fn members_from_mixed_pool() {
         "ws://b:8881/api/v1/disks/4".into(),
     ];
     let m = derive(&paths, "raidz2", |_| false).unwrap();
-    assert_eq!(m.me, 0);
+    assert_eq!(m.me, nid(0));
     assert_eq!(
         m.peers,
-        BTreeMap::from([(1, "http://b:8881".into()), (2, "http://c:8881".into())])
+        BTreeMap::from([
+            (nid(1), "http://b:8881".into()),
+            (nid(2), "http://c:8881".into())
+        ])
     );
-    assert_eq!(m.disks[&0], vec![0, 3]);
-    assert_eq!(m.disks[&1], vec![1, 4]);
-    assert_eq!(m.disks[&2], vec![2]);
+    assert_eq!(m.disks[&nid(0)], vec![0, 3]);
+    assert_eq!(m.disks[&nid(1)], vec![1, 4]);
+    assert_eq!(m.disks[&nid(2)], vec![2]);
 }
 
 #[test]
@@ -213,7 +251,7 @@ fn every_node_derives_the_same_ids_and_fingerprint() {
         derive(&paths, "raidz1", |_| false).unwrap()
     };
     let (a, b, c) = (view(0), view(1), view(2));
-    assert_eq!((a.me, b.me, c.me), (0, 1, 2));
+    assert_eq!((a.me, b.me, c.me), (nid(0), nid(1), nid(2)));
     assert_eq!(a.fingerprint, b.fingerprint);
     assert_eq!(b.fingerprint, c.fingerprint);
     assert_eq!(a.disks, c.disks);
@@ -238,7 +276,7 @@ fn disagreeing_configs_have_different_fingerprints() {
 fn all_local_pool_is_a_cluster_of_one() {
     let paths: Vec<String> = (0..5).map(|i| format!("disks/d{}", i)).collect();
     let m = derive(&paths, "raidz2", |_| false).unwrap();
-    assert_eq!(m.me, 0);
+    assert_eq!(m.me, nid(0));
     assert!(m.peers.is_empty());
     assert_eq!(m.disks.len(), 1);
 }
@@ -589,7 +627,7 @@ async fn node_with_a_different_layout_is_refused() {
             .current_leader
             .is_none()
     );
-    assert!(nodes[2].cluster.check_peer(0).await.unwrap().is_some());
+    assert!(nodes[2].cluster.check_peer(nid(0)).await.unwrap().is_some());
     for n in &nodes {
         stop_node(n).await;
     }
@@ -614,10 +652,10 @@ async fn swapped_nodes_are_detected() {
         nodes[2].cluster.members.fingerprint
     );
     // ...but node 3 can tell its view is wrong, and the others can't.
-    let problem = nodes[2].cluster.check_peer(0).await.unwrap();
+    let problem = nodes[2].cluster.check_peer(nid(0)).await.unwrap();
     assert!(problem.is_some_and(|p| p.contains("different orders")));
-    assert_eq!(nodes[0].cluster.check_peer(1).await.unwrap(), None);
-    assert_eq!(nodes[0].cluster.check_peer(2).await.unwrap(), None);
+    assert_eq!(nodes[0].cluster.check_peer(nid(1)).await.unwrap(), None);
+    assert_eq!(nodes[0].cluster.check_peer(nid(2)).await.unwrap(), None);
 
     // A Raft RPC addressed to the wrong node id is refused.
     let vote = openraft::raft::VoteRequest::<u64> {
@@ -1522,7 +1560,7 @@ async fn a_wiped_node_catches_up_before_it_votes() {
     );
     assert_eq!(back.floor.pool_floor(), epoch);
     assert!(!dir.path().join(&wiped_name).join(CATCHING_UP).exists());
-    let voters: Vec<u64> = back
+    let voters: Vec<NodeId> = back
         .cluster
         .raft
         .metrics()
@@ -1554,7 +1592,7 @@ async fn a_node_stopped_between_initializing_and_voting_still_forms_the_group() 
     // a stop right after `initialize` leaves.
     for (i, name) in ["n1", "n2"].iter().enumerate() {
         let n = start_node(name, &pool, ports[i], dir.path()).await;
-        let initial: BTreeMap<u64, BasicNode> = n
+        let initial: BTreeMap<NodeId, BasicNode> = n
             .cluster
             .members
             .ids()
@@ -1597,7 +1635,7 @@ async fn a_good_node_hearing_only_a_bad_peer_doesnt_sit_out() {
     let bad = start_node("n3", &odd, ports[2], dir.path()).await;
     let n1 = start_node("n1", &pool, ports[0], dir.path()).await;
     assert!(
-        n1.cluster.check_peer(2).await.unwrap().is_some(),
+        n1.cluster.check_peer(nid(2)).await.unwrap().is_some(),
         "node 1 sees node 3 at another id"
     );
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

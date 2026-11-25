@@ -23,6 +23,7 @@ use crate::export::{
 };
 use crate::fs::{FileSystem, FileSystemError};
 use crate::nbd::DEFAULT_BIND;
+use crate::types::DatasetName;
 use crate::volume_io::ensure_sync_loop;
 use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ use tokio::task::JoinSet;
 pub const NQN_PREFIX: &str = "nqn.2024-01.com.raidish:nvme:";
 /// NQNs are at most 223 bytes.
 const MAX_NQN: usize = 223;
+// Every dataset name fits in a subsystem NQN: none is refused for its length.
+const _: () = assert!(NQN_PREFIX.len() + crate::types::MAX_DATASET_NAME <= MAX_NQN);
 
 /// The subsystem NQN a volume is exported under.
 pub fn subsystem_nqn(volume: &str) -> String {
@@ -274,7 +277,7 @@ impl Exported for Export {
 }
 
 impl Export {
-    fn new(volume: &str, size: u64, io: Arc<dyn VolumeIo>) -> Self {
+    fn new(volume: &DatasetName, size: u64, io: Arc<dyn VolumeIo>) -> Self {
         let hash = blake3::hash(format!("raidish-ns:{}", volume).as_bytes());
         Export {
             volume: volume.to_string(),
@@ -345,7 +348,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
         fs: Arc<FileSystem<D>>,
-        volume: String,
+        volume: DatasetName,
         port: u16,
     ) -> Result<Self, FileSystemError> {
         let server = Self::with_bind(fs, DEFAULT_BIND, port);
@@ -365,16 +368,6 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
             bind: bind.into(),
             port,
         }
-    }
-
-    fn check_name(volume: &str) -> Result<(), FileSystemError> {
-        if volume.is_empty() || subsystem_nqn(volume).len() > MAX_NQN || volume.contains('\0') {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume name '{}' does not fit in an NQN",
-                volume
-            )));
-        }
-        Ok(())
     }
 
     /// Bind `bind:port` and serve until the listener fails.
@@ -411,8 +404,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
 #[async_trait::async_trait]
 impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
     /// Exported as subsystem `subsystem_nqn(volume)`.
-    async fn add_export(&self, volume: &str) -> Result<(), FileSystemError> {
-        Self::check_name(volume)?;
+    async fn add_export(&self, volume: &DatasetName) -> Result<(), FileSystemError> {
         let size = self.target.fs.open_dataset(volume).await?.size_bytes;
         let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
         self.add_export_io(volume, size, io)
@@ -420,23 +412,22 @@ impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> 
 
     fn add_export_io(
         &self,
-        volume: &str,
+        volume: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
     ) -> Result<(), FileSystemError> {
-        Self::check_name(volume)?;
         self.target.exports.insert(Export::new(volume, size, io))
     }
 
-    fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
+    fn export_io(&self, volume: &DatasetName) -> Option<Arc<SwitchableIo>> {
         self.target.exports.export_io(volume)
     }
 
-    fn peer_export(&self, volume: &str) -> Option<crate::peer_io::PeerExport> {
+    fn peer_export(&self, volume: &DatasetName) -> Option<crate::peer_io::PeerExport> {
         self.target.exports.peer_export(volume)
     }
 
-    async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError> {
+    async fn remove_export(&self, volume: &DatasetName) -> Result<bool, FileSystemError> {
         self.target.exports.remove(volume).await
     }
 

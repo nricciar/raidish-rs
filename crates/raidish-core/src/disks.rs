@@ -328,9 +328,8 @@ impl BlockDevice for Caddy {
     async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.map_err(|e| {
-                log_err("read from", dev, &e);
-                e
+            Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.inspect_err(|e| {
+                log_err("read from", dev, e);
             }),
         }
     }
@@ -338,9 +337,8 @@ impl BlockDevice for Caddy {
     async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.write_block(block, buf).await.map_err(|e| {
-                log_err("write to", dev, &e);
-                e
+            Caddy::Healthy(dev, disk) => disk.write_block(block, buf).await.inspect_err(|e| {
+                log_err("write to", dev, e);
             }),
         }
     }
@@ -355,9 +353,8 @@ impl BlockDevice for Caddy {
     async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.map_err(|e| {
-                log_err("read from", dev, &e);
-                e
+            Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.inspect_err(|e| {
+                log_err("read from", dev, e);
             }),
         }
     }
@@ -365,9 +362,8 @@ impl BlockDevice for Caddy {
     async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.map_err(|e| {
-                log_err("write to", dev, &e);
-                e
+            Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.inspect_err(|e| {
+                log_err("write to", dev, e);
             }),
         }
     }
@@ -375,9 +371,8 @@ impl BlockDevice for Caddy {
     async fn flush(&self) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.flush().await.map_err(|e| {
-                log_err("flush", dev, &e);
-                e
+            Caddy::Healthy(dev, disk) => disk.flush().await.inspect_err(|e| {
+                log_err("flush", dev, e);
             }),
         }
     }

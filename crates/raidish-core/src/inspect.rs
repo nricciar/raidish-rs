@@ -8,6 +8,7 @@ use crate::disk::{BlockDevice, IoStats};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
 use crate::inode::ObjType;
 use crate::metaslab::SPACEMAP_SLOTS;
+use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::vdev::Topology;
 
@@ -615,8 +616,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// (records, discontiguities) of a volume (see `defrag --check`).
-    pub async fn volume_fragmentation(&self, name: &str) -> Result<(u64, u64), String> {
-        let name = name.trim_start_matches('/');
+    pub async fn volume_fragmentation(&self, name: &DatasetName) -> Result<(u64, u64), String> {
         let r = self.fragmentation(name).await.map_err(|e| e.to_string())?;
         Ok((r.records, r.breaks))
     }

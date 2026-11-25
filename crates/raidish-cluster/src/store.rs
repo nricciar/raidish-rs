@@ -21,7 +21,7 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-type NodeId = u64;
+use crate::types::NodeId;
 type Node = openraft::BasicNode;
 type SErr = StorageError<NodeId>;
 

@@ -39,6 +39,7 @@ use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, DatasetProps, Dnode, ObjType};
 use crate::object::{Dirty, ObjTree, Sizing};
+use crate::types::DatasetName;
 use crate::types::Txg;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -56,12 +57,6 @@ fn sizing(format: DatasetFormat) -> Sizing {
         // A B+tree's node ids are a fixed (large, sparse) range.
         _ => Sizing::Fixed,
     }
-}
-
-/// Refuse names a dataset can't have (see `crate::types::DatasetName`).
-pub(crate) fn check_dataset_name(name: &str) -> Result<(), FileSystemError> {
-    crate::types::DatasetName::try_from(name)?;
-    Ok(())
 }
 
 /// A dataset, as the dataset directory records it.
@@ -83,7 +78,7 @@ pub struct DatasetEntry {
 /// `queue`), as listed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DatasetInfo {
-    pub name: String,
+    pub name: DatasetName,
     pub format: DatasetFormat,
     pub guid: u64,
     pub created_ms: u64,
@@ -100,7 +95,7 @@ pub struct DatasetIndex {
 /// [`DatasetFormat::is_tree`]): what a writer runs under its `ds/<name>`
 /// lease, syncs, logs, snapshots and sends.
 pub struct Dataset {
-    pub name: String,
+    pub name: DatasetName,
     /// Its root object's number.
     pub id: FileId,
     pub format: DatasetFormat,
@@ -211,17 +206,17 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Dataset `name`'s entry (uncommitted changes included).
-    pub async fn dataset_entry(&self, name: &str) -> Result<DatasetEntry, FileSystemError> {
+    pub async fn dataset_entry(&self, name: &DatasetName) -> Result<DatasetEntry, FileSystemError> {
         self.datasets()
             .await?
             .datasets
-            .remove(name)
+            .remove(name.as_str())
             .ok_or(FileSystemError::FileNotFound)
     }
 
     /// Tree dataset `name`'s root object number.
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn dataset_id(&self, name: &str) -> Result<FileId, FileSystemError> {
+    pub async fn dataset_id(&self, name: &DatasetName) -> Result<FileId, FileSystemError> {
         let e = self.dataset_entry(name).await?;
         if !e.format.is_tree() {
             return Err(FileSystemError::NotAFile);
@@ -237,7 +232,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// otherwise open it again from disk and buffer writes nothing will
     /// ever commit, which then fail every later unscoped `sync` and count
     /// against the dirty limit (structural triage I-23).
-    pub async fn open_dataset(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
+    pub async fn open_dataset(&self, name: &DatasetName) -> Result<Arc<Dataset>, FileSystemError> {
         if let Some(w) = &self.writer {
             // Attached means open (`attach_dataset` opens before it records
             // the attachment; only `abandon_dataset` closes one, after it
@@ -265,7 +260,10 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// `open_dataset` without a writer's attachment check (for attaching).
-    pub(crate) async fn load_dataset(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
+    pub(crate) async fn load_dataset(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
         if let Some(v) = self.open_datasets.lock().unwrap().get(name) {
             return Ok(v.clone());
         }
@@ -289,7 +287,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let props = dnode.props().cloned().unwrap_or_default();
         let log = dnode.log().cloned();
         let ds = Arc::new(Dataset {
-            name: name.to_string(),
+            name: name.clone(),
             id: e.root,
             format: e.format,
             size_bytes: dnode.size,
@@ -312,7 +310,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .open_datasets
             .lock()
             .unwrap()
-            .entry(name.to_string())
+            .entry(name.clone())
             .or_insert(ds)
             .clone())
     }
@@ -326,7 +324,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             let d = self.read_dnode(e.root).await?;
             out.push(DatasetInfo {
-                name,
+                name: DatasetName::try_from(name)?,
                 format: e.format,
                 guid: e.guid,
                 created_ms: e.created_ms,
@@ -355,14 +353,13 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn create_dataset_locked(
         &self,
         tx: &mut crate::tx::Tx,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
         mut root: Dnode,
     ) -> Result<FileId, FileSystemError> {
-        check_dataset_name(name)?;
         debug_assert_eq!(root.kind(), format.root_kind());
         let mut index = self.datasets().await?;
-        if index.datasets.contains_key(name) {
+        if index.datasets.contains_key(name.as_str()) {
             return Err(FileSystemError::AlreadyExists);
         }
         let id = self.alloc_object();
@@ -390,7 +387,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Delete tree dataset `name` and free what only it references (it
     /// must not be running, and must have no snapshots).
-    pub async fn delete_dataset(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn delete_dataset(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let mut tx = self.begin_tx().await;
         let tx = &mut tx;
         let r = self.delete_dataset_locked(tx, name).await;
@@ -403,12 +400,12 @@ impl<D: BlockDevice> FileSystem<D> {
     pub async fn delete_dataset_locked(
         &self,
         tx: &mut crate::tx::Tx,
-        name: &str,
+        name: &DatasetName,
     ) -> Result<(), FileSystemError> {
         let mut index = self.datasets().await?;
         let e = index
             .datasets
-            .get(name)
+            .get(name.as_str())
             .cloned()
             .ok_or(FileSystemError::FileNotFound)?;
         if !e.format.is_tree() {
@@ -431,7 +428,7 @@ impl<D: BlockDevice> FileSystem<D> {
             self.free(tx, r.start, r.len).await?;
         }
         self.write_dnode(tx, e.root, None).await?;
-        index.datasets.remove(name);
+        index.datasets.remove(name.as_str());
         self.write_datasets(tx, &index).await?;
         self.close_dataset(name);
         Ok(())
@@ -440,7 +437,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Change a dataset's placement settings (committed right away).
     pub async fn set_dataset_props(
         &self,
-        name: &str,
+        name: &DatasetName,
         props: DatasetProps,
     ) -> Result<(), FileSystemError> {
         let mut tx = self.begin_tx().await;
@@ -490,7 +487,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub(crate) async fn sync_datasets_noting(
         &self,
         tx: &mut crate::tx::Tx,
-    ) -> (Vec<String>, Result<(), FileSystemError>) {
+    ) -> (Vec<DatasetName>, Result<(), FileSystemError>) {
         let mut clean = Vec::new();
         let vols: Vec<Arc<Dataset>> = self
             .open_datasets
@@ -677,7 +674,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Forget an open dataset (on delete); its unsynced writes are discarded.
-    pub(crate) fn close_dataset(&self, name: &str) {
+    pub(crate) fn close_dataset(&self, name: &DatasetName) {
         self.open_datasets.lock().unwrap().remove(name);
     }
 

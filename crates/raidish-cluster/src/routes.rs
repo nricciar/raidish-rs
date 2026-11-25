@@ -13,7 +13,7 @@ use rocket::serde::json::Json;
 use rocket::{State, get, post};
 use std::sync::Arc;
 
-type NodeId = u64;
+use crate::types::NodeId;
 type Shared = Arc<Cluster>;
 
 /// Refuses Raft RPCs from a node that speaks another Raft protocol version
@@ -46,10 +46,10 @@ impl<'r> FromRequest<'r> for SameLayout {
             .headers()
             .get_one(super::FINGERPRINT_HEADER)
             .unwrap_or("");
-        let to: Option<u64> = req
+        let to = req
             .headers()
             .get_one(super::TO_HEADER)
-            .and_then(|v| v.parse().ok());
+            .and_then(super::parse_to_header);
         if cluster.misconfigured() {
             // Sitting out: see `Cluster::misconfigured`.
             return Outcome::Error((
@@ -64,9 +64,12 @@ impl<'r> FromRequest<'r> for SameLayout {
         WARNED.call_once(|| {
             eprintln!(
                 "cluster: refusing Raft traffic from a node whose pool config disagrees \
-                 (layout {:?} vs ours {}, sent to node {:?} but we are node {}): every node \
+                 (layout {:?} vs ours {}, sent to {} but we are {}): every node \
                  must list the same disks in the same order",
-                theirs, cluster.members.fingerprint, to, cluster.members.me
+                theirs,
+                cluster.members.fingerprint,
+                to.map_or_else(|| "nobody".to_string(), |t| t.to_string()),
+                cluster.members.me
             )
         });
         Outcome::Error((Status::Conflict, "different pool layout".into()))

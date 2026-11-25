@@ -1,6 +1,7 @@
 use super::*;
 use crate::object::INDIRECT_FANOUT;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
 
@@ -30,7 +31,7 @@ async fn settle(fs: &FileSystem<Pool>) {
 
 async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
-    let n = fs.block_read("vol", offset, &mut buf).await.unwrap();
+    let n = fs.block_read(&ds("vol"), offset, &mut buf).await.unwrap();
     buf.truncate(n);
     buf
 }
@@ -50,15 +51,15 @@ async fn create_validates_arguments() {
     let fs = pool.format().await;
     for vbs in [0, 4096, 16384, MAX_VOLBLOCKSIZE + VOLBLOCK_ALIGN] {
         assert!(matches!(
-            fs.create_block("v", MB, vbs).await,
+            fs.create_block(&ds("v"), MB, vbs).await,
             Err(FileSystemError::InvalidArgument(_))
         ));
     }
-    fs.create_block("v", MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("v"), MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     assert!(matches!(
-        fs.create_block("v", MB, DEFAULT_VOLBLOCKSIZE).await,
+        fs.create_block(&ds("v"), MB, DEFAULT_VOLBLOCKSIZE).await,
         Err(FileSystemError::AlreadyExists)
     ));
 }
@@ -71,7 +72,7 @@ async fn new_volume_is_sparse_and_reads_zeros() {
     let before = allocated(&fs).await;
 
     // A volume far larger than the pool is fine while it's empty.
-    fs.create_block("vol", 64 * 1024 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 64 * 1024 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     settle(&fs).await;
@@ -91,16 +92,16 @@ async fn new_volume_is_sparse_and_reads_zeros() {
 async fn writes_visible_before_and_after_sync_and_reload() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 8 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 8 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
     let a = pattern(4096, 1); // aligned, inside one record
     let b = pattern(70_000, 2); // unaligned, spans records
     let c = pattern(DEFAULT_VOLBLOCKSIZE as usize, 3); // exactly one record
-    fs.block_write("vol", 8192, &a).await.unwrap();
-    fs.block_write("vol", 100_003, &b).await.unwrap();
-    fs.block_write("vol", 10 * DEFAULT_VOLBLOCKSIZE as u64, &c)
+    fs.block_write(&ds("vol"), 8192, &a).await.unwrap();
+    fs.block_write(&ds("vol"), 100_003, &b).await.unwrap();
+    fs.block_write(&ds("vol"), 10 * DEFAULT_VOLBLOCKSIZE as u64, &c)
         .await
         .unwrap();
 
@@ -127,7 +128,7 @@ async fn writes_visible_before_and_after_sync_and_reload() {
 async fn partial_writes_merge_across_txgs() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
@@ -138,7 +139,9 @@ async fn partial_writes_merge_across_txgs() {
     {
         let chunk = pattern(9000, i as u8 + 10);
         expect[off..off + chunk.len()].copy_from_slice(&chunk);
-        fs.block_write("vol", off as u64, &chunk).await.unwrap();
+        fs.block_write(&ds("vol"), off as u64, &chunk)
+            .await
+            .unwrap();
         fs.sync().await.unwrap(); // each lands in its own TXG
     }
     drop(fs);
@@ -152,16 +155,18 @@ async fn writes_are_clipped_at_end_of_volume() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let size = DEFAULT_VOLBLOCKSIZE as u64 * 3 + 1000;
-    fs.create_block("vol", size, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), size, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
     let tail = pattern(5000, 4);
     assert_eq!(
-        fs.block_write("vol", size - 1000, &tail).await.unwrap(),
+        fs.block_write(&ds("vol"), size - 1000, &tail)
+            .await
+            .unwrap(),
         1000
     );
-    assert_eq!(fs.block_write("vol", size, &tail).await.unwrap(), 0);
+    assert_eq!(fs.block_write(&ds("vol"), size, &tail).await.unwrap(), 0);
     fs.sync().await.unwrap();
     assert_eq!(read(&fs, size - 1000, 5000).await, tail[..1000]);
 }
@@ -170,15 +175,15 @@ async fn writes_are_clipped_at_end_of_volume() {
 async fn overwrites_are_copy_on_write_and_free_old_space() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 4 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 4 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
     let first = pattern(2 * MB as usize, 1);
-    fs.block_write("vol", 0, &first).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &first).await.unwrap();
     fs.sync().await.unwrap();
 
-    let vol = fs.open_dataset("vol").await.unwrap();
+    let vol = fs.open_dataset(&ds("vol")).await.unwrap();
     let old_leaf = fs
         .tree_lookup(&vol.obj, &vol.obj.root(), 0, 3)
         .await
@@ -190,7 +195,7 @@ async fn overwrites_are_copy_on_write_and_free_old_space() {
 
     // Overwrite everything: new locations, old space comes back.
     let second = pattern(2 * MB as usize, 2);
-    fs.block_write("vol", 0, &second).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &second).await.unwrap();
     fs.sync().await.unwrap();
     let new_leaf = fs
         .tree_lookup(&vol.obj, &vol.obj.root(), 0, 3)
@@ -214,13 +219,13 @@ async fn trim_and_zero_writes_become_holes() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     settle(&fs).await;
-    fs.create_block("vol", 4 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 4 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     settle(&fs).await;
     let empty = allocated(&fs).await;
 
-    fs.block_write("vol", 0, &pattern(MB as usize, 7))
+    fs.block_write(&ds("vol"), 0, &pattern(MB as usize, 7))
         .await
         .unwrap();
     settle(&fs).await;
@@ -228,8 +233,8 @@ async fn trim_and_zero_writes_become_holes() {
 
     // Trim the first half, write zeros over the second half.
     let half = MB as usize / 2;
-    fs.block_zero("vol", 0, half).await.unwrap();
-    fs.block_write("vol", half as u64, &vec![0u8; half])
+    fs.block_zero(&ds("vol"), 0, half).await.unwrap();
+    fs.block_write(&ds("vol"), half as u64, &vec![0u8; half])
         .await
         .unwrap();
     settle(&fs).await;
@@ -246,8 +251,10 @@ async fn multi_level_trees() {
     let vbs = VOLBLOCK_ALIGN as u64;
     // > FANOUT^2 records -> 3 levels, all sparse.
     let size = (INDIRECT_FANOUT * INDIRECT_FANOUT + 10) * vbs;
-    fs.create_block("vol", size, VOLBLOCK_ALIGN).await.unwrap();
-    assert_eq!(fs.open_dataset("vol").await.unwrap().obj.levels(), 3);
+    fs.create_block(&ds("vol"), size, VOLBLOCK_ALIGN)
+        .await
+        .unwrap();
+    assert_eq!(fs.open_dataset(&ds("vol")).await.unwrap().obj.levels(), 3);
 
     let records = [
         0,
@@ -257,7 +264,7 @@ async fn multi_level_trees() {
         INDIRECT_FANOUT * INDIRECT_FANOUT + 9,
     ];
     for (i, r) in records.iter().enumerate() {
-        fs.block_write("vol", r * vbs + 100, &pattern(500, i as u8))
+        fs.block_write(&ds("vol"), r * vbs + 100, &pattern(500, i as u8))
             .await
             .unwrap();
     }
@@ -276,7 +283,7 @@ async fn multi_level_trees() {
 async fn concurrent_writers_and_readers() {
     let pool = TestPool::new().await;
     let fs = std::sync::Arc::new(pool.format().await);
-    fs.create_block("vol", 16 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 16 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
@@ -288,12 +295,12 @@ async fn concurrent_writers_and_readers() {
         tasks.spawn(async move {
             for i in 0..16u64 {
                 let off = (i * 64 + t) * 4096;
-                fs.block_write("vol", off, &pattern(4096, (t * 16 + i) as u8))
+                fs.block_write(&ds("vol"), off, &pattern(4096, (t * 16 + i) as u8))
                     .await
                     .unwrap();
                 if i % 5 == 0 {
                     let mut buf = vec![0u8; 4096];
-                    fs.block_read("vol", off, &mut buf).await.unwrap();
+                    fs.block_read(&ds("vol"), off, &mut buf).await.unwrap();
                     assert_eq!(buf, pattern(4096, (t * 16 + i) as u8));
                 }
             }
@@ -335,22 +342,22 @@ async fn delete_frees_the_whole_tree() {
     settle(&fs).await;
     let baseline = allocated(&fs).await;
 
-    fs.create_block("vol", 8 * MB, VOLBLOCK_ALIGN)
+    fs.create_block(&ds("vol"), 8 * MB, VOLBLOCK_ALIGN)
         .await
         .unwrap();
-    fs.block_write("vol", 0, &pattern(3 * MB as usize, 1))
+    fs.block_write(&ds("vol"), 0, &pattern(3 * MB as usize, 1))
         .await
         .unwrap();
-    fs.block_write("vol", 7 * MB, &pattern(4096, 2))
+    fs.block_write(&ds("vol"), 7 * MB, &pattern(4096, 2))
         .await
         .unwrap();
     fs.sync().await.unwrap();
 
-    fs.delete_volume("vol").await.unwrap();
+    fs.delete_volume(&ds("vol")).await.unwrap();
     settle(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);
     assert!(matches!(
-        fs.block_read("vol", 0, &mut [0u8; 10]).await,
+        fs.block_read(&ds("vol"), 0, &mut [0u8; 10]).await,
         Err(FileSystemError::FileNotFound)
     ));
 }
@@ -359,13 +366,13 @@ async fn delete_frees_the_whole_tree() {
 async fn corrupted_volume_record_self_heals() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let data = pattern(DEFAULT_VOLBLOCKSIZE as usize, 9);
-    fs.block_write("vol", 0, &data).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &data).await.unwrap();
     fs.sync().await.unwrap();
-    let vol = fs.open_dataset("vol").await.unwrap();
+    let vol = fs.open_dataset(&ds("vol")).await.unwrap();
     let leaf = fs
         .tree_lookup(&vol.obj, &vol.obj.root(), 0, 0)
         .await
@@ -386,19 +393,19 @@ async fn corrupted_volume_record_self_heals() {
 async fn full_pool_fails_cleanly_without_leaking() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 1024 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 1024 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
     let a = pattern(60 * MB as usize, 1);
-    fs.block_write("vol", 0, &a).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &a).await.unwrap();
     fs.sync().await.unwrap();
     settle(&fs).await;
     let used_before = allocated(&fs).await;
     let free_before = fs.allocatable_blocks().await;
 
     let b = pattern(60 * MB as usize, 2);
-    fs.block_write("vol", 200 * MB, &b).await.unwrap();
+    fs.block_write(&ds("vol"), 200 * MB, &b).await.unwrap();
     assert!(matches!(fs.sync().await, Err(FileSystemError::NoSpace(_))));
 
     // Nothing allocated, nothing freed, data still served from memory.
@@ -425,20 +432,20 @@ async fn full_pool_fails_cleanly_without_leaking() {
 async fn trim_lets_a_full_pool_recover() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 1024 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 1024 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let a = pattern(60 * MB as usize, 3);
-    fs.block_write("vol", 0, &a).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &a).await.unwrap();
     fs.sync().await.unwrap();
 
     let b = pattern(60 * MB as usize, 4);
-    fs.block_write("vol", 200 * MB, &b).await.unwrap();
+    fs.block_write(&ds("vol"), 200 * MB, &b).await.unwrap();
     assert!(fs.sync().await.is_err());
 
     // The guest trims A. Holes commit on their own even though B can't fit
     // yet; once A's space clears the defer window, B goes through.
-    fs.block_zero("vol", 0, a.len()).await.unwrap();
+    fs.block_zero(&ds("vol"), 0, a.len()).await.unwrap();
     let mut attempts = 0;
     while fs.sync().await.is_err() {
         attempts += 1;
@@ -457,7 +464,7 @@ async fn trim_lets_a_full_pool_recover() {
 async fn concurrent_flushes_share_commits() {
     let pool = TestPool::new().await;
     let fs = std::sync::Arc::new(pool.format().await);
-    fs.create_block("vol", 64 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 64 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let txg_before = fs.uberblock().await.unwrap().txg;
@@ -466,7 +473,7 @@ async fn concurrent_flushes_share_commits() {
     for t in 0..32u64 {
         let fs = fs.clone();
         tasks.spawn(async move {
-            fs.block_write("vol", t * MB, &pattern(64 * 1024, t as u8))
+            fs.block_write(&ds("vol"), t * MB, &pattern(64 * 1024, t as u8))
                 .await
                 .unwrap();
             // Like fsync: once this returns, the write must be durable.
@@ -497,15 +504,15 @@ async fn concurrent_flushes_share_commits() {
 async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
     let pool = TestPool::new().await;
     let (fs, faults) = pool.format_faulty().await;
-    fs.create_block("vol", 64 * MB, VOLBLOCK_ALIGN)
+    fs.create_block(&ds("vol"), 64 * MB, VOLBLOCK_ALIGN)
         .await
         .unwrap();
     let vbs = VOLBLOCK_ALIGN as usize;
 
     // Two levels: record 600 needs an L1 indirect and the root indirect.
-    assert_eq!(fs.open_dataset("vol").await.unwrap().obj.levels(), 2);
+    assert_eq!(fs.open_dataset(&ds("vol")).await.unwrap().obj.levels(), 2);
     let rec = 600u64;
-    fs.block_write("vol", rec * vbs as u64, &pattern(vbs, 1))
+    fs.block_write(&ds("vol"), rec * vbs as u64, &pattern(vbs, 1))
         .await
         .unwrap();
     // Sync writes: the data record, then L1 (cached), then the root -> fail it.
@@ -515,7 +522,7 @@ async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
 
     // Change the record so the retry's L1 has different contents.
     let second = pattern(vbs, 2);
-    fs.block_write("vol", rec * vbs as u64, &second)
+    fs.block_write(&ds("vol"), rec * vbs as u64, &second)
         .await
         .unwrap();
     fs.sync().await.unwrap();
@@ -529,7 +536,7 @@ async fn read_any<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     len: usize,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; len];
-    fs.block_read("vol", offset, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), offset, &mut buf).await.unwrap();
     buf
 }
 
@@ -538,14 +545,14 @@ async fn volume_props_persist_and_keep_data() {
     use crate::inode::{DatasetProps, Transport};
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 4 * MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 4 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
-    fs.create_block("other", MB, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("other"), MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     let data = pattern(100_000, 7);
-    fs.block_write("vol", 4096, &data).await.unwrap();
+    fs.block_write(&ds("vol"), 4096, &data).await.unwrap();
     fs.sync().await.unwrap();
     let before = allocated(&fs).await;
 
@@ -556,10 +563,14 @@ async fn volume_props_persist_and_keep_data() {
         move_to: None,
         port: None,
     };
-    fs.set_dataset_props("vol", props.clone()).await.unwrap();
+    fs.set_dataset_props(&ds("vol"), props.clone())
+        .await
+        .unwrap();
     // Unsynced writes ride along with the next commit, props or not.
-    fs.block_write("vol", 0, &[1u8; 10]).await.unwrap();
-    fs.set_dataset_props("vol", props.clone()).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &[1u8; 10]).await.unwrap();
+    fs.set_dataset_props(&ds("vol"), props.clone())
+        .await
+        .unwrap();
     settle(&fs).await;
     assert!(
         allocated(&fs).await <= before + 64,
@@ -580,7 +591,7 @@ async fn volume_props_persist_and_keep_data() {
     assert_eq!(read(&fs, 4096, data.len()).await, data);
     assert_eq!(read(&fs, 0, 10).await, vec![1u8; 10]);
     assert!(matches!(
-        fs.set_dataset_props("missing", props).await,
+        fs.set_dataset_props(&ds("missing"), props).await,
         Err(FileSystemError::FileNotFound)
     ));
 }

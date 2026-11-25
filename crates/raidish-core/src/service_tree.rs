@@ -7,6 +7,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::types::DatasetName;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -45,7 +46,7 @@ pub trait ServiceError: From<FileSystemError> {
 /// durable writes.
 pub struct ServiceTree<D: BlockDevice> {
     pub fs: Arc<FileSystem<D>>,
-    pub name: String,
+    pub name: DatasetName,
     format: DatasetFormat,
     stopped: AtomicBool,
     pub settler: Settler,
@@ -55,13 +56,13 @@ impl<D: BlockDevice + 'static> ServiceTree<D> {
     /// Serve `name` (a `format` dataset) of `fs`.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
     ) -> Result<Self, FileSystemError> {
         fs.open_btree(name, format).await?;
         Ok(ServiceTree {
             fs,
-            name: name.to_string(),
+            name: name.clone(),
             format,
             stopped: AtomicBool::new(false),
             settler: Settler::default(),
@@ -154,7 +155,7 @@ impl Settler {
     pub async fn settle<D: BlockDevice>(
         &self,
         fs: &FileSystem<D>,
-        name: &str,
+        name: &DatasetName,
     ) -> Result<(), FileSystemError> {
         let target = self.applied.load(Ordering::SeqCst);
         if self.durable.load(Ordering::SeqCst) >= target {
@@ -171,10 +172,10 @@ impl Settler {
 /// committer's own stores: `.vms`, `.events`).
 pub async fn ensure_btree<D: BlockDevice>(
     fs: &FileSystem<D>,
-    name: &str,
+    name: &DatasetName,
     format: DatasetFormat,
 ) -> Result<Arc<Dataset>, FileSystemError> {
-    if !fs.datasets().await?.datasets.contains_key(name) {
+    if !fs.datasets().await?.datasets.contains_key(name.as_str()) {
         let blksz = fs.default_kv_blksz();
         match fs
             .create_btree(

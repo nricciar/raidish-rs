@@ -5,6 +5,7 @@ use super::*;
 use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::vdev::Pool;
 
 const MB: u64 = 1 << 20;
@@ -311,6 +312,7 @@ async fn serve_many(
     let fs = Arc::new(pool.format().await);
     let server = Arc::new(NvmeTcpServer::with_bind(fs.clone(), DEFAULT_BIND, 0));
     for &(name, size) in volumes {
+        let name = &ds(name);
         fs.create_block(name, size, DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
@@ -325,13 +327,11 @@ async fn serve_many(
 
 async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::SocketAddr) {
     let fs = Arc::new(pool.format().await);
-    fs.create_block("vol", size, DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), size, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
     // The single-export constructor the CLI uses.
-    let server = NvmeTcpServer::new(fs.clone(), "vol".into(), 0)
-        .await
-        .unwrap();
+    let server = NvmeTcpServer::new(fs.clone(), ds("vol"), 0).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { server.serve(listener).await });
@@ -404,9 +404,13 @@ async fn two_volumes_on_one_target() {
     assert!(qa.io(IO_READ, 3, 2, &[], 8192, false).await.data == da);
     assert!(qb.io(IO_READ, 3, 2, &[], 8192, false).await.data == db);
     let mut buf = vec![0u8; 8192];
-    fs.block_read("alpha", 3 * 4096, &mut buf).await.unwrap();
+    fs.block_read(&ds("alpha"), 3 * 4096, &mut buf)
+        .await
+        .unwrap();
     assert!(buf == da);
-    fs.block_read("beta", 3 * 4096, &mut buf).await.unwrap();
+    fs.block_read(&ds("beta"), 3 * 4096, &mut buf)
+        .await
+        .unwrap();
     assert!(buf == db);
     // Alpha's namespace ends at 16 MiB even though beta's doesn't.
     let last = 16 * MB / LBA_SIZE;
@@ -422,15 +426,18 @@ async fn add_export_validation() {
     let pool = TestPool::new().await;
     let (_fs, server, _addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     assert!(matches!(
-        server.add_export("vol").await,
+        server.add_export(&ds("vol")).await,
         Err(FileSystemError::AlreadyExists)
     ));
-    assert!(server.add_export("missing").await.is_err());
-    assert!(server.add_export("").await.is_err());
-    assert!(
-        server.add_export(&"x".repeat(200)).await.is_err(),
-        "NQN too long"
-    );
+    assert!(server.add_export(&ds("missing")).await.is_err());
+    // Empty and over-long names don't get this far: they don't parse, and
+    // every name that does fits in an NQN (checked at compile time).
+    assert!(crate::types::DatasetName::try_from("").is_err());
+    assert!(crate::types::DatasetName::try_from("x".repeat(200).as_str()).is_err());
+    let longest =
+        crate::types::DatasetName::try_from("x".repeat(crate::types::MAX_DATASET_NAME).as_str())
+            .unwrap();
+    assert!(crate::nvme::subsystem_nqn(&longest).len() <= 223);
     assert_eq!(server.exports(), vec!["vol"]);
 }
 
@@ -463,7 +470,7 @@ async fn remove_export_flushes_and_closes_its_queues() {
     assert!(qa.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
     assert!(fs.has_dirty_datasets(), "write not yet committed");
 
-    assert!(server.remove_export("alpha").await.unwrap());
+    assert!(server.remove_export(&ds("alpha")).await.unwrap());
     assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut qa).await;
     assert_hung_up(&mut admin_a).await;
@@ -475,17 +482,17 @@ async fn remove_export_flushes_and_closes_its_queues() {
     assert!(qb.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
     assert!(qb.io(IO_READ, 0, 1, &[], 4096, false).await.data == data);
     assert!(admin_b.admin(ADM_KEEP_ALIVE, 0, 0, 0, 0).await.ok());
-    assert!(!server.remove_export("alpha").await.unwrap());
+    assert!(!server.remove_export(&ds("alpha")).await.unwrap());
 
     // The committed write survives a reload, and the volume can come back.
     let mut buf = vec![0u8; 4096];
     pool.load()
         .await
-        .block_read("alpha", 0, &mut buf)
+        .block_read(&ds("alpha"), 0, &mut buf)
         .await
         .unwrap();
     assert!(buf == data);
-    server.add_export("alpha").await.unwrap();
+    server.add_export(&ds("alpha")).await.unwrap();
     let mut admin_a = Host::connect(addr).await;
     let cntlid_a = admin_a.bring_up_admin_of(&alpha, 1).await;
     let mut qa = Host::connect(addr).await;
@@ -704,7 +711,9 @@ async fn data_survives_reload() {
 
     let fs = pool.load().await;
     let mut buf = vec![0u8; data.len()];
-    fs.block_read("vol", 77 * 4096, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), 77 * 4096, &mut buf)
+        .await
+        .unwrap();
     assert!(buf == data);
 }
 
@@ -791,9 +800,9 @@ async fn an_exports_backend_switches_under_a_connected_queue() {
     assert!(q.io(IO_WRITE, 0, 2, &before, 0, true).await.ok());
 
     let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let io = server.export_io("vol").unwrap();
+    let io = server.export_io(&ds("vol")).unwrap();
     io.switch(Arc::new(Counting {
-        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+        inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), &ds("vol"))),
         n: n.clone(),
     }))
     .await;
@@ -851,7 +860,7 @@ async fn a_shutdown_leaves_lost_writes_for_the_next_hosts_flush() {
     let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     admin.bring_up_admin(1).await;
-    server.export_io("vol").unwrap().poison();
+    server.export_io(&ds("vol")).unwrap().poison();
     // SHN=normal. The sync fails (writes were lost), so the shutdown isn't
     // reported complete: it used to be (SHST=2) whatever the sync said.
     let cid = admin.cid();
@@ -1090,10 +1099,10 @@ async fn a_queue_has_at_most_its_depth_of_commands_running() {
     let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let open = Arc::new(watch::Sender::new(false));
     server
-        .export_io("vol")
+        .export_io(&ds("vol"))
         .unwrap()
         .switch(Arc::new(Gate {
-            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), &ds("vol"))),
             entered: entered.clone(),
             open: open.clone(),
         }))

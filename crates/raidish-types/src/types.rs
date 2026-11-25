@@ -661,6 +661,16 @@ macro_rules! name_type {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            /// A name fixed in the source (a constant). Panics if it isn't
+            /// valid: that's a bug, which every test using it catches.
+            #[track_caller]
+            pub fn from_static(s: &'static str) -> Self {
+                match <$t>::try_from(s) {
+                    Ok(n) => n,
+                    Err(e) => panic!("{}", e),
+                }
+            }
         }
 
         impl TryFrom<String> for $t {
@@ -1106,7 +1116,7 @@ impl SnapshotInfo {
 /// A volume as listed (see `FileSystem::list_volumes`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct VolumeInfo {
-    pub name: String,
+    pub name: DatasetName,
     pub size_bytes: u64,
     pub volblocksize: u32,
     pub props: DatasetProps,

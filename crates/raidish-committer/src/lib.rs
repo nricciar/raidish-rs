@@ -32,6 +32,7 @@ use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::DatasetProps;
 use crate::send::StreamReport;
 use crate::snapshot::SnapshotInfo;
+use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use crate::types::MetaslabIdx;
 use crate::types::{Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, Txg};
@@ -52,7 +53,7 @@ pub trait Authority: Send + Sync {
     /// This node's applied cluster state.
     fn state(&self) -> ClusterState;
     /// The Raft leader's id.
-    fn leader(&self) -> Option<u64> {
+    fn leader(&self) -> Option<crate::types::NodeId> {
         None
     }
     /// Which node serves each pool disk (by name).
@@ -69,18 +70,14 @@ impl Authority for Cluster {
     fn state(&self) -> ClusterState {
         self.status().state
     }
-    fn leader(&self) -> Option<u64> {
+    fn leader(&self) -> Option<crate::types::NodeId> {
         self.status().leader
     }
     fn disk_nodes(&self) -> std::collections::BTreeMap<usize, String> {
         self.members
             .disks
             .iter()
-            .flat_map(|(id, disks)| {
-                disks
-                    .iter()
-                    .map(move |d| (*d, crate::cluster::members::node_name(*id)))
-            })
+            .flat_map(|(id, disks)| disks.iter().map(move |d| (*d, id.name())))
             .collect()
     }
 }
@@ -946,7 +943,11 @@ impl<D: BlockDevice> Committer<D> {
             .await
     }
 
-    pub async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    pub async fn claim_dataset(
+        &self,
+        volume: &DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         check_held(&self.auth.state(), &dataset_resource(volume), ds)?;
         let vol = self
             .fs
@@ -1112,7 +1113,11 @@ impl<D: BlockDevice> Committer<D> {
         self.fs.list_volumes().await
     }
 
-    pub async fn create_volume(&self, name: &str, size_bytes: u64) -> Result<(), FileSystemError> {
+    pub async fn create_volume(
+        &self,
+        name: &DatasetName,
+        size_bytes: u64,
+    ) -> Result<(), FileSystemError> {
         check_not_reserved(name)?;
         let vbs = self.fs.default_volblocksize();
         self.fs
@@ -1123,7 +1128,7 @@ impl<D: BlockDevice> Committer<D> {
 
     /// Who holds `name`'s `ds/` lease, as this node's view has it: only a
     /// hint (it may lag); `hold_dataset` is the check that counts.
-    fn in_use(&self, name: &str) -> Option<String> {
+    fn in_use(&self, name: &DatasetName) -> Option<String> {
         let state = self.auth.state();
         state
             .live_lease(&dataset_resource(name), now_ms())
@@ -1135,7 +1140,7 @@ impl<D: BlockDevice> Committer<D> {
     /// with its holder (I-14b).
     async fn hold_dataset(
         &self,
-        name: &str,
+        name: &DatasetName,
         doing: &str,
         busy: impl FnOnce(String) -> FileSystemError,
     ) -> Result<AdminHold, FileSystemError> {
@@ -1189,7 +1194,7 @@ impl<D: BlockDevice> Committer<D> {
         })
     }
 
-    pub async fn delete_volume(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn delete_volume(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let hold = self
             .hold_dataset(name, "deleting it", |by| running(name, &by))
             .await?;
@@ -1208,7 +1213,11 @@ impl<D: BlockDevice> Committer<D> {
         r
     }
 
-    pub async fn set_props(&self, name: &str, props: DatasetProps) -> Result<(), FileSystemError> {
+    pub async fn set_props(
+        &self,
+        name: &DatasetName,
+        props: DatasetProps,
+    ) -> Result<(), FileSystemError> {
         if let Ok(e) = self.fs.dataset_entry(name).await {
             if e.format.is_system() {
                 return Err(reserved(name));
@@ -1223,7 +1232,7 @@ impl<D: BlockDevice> Committer<D> {
     /// Dataset `name`'s kind ("Volume"...) and settings, for describing a
     /// change to them.
     /// Dataset `name`'s format and props.
-    pub async fn props_of(&self, name: &str) -> Option<(DatasetFormat, DatasetProps)> {
+    pub async fn props_of(&self, name: &DatasetName) -> Option<(DatasetFormat, DatasetProps)> {
         let e = self.fs.dataset_entry(name).await.ok()?;
         let d = self.fs.read_dnode(e.root).await.ok()?;
         Some((e.format, d.props().cloned().unwrap_or_default()))
@@ -1238,7 +1247,7 @@ impl<D: BlockDevice> Committer<D> {
     /// An etcd dataset needs a port of its own.
     async fn check_etcd_port(
         &self,
-        name: &str,
+        name: &DatasetName,
         props: &DatasetProps,
     ) -> Result<(), FileSystemError> {
         let Some(port) = props.port else {
@@ -1247,7 +1256,7 @@ impl<D: BlockDevice> Committer<D> {
             ));
         };
         for d in self.fs.list_btree_datasets().await? {
-            if d.name != name
+            if d.name != name.as_str()
                 && d.format == crate::dataset::DatasetFormat::Etcd
                 && d.props.port == Some(port)
             {
@@ -1288,7 +1297,7 @@ impl<D: BlockDevice> Committer<D> {
     }
 
     /// Delete dataset `name` (not a volume: see `delete_volume`).
-    pub async fn delete_dataset(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn delete_dataset(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let e = self.fs.dataset_entry(name).await?;
         if e.format.is_system() {
             return Err(reserved(name));
@@ -1319,25 +1328,36 @@ impl<D: BlockDevice> Committer<D> {
 
     // ---- snapshots (see `crate::snapshot`) ----
 
-    pub async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, FileSystemError> {
+    pub async fn snapshots(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Vec<SnapshotInfo>, FileSystemError> {
         self.fs.list_snapshots(name).await
     }
 
     /// Snapshot `name` as last committed (a running volume's writes since
     /// its writer's last commit aren't in it). Returns its TXG.
-    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, FileSystemError> {
+    pub async fn create_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<Txg, FileSystemError> {
         self.fs.create_snapshot(name, snap).await
     }
 
-    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
+    pub async fn destroy_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<(), FileSystemError> {
         self.fs.destroy_snapshot(name, snap).await
     }
 
     pub async fn clone_snapshot(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
-        new: &str,
+        new: &DatasetName,
     ) -> Result<(), FileSystemError> {
         self.fs.clone_snapshot(name, snap, new).await.map(|_| ())
     }
@@ -1346,7 +1366,7 @@ impl<D: BlockDevice> Committer<D> {
     /// must not be running.
     pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send>(
         &self,
-        name: &str,
+        name: &DatasetName,
         r: &mut R,
         force: bool,
     ) -> Result<StreamReport, FileSystemError> {
@@ -1361,7 +1381,7 @@ impl<D: BlockDevice> Committer<D> {
     /// Whether a stream with `header` would be received into `name`.
     pub async fn recv_check(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &crate::send::SendHeader,
         force: bool,
     ) -> Result<(), FileSystemError> {
@@ -1374,7 +1394,7 @@ impl<D: BlockDevice> Committer<D> {
     }
 
     /// Roll `name` back to its newest snapshot (it must not be running).
-    pub async fn rollback(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn rollback(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let hold = self
             .hold_dataset(name, "rolling it back", |by| running(name, &by))
             .await?;
@@ -1411,7 +1431,7 @@ impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.committer.commit_fs(&c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(&self, volume: &DatasetName, ds: &Holding) -> Result<(), CommitError> {
         self.committer.claim_dataset(volume, ds).await
     }
 }
@@ -1430,7 +1450,7 @@ pub struct ReturnRequest {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClaimRequest {
-    pub dataset: String,
+    pub dataset: DatasetName,
     pub ds: Holding,
 }
 
@@ -1447,7 +1467,7 @@ pub struct CreateDataset {
 /// A VM definition to store (`PUT /api/v1/pool/vms`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PutVm {
-    pub name: String,
+    pub name: crate::types::VmName,
     pub xml: String,
     /// Refuse if there is one.
     #[serde(default)]

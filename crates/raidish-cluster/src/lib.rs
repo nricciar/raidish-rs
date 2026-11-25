@@ -60,6 +60,7 @@ openraft::declare_raft_types!(
     pub TypeConfig:
         D = Request,
         R = Response,
+        NodeId = crate::types::NodeId,
 );
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,6 +77,18 @@ pub const FINGERPRINT_HEADER: &str = "X-Raidish-Layout";
 /// whose config disagrees about who is who gets refused.
 #[cfg(not(target_arch = "wasm32"))]
 pub const TO_HEADER: &str = "X-Raidish-To";
+/// `TO_HEADER`'s value for `id`: the bare number (`3`), not its name
+/// (`node-3`), which is what older nodes parse.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn to_header(id: NodeId) -> String {
+    id.get().to_string()
+}
+
+/// Parse a `TO_HEADER` value (see `to_header`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn parse_to_header(v: &str) -> Option<NodeId> {
+    v.parse().ok().map(NodeId::from_raw)
+}
 /// Header carrying the Raft protocol version the sender speaks.
 #[cfg(not(target_arch = "wasm32"))]
 pub const PROTOCOL_HEADER: &str = "X-Raidish-Raft";
@@ -92,6 +105,7 @@ pub const RAFT_PROTOCOL: u32 = 1;
 #[cfg(not(target_arch = "wasm32"))]
 pub const FORWARD_WAIT: Duration = Duration::from_secs(4);
 
+use crate::types::NodeId;
 pub use crate::types::now_ms;
 
 pub use state::{MemberView, Status};
@@ -225,7 +239,7 @@ impl Cluster {
         let weak = Arc::downgrade(&cluster);
         tokio::spawn(async move {
             // Check every peer once it answers, then stop.
-            let mut pending: Vec<u64> = match weak.upgrade() {
+            let mut pending: Vec<NodeId> = match weak.upgrade() {
                 Some(c) => c.members.peers.keys().copied().collect(),
                 None => return,
             };
@@ -277,7 +291,7 @@ impl Cluster {
 
     /// Ask peer `id` who it is. `Ok(Some(problem))` if its answer doesn't
     /// match this node's view of the pool, `Err` if it didn't answer.
-    pub async fn check_peer(&self, id: u64) -> Result<Option<String>, String> {
+    pub async fn check_peer(&self, id: NodeId) -> Result<Option<String>, String> {
         Ok(match self.peer_check(id).await? {
             PeerCheck::Agrees => None,
             PeerCheck::OtherId(p) | PeerCheck::OtherLayout(p) => Some(p),
@@ -290,7 +304,7 @@ impl Cluster {
         self.misconfigured.load(SeqCst)
     }
 
-    async fn peer_check(&self, id: u64) -> Result<PeerCheck, String> {
+    async fn peer_check(&self, id: NodeId) -> Result<PeerCheck, String> {
         let addr = self.members.peers.get(&id).ok_or("unknown peer")?;
         let status: Status = self
             .http
@@ -304,7 +318,7 @@ impl Cluster {
             .map_err(|e| e.to_string())?;
         Ok(if status.id != id {
             PeerCheck::OtherId(format!(
-                "{} says it is node {} (disks {:?}), but this node's pool config makes it node {} \
+                "{} says it is {} (disks {:?}), but this node's pool config makes it {} \
                  (disks {:?}): the nodes list the pool's disks in different orders",
                 addr,
                 status.id,
@@ -319,7 +333,7 @@ impl Cluster {
             ))
         } else if status.fingerprint != self.members.fingerprint {
             PeerCheck::OtherLayout(format!(
-                "{} (node {}) has a different pool layout (fingerprint {}, ours {})",
+                "{} ({}) has a different pool layout (fingerprint {}, ours {})",
                 addr, id, status.fingerprint, self.members.fingerprint
             ))
         } else {
@@ -490,7 +504,7 @@ impl Cluster {
     /// Ask leader `id` at `addr` for its read index.
     async fn leaders_read_index(
         &self,
-        id: u64,
+        id: NodeId,
         addr: &str,
         deadline: tokio::time::Instant,
     ) -> Result<Option<u64>, String> {
@@ -501,7 +515,7 @@ impl Cluster {
             .http
             .get(format!("{}/api/v1/cluster/read_index", addr))
             .header(FINGERPRINT_HEADER, &self.members.fingerprint)
-            .header(TO_HEADER, id.to_string())
+            .header(TO_HEADER, to_header(id))
             .header(PROTOCOL_HEADER, RAFT_PROTOCOL.to_string())
             .timeout(left.max(Duration::from_millis(100)))
             .send()
@@ -595,7 +609,7 @@ impl Cluster {
         if !committed {
             match view {
                 PeerView::Fresh => {
-                    let initial: BTreeMap<u64, BasicNode> = self
+                    let initial: BTreeMap<NodeId, BasicNode> = self
                         .members
                         .ids()
                         .map(|id| (id, BasicNode::default()))

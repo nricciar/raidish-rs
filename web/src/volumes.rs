@@ -256,7 +256,12 @@ impl Component for Volumes {
                 ctx.link().send_future(async move {
                     // The newest committed state, read here (not by the node).
                     let r = match session.snapshot().await {
-                        Ok(snap) => snap.fs.volume_fragmentation(&name).await,
+                        Ok(snap) => {
+                            match raidish_types::types::DatasetName::try_from(name.as_str()) {
+                                Ok(n) => snap.fs.volume_fragmentation(&n).await,
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
                         Err(e) => Err(e),
                     };
                     Msg::FragDone(name, r)
@@ -395,7 +400,7 @@ impl Volumes {
     fn volume_rows(&self, ctx: &Context<Self>, vol: &VolumeView) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
-        let name = vol.info.name.clone();
+        let name = vol.info.name.to_string();
         let open = self.expanded.contains(&name);
         let running = self.running(ctx, &name);
         let status = match (&running, vol.info.props.enabled) {
@@ -533,7 +538,7 @@ impl Volumes {
                 </tr></thead>
                 <tbody>
                 { for vol.snapshots.iter().enumerate().map(|(i, s)| {
-                    let (v, snap) = (vol.info.name.clone(), s.short().to_string());
+                    let (v, snap) = (vol.info.name.to_string(), s.short().to_string());
                     let clone = {
                         let (v, snap) = (v.clone(), snap.clone());
                         link.callback(move |_| Msg::Ask(

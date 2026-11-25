@@ -598,7 +598,7 @@ pub fn is_tls_error(e: &str) -> bool {
 pub struct Collector {
     pub node: String,
     /// The other nodes: id → base URL (`Members::peers`).
-    pub peers: BTreeMap<u64, String>,
+    pub peers: BTreeMap<crate::types::NodeId, String>,
     pub vm: Option<Arc<VmRuntime>>,
     /// The cluster's CAs (empty without `tls:`).
     pub roots: Vec<CertificateDer<'static>>,
@@ -628,7 +628,7 @@ impl Collector {
         };
         let mut peers = BTreeMap::new();
         let probes = self.peers.iter().filter_map(|(id, url)| {
-            let name = crate::cluster::members::node_name(*id);
+            let name = id.name();
             let h = url_host(url)?;
             Some(async move {
                 let libvirt = match &self.vm {

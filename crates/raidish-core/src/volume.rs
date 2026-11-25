@@ -12,6 +12,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{Dirty, levels_for};
+use crate::types::DatasetName;
 use std::sync::Arc;
 
 /// Preferred volume block size, rounded up to the pool's alignment.
@@ -80,7 +81,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// of `volblock_align()` and at most `max_volblocksize()`.
     pub async fn create_block(
         &self,
-        name: &str,
+        name: &DatasetName,
         size_bytes: u64,
         volblocksize: u32,
     ) -> Result<FileId, FileSystemError> {
@@ -113,7 +114,10 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Volume `name`, opened (refused if it's another kind of dataset).
-    pub(crate) async fn open_block(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
+    pub(crate) async fn open_block(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
         let ds = self.open_dataset(name).await?;
         if ds.format != DatasetFormat::Block {
             return Err(FileSystemError::InvalidArgument(format!(
@@ -126,7 +130,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Delete volume `name` (it must have no snapshots).
-    pub async fn delete_volume(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn delete_volume(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         if self.dataset_entry(name).await?.format != DatasetFormat::Block {
             return Err(FileSystemError::InvalidArgument(format!(
                 "'{}' isn't a volume",
@@ -145,7 +149,7 @@ impl<D: BlockDevice> FileSystem<D> {
             }
             let d = self.read_dnode(e.root).await?;
             out.push(VolumeInfo {
-                name,
+                name: DatasetName::try_from(name)?,
                 size_bytes: d.size,
                 volblocksize: d.blksz,
                 props: d.props().cloned().unwrap_or_default(),
@@ -157,7 +161,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Read data from a virtual block device at a specific byte offset
     pub async fn block_read(
         &self,
-        name: &str,
+        name: &DatasetName,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, FileSystemError> {
@@ -168,7 +172,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Write data to a virtual block device at a specific byte offset
     pub async fn block_write(
         &self,
-        name: &str,
+        name: &DatasetName,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, FileSystemError> {
@@ -189,7 +193,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// release their space on the next commit.
     pub async fn block_zero(
         &self,
-        name: &str,
+        name: &DatasetName,
         offset: u64,
         len: usize,
     ) -> Result<usize, FileSystemError> {
@@ -197,7 +201,7 @@ impl<D: BlockDevice> FileSystem<D> {
         self.object_modify(&vol.obj, offset, len, None).await
     }
     /// How scattered volume `name`'s committed records are.
-    pub async fn fragmentation(&self, name: &str) -> Result<FragReport, FileSystemError> {
+    pub async fn fragmentation(&self, name: &DatasetName) -> Result<FragReport, FileSystemError> {
         let vol = self.open_block(name).await?;
         let leaves = self.tree_leaves(&vol.obj.root()).await?;
         Ok(frag_of(&leaves))
@@ -209,7 +213,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// are left to the writer. Returns the fragmentation before and after.
     pub async fn defrag(
         &self,
-        name: &str,
+        name: &DatasetName,
         batch_records: usize,
     ) -> Result<(FragReport, FragReport), FileSystemError> {
         let vol = self.open_block(name).await?;

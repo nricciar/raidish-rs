@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
 
@@ -31,8 +32,8 @@ async fn settle(fs: &FileSystem<Pool>) {
 async fn read(fs: &FileSystem<Pool>, name: &str, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = match name.split_once('@') {
-        Some((v, s)) => fs.snapshot_read(v, s, 0, &mut buf).await.unwrap(),
-        None => fs.block_read(name, 0, &mut buf).await.unwrap(),
+        Some((v, s)) => fs.snapshot_read(&ds(v), s, 0, &mut buf).await.unwrap(),
+        None => fs.block_read(&ds(name), 0, &mut buf).await.unwrap(),
     };
     buf.truncate(n);
     buf
@@ -45,14 +46,18 @@ async fn clean(fs: &FileSystem<Pool>) {
 
 /// Write `data` at `offset` of `want` too (what the volume should hold).
 async fn write(fs: &FileSystem<Pool>, want: &mut [u8], offset: usize, data: &[u8]) {
-    fs.block_write("vol", offset as u64, data).await.unwrap();
+    fs.block_write(&ds("vol"), offset as u64, data)
+        .await
+        .unwrap();
     want[offset..offset + data.len()].copy_from_slice(data);
 }
 
 async fn volume(fs: &FileSystem<Pool>) -> Vec<u8> {
-    fs.create_block("vol", VOL, VOLBLOCK_ALIGN).await.unwrap();
+    fs.create_block(&ds("vol"), VOL, VOLBLOCK_ALIGN)
+        .await
+        .unwrap();
     let want = pattern(VOL as usize, 1);
-    fs.block_write("vol", 0, &want).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &want).await.unwrap();
     fs.sync().await.unwrap();
     want
 }
@@ -64,19 +69,21 @@ async fn a_snapshot_keeps_the_contents() {
     let fs = pool.format().await;
     let mut want = volume(&fs).await;
     let at_snap = want.clone();
-    fs.create_snapshot("vol", "s1").await.unwrap();
+    fs.create_snapshot(&ds("vol"), "s1").await.unwrap();
     write(&fs, &mut want, 100_000, &pattern(2 * MB as usize, 2)).await;
-    fs.block_zero("vol", 5 * MB, MB as usize).await.unwrap();
+    fs.block_zero(&ds("vol"), 5 * MB, MB as usize)
+        .await
+        .unwrap();
     want[5 * MB as usize..6 * MB as usize].fill(0);
     fs.sync().await.unwrap();
 
     assert_eq!(read(&fs, "vol@s1", VOL as usize).await, at_snap);
     assert_eq!(read(&fs, "vol", VOL as usize).await, want);
     assert!(matches!(
-        fs.create_snapshot("vol", "s1").await,
+        fs.create_snapshot(&ds("vol"), "s1").await,
         Err(FileSystemError::AlreadyExists)
     ));
-    assert!(fs.create_snapshot("vol", "no/slash").await.is_err());
+    assert!(fs.create_snapshot(&ds("vol"), "no/slash").await.is_err());
     clean(&fs).await;
 
     // And after reopening the pool.
@@ -84,7 +91,7 @@ async fn a_snapshot_keeps_the_contents() {
     let fs = pool.load().await;
     assert_eq!(read(&fs, "vol@s1", VOL as usize).await, at_snap);
     assert_eq!(read(&fs, "vol", VOL as usize).await, want);
-    let list = fs.list_snapshots("vol").await.unwrap();
+    let list = fs.list_snapshots(&ds("vol")).await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].name, "vol@s1");
     // What the overwrites and the zeroing replaced is the snapshot's alone.
@@ -112,14 +119,14 @@ async fn destroying_snapshots_frees_exactly_their_blocks() {
         .enumerate()
     {
         let name = format!("s{}", i);
-        fs.create_snapshot("vol", &name).await.unwrap();
+        fs.create_snapshot(&ds("vol"), &name).await.unwrap();
         snaps.push((name, want.clone()));
         write(&fs, &mut want, off, &pattern(MB as usize, 10 + i as u8)).await;
         fs.sync().await.unwrap();
     }
     // The middle ones first, then the oldest, then the newest.
     for victim in ["s2", "s1", "s0"] {
-        fs.destroy_snapshot("vol", victim).await.unwrap();
+        fs.destroy_snapshot(&ds("vol"), victim).await.unwrap();
         snaps.retain(|(n, _)| n != victim);
         settle(&fs).await;
         clean(&fs).await;
@@ -128,13 +135,16 @@ async fn destroying_snapshots_frees_exactly_their_blocks() {
         }
         assert_eq!(read(&fs, "vol", VOL as usize).await, want);
     }
-    assert!(fs.delete_volume("vol").await.is_err(), "it has a snapshot");
-    fs.destroy_snapshot("vol", "s3").await.unwrap();
+    assert!(
+        fs.delete_volume(&ds("vol")).await.is_err(),
+        "it has a snapshot"
+    );
+    fs.destroy_snapshot(&ds("vol"), "s3").await.unwrap();
     assert!(matches!(
-        fs.destroy_snapshot("vol", "s3").await,
+        fs.destroy_snapshot(&ds("vol"), "s3").await,
         Err(FileSystemError::FileNotFound)
     ));
-    fs.delete_volume("vol").await.unwrap();
+    fs.delete_volume(&ds("vol")).await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);
@@ -151,9 +161,11 @@ async fn clones_share_until_written() {
     let baseline = allocated(&fs).await;
     let mut want = volume(&fs).await;
     let at_snap = want.clone();
-    fs.create_snapshot("vol", "s").await.unwrap();
+    fs.create_snapshot(&ds("vol"), "s").await.unwrap();
     let before_clone = allocated(&fs).await;
-    fs.clone_snapshot("vol", "s", "copy").await.unwrap();
+    fs.clone_snapshot(&ds("vol"), "s", &ds("copy"))
+        .await
+        .unwrap();
     assert!(
         allocated(&fs).await - before_clone < 100,
         "a clone copies nothing"
@@ -162,7 +174,7 @@ async fn clones_share_until_written() {
 
     let mut theirs = at_snap.clone();
     let data = pattern(MB as usize, 7);
-    fs.block_write("copy", 2 * MB, &data).await.unwrap();
+    fs.block_write(&ds("copy"), 2 * MB, &data).await.unwrap();
     theirs[2 * MB as usize..3 * MB as usize].copy_from_slice(&data);
     write(&fs, &mut want, 4 * MB as usize, &pattern(MB as usize, 8)).await;
     fs.sync().await.unwrap();
@@ -172,26 +184,26 @@ async fn clones_share_until_written() {
     clean(&fs).await;
 
     // Snapshots of a clone work the same.
-    fs.create_snapshot("copy", "c1").await.unwrap();
-    fs.block_write("copy", 0, &pattern(MB as usize, 9))
+    fs.create_snapshot(&ds("copy"), "c1").await.unwrap();
+    fs.block_write(&ds("copy"), 0, &pattern(MB as usize, 9))
         .await
         .unwrap();
     fs.sync().await.unwrap();
     assert_eq!(read(&fs, "copy@c1", VOL as usize).await, theirs);
-    let list = fs.list_snapshots("vol").await.unwrap();
+    let list = fs.list_snapshots(&ds("vol")).await.unwrap();
     assert_eq!(list[0].clones, vec!["copy".to_string()]);
 
     assert!(matches!(
-        fs.destroy_snapshot("vol", "s").await,
+        fs.destroy_snapshot(&ds("vol"), "s").await,
         Err(FileSystemError::InvalidArgument(_))
     ));
-    fs.destroy_snapshot("copy", "c1").await.unwrap();
-    fs.delete_volume("copy").await.unwrap();
+    fs.destroy_snapshot(&ds("copy"), "c1").await.unwrap();
+    fs.delete_volume(&ds("copy")).await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(read(&fs, "vol@s", VOL as usize).await, at_snap);
-    fs.destroy_snapshot("vol", "s").await.unwrap();
-    fs.delete_volume("vol").await.unwrap();
+    fs.destroy_snapshot(&ds("vol"), "s").await.unwrap();
+    fs.delete_volume(&ds("vol")).await.unwrap();
     settle(&fs).await;
     clean(&fs).await;
     assert_eq!(allocated(&fs).await, baseline);
@@ -204,21 +216,26 @@ async fn rollback_returns_to_the_newest_snapshot() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let mut want = volume(&fs).await;
-    assert!(fs.rollback_volume("vol").await.is_err(), "no snapshots");
-    fs.create_snapshot("vol", "s").await.unwrap();
+    assert!(
+        fs.rollback_volume(&ds("vol")).await.is_err(),
+        "no snapshots"
+    );
+    fs.create_snapshot(&ds("vol"), "s").await.unwrap();
     let at_snap = want.clone();
     settle(&fs).await;
     let held = allocated(&fs).await;
     write(&fs, &mut want, 0, &pattern(3 * MB as usize, 4)).await;
     fs.sync().await.unwrap();
     write(&fs, &mut want, 5 * MB as usize, &pattern(MB as usize, 5)).await; // unsynced
-    fs.rollback_volume("vol").await.unwrap();
+    fs.rollback_volume(&ds("vol")).await.unwrap();
     assert_eq!(read(&fs, "vol", VOL as usize).await, at_snap);
     settle(&fs).await;
     assert_eq!(allocated(&fs).await, held);
     clean(&fs).await;
     // And it goes on from there.
-    fs.block_write("vol", 0, &pattern(4096, 6)).await.unwrap();
+    fs.block_write(&ds("vol"), 0, &pattern(4096, 6))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     assert_eq!(read(&fs, "vol@s", VOL as usize).await, at_snap);
     clean(&fs).await;
@@ -230,7 +247,7 @@ async fn scrub_walks_snapshots() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let mut want = volume(&fs).await;
-    fs.create_snapshot("vol", "s").await.unwrap();
+    fs.create_snapshot(&ds("vol"), "s").await.unwrap();
     write(&fs, &mut want, 0, &pattern(MB as usize, 3)).await;
     fs.sync().await.unwrap();
     let report = fs.scrub(false).await.unwrap();

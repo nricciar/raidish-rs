@@ -24,7 +24,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
-use crate::types::Epoch;
+use crate::types::{Epoch, NodeId};
 use crate::types::{HolderRole, LeaseResource};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -89,8 +89,12 @@ pub struct EventLog<D: BlockDevice> {
 impl<D: BlockDevice> EventLog<D> {
     /// Open the pool's log, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
-        let ds =
-            crate::service_tree::ensure_btree(&fs, EVENTS_DATASET, DatasetFormat::Events).await?;
+        let ds = crate::service_tree::ensure_btree(
+            &fs,
+            &crate::types::DatasetName::from_static(EVENTS_DATASET),
+            DatasetFormat::Events,
+        )
+        .await?;
         Ok(Arc::new(EventLog {
             fs,
             ds,
@@ -235,7 +239,7 @@ pub struct Observed {
     pub datasets: BTreeMap<String, Held>,
     pub committer: Option<Held>,
     /// The Raft leader's id.
-    pub leader: Option<u64>,
+    pub leader: Option<NodeId>,
 }
 
 /// What `state` shows at `now`. Nodes stay known once seen.
@@ -243,7 +247,7 @@ pub fn observe(
     state: &crate::cluster::state::ClusterState,
     now: u64,
     committer: Held,
-    leader: Option<u64>,
+    leader: Option<NodeId>,
 ) -> Observed {
     let mut o = Observed {
         committer: Some(committer),
@@ -403,10 +407,7 @@ pub fn diff(
                 Level::Info,
                 EventKind::RaftLeader,
                 Subject::Cluster,
-                format!(
-                    "Raft leader is now {}",
-                    crate::cluster::members::node_name(*id)
-                ),
+                format!("Raft leader is now {}", id),
             )),
             None => out.push((
                 Level::Warn,

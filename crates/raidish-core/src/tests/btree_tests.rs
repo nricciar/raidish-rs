@@ -3,6 +3,7 @@
 
 use crate::disk::BlockDevice;
 use crate::fs::FileSystem;
+use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
 use std::collections::BTreeMap;
@@ -35,6 +36,7 @@ fn value(i: u64, generation: u64, len: usize) -> Vec<u8> {
 }
 
 async fn small_kv(pool: &TestPool, name: &str) -> FileSystem<Pool> {
+    let name = &ds(name);
     let fs = pool.format().await;
     fs.create_kv_with(name, VOLBLOCK_ALIGN, 1 << 20)
         .await
@@ -48,6 +50,7 @@ async fn verify<D: BlockDevice>(
     name: &str,
     model: &BTreeMap<Vec<u8>, Vec<u8>>,
 ) {
+    let name = &ds(name);
     fs.sync().await.unwrap();
     let id = fs.dataset_id(name).await.unwrap();
     let d = fs.read_dnode(id).await.unwrap();
@@ -76,20 +79,20 @@ async fn random_puts_and_deletes_match_a_model() {
             let k = key(i, 8 + rng.below(120) as usize);
             if rng.below(4) == 0 {
                 let had = model.remove(&k).is_some();
-                assert_eq!(fs.kv_delete("t", &k).await.unwrap(), had);
+                assert_eq!(fs.kv_delete(&ds("t"), &k).await.unwrap(), had);
             } else {
                 let v = value(i, round, rng.below(300) as usize);
                 let had = model.insert(k.clone(), v.clone()).is_some();
-                assert_eq!(fs.kv_put("t", &k, &v).await.unwrap(), had);
+                assert_eq!(fs.kv_put(&ds("t"), &k, &v).await.unwrap(), had);
             }
         }
         verify(&fs, "t", &model).await;
     }
     // Spot checks by key.
     for (k, v) in model.iter().step_by(37) {
-        assert_eq!(fs.kv_get("t", k).await.unwrap().as_ref(), Some(v));
+        assert_eq!(fs.kv_get(&ds("t"), k).await.unwrap().as_ref(), Some(v));
     }
-    assert_eq!(fs.kv_get("t", b"absent").await.unwrap(), None);
+    assert_eq!(fs.kv_get(&ds("t"), b"absent").await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -101,12 +104,12 @@ async fn a_deep_tree_shrinks_back_to_nothing() {
     for i in 0..2500 {
         let k = key(i, 600);
         let v = value(i, 0, 8);
-        fs.kv_put("t", &k, &v).await.unwrap();
+        fs.kv_put(&ds("t"), &k, &v).await.unwrap();
         model.insert(k, v);
     }
     verify(&fs, "t", &model).await;
     let t = {
-        let ds = fs.open_kv("t").await.unwrap();
+        let ds = fs.open_kv(&ds("t")).await.unwrap();
         crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
     };
     assert!(t.height >= 2, "height {}", t.height);
@@ -117,7 +120,7 @@ async fn a_deep_tree_shrinks_back_to_nothing() {
         keys.swap(i, rng.below(i as u64 + 1) as usize);
     }
     for (n, k) in keys.iter().enumerate() {
-        assert!(fs.kv_delete("t", k).await.unwrap());
+        assert!(fs.kv_delete(&ds("t"), k).await.unwrap());
         model.remove(k);
         if n % 600 == 0 {
             verify(&fs, "t", &model).await;
@@ -125,13 +128,13 @@ async fn a_deep_tree_shrinks_back_to_nothing() {
     }
     verify(&fs, "t", &model).await;
     let h = {
-        let ds = fs.open_kv("t").await.unwrap();
+        let ds = fs.open_kv(&ds("t")).await.unwrap();
         crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
     };
     assert_eq!((h.root, h.height, h.entries), (None, 0, 0));
     // Every node's record was freed: what's left is the header and the
     // pages the spilled free ids are listed in, and every other id is free.
-    let id = fs.dataset_id("t").await.unwrap();
+    let id = fs.dataset_id(&ds("t")).await.unwrap();
     let d = fs.read_dnode(id).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
     assert_eq!(leaves[0].0, 0);
@@ -151,15 +154,15 @@ async fn large_values_go_to_overflow_pages() {
     {
         let k = key(i as u64, 10);
         let v = value(i as u64, 1, len);
-        fs.kv_put("t", &k, &v).await.unwrap();
+        fs.kv_put(&ds("t"), &k, &v).await.unwrap();
         model.insert(k, v);
     }
     verify(&fs, "t", &model).await;
     // Replacing and deleting large values frees their pages.
     let big = key(8, 10);
-    fs.kv_put("t", &big, b"small now").await.unwrap();
+    fs.kv_put(&ds("t"), &big, b"small now").await.unwrap();
     model.insert(big.clone(), b"small now".to_vec());
-    fs.kv_delete("t", &key(7, 10)).await.unwrap();
+    fs.kv_delete(&ds("t"), &key(7, 10)).await.unwrap();
     model.remove(&key(7, 10));
     verify(&fs, "t", &model).await;
 }
@@ -172,7 +175,7 @@ async fn ranges_and_prefixes() {
     for dir in ["a", "b", "b/c", "ba", "c"] {
         for i in 0..400 {
             let k = format!("{}/{:04}", dir, i).into_bytes();
-            fs.kv_put("t", &k, &k).await.unwrap();
+            fs.kv_put(&ds("t"), &k, &k).await.unwrap();
             model.insert(k.clone(), k);
         }
     }
@@ -181,7 +184,7 @@ async fn ranges_and_prefixes() {
     let mut after: Option<Vec<u8>> = None;
     loop {
         let page = fs
-            .kv_scan_prefix("t", b"b/", after.as_deref(), 77)
+            .kv_scan_prefix(&ds("t"), b"b/", after.as_deref(), 77)
             .await
             .unwrap();
         if page.is_empty() {
@@ -200,7 +203,7 @@ async fn ranges_and_prefixes() {
     // Bounds of every kind.
     let r = fs
         .kv_range(
-            "t",
+            &ds("t"),
             Bound::Excluded(b"a/0399"),
             Bound::Included(b"b/0001"),
             usize::MAX,
@@ -218,24 +221,26 @@ async fn limits_are_enforced() {
     let pool = TestPool::new().await;
     let fs = small_kv(&pool, "t").await;
     let max_key = (VOLBLOCK_ALIGN as usize - 4) / 16;
-    assert!(fs.kv_put("t", b"", b"v").await.is_err());
+    assert!(fs.kv_put(&ds("t"), b"", b"v").await.is_err());
     assert!(
-        fs.kv_put("t", &vec![b'k'; max_key + 1], b"v")
+        fs.kv_put(&ds("t"), &vec![b'k'; max_key + 1], b"v")
             .await
             .is_err()
     );
-    fs.kv_put("t", &vec![b'k'; max_key], b"v").await.unwrap();
+    fs.kv_put(&ds("t"), &vec![b'k'; max_key], b"v")
+        .await
+        .unwrap();
     assert!(
-        fs.kv_put("t", b"big", &vec![0; crate::btree::MAX_VALUE + 1])
+        fs.kv_put(&ds("t"), b"big", &vec![0; crate::btree::MAX_VALUE + 1])
             .await
             .is_err()
     );
     // A volume isn't a kv dataset, and the other way round.
-    fs.create_block("vol", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    assert!(fs.kv_get("vol", b"k").await.is_err());
-    assert!(fs.block_read("t", 0, &mut [0u8; 8]).await.is_err());
+    assert!(fs.kv_get(&ds("vol"), b"k").await.is_err());
+    assert!(fs.block_read(&ds("t"), 0, &mut [0u8; 8]).await.is_err());
 }
 
 #[test]
@@ -267,12 +272,12 @@ async fn zero_overflow_pages_read_back() {
     tail[50_000..].fill(0);
     for (i, v) in [vec![0u8; 100_000], middle, tail].into_iter().enumerate() {
         let k = key(i as u64, 10);
-        fs.kv_put("t", &k, &v).await.unwrap();
+        fs.kv_put(&ds("t"), &k, &v).await.unwrap();
         model.insert(k, v);
     }
     verify(&fs, "t", &model).await;
     for (k, v) in &model {
-        assert_eq!(fs.kv_get("t", k).await.unwrap().as_ref(), Some(v));
+        assert_eq!(fs.kv_get(&ds("t"), k).await.unwrap().as_ref(), Some(v));
     }
 }
 
@@ -285,7 +290,7 @@ async fn churning_large_values_reuses_freed_ids() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let capacity = 4096;
-    fs.create_kv_with("t", VOLBLOCK_ALIGN, capacity)
+    fs.create_kv_with(&ds("t"), VOLBLOCK_ALIGN, capacity)
         .await
         .unwrap();
     let blksz = VOLBLOCK_ALIGN as usize;
@@ -295,13 +300,13 @@ async fn churning_large_values_reuses_freed_ids() {
     for round in 0..2000u64 {
         let k = key(rng.below(8), 10);
         if rng.below(5) == 0 {
-            fs.kv_delete("t", &k).await.unwrap();
+            fs.kv_delete(&ds("t"), &k).await.unwrap();
             model.remove(&k);
         } else {
             let len = blksz + rng.below(30 * blksz as u64) as usize;
             pages_written += len.div_ceil(blksz);
             let v = value(round, round, len);
-            fs.kv_put("t", &k, &v)
+            fs.kv_put(&ds("t"), &k, &v)
                 .await
                 .unwrap_or_else(|e| panic!("round {}: {}", round, e));
             model.insert(k, v);
@@ -312,7 +317,7 @@ async fn churning_large_values_reuses_freed_ids() {
     }
     verify(&fs, "t", &model).await;
     let h = {
-        let ds = fs.open_kv("t").await.unwrap();
+        let ds = fs.open_kv(&ds("t")).await.unwrap();
         crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap().header
     };
     assert!(pages_written > 5 * capacity as usize);
@@ -329,7 +334,7 @@ async fn ids_freed_in_bulk_are_all_kept_for_reuse() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let capacity = 4096;
-    fs.create_kv_with("t", VOLBLOCK_ALIGN, capacity)
+    fs.create_kv_with(&ds("t"), VOLBLOCK_ALIGN, capacity)
         .await
         .unwrap();
     let blksz = VOLBLOCK_ALIGN as usize;
@@ -338,14 +343,14 @@ async fn ids_freed_in_bulk_are_all_kept_for_reuse() {
         let mut model = BTreeMap::new();
         for i in 0..40 {
             let (k, v) = (key(cycle * 100 + i, 10), value(i, cycle, 30 * blksz));
-            fs.kv_put("t", &k, &v)
+            fs.kv_put(&ds("t"), &k, &v)
                 .await
                 .unwrap_or_else(|e| panic!("cycle {} put {}: {}", cycle, i, e));
             model.insert(k, v);
         }
         verify(&fs, "t", &model).await;
         let next_id = {
-            let ds = fs.open_kv("t").await.unwrap();
+            let ds = fs.open_kv(&ds("t")).await.unwrap();
             crate::btree::Txn::begin(&fs, &ds.obj)
                 .await
                 .unwrap()
@@ -361,7 +366,7 @@ async fn ids_freed_in_bulk_are_all_kept_for_reuse() {
             first
         );
         for k in model.keys() {
-            fs.kv_delete("t", k).await.unwrap();
+            fs.kv_delete(&ds("t"), k).await.unwrap();
         }
         verify(&fs, "t", &BTreeMap::new()).await;
     }

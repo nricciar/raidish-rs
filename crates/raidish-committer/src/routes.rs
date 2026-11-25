@@ -8,6 +8,7 @@ use crate::api_types::NodeFacts;
 use crate::api_types::VmDef;
 use crate::auth::{Actor, CanRead, CanWrite, IsNode};
 use crate::events::{EventPage, EventQuery};
+use crate::types::{DatasetName, VmName};
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::serde::json::Json;
 use rocket::{delete, get, post, put};
@@ -42,6 +43,29 @@ macro_rules! here {
         match $h.0 {
             Ok(a) => a,
             Err(e) => return Json(Err(e)),
+        }
+    };
+}
+
+/// A dataset name from the URL, or the route answers why it isn't one.
+macro_rules! dataset {
+    ($n:expr) => {
+        named!(DatasetName, $n)
+    };
+}
+
+/// A VM name from the path, or the route answers with why it isn't one.
+macro_rules! vm {
+    ($n:expr) => {
+        named!(VmName, $n)
+    };
+}
+
+macro_rules! named {
+    ($t:ident, $n:expr) => {
+        match $t::try_from($n) {
+            Ok(n) => n,
+            Err(e) => return Json(Err(crate::fs::FileSystemError::from(e).into())),
         }
     };
 }
@@ -104,6 +128,7 @@ pub async fn create(_auth: CanWrite, here: Here, req: Json<CreateVolume>) -> Ans
 
 #[delete("/api/v1/pool/volumes/<name>")]
 pub async fn remove(_auth: CanWrite, here: Here, name: &str) -> Answer<()> {
+    let name = &dataset!(name);
     Json(here!(here).delete_volume(name).await)
 }
 
@@ -114,6 +139,7 @@ pub async fn props(
     name: &str,
     props: Json<DatasetProps>,
 ) -> Answer<()> {
+    let name = &dataset!(name);
     Json(here!(here).set_props(name, &props).await)
 }
 
@@ -129,21 +155,25 @@ pub async fn create_dataset(_auth: CanWrite, here: Here, req: Json<CreateDataset
 
 #[delete("/api/v1/pool/datasets/<name>")]
 pub async fn delete_dataset(_auth: CanWrite, here: Here, name: &str) -> Answer<()> {
+    let name = &dataset!(name);
     Json(here!(here).delete_dataset(name).await)
 }
 
 #[get("/api/v1/pool/volumes/<name>/snapshots")]
 pub async fn snapshots(_auth: CanRead, here: Here, name: &str) -> Answer<Vec<SnapshotInfo>> {
+    let name = &dataset!(name);
     Json(here!(here).snapshots(name).await)
 }
 
 #[post("/api/v1/pool/volumes/<name>/snapshots", data = "<req>")]
 pub async fn snapshot(_auth: CanWrite, here: Here, name: &str, req: Json<NewName>) -> Answer<Txg> {
+    let name = &dataset!(name);
     Json(here!(here).create_snapshot(name, &req.name).await)
 }
 
 #[delete("/api/v1/pool/volumes/<name>/snapshots/<snap>")]
 pub async fn destroy_snapshot(_auth: CanWrite, here: Here, name: &str, snap: &str) -> Answer<()> {
+    let name = &dataset!(name);
     Json(here!(here).destroy_snapshot(name, snap).await)
 }
 
@@ -155,11 +185,17 @@ pub async fn clone_snapshot(
     snap: &str,
     req: Json<NewName>,
 ) -> Answer<()> {
-    Json(here!(here).clone_snapshot(name, snap, &req.name).await)
+    let name = &dataset!(name);
+    Json(
+        here!(here)
+            .clone_snapshot(name, snap, &dataset!(req.name.as_str()))
+            .await,
+    )
 }
 
 #[post("/api/v1/pool/volumes/<name>/rollback")]
 pub async fn rollback(_auth: CanWrite, here: Here, name: &str) -> Answer<()> {
+    let name = &dataset!(name);
     Json(here!(here).rollback(name).await)
 }
 
@@ -171,6 +207,7 @@ pub async fn recv(
     force: Option<bool>,
     data: rocket::Data<'_>,
 ) -> Answer<StreamReport> {
+    let name = &dataset!(name);
     let a = here!(here);
     let mut stream = data.open(rocket::data::ByteUnit::max_value());
     Json(a.recv(name, &mut stream, force.unwrap_or(false)).await)
@@ -184,6 +221,7 @@ pub async fn recv_check(
     force: Option<bool>,
     header: Json<crate::send::SendHeader>,
 ) -> Answer<()> {
+    let name = &dataset!(name);
     Json(
         here!(here)
             .recv_check(name, &header, force.unwrap_or(false))
@@ -207,7 +245,7 @@ pub async fn report_events(
 }
 
 #[get("/api/v1/pool/vms")]
-pub async fn vms(_auth: CanRead, here: Here) -> Answer<BTreeMap<String, VmDef>> {
+pub async fn vms(_auth: CanRead, here: Here) -> Answer<BTreeMap<VmName, VmDef>> {
     Json(here!(here).vms().await)
 }
 
@@ -218,6 +256,7 @@ pub async fn put_vm(_auth: CanWrite, here: Here, req: Json<PutVm>) -> Answer<VmD
 
 #[delete("/api/v1/pool/vms/<name>?<change>")]
 pub async fn delete_vm(_auth: CanWrite, here: Here, name: &str, change: Option<u64>) -> Answer<()> {
+    let name = &vm!(name);
     Json(here!(here).delete_vm(name, change).await)
 }
 

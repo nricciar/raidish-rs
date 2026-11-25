@@ -37,6 +37,7 @@ use crate::committer::PoolAdmin;
 use crate::committer::PutVm;
 use crate::committer::dataset_resource;
 use crate::events::{EventKind, Subject};
+use crate::types::VmName;
 use crate::vm::{VmRuntime, VmSpec};
 use crate::vm_store::{DefSpec, VmDef};
 use crate::volumes_api::VolumesState;
@@ -108,7 +109,7 @@ async fn local_view(
     };
     if let Some(rt) = &st.runtime {
         match rt.local_vms().await {
-            Ok(vms) => view.vms = vms.into_iter().filter(|v| v.domain.id.is_some()).collect(),
+            Ok(vms) => view.vms = vms.into_iter().filter(|v| v.id.is_some()).collect(),
             Err(e) => view.error = Some(e),
         }
     }
@@ -135,7 +136,7 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
         rt.poke();
         return Ok(());
     }
-    crate::types::VmName::try_from(name).map_err(|e| ApiError::bad(e.to_string()))?;
+    let name = &vm(name)?;
     // Only a domain this node started (see `crate::vm::DomMeta::pool`).
     let ours = match (rt.ident(), rt.virsh.meta(name).await) {
         (Some(me), Ok(Some(m))) => me.owns(&m),
@@ -243,7 +244,7 @@ async fn list(
         .map(|spec| {
             let node = vm_node(cluster, &spec);
             let mut v = VmView {
-                want_running: intent.contains_key(&spec.name),
+                want_running: intent.contains_key(spec.name.as_str()),
                 node: node.clone(),
                 state: None,
                 unreachable: None,
@@ -257,15 +258,15 @@ async fn list(
             };
             match node.as_ref().and_then(|n| views.get(n)) {
                 Some(Ok(view)) => {
-                    if let Some(l) = view.vms.iter().find(|l| l.domain.name == v.spec.name) {
-                        v.state = Some(l.domain.state.clone());
+                    if let Some(l) = view.vms.iter().find(|l| l.name == v.spec.name) {
+                        v.state = Some(l.state.clone());
                         v.restart_pending = l.meta.change != v.spec.change;
                         v.vcpus = l.vcpus;
                         v.memory = l.memory;
                         v.cpu_s = l.cpu_s;
                         v.console = l.vnc_port.is_some();
                     }
-                    v.start_error = view.errors.get(&v.spec.name).cloned().or_else(|| {
+                    v.start_error = view.errors.get(v.spec.name.as_str()).cloned().or_else(|| {
                         (!view.enabled && v.want_running)
                             .then(|| format!("{} runs no VMs (no `vm:` config)", view.node))
                     });
@@ -284,8 +285,8 @@ async fn list(
 
 /// Every VM definition, as the committer has them (one sharing a volume
 /// with an earlier one is unusable, see `crate::vm::mark_conflicts`).
-async fn specs(volumes: &VolumesState) -> Result<BTreeMap<String, VmSpec>, ApiError> {
-    let mut specs: BTreeMap<String, VmSpec> = volumes
+async fn specs(volumes: &VolumesState) -> Result<BTreeMap<VmName, VmSpec>, ApiError> {
+    let mut specs: BTreeMap<VmName, VmSpec> = volumes
         .admin
         .vms()
         .await?
@@ -296,11 +297,16 @@ async fn specs(volumes: &VolumesState) -> Result<BTreeMap<String, VmSpec>, ApiEr
     Ok(specs)
 }
 
-async fn spec(volumes: &VolumesState, name: &str) -> Result<VmSpec, ApiError> {
+async fn spec(volumes: &VolumesState, name: &VmName) -> Result<VmSpec, ApiError> {
     specs(volumes)
         .await?
         .remove(name)
         .ok_or_else(|| ApiError::new(Status::NotFound, format!("no VM '{}'", name)))
+}
+
+/// A VM name from the URL (400 if it isn't one).
+fn vm(name: &str) -> Result<VmName, ApiError> {
+    VmName::try_from(name).map_err(|e| ApiError::bad(e.to_string()))
 }
 
 // ---- definitions ------------------------------------------------------------
@@ -312,6 +318,7 @@ async fn definition(
     name: &str,
     volumes: &State<VolumesState>,
 ) -> Result<Json<VmDef>, ApiError> {
+    let name = &vm(name)?;
     volumes
         .admin
         .vms()
@@ -334,6 +341,7 @@ async fn put_definition(
     body: rocket::Data<'_>,
     volumes: &State<VolumesState>,
 ) -> Result<Json<VmDef>, ApiError> {
+    let name = &vm(name)?;
     use rocket::data::ToByteUnit;
     let xml = body
         .open((crate::vm_store::MAX_XML + 1).bytes())
@@ -350,7 +358,7 @@ async fn put_definition(
         ));
     }
     let req = PutVm {
-        name: name.to_string(),
+        name: name.clone(),
         xml: xml.into_inner(),
         create: create.unwrap_or(false),
         change,
@@ -376,6 +384,7 @@ async fn delete_definition(
     cluster: &State<Arc<Cluster>>,
     volumes: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &vm(name)?;
     let spec = spec(volumes, name).await.ok();
     volumes
         .admin
@@ -390,7 +399,7 @@ async fn delete_definition(
     Ok(Json(()))
 }
 
-async fn set_intent(cluster: &Cluster, name: &str, running: bool) -> Result<(), ApiError> {
+async fn set_intent(cluster: &Cluster, name: &VmName, running: bool) -> Result<(), ApiError> {
     let op = LeaseOp::SetVm {
         name: name.to_string(),
         running,
@@ -522,7 +531,7 @@ async fn check_vm(
     st: &VmsState,
     cluster: &Cluster,
     volumes: &VolumesState,
-    name: &str,
+    name: &VmName,
     only: Option<&str>,
 ) -> Result<CheckView, ApiError> {
     use crate::vm_check::{Mode, check, cpu_to_compare, needs};
@@ -534,17 +543,11 @@ async fn check_vm(
     let mut facts = volumes.admin.node_facts().await?;
     let live = live_nodes(cluster);
     let holder = vm_node(cluster, &spec);
-    let running_on = holder.filter(|_| cluster.status().state.vms.contains_key(name));
+    let running_on = holder.filter(|_| cluster.status().state.vms.contains_key(name.as_str()));
     let source = running_on.as_ref().and_then(|n| facts.get(n)).cloned();
     let mut names: std::collections::BTreeSet<String> = facts.keys().cloned().collect();
     names.insert(cluster.name.clone());
-    names.extend(
-        cluster
-            .members
-            .peers
-            .keys()
-            .map(|id| crate::cluster::members::node_name(*id)),
-    );
+    names.extend(cluster.members.peers.keys().map(|id| id.name()));
     let mut verdicts = Vec::new();
     for node in names {
         if only.is_some_and(|o| o != node) || running_on.as_deref() == Some(node.as_str()) {
@@ -674,6 +677,7 @@ async fn check_route(
     cluster: &State<Arc<Cluster>>,
     volumes: &State<VolumesState>,
 ) -> Result<Json<CheckView>, ApiError> {
+    let name = &vm(name)?;
     check_vm(st, cluster, volumes, name, node).await.map(Json)
 }
 
@@ -688,6 +692,7 @@ async fn move_vm(
     cluster: &State<Arc<Cluster>>,
     volumes: &State<VolumesState>,
 ) -> Result<Json<CheckView>, ApiError> {
+    let name = &vm(name)?;
     let spec = spec(volumes, name).await?;
     let Some(anchor) = spec.anchor() else {
         return Err(ApiError::bad(spec.error().unwrap_or_default().to_string()));
@@ -717,7 +722,7 @@ async fn move_vm(
         .map_err(|e| ApiError::new(Status::ServiceUnavailable, e.to_string()))?;
     let mut props = vols
         .into_iter()
-        .find(|v| v.name == anchor)
+        .find(|v| &v.name == anchor)
         .ok_or_else(|| ApiError::new(Status::NotFound, format!("no volume '{}'", anchor)))?
         .props;
     if !props.nodes.is_empty() && !props.nodes.contains(&to.node) {
@@ -751,6 +756,7 @@ async fn action(
     volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
 ) -> Result<Json<()>, ApiError> {
+    let name = &vm(name)?;
     let spec = spec(volumes, name).await?;
     match action {
         "start" => {
@@ -807,6 +813,7 @@ async fn console(
     volumes: &State<VolumesState>,
     cluster: &State<Arc<Cluster>>,
 ) -> Result<ws::Channel<'static>, ApiError> {
+    let name = &vm(name)?;
     let spec = spec(volumes, name).await?;
     let node = vm_node(cluster, &spec)
         .ok_or_else(|| ApiError::new(Status::Conflict, format!("'{}' isn't running", name)))?;
@@ -942,6 +949,7 @@ async fn incoming(
     volumes: &State<VolumesState>,
     agent: &State<crate::agent::AgentState>,
 ) -> Result<Json<crate::vm::Incoming>, ApiError> {
+    let name = &vm(name)?;
     let not_yet = |m: String| ApiError::new(Status::Conflict, m);
     let never = |m: &str| ApiError::new(Status::UnprocessableEntity, m.to_string());
     let rt = st
@@ -955,7 +963,7 @@ async fn incoming(
     if let Some(e) = spec.error() {
         return Err(ApiError::bad(e.to_string()));
     }
-    let proxied: Vec<String> = agent
+    let proxied: Vec<crate::types::DatasetName> = agent
         .read()
         .unwrap()
         .volumes
@@ -963,7 +971,7 @@ async fn incoming(
         .filter(|v| v.proxied && v.transport == crate::inode::Transport::Nbd)
         .map(|v| v.name.clone())
         .collect();
-    let missing: Vec<&String> = spec
+    let missing: Vec<&crate::types::DatasetName> = spec
         .volumes()
         .iter()
         .filter(|v| !proxied.contains(v))

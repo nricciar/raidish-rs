@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_util::dsn;
 
 fn props(nodes: &[&str]) -> DatasetProps {
     DatasetProps {
@@ -161,8 +162,8 @@ fn a_move_within_the_attached_nodes_wins_and_off_is_off() {
 /// after the writer was dropped).
 #[test]
 fn handed_over_volumes_go_with_their_lease_or_the_writers() {
-    let slots = [("kept", false), ("lapsed", true)];
-    let drop = |w| adopted_to_drop(slots.iter().copied(), w);
+    let slots = [(dsn("kept"), false), (dsn("lapsed"), true)];
+    let drop = |w| adopted_to_drop(slots.iter().map(|(n, l)| (n, *l)), w);
     assert_eq!(drop(WriterStanding::Held), vec!["lapsed"]);
     assert_eq!(drop(WriterStanding::Lost), vec!["kept", "lapsed"]);
     assert_eq!(drop(WriterStanding::Gone), vec!["kept", "lapsed"]);
@@ -206,18 +207,16 @@ async fn answer_once(status: &'static str, body: String) -> String {
 
 #[tokio::test]
 async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
-    use crate::vm::{DomMeta, DomOwner, DomState, Domain, LocalVm};
+    use crate::vm::{DomMeta, DomOwner, DomState, LocalVm};
     use crate::vms_api::LocalView;
     let http = reqwest::Client::new();
     let vm = |name: &str| LocalVm {
-        domain: Domain {
-            name: name.into(),
-            id: Some(1),
-            state: DomState::Running,
-        },
+        name: name.parse().unwrap(),
+        id: Some(1),
+        state: DomState::Running,
         meta: DomMeta {
-            anchor: name.into(),
-            volumes: vec![name.into()],
+            anchor: dsn(name),
+            volumes: vec![dsn(name)],
             change: 1,
             owner: DomOwner::Migrating,
             pool: String::new(),
@@ -270,7 +269,7 @@ struct Node {
 async fn node() -> Node {
     let pool = crate::test_util::TestPool::new().await;
     let fs = Arc::new(pool.format().await);
-    fs.create_block("vol", 16 << 20, fs.default_volblocksize())
+    fs.create_block(&dsn("vol"), 16 << 20, fs.default_volblocksize())
         .await
         .unwrap();
     let parts = handoff::WriterParts {
@@ -295,15 +294,15 @@ impl Node {
             tokio_rustls::TlsConnector::from(Arc::new(self.pki.tls.client_config().unwrap()));
         let nowhere = || None::<(String, u16, crate::types::Epoch)>;
         let peer = Arc::new(
-            crate::peer_io::PeerIo::new("vol", connector, Arc::new(nowhere))
+            crate::peer_io::PeerIo::new(&dsn("vol"), connector, Arc::new(nowhere))
                 .retry_for(Duration::from_millis(200)),
         );
         let exporter = self.parts.exporter(t);
         exporter
-            .add_export_io("vol", 16 << 20, peer.clone())
+            .add_export_io(&dsn("vol"), 16 << 20, peer.clone())
             .unwrap();
         handoff::Proxy {
-            io: exporter.export_io("vol").unwrap(),
+            io: exporter.export_io(&dsn("vol")).unwrap(),
             peer,
             transport: t,
             device: None,
@@ -333,15 +332,15 @@ impl Node {
 async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
     let n = node().await;
     let set = |s: handoff::Slot| {
-        n.shared.slots.lock().unwrap().insert("vol".into(), s);
+        n.shared.slots.lock().unwrap().insert(dsn("vol"), s);
     };
 
     // Writer still here, claim standing: put back.
     let p = n.proxy(Transport::Nbd);
     set(handoff::Slot::TakingOver);
-    n.shared.restore("vol", Some(p), &n.parts).await;
+    n.shared.restore(&dsn("vol"), Some(p), &n.parts).await;
     assert_eq!(n.slot(), Some("proxy"));
-    assert!(n.parts.nbd.export_io("vol").is_some());
+    assert!(n.parts.nbd.export_io(&dsn("vol")).is_some());
 
     // The writer dropped while the takeover ran: taken down, not back.
     let Some(handoff::Slot::Proxy(p)) = n.shared.slots.lock().unwrap().remove("vol") else {
@@ -352,7 +351,7 @@ async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
     *n.shared.writer.lock().unwrap() = None;
     n.shared.slots.lock().unwrap().clear();
     let t = std::time::Instant::now();
-    n.shared.restore("vol", Some(p), &n.parts).await;
+    n.shared.restore(&dsn("vol"), Some(p), &n.parts).await;
     // And at once: its last sync doesn't wait for a replacement backend
     // (`REPLACE_WAIT`, 30 s) nor retry the writer that's gone.
     assert!(
@@ -362,7 +361,7 @@ async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
     );
     assert_eq!(n.slot(), None, "a dead proxy was put back");
     assert!(
-        n.parts.nbd.export_io("vol").is_none(),
+        n.parts.nbd.export_io(&dsn("vol")).is_none(),
         "its export stayed up"
     );
     assert!(crate::volume_io::VolumeIo::retired(&*peer));
@@ -371,7 +370,7 @@ async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
     *n.shared.writer.lock().unwrap() = Some(n.parts.clone());
     let p2 = n.proxy(Transport::Nvme);
     set(handoff::Slot::Proxy(p2));
-    n.shared.restore("vol", None, &n.parts).await;
+    n.shared.restore(&dsn("vol"), None, &n.parts).await;
     assert_eq!(n.slot(), Some("proxy"));
 }
 
@@ -388,7 +387,7 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
         .slots
         .lock()
         .unwrap()
-        .insert("vol".into(), handoff::Slot::Proxy(p));
+        .insert(dsn("vol"), handoff::Slot::Proxy(p));
 
     let acceptor =
         tokio_rustls::TlsAcceptor::from(Arc::new(n.pki.tls.server_config(true, &[]).unwrap()));
@@ -413,7 +412,7 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
         .unwrap();
     assert!(answer.starts_with("ERR "), "{}", answer);
     assert_eq!(n.slot(), Some("proxy"));
-    assert!(n.parts.nbd.export_io("vol").is_some());
+    assert!(n.parts.nbd.export_io(&dsn("vol")).is_some());
 }
 
 /// The receiver waits for the transfer longer than the sender may take

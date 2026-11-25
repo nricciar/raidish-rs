@@ -25,6 +25,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError, parse_label};
 use crate::fsck::{Node, table_node};
 use crate::object::TreeRoot;
+use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::vdev::StripeCheck;
 
@@ -385,7 +386,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// the end of its log, as for replay: not an error.
     async fn scan_logs(
         &self,
-        logs: &[(String, crate::inode::DatasetLog)],
+        logs: &[(DatasetName, crate::inode::DatasetLog)],
         repair: &(dyn Fn(u64) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) {
@@ -513,7 +514,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .await?;
             // And the logs of the volumes it runs: they're in its lent
             // space too, where only it can rewrite them (audit D4).
-            let names: Vec<String> = w.datasets.lock().unwrap().keys().cloned().collect();
+            let names: Vec<DatasetName> = w.datasets.lock().unwrap().keys().cloned().collect();
             let mut logs = Vec::new();
             for name in names {
                 if let Ok(vol) = self.open_dataset(&name).await
