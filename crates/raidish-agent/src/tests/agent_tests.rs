@@ -195,8 +195,8 @@ async fn answer_once(status: &'static str, body: String) -> String {
 
 #[tokio::test]
 async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
+    use crate::vm::LocalView;
     use crate::vm::{DomMeta, DomOwner, DomState, LocalVm};
-    use crate::vms_api::LocalView;
     let http = reqwest::Client::new();
     let vm = |name: &str| LocalVm {
         name: name.parse().unwrap(),

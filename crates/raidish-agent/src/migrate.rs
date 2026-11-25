@@ -254,7 +254,7 @@ impl Job {
 
 /// What the node at `url` says now about running a VM with CPU `cpu`
 /// (`POST /api/v1/vm/check`). None: it couldn't be asked.
-pub(crate) async fn ask_live(
+pub async fn ask_live(
     http: &reqwest::Client,
     url: &str,
     cpu: Option<String>,

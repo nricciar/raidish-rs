@@ -1,6 +1,6 @@
 //! The node agent: every `listen` node runs one. It decides which volumes
 //! belong on this node (their placement settings, see `inode::DatasetProps`),
-//! runs them as a volume writer (see `crate::writer`), exports them over
+//! runs them as a volume writer (see `raidish_core::writer`), exports them over
 //! NBD or NVMe/TCP and attaches the kernel device.
 //!
 //! Liveness is a `node/<name>` lease each agent keeps renewing. A volume
@@ -10,12 +10,23 @@
 //! `ds/<name>` lease, so two agents that both think a volume is theirs
 //! can't both run it.
 
-#[path = "agent_handoff.rs"]
 mod handoff;
-#[path = "agent_migrate.rs"]
 mod migrate;
-#[path = "agent_volume.rs"]
+pub mod node_facts;
+pub mod vm_check;
 mod volumes;
+
+pub(crate) use raidish_auth::{pki, tls};
+pub(crate) use raidish_block::{export, nbd, nvme, peer_io, volume_io};
+pub(crate) use raidish_cluster as cluster;
+pub(crate) use raidish_committer as committer;
+pub(crate) use raidish_committer::events;
+#[cfg(test)]
+pub(crate) use raidish_core::test_util;
+pub(crate) use raidish_core::{dataset, fs, inode, vdev, volume};
+pub(crate) use raidish_services::frontend;
+pub(crate) use raidish_types::{api_types, types, vm_def};
+pub(crate) use raidish_vm::{proc, vm, vm_store};
 
 use crate::cluster::Cluster;
 use crate::cluster::lease::{HeldLease, LeaseClient};
@@ -2380,22 +2391,17 @@ impl Lost {
     }
 }
 
-/// The host of node `node`'s base URL among `peers` (by id: `node-<id>`).
-/// Node `node`'s API base URL (`https://node1:8881`).
-/// See `migrate::ask_live`.
-pub(crate) async fn migrate_ask_live(
-    http: &reqwest::Client,
-    url: &str,
-    cpu: Option<String>,
-) -> Option<crate::vm_check::Live> {
-    migrate::ask_live(http, url, cpu).await
-}
+pub use migrate::ask_live as migrate_ask_live;
 
+/// Node `node`'s API base URL among `peers` (`https://node1:8881`; by id:
+/// `node-<id>`).
 fn peer_url(peers: &BTreeMap<crate::types::NodeId, String>, node: &str) -> Option<String> {
     let id: crate::types::NodeId = node.parse().ok()?;
     Some(peers.get(&id)?.trim_end_matches('/').to_string())
 }
 
+/// The host of node `node`'s base URL among `peers` (the name its
+/// certificate is issued for).
 fn peer_host(peers: &BTreeMap<crate::types::NodeId, String>, node: &str) -> Option<String> {
     let id: crate::types::NodeId = node.parse().ok()?;
     let url = reqwest::Url::parse(peers.get(&id)?).ok()?;
