@@ -674,3 +674,104 @@ fn handoff_messages_round_trip() {
         assert!(Msg::parse(bad).is_err(), "{:?} parsed", bad);
     }
 }
+
+/// A VM that can't move live is shut down at once: `NotLive` (and a failed
+/// migration found still here) leave it `Stopping` with no shutdown sent,
+/// so the next stop pass sends it instead of waiting out the timeout.
+#[test]
+fn vm_moving_cold_is_shut_down_at_once() {
+    use vms::migrate::{Failure, Unsettled, Whereabouts};
+    use vms::state::{self, StopStep, Stopping, VmState};
+    let timeout = Duration::from_secs(120);
+    let now = std::time::Instant::now();
+    let unsettled = || Unsettled {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        why: "lost".into(),
+        told: false,
+    };
+    for st in [
+        state::finished(
+            "node-2".into(),
+            vec![vol()],
+            Err(Failure::NotLive("no shared CPU".into())),
+        ),
+        state::settled(unsettled(), Whereabouts::Here),
+        state::settled(unsettled(), Whereabouts::Neither),
+    ] {
+        let VmState::Stopping(s) = st else {
+            panic!("not stopping");
+        };
+        assert_eq!(s, Stopping::cold("node-2".into()));
+        assert_eq!(
+            state::stop_step(s.shutdown_sent, now, timeout),
+            StopStep::Shutdown
+        );
+    }
+    // Sent: it gets the timeout, then it's forced off.
+    let sent = Some(now);
+    assert_eq!(
+        state::stop_step(sent, now + timeout / 2, timeout),
+        StopStep::Wait
+    );
+    assert_eq!(
+        state::stop_step(sent, now + timeout + Duration::from_secs(1), timeout),
+        StopStep::ForceOff
+    );
+}
+
+/// Where a migration leaves a VM, and the cold move's memo.
+#[tokio::test]
+async fn vm_state_transitions() {
+    use vms::migrate::{self, Failure, Unsettled, Whereabouts};
+    use vms::state::{self, Stopping, VmState};
+    let u = Unsettled {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        why: "lost".into(),
+        told: false,
+    };
+    // Done: its volumes are handed over, starting with this node detaching.
+    let VmState::HandingOffVolumes(m) = state::finished("node-2".into(), vec![vol()], Ok(()))
+    else {
+        panic!("not handing off");
+    };
+    assert_eq!(
+        (m.to.as_str(), m.volumes, m.detached),
+        ("node-2", vec![vol()], false)
+    );
+    // Failed: unsettled until where the guest runs is known.
+    let st = state::finished(
+        "node-2".into(),
+        vec![vol()],
+        Err(Failure::Failed("lost".into())),
+    );
+    assert!(matches!(&st, VmState::Unsettled(x) if x.why == "lost" && !x.told));
+    assert!(st.leaving());
+    // B can't be asked: still unsettled, and the operator was told.
+    let st = state::settled(u, Whereabouts::Unknown);
+    let VmState::Unsettled(u) = st else {
+        panic!("settled");
+    };
+    assert!(u.told);
+    // It switched over after all: handed over like a success.
+    let st = state::settled(u, Whereabouts::There);
+    assert!(matches!(&st, VmState::HandingOffVolumes(m) if !m.detached));
+    assert!(st.leaving());
+    // A migration under way is leaving; a stop isn't.
+    let running = migrate::Migration {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        started: std::time::Instant::now(),
+        task: tokio::spawn(async { Ok(()) }),
+    };
+    assert!(VmState::Migrating(running).leaving());
+    assert!(!VmState::Stopping(Stopping::default()).leaving());
+    // The memo lasts while the anchor is asked to move there.
+    let to = || Some("node-2".to_string());
+    assert_eq!(state::keep_cold_to(to(), Some("node-2")), to());
+    assert_eq!(state::keep_cold_to(to(), Some("node-3")), None);
+    assert_eq!(state::keep_cold_to(to(), None), None);
+    assert!(Stopping::default().idle());
+    assert!(!Stopping::cold("node-2".into()).idle());
+}

@@ -2,6 +2,7 @@
 //! rest, orphans, arrivals, and live migration (`migrate`).
 
 pub(crate) mod migrate;
+pub(crate) mod state;
 
 use crate::committer::PoolAdmin;
 use crate::events::{EventKind, Level, Subject};
@@ -12,6 +13,7 @@ use crate::vm_store::DefSpec;
 use crate::volume::VolumeInfo;
 use crate::volumes::VolumeView;
 use crate::{Agent, peer_host, peer_url};
+use state::{StopStep, Stopping, VmState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,17 +88,33 @@ impl Domains {
 pub(crate) struct VmBook {
     /// The VM definitions as last read.
     pub(crate) specs: BTreeMap<crate::types::VmName, crate::vm::VmSpec>,
-    /// VMs asked to shut down here, and when.
-    pub(crate) stopping: BTreeMap<crate::types::VmName, std::time::Instant>,
-    /// Live migrations of VMs from here, under way (see `migrate`).
-    pub(crate) migrations: BTreeMap<crate::types::VmName, migrate::Migration>,
-    /// VMs migrated away whose volumes are being handed over.
-    pub(crate) migrated: BTreeMap<crate::types::VmName, migrate::Migrated>,
-    /// VMs whose live migration to a node failed: they move there cold.
-    pub(crate) migrate_failed: BTreeMap<crate::types::VmName, String>,
-    /// Failed live migrations whose guest's whereabouts aren't settled yet
-    /// (see `Agent::settle_failed`).
-    pub(crate) unsettled: BTreeMap<crate::types::VmName, migrate::Unsettled>,
+    /// What this node is doing with each VM, beyond what libvirt says (see
+    /// `state`): none, it runs or not as libvirt says.
+    pub(crate) states: BTreeMap<crate::types::VmName, VmState>,
+}
+
+impl VmBook {
+    /// Whether VM `name` is leaving, or just left, by migration.
+    pub(crate) fn leaving(&self, name: &crate::types::VmName) -> bool {
+        self.states.get(name).is_some_and(VmState::leaving)
+    }
+
+    /// VM `name`'s stop, if it's being stopped here.
+    pub(crate) fn stopping(&self, name: &crate::types::VmName) -> Option<&Stopping> {
+        match self.states.get(name) {
+            Some(VmState::Stopping(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The VMs in states `pick` selects.
+    fn named(&self, pick: impl Fn(&VmState) -> bool) -> Vec<crate::types::VmName> {
+        self.states
+            .iter()
+            .filter(|(_, s)| pick(s))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
 }
 
 impl Agent {
@@ -135,9 +153,13 @@ impl Agent {
         }
         let migrating = self
             .vms
-            .migrations
+            .states
             .values()
-            .flat_map(|m| m.volumes.iter().cloned())
+            .filter_map(|s| match s {
+                VmState::Migrating(m) => Some(m.volumes.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
             .collect();
         let disks = self
             .vms
@@ -227,15 +249,20 @@ impl Agent {
         // A failed migration is tried again only once the VM is asked to
         // move somewhere (else) again.
         let specs = &self.vms.specs;
-        self.vms.migrate_failed.retain(|vm, to| {
-            specs
+        self.vms.states.retain(|vm, st| {
+            let VmState::Stopping(s) = st else {
+                return true;
+            };
+            let move_to = specs
                 .get(vm)
                 .and_then(|s| p.volume(s.anchor()?))
-                .is_some_and(|a| a.props.move_to.as_deref() == Some(to.as_str()))
+                .and_then(|a| a.props.move_to.as_deref());
+            s.cold_to = state::keep_cold_to(s.cold_to.take(), move_to);
+            !s.idle()
         });
         for v in ours {
             let name = &v.name;
-            if self.vms.migrations.contains_key(name) || self.vms.unsettled.contains_key(name) {
+            if self.vms.leaving(name) {
                 continue; // leaving: see `poll_migrations`
             }
             // Migrated here: left alone while its volumes are proxied here
@@ -272,7 +299,7 @@ impl Agent {
                         name, self.node
                     ),
                 );
-                self.vms.stopping.remove(name);
+                self.vms.states.remove(name);
                 continue;
             }
             let wanted = p.state.vms.contains_key(name.as_str())
@@ -283,15 +310,18 @@ impl Agent {
                     .get(name)
                     .is_some_and(|s| s.usable() && anchor_here(p, s));
             if wanted {
-                self.vms.stopping.remove(name);
+                self.vms.states.remove(name);
                 continue;
             }
-            // Asked to move: live if it can be, instead of shutting down.
-            if !self.vms.stopping.contains_key(name) && self.start_migration(vm, v, p) {
+            let stop = self.vms.stopping(name).cloned().unwrap_or_default();
+            // Asked to move: live if it can be, instead of shutting down
+            // (not once the shutdown is sent).
+            if stop.shutdown_sent.is_none() && self.start_migration(vm, v, p, &stop) {
                 continue;
             }
-            match self.vms.stopping.get(name) {
-                None => {
+            let now = std::time::Instant::now();
+            match state::stop_step(stop.shutdown_sent, now, vm.shutdown_timeout) {
+                StopStep::Shutdown => {
                     self.note(
                         Level::Info,
                         EventKind::VmStopping,
@@ -301,11 +331,15 @@ impl Agent {
                     if let Err(e) = vm.virsh.shutdown(name).await {
                         eprintln!("agent: {}", e);
                     }
-                    self.vms
-                        .stopping
-                        .insert(name.clone(), std::time::Instant::now());
+                    self.vms.states.insert(
+                        name.clone(),
+                        VmState::Stopping(Stopping {
+                            shutdown_sent: Some(now),
+                            ..stop
+                        }),
+                    );
                 }
-                Some(t) if t.elapsed() > vm.shutdown_timeout => {
+                StopStep::ForceOff => {
                     self.note(
                         Level::Warn,
                         EventKind::VmForcedOff,
@@ -319,19 +353,28 @@ impl Agent {
                         eprintln!("agent: {}", e);
                     }
                 }
-                Some(_) => {}
+                StopStep::Wait => {}
             }
         }
+        // Stopped: its domain is gone. (One moving cold whose shutdown
+        // wasn't sent yet just goes: there was nothing here to stop.)
         let up = |n: &str| ours.iter().any(|v| v.name.as_str() == n);
-        for n in self.vms.stopping.keys().filter(|n| !up(n)) {
-            self.note(
-                Level::Info,
-                EventKind::VmStopped,
-                Subject::vm(n),
-                format!("VM '{}' stopped on {}", n, self.node),
-            );
+        let gone = self.vms.named(|s| matches!(s, VmState::Stopping(_)));
+        for n in gone.iter().filter(|n| !up(n)) {
+            let sent = self
+                .vms
+                .stopping(n)
+                .is_some_and(|s| s.shutdown_sent.is_some());
+            self.vms.states.remove(n);
+            if sent {
+                self.note(
+                    Level::Info,
+                    EventKind::VmStopped,
+                    Subject::vm(n),
+                    format!("VM '{}' stopped on {}", n, self.node),
+                );
+            }
         }
-        self.vms.stopping.retain(|n, _| up(n));
         // Restarts are done once the old domain is gone (it's started again
         // by `start_wanted_vms`, from the current XML).
         vm.restarts_done(up);
@@ -354,10 +397,7 @@ impl Agent {
             // Leaving, or just left, by migration: it runs elsewhere even
             // where its domain is already gone from here.
             // Or a failed migration's guest may run elsewhere (unknown yet).
-            if self.vms.migrations.contains_key(&spec.name)
-                || self.vms.migrated.contains_key(&spec.name)
-                || self.vms.unsettled.contains_key(&spec.name)
-            {
+            if self.vms.leaving(&spec.name) {
                 continue;
             }
             if let Some(e) = spec.error() {
@@ -483,18 +523,22 @@ impl Agent {
             if let Err(e) = vm.virsh.destroy(&d.name).await {
                 eprintln!("agent: {}", e);
             }
-            self.vms.stopping.remove(d.name.as_str());
+            let name = d.name.as_str();
+            if matches!(self.vms.states.get(name), Some(VmState::Stopping(_))) {
+                self.vms.states.remove(name);
+            }
         }
     }
 
-    /// Migrate VM `v` live to where its anchor is asked to move, if it can
-    /// be (see `migrate`): true if a migration started (or the VM is
-    /// already leaving), false to move it cold.
+    /// Migrate VM `v` (being stopped as `stop` says) live to where its
+    /// anchor is asked to move, if it can be (see `migrate`): true if a
+    /// migration started, false to move it cold.
     pub(crate) fn start_migration(
         &mut self,
         vm: &Arc<crate::vm::VmRuntime>,
         v: &crate::vm::LocalVm,
         p: &Placement,
+        stop: &Stopping,
     ) -> bool {
         let name = &v.name;
         if self.peer.is_none() || v.state != crate::vm::DomState::Running {
@@ -518,7 +562,7 @@ impl Agent {
             || !p.state.vms.contains_key(name.as_str())
             || vm.restarting(name)
             || !spec.volumes().iter().all(|x| self.volumes_here().writes(x))
-            || self.vms.migrate_failed.get(name) == Some(&to)
+            || stop.cold_to.as_deref() == Some(to.as_str())
         {
             return false;
         }
@@ -549,14 +593,14 @@ impl Agent {
             committer: self.committer.clone(),
         };
         println!("agent: moving VM '{}' to {} (live, if it can be)", name, to);
-        self.vms.migrations.insert(
+        self.vms.states.insert(
             name.clone(),
-            migrate::Migration {
+            VmState::Migrating(migrate::Migration {
                 to,
                 volumes: spec.volumes().to_vec(),
                 started: std::time::Instant::now(),
                 task: tokio::spawn(job.run()),
-            },
+            }),
         );
         true
     }
@@ -565,25 +609,21 @@ impl Agent {
     /// volumes of a VM that left to where it went, or put a failed one's
     /// back, to move cold.
     pub(crate) async fn poll_migrations(&mut self) {
-        let done: Vec<crate::types::VmName> = self
+        let done = self
             .vms
-            .migrations
-            .iter()
-            .filter(|(_, m)| m.task.is_finished())
-            .map(|(n, _)| n.clone())
-            .collect();
+            .named(|s| matches!(s, VmState::Migrating(m) if m.task.is_finished()));
         for name in done {
-            let m = self.vms.migrations.remove(&name).unwrap();
+            let Some(VmState::Migrating(m)) = self.vms.states.remove(&name) else {
+                continue;
+            };
             let result = match m.task.await {
                 Ok(r) => r,
                 Err(e) => Err(migrate::Failure::Failed(e.to_string())),
             };
             // A failure is noted once it's settled (`settle_failed`).
-            if result.is_ok() {
-                self.facts.note_migration(&m.to, &Ok(()));
-            }
-            match result {
+            match &result {
                 Ok(()) => {
+                    self.facts.note_migration(&m.to, &Ok(()));
                     self.note(
                         Level::Info,
                         EventKind::VmMigrated,
@@ -596,14 +636,6 @@ impl Agent {
                             m.started.elapsed().as_secs_f64()
                         ),
                     );
-                    self.vms.migrated.insert(
-                        name,
-                        migrate::Migrated {
-                            to: m.to,
-                            volumes: m.volumes,
-                            detached: false,
-                        },
-                    );
                 }
                 Err(migrate::Failure::NotLive(why)) => {
                     self.note(
@@ -615,27 +647,22 @@ impl Agent {
                             name, self.node, m.to, why
                         ),
                     );
-                    self.vms.migrate_failed.insert(name, m.to);
                 }
-                Err(migrate::Failure::Failed(e)) => {
-                    self.vms.unsettled.insert(
-                        name,
-                        migrate::Unsettled {
-                            to: m.to,
-                            volumes: m.volumes,
-                            why: e,
-                            told: false,
-                        },
-                    );
-                }
+                Err(migrate::Failure::Failed(_)) => {}
             }
+            let next = state::finished(m.to, m.volumes, result);
+            self.vms.states.insert(name, next);
         }
         self.settle_failed().await;
         // Migrated: detach here (so each volume is handed over), then, once
         // none runs here, there too (back to their own placement).
-        let names: Vec<crate::types::VmName> = self.vms.migrated.keys().cloned().collect();
+        let names = self
+            .vms
+            .named(|s| matches!(s, VmState::HandingOffVolumes(_)));
         for name in names {
-            let mut m = self.vms.migrated.remove(&name).unwrap();
+            let Some(VmState::HandingOffVolumes(mut m)) = self.vms.states.remove(&name) else {
+                continue;
+            };
             if !m.detached {
                 let mut ok = true;
                 for v in &m.volumes {
@@ -645,11 +672,11 @@ impl Agent {
                     }
                 }
                 m.detached = ok;
-                self.vms.migrated.insert(name, m);
+                self.vms.states.insert(name, VmState::HandingOffVolumes(m));
                 continue;
             }
             if m.volumes.iter().any(|v| self.volumes_here().writes(v)) {
-                self.vms.migrated.insert(name, m);
+                self.vms.states.insert(name, VmState::HandingOffVolumes(m));
                 continue;
             }
             let mut ok = true;
@@ -660,7 +687,7 @@ impl Agent {
                 }
             }
             if !ok {
-                self.vms.migrated.insert(name, m);
+                self.vms.states.insert(name, VmState::HandingOffVolumes(m));
             }
         }
     }
@@ -668,9 +695,11 @@ impl Agent {
     /// Failed live migrations: where does the guest run now? It may have
     /// switched over before the failure (`migrate::Whereabouts`).
     pub(crate) async fn settle_failed(&mut self) {
-        let names: Vec<crate::types::VmName> = self.vms.unsettled.keys().cloned().collect();
+        let names = self.vms.named(|s| matches!(s, VmState::Unsettled(_)));
         for name in names {
-            let mut u = self.vms.unsettled.remove(&name).unwrap();
+            let Some(VmState::Unsettled(u)) = self.vms.states.remove(&name) else {
+                continue;
+            };
             let here = match &self.vm {
                 Some(vm) => vm.virsh.list().await.ok().map(|l| {
                     l.iter()
@@ -684,10 +713,10 @@ impl Agent {
             } else {
                 None
             };
-            match migrate::whereabouts(here, there) {
+            let w = migrate::whereabouts(here, there);
+            match w {
                 migrate::Whereabouts::Unknown => {
                     if !u.told {
-                        u.told = true;
                         self.note(
                             Level::Warn,
                             EventKind::VmMigrateFailed,
@@ -700,7 +729,6 @@ impl Agent {
                             ),
                         );
                     }
-                    self.vms.unsettled.insert(name, u);
                 }
                 migrate::Whereabouts::There => {
                     self.facts.note_migration(&u.to, &Ok(()));
@@ -713,16 +741,8 @@ impl Agent {
                             name, self.node, u.to, self.node, u.why
                         ),
                     );
-                    self.vms.migrated.insert(
-                        name,
-                        migrate::Migrated {
-                            to: u.to,
-                            volumes: u.volumes,
-                            detached: false,
-                        },
-                    );
                 }
-                w @ (migrate::Whereabouts::Here | migrate::Whereabouts::Neither) => {
+                migrate::Whereabouts::Here | migrate::Whereabouts::Neither => {
                     let at = if w == migrate::Whereabouts::Here {
                         format!("it still runs on {}", self.node)
                     } else {
@@ -745,9 +765,9 @@ impl Agent {
                             }
                         }
                     }
-                    self.vms.migrate_failed.insert(name, u.to);
                 }
             }
+            self.vms.states.insert(name, state::settled(u, w));
         }
     }
 
@@ -766,11 +786,7 @@ impl Agent {
     /// node's (its metadata names this node's lease owner).
     pub(crate) async fn arrived(&mut self, vm: &Arc<crate::vm::VmRuntime>, v: &crate::vm::LocalVm) {
         let name = &v.name;
-        let Some(owner) = self
-            .shared
-            .volumes
-            .owned(&v.meta.anchor, |o| o.lease.owner.clone())
-        else {
+        let Some(owner) = self.volumes_here().owner_of(&v.meta.anchor) else {
             return;
         };
         let meta = crate::vm::DomMeta {
