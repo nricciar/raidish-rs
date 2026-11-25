@@ -14,7 +14,7 @@
 //! put back for a writer that was gone, an export left behind (structural
 //! triage I-27).
 
-use super::Lost;
+use crate::Lost;
 use crate::api_types::{Attach, RunningVolume};
 use crate::cluster::lease::HeldLease;
 use crate::export::{BlockExporter, ExportHandle};
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// under: a new one each time it's opened. What a writer ran goes with it,
 /// so a slot made under an earlier one is never taken for the current one's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct WriterGen(u64);
+pub(crate) struct WriterGen(u64);
 
 impl WriterGen {
     pub fn next() -> Self {
@@ -46,7 +46,7 @@ impl WriterGen {
 
 /// This node's writer, as what runs on it needs it.
 #[derive(Clone)]
-pub(super) struct WriterParts {
+pub(crate) struct WriterParts {
     pub wgen: WriterGen,
     pub fs: Arc<FileSystem<Pool>>,
     pub nbd: Arc<NbdServer<Pool>>,
@@ -75,7 +75,7 @@ impl WriterParts {
 /// A volume's export here, and the transport it's served over: one
 /// value, so the two can't disagree.
 #[derive(Debug)]
-pub(super) struct Export {
+pub(crate) struct Export {
     pub transport: Transport,
     handle: ExportHandle,
 }
@@ -100,7 +100,7 @@ impl Export {
 }
 
 /// A volume this node writes, under its own `ds/` lease.
-pub(super) struct Owned {
+pub(crate) struct Owned {
     pub lease: Arc<HeldLease>,
     pub lost: Lost,
     /// Taken over in a clean handoff: the epoch of the writer it came from
@@ -115,7 +115,7 @@ pub(super) struct Owned {
 }
 
 /// A volume exported here and written by another node.
-pub(super) struct Proxied {
+pub(crate) struct Proxied {
     pub peer: Arc<PeerIo>,
     pub export: Export,
     pub attach: Attach,
@@ -141,7 +141,7 @@ impl Proxied {
 }
 
 /// What this node has of one volume.
-pub(super) enum VolumeSlot {
+pub(crate) enum VolumeSlot {
     /// Written here.
     Running { wgen: WriterGen, vol: Owned },
     /// Handed over to this node, not yet picked up by the agent loop (it
@@ -180,7 +180,7 @@ impl VolumeSlot {
 
 /// Why a takeover couldn't claim a volume's slot (nothing was changed).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Claim {
+pub(crate) enum Claim {
     /// That isn't this node's current writer (or there's none).
     StaleWriter,
     /// Written here already.
@@ -204,7 +204,7 @@ impl std::fmt::Display for Claim {
 }
 
 /// What a dropped writer ran, for the caller to stop.
-pub(super) struct Dropped {
+pub(crate) struct Dropped {
     pub owned: Vec<(DatasetName, Owned)>,
     pub proxies: Vec<(DatasetName, Proxied)>,
 }
@@ -215,7 +215,7 @@ struct Inner {
 }
 
 /// See the module docs.
-pub(super) struct Volumes(Mutex<Inner>);
+pub(crate) struct Volumes(Mutex<Inner>);
 
 impl Default for Volumes {
     fn default() -> Self {
@@ -590,7 +590,7 @@ fn current(inner: &Inner, wgen: WriterGen) -> bool {
 /// node, see [`Volumes::pick_up`]) or running already (started by the
 /// loop itself).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Took {
+pub(crate) enum Took {
     Adopted,
     Running,
 }
@@ -605,7 +605,7 @@ pub(super) enum Took {
 /// nobody). Dropped without either (an error, a cancelled task), it aborts
 /// all the same, taking a dead proxy down in the background: a takeover
 /// can't leave a claim behind.
-pub(super) struct TakeoverGuard<'a> {
+pub(crate) struct TakeoverGuard<'a> {
     volumes: &'a Volumes,
     name: DatasetName,
     wgen: WriterGen,

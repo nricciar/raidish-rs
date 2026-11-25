@@ -2,7 +2,7 @@
 //! nodes that don't write a volume, and handing a volume from the node
 //! that writes it to another (`docs/design/mig-1-volume-handoff.md`).
 //!
-//! The agent loop (see `super::Agent::tick`) decides what should happen:
+//! The agent loop (see `crate::Agent::tick`) decides what should happen:
 //! which volumes get a proxied export here, and when to hand one this node
 //! writes to another node. The receiving end of a handoff runs outside that
 //! loop, in the peer I/O listener ([`Shared::handoff`]), so what it needs
@@ -25,15 +25,19 @@
 //! B gives up and unpauses (its export proxying again) if A stops short
 //! of step 3; A never stops serving before B is paused and ready.
 
-use super::volumes::{Export, Owned, Took, Volumes, WriterParts};
-use super::{Lost, hold};
+use super::ATTACH_RETRY;
+use super::{Export, Owned, Took, Volumes, WriterParts};
+use crate::Agent;
 use crate::api_types::Attach;
 use crate::cluster::lease::{HeldLease, LeaseClient, owner_id};
 use crate::committer::dataset_resource;
+use crate::events::{EventKind, Subject};
 use crate::inode::Transport;
 use crate::peer_io::{PeerExport, PeerLines, PeerOut, PeerVolumes, read_line};
+use crate::types::Holder;
 use crate::types::{DatasetName, Epoch};
 use crate::volume_io::LocalIo;
+use crate::{Lost, hold};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,24 +45,24 @@ use tokio::io::AsyncWriteExt;
 
 /// How long either end waits on the other for a reply that needs no work
 /// (READY, DONE).
-pub(super) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest the writer handing a volume over may take from the
 /// receiver's READY to transferring the lease: its clients' drain
 /// (`DRAIN_TIMEOUT`, 30 s) and the last syncs. Past it, the writer gives up
 /// instead (the volume synced, its lease released).
-pub(super) const SENDER_BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const SENDER_BUDGET: Duration = Duration::from_secs(60);
 /// How long the receiver waits for TRANSFERRED: the sender's budget, then
 /// the transfer itself (two lease calls of at most 5 s) with room to spare.
 /// Waiting less, the receiver could give up first and the lease be handed
 /// to an owner nobody renews: the volume down until it expired (structural
 /// triage I-27).
-pub(super) const TRANSFER_WAIT: Duration = Duration::from_secs(SENDER_BUDGET.as_secs() + 30);
+pub(crate) const TRANSFER_WAIT: Duration = Duration::from_secs(SENDER_BUDGET.as_secs() + 30);
 /// How long a proxied request keeps retrying (the writer failing over
 /// takes a lease TTL or so).
-pub(super) const PROXY_RETRY: Duration = Duration::from_secs(20);
+pub(crate) const PROXY_RETRY: Duration = Duration::from_secs(20);
 
 /// What the agent shares with its peer I/O listener.
-pub(super) struct Shared {
+pub(crate) struct Shared {
     pub leases: LeaseClient,
     /// What this node's leases say of it.
     pub desc: Mutex<crate::types::Holder>,
@@ -79,7 +83,7 @@ impl Shared {
 /// Hold volume `name`'s lease as `owner` at `epoch` (granted no earlier
 /// than `asked`) and attach its dataset on writer `w`: the first half of
 /// taking it over (the export is the caller's).
-pub(super) async fn take_lease(
+pub(crate) async fn take_lease(
     leases: &LeaseClient,
     w: &WriterParts,
     name: &DatasetName,
@@ -255,5 +259,201 @@ impl PeerVolumes for Shared {
         println!("agent: took volume '{}' over (epoch {})", volume, new_epoch);
         let _ = wr.write_all(b"DONE\n").await;
         let _ = wr.flush().await;
+    }
+}
+
+impl Agent {
+    /// Hand volume `name`, which this node writes, to node `to` (see
+    /// `handoff`). Ok(true): it's not run here any more (handed over, or
+    /// stopped cleanly when the handoff failed after this node let go);
+    /// Ok(false): no peer I/O, stop it instead; Err: still run here.
+    pub(crate) async fn hand_off(&mut self, name: &DatasetName, to: &str) -> Result<bool, String> {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let Some(p) = &self.peer else {
+            return Ok(false);
+        };
+        let (connector, port) = (p.connector.clone(), p.port);
+        let addr = self.peer_addr(to)?;
+        let (epoch, transport) = self
+            .shared
+            .volumes
+            .owned(name, |o| (o.lease.epoch, o.export.transport))
+            .ok_or("not running here")?;
+        let parts = self
+            .writer
+            .as_ref()
+            .map(|w| w.parts.clone())
+            .ok_or("no writer here")?;
+        let tls = crate::peer_io::dial(&connector, &addr, port).await?;
+        let (rd, mut wr) = tokio::io::split(tls);
+        let mut rd = BufReader::new(rd);
+        let ask = format!(
+            "{} {} {} {}\n",
+            crate::peer_io::HANDOFF,
+            name,
+            epoch,
+            transport
+        );
+        wr.write_all(ask.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        wr.flush().await.map_err(|e| e.to_string())?;
+        let answer = tokio::time::timeout(HANDOFF_TIMEOUT, crate::peer_io::read_line(&mut rd))
+            .await
+            .map_err(|_| format!("{} didn't answer", to))?
+            .map_err(|e| format!("{}: {}", to, e))?;
+        let Some((owner, desc)) = answer
+            .strip_prefix("READY ")
+            .and_then(|r| r.split_once('\t'))
+        else {
+            return Err(format!("{} said: {}", to, answer));
+        };
+        let desc: Holder =
+            serde_json::from_str(desc).map_err(|e| format!("{}'s holder: {}", to, e))?;
+        let owner = owner.to_string();
+        // From here it's the handoff's: peers aren't pointed at it any more,
+        // nothing else claims it, and it comes back whole if called off.
+        let Some(vol) = self.shared.volumes.begin_handoff(name, parts.wgen) else {
+            return Err("not running here any more".into());
+        };
+        println!("agent: handing volume '{}' to {}", name, to);
+        let started = std::time::Instant::now();
+
+        // Stop serving it here: clients (the peer's proxy too) drain, then
+        // the last sync.
+        let Owned {
+            lease,
+            lost,
+            handed_from,
+            export,
+            attach,
+            attach_tried,
+        } = vol;
+        if attach.device().is_some()
+            && let Err(e) = self.detach(name, transport).await
+        {
+            eprintln!("agent: detaching '{}': {}", name, e);
+        }
+        if let Err(e) = export.close().await {
+            eprintln!("agent: unexporting '{}': {}", name, e);
+        }
+        if let Err(e) = parts.fs.detach_dataset(name).await {
+            // Not all of it is committed: keep it, call the handoff off.
+            let _ = wr.write_all(b"ABORT\n").await;
+            let _ = wr.flush().await;
+            let export = match parts.add_export(name, transport).await {
+                Ok(x) => x,
+                Err(e2) => {
+                    // Not served, it can't run here: let go, and whoever's
+                    // next replays its intent log.
+                    parts.fs.abandon_dataset(name);
+                    lease.release().await;
+                    self.shared.volumes.finish_handoff(name, parts.wgen);
+                    return Err(format!(
+                        "last sync: {}; exporting it again: {}; stopped here",
+                        e, e2
+                    ));
+                }
+            };
+            let (attach, attach_tried) = match attach.device() {
+                // Detached for the handoff: attached again right away.
+                Some(_) => (
+                    Attach::Failed {
+                        error: "detached for a handoff that failed".into(),
+                    },
+                    std::time::Instant::now()
+                        .checked_sub(ATTACH_RETRY)
+                        .unwrap_or_else(std::time::Instant::now),
+                ),
+                None => (attach, attach_tried),
+            };
+            let vol = Owned {
+                lease,
+                lost,
+                handed_from,
+                export,
+                attach,
+                attach_tried,
+            };
+            if let Err(vol) = self.shared.volumes.abort_handoff(name, parts.wgen, vol) {
+                self.wind_down(name, vol, true).await;
+            }
+            return Err(format!("last sync: {}", e));
+        }
+        self.shared.volumes.finish_handoff(name, parts.wgen);
+
+        if started.elapsed() > SENDER_BUDGET {
+            // The receiver stops waiting not long after: transferred now,
+            // the lease could go to an owner nobody renews. Synced, so let
+            // go of it instead: whoever's next starts it (I-27).
+            let _ = wr.write_all(b"ABORT\n").await;
+            let _ = wr.flush().await;
+            lease.release().await;
+            self.events.warn(
+                EventKind::VolumeHandoffFailed,
+                Subject::volume(name),
+                format!(
+                    "Volume '{}' took too long to hand from {} to {} ({:?}); stopped here instead",
+                    name,
+                    self.node,
+                    to,
+                    started.elapsed()
+                ),
+            );
+            return Ok(true);
+        }
+        let mut transferred = lease.transfer(&owner, desc.clone()).await;
+        if let Err(crate::cluster::lease::TransferError::NoAnswer(_)) = &transferred {
+            // No answer may still have gone through: the same transfer
+            // again says which.
+            transferred = lease.transfer(&owner, desc.clone()).await;
+        }
+        let new_epoch = match transferred {
+            Ok(e) => e,
+            Err(e) => {
+                // Synced and let go of: whoever's next starts it.
+                let _ = wr.write_all(b"ABORT\n").await;
+                let _ = wr.flush().await;
+                lease.release().await;
+                self.events.warn(
+                    EventKind::VolumeHandoffFailed,
+                    Subject::volume(name),
+                    format!(
+                        "Volume '{}' couldn't be handed from {} to {} ({}); stopped here instead",
+                        name, self.node, to, e
+                    ),
+                );
+                return Ok(true);
+            }
+        };
+        let _ = wr
+            .write_all(format!("TRANSFERRED {}\n", new_epoch).as_bytes())
+            .await;
+        let _ = wr.flush().await;
+        let done = tokio::time::timeout(HANDOFF_TIMEOUT, crate::peer_io::read_line(&mut rd)).await;
+        match done {
+            Ok(Ok(l)) if l == "DONE" => {
+                println!(
+                    "agent: handed volume '{}' to {} in {:?}",
+                    name,
+                    to,
+                    started.elapsed()
+                );
+                self.events.info(
+                    EventKind::VolumeHandedOff,
+                    Subject::volume(name),
+                    format!("Volume '{}' was handed from {} to {}", name, self.node, to),
+                );
+            }
+            other => {
+                // Its lease is theirs either way: if they couldn't take it,
+                // they let go of it and it starts wherever it goes next.
+                eprintln!(
+                    "agent: {} didn't confirm taking '{}' over: {:?}",
+                    to, name, other
+                );
+            }
+        }
+        Ok(true)
     }
 }

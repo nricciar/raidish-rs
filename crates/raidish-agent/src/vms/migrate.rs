@@ -9,13 +9,13 @@
 //!    moves cold at once, saying why.
 //! 1. Its volumes are attached to A and B (`Request::Attach`): A keeps
 //!    writing them (the agent places a migrating VM's volumes here), B
-//!    exports them proxied to A (see `super::handoff`).
+//!    exports them proxied to A (see `crate::volumes::handoff`).
 //! 2. B is asked whether it's ready (`POST /api/v1/vm/incoming/<name>`),
 //!    and how to reach it.
 //! 3. A's `virsh dumpxml --migratable` is pointed at B (`vm::retarget`) and
 //!    `virsh migrate --live --p2p` sends the guest there.
 //!
-//! The agent loop then finishes it (see `super::Agent::poll_migrations`):
+//! The agent loop then finishes it (see `crate::Agent::poll_migrations`):
 //! on success A detaches itself, so each volume is handed to B; once none
 //! runs here, B is detached too. On failure where the guest runs now is
 //! asked first (`Whereabouts`): a migration can fail after the switchover
@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 const READY_WAIT: Duration = Duration::from_secs(60);
 
 /// A live migration from this node, under way.
-pub(super) struct Migration {
+pub(crate) struct Migration {
     pub to: String,
     pub volumes: Vec<DatasetName>,
     pub started: Instant,
@@ -47,7 +47,7 @@ pub(super) struct Migration {
 
 /// Why a live migration didn't happen.
 #[derive(Debug, Clone)]
-pub(super) enum Failure {
+pub(crate) enum Failure {
     /// The check said it can't be live (nothing was tried).
     NotLive(String),
     /// It was tried and failed.
@@ -67,7 +67,7 @@ impl From<crate::vm::VmError> for Failure {
 }
 
 /// Migrated away: its volumes being handed to `to`.
-pub(super) struct Migrated {
+pub(crate) struct Migrated {
     pub to: String,
     pub volumes: Vec<DatasetName>,
     /// This node detached from them (so they're handed over).
@@ -75,7 +75,7 @@ pub(super) struct Migrated {
 }
 
 /// A live migration that failed, until where its guest runs is known.
-pub(super) struct Unsettled {
+pub(crate) struct Unsettled {
     pub to: String,
     pub volumes: Vec<DatasetName>,
     pub why: String,
@@ -85,7 +85,7 @@ pub(super) struct Unsettled {
 
 /// Where a failed migration's guest runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Whereabouts {
+pub(crate) enum Whereabouts {
     /// Still here (or both: here wins, B destroys its copy once detached).
     Here,
     /// On B only: the switchover happened.
@@ -97,7 +97,7 @@ pub(super) enum Whereabouts {
 }
 
 /// From whether it runs `here` and on B (`there`); None: couldn't be asked.
-pub(super) fn whereabouts(here: Option<bool>, there: Option<bool>) -> Whereabouts {
+pub(crate) fn whereabouts(here: Option<bool>, there: Option<bool>) -> Whereabouts {
     match (here, there) {
         (Some(true), _) => Whereabouts::Here,
         (Some(false), Some(true)) => Whereabouts::There,
@@ -108,7 +108,7 @@ pub(super) fn whereabouts(here: Option<bool>, there: Option<bool>) -> Whereabout
 
 /// Does the node at `url` run VM `name` (`GET /api/v1/vm/local`)? None: it
 /// couldn't be asked, or couldn't ask its libvirt.
-pub(super) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) -> Option<bool> {
+pub(crate) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) -> Option<bool> {
     let view: crate::vm::LocalView = http
         .get(format!("{}/api/v1/vm/local", url))
         .send()
@@ -126,7 +126,7 @@ pub(super) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) ->
 }
 
 /// Attach `volume` to `node` too, or (`on: false`) no longer.
-pub(super) async fn attach(
+pub(crate) async fn attach(
     leases: &LeaseClient,
     volume: &str,
     node: &str,
@@ -143,7 +143,7 @@ pub(super) async fn attach(
 }
 
 /// Everything a migration needs, taken from the agent when it starts.
-pub(super) struct Job {
+pub(crate) struct Job {
     pub leases: LeaseClient,
     pub http: reqwest::Client,
     /// B's API (`https://node1:8881`).

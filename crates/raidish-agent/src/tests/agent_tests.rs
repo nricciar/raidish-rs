@@ -1,5 +1,10 @@
 use super::*;
+use crate::committer::dataset_resource;
+use crate::inode::{DatasetProps, Transport};
+use crate::nbd::NbdServer;
+use crate::nvme::NvmeTcpServer;
 use crate::test_util::dsn;
+use std::collections::BTreeSet;
 
 fn props(nodes: &[&str]) -> DatasetProps {
     DatasetProps {
@@ -162,7 +167,7 @@ fn a_move_within_the_attached_nodes_wins_and_off_is_off() {
 /// leaves it alone (never moved cold, so never started twice).
 #[test]
 fn a_failed_migration_is_settled_by_where_its_guest_runs() {
-    use migrate::{Whereabouts::*, whereabouts};
+    use vms::migrate::{Whereabouts::*, whereabouts};
     assert_eq!(whereabouts(Some(true), None), Here);
     assert_eq!(whereabouts(Some(true), Some(true)), Here);
     assert_eq!(whereabouts(Some(true), Some(false)), Here);
@@ -226,19 +231,25 @@ async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
         .unwrap()
     };
     let url = answer_once("200 OK", view(vec![vm("web")], None)).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(true));
+    assert_eq!(
+        vms::migrate::runs_there(&http, &url, "web").await,
+        Some(true)
+    );
     let url = answer_once("200 OK", view(vec![vm("db")], None)).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(false));
+    assert_eq!(
+        vms::migrate::runs_there(&http, &url, "web").await,
+        Some(false)
+    );
     // Its libvirt couldn't be asked: not "it doesn't run there".
     let url = answer_once("200 OK", view(vec![], Some("libvirt down"))).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
     let url = answer_once("503 Service Unavailable", "{}".into()).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
     // Nobody there.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     drop(l);
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
 }
 
 // ---- volume slots (structural triage I-27, Phase B) ----
@@ -249,7 +260,7 @@ use volumes::{Claim, Owned, Proxied, Took, WriterGen, WriterParts};
 struct Node {
     _pool: crate::test_util::TestPool,
     parts: WriterParts,
-    shared: Arc<handoff::Shared>,
+    shared: Arc<volumes::handoff::Shared>,
     pki: raidish_auth::testing::Pki,
 }
 
@@ -266,7 +277,7 @@ async fn node() -> Node {
         .await
         .unwrap();
     let parts = writer_on(fs);
-    let shared = Arc::new(handoff::Shared::new(LeaseClient::new(vec![])));
+    let shared = Arc::new(volumes::handoff::Shared::new(LeaseClient::new(vec![])));
     shared.volumes.set_writer(parts.clone());
     Node {
         _pool: pool,
@@ -619,7 +630,10 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
 /// transfer: else the lease could go to an owner that stopped waiting.
 #[test]
 fn the_receiver_outwaits_the_sender() {
-    assert!(handoff::TRANSFER_WAIT >= handoff::SENDER_BUDGET + Duration::from_secs(20));
+    assert!(
+        volumes::handoff::TRANSFER_WAIT
+            >= volumes::handoff::SENDER_BUDGET + Duration::from_secs(20)
+    );
     // The drain alone takes up to 30 s (`DRAIN_TIMEOUT`).
-    assert!(handoff::SENDER_BUDGET > Duration::from_secs(30));
+    assert!(volumes::handoff::SENDER_BUDGET > Duration::from_secs(30));
 }
