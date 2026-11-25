@@ -81,6 +81,9 @@ pub(crate) struct Unsettled {
     pub why: String,
     /// It was said that B couldn't be asked (said once).
     pub told: bool,
+    /// Found by its record, not by a job that ran here: the agent here
+    /// restarted (or a stale snapshot showed an ended one).
+    pub recovered: bool,
 }
 
 /// Where a failed migration's guest runs.
@@ -123,6 +126,48 @@ pub(crate) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) ->
         return None;
     }
     Some(view.vms.iter().any(|v| v.name.as_str() == name))
+}
+
+/// Record that VM `vm` migrates from `from` to `to` (`LeaseOp::BeginMigration`).
+pub(crate) async fn begin(
+    leases: &LeaseClient,
+    vm: &crate::types::VmName,
+    from: &str,
+    to: &str,
+    volumes: &[DatasetName],
+) -> Result<(), String> {
+    recorded(leases.call(&LeaseOp::BeginMigration {
+        vm: vm.clone(),
+        from: from.to_string(),
+        to: to.to_string(),
+        volumes: volumes.to_vec(),
+    }))
+    .await
+}
+
+/// VM `vm`'s migration from `from` to `to` is over (`LeaseOp::EndMigration`).
+pub(crate) async fn end(
+    leases: &LeaseClient,
+    vm: &crate::types::VmName,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    recorded(leases.call(&LeaseOp::EndMigration {
+        vm: vm.clone(),
+        from: from.to_string(),
+        to: to.to_string(),
+    }))
+    .await
+}
+
+/// A record op's answer: `Refused` is an error too.
+async fn recorded(
+    call: impl std::future::Future<Output = Result<crate::cluster::state::Response, String>>,
+) -> Result<(), String> {
+    match call.await? {
+        crate::cluster::state::Response::Refused(why) => Err(why),
+        _ => Ok(()),
+    }
 }
 
 /// Attach `volume` to `node` too, or (`on: false`) no longer.
@@ -173,6 +218,11 @@ impl Job {
         if verdict.mode != crate::vm_check::Mode::Live {
             return Err(Failure::NotLive(verdict.why()));
         }
+        // Its intent first, so it's finished even if this agent restarts
+        // or is gone (`state::recovery`): ended once both are detached.
+        begin(&self.leases, &self.name, &self.me, &self.to, &self.volumes)
+            .await
+            .map_err(|e| format!("recording the migration: {}", e))?;
         for node in [&self.me, &self.to] {
             for v in &self.volumes {
                 attach(&self.leases, v, node, true)

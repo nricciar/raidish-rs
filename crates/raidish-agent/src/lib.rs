@@ -376,6 +376,10 @@ impl Agent {
         }
         self.refresh_vms().await;
         let mut place = self.placement(volumes);
+        // Migrations recorded but no longer run by anyone (I-29).
+        if self.vm.is_some() {
+            self.recover_migrations(&place).await;
+        }
         // What was handed to this node since the last tick.
         self.adopt_handed_over(&place).await;
 

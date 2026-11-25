@@ -1648,3 +1648,54 @@ async fn a_good_node_hearing_only_a_bad_peer_doesnt_sit_out() {
         stop_node(n).await;
     }
 }
+
+/// A migration's record (I-29): begun once, the same one again answered
+/// as the first time, another refused while it's there; ended only as
+/// itself, and ending it again is fine.
+#[test]
+fn migrations_are_recorded_once_and_ended_as_themselves() {
+    use crate::types::{DatasetName, VmName};
+    let mut s = ClusterState::default();
+    let vm = VmName::from_static("mig");
+    let vols = vec![DatasetName::from_static("mig")];
+    let begin = |from: &str, to: &str| {
+        LeaseOp::BeginMigration {
+            vm: vm.clone(),
+            from: from.into(),
+            to: to.into(),
+            volumes: vols.clone(),
+        }
+        .stamp(5)
+    };
+    let end = |from: &str, to: &str| {
+        LeaseOp::EndMigration {
+            vm: vm.clone(),
+            from: from.into(),
+            to: to.into(),
+        }
+        .stamp(6)
+    };
+    assert_eq!(s.apply(&begin("node-0", "node-1")), Response::Recorded);
+    assert_eq!(s.apply(&begin("node-0", "node-1")), Response::Recorded);
+    assert!(matches!(
+        s.apply(&begin("node-1", "node-2")),
+        Response::Refused(_)
+    ));
+    let m = &s.migrations[&vm];
+    assert_eq!(
+        (m.from.as_str(), m.to.as_str(), m.since_ms),
+        ("node-0", "node-1", 5)
+    );
+    assert!(matches!(
+        s.apply(&end("node-1", "node-2")),
+        Response::Refused(_)
+    ));
+    assert!(s.migrations.contains_key(&vm));
+    assert_eq!(s.apply(&end("node-0", "node-1")), Response::Recorded);
+    assert!(s.migrations.is_empty());
+    assert_eq!(s.apply(&end("node-0", "node-1")), Response::Recorded);
+    // A state from before migrations were recorded still reads.
+    let old = r#"{"epoch":3,"leases":{}}"#;
+    let st: ClusterState = serde_json::from_str(old).unwrap();
+    assert!(st.migrations.is_empty());
+}

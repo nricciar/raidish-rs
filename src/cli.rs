@@ -1519,4 +1519,15 @@ fn print_cluster_status(s: &cluster::Status) {
     for (volume, nodes) in &s.state.attached {
         println!("attached {} to {}", volume, nodes.join(", "));
     }
+    for (vm, m) in &s.state.migrations {
+        let vols: Vec<&str> = m.volumes.iter().map(|v| v.as_str()).collect();
+        println!(
+            "migrating VM {} from {} to {} ({}) for {:.1}s",
+            vm,
+            m.from,
+            m.to,
+            vols.join(", "),
+            s.now_ms.saturating_sub(m.since_ms) as f64 / 1000.0
+        );
+    }
 }

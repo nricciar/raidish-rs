@@ -11,7 +11,8 @@
 //! request before proposing it, so every replica computes the same result.
 
 use crate::types::{
-    Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, MetaslabIdx, NodeId,
+    DatasetName, Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, MetaslabIdx, NodeId,
+    VmName,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -177,6 +178,25 @@ pub enum LeaseOp {
         node: String,
         on: bool,
     },
+    /// A live migration of VM `vm` from node `from` to `to` begins: its
+    /// intent, written before its volumes are attached to both, so it can
+    /// be finished by whoever is left if the source restarts or is gone
+    /// (see [`MigrationRecord`]). Refused while another migration of the
+    /// VM is recorded; the same one again is answered as the first time.
+    BeginMigration {
+        vm: VmName,
+        from: String,
+        to: String,
+        volumes: Vec<DatasetName>,
+    },
+    /// VM `vm`'s migration from `from` to `to` is over (its volumes
+    /// detached from both nodes, or it moves cold). Refused if the
+    /// recorded one is another; none recorded: already over.
+    EndMigration {
+        vm: VmName,
+        from: String,
+        to: String,
+    },
 }
 
 impl LeaseOp {
@@ -193,6 +213,20 @@ impl LeaseOp {
 pub struct Request {
     pub op: LeaseOp,
     pub now_ms: u64,
+}
+
+/// A live migration under way (`ClusterState::migrations`): only its
+/// intent. Where the guest runs is libvirt's to say, and who writes the
+/// volumes is their `ds/` leases'.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MigrationRecord {
+    /// The node it migrates from (which writes the record and attaches
+    /// the volumes to both).
+    pub from: String,
+    pub to: String,
+    pub volumes: Vec<DatasetName>,
+    /// When it began.
+    pub since_ms: u64,
 }
 
 /// What applying a [`Request`] produced.
@@ -274,6 +308,12 @@ pub struct ClusterState {
     /// multi-node block volume): name → nodes. Absent: placed as usual.
     #[serde(default)]
     pub attached: BTreeMap<String, Vec<String>>,
+    /// Live migrations under way, by VM: recorded before their volumes
+    /// are attached to both nodes, cleared once they're detached again
+    /// (structural triage I-29: a source that restarts mid-way must not
+    /// leave them attached to both for ever).
+    #[serde(default)]
+    pub migrations: BTreeMap<VmName, MigrationRecord>,
 }
 
 impl ClusterState {
@@ -596,6 +636,43 @@ impl ClusterState {
                 }
                 Response::Recorded
             }
+            LeaseOp::BeginMigration {
+                vm,
+                from,
+                to,
+                volumes,
+            } => match self.migrations.get(vm) {
+                Some(m) if m.from == *from && m.to == *to && m.volumes == *volumes => {
+                    Response::Recorded
+                }
+                Some(m) => Response::Refused(format!(
+                    "VM '{}' is migrating from {} to {}",
+                    vm, m.from, m.to
+                )),
+                None => {
+                    self.migrations.insert(
+                        vm.clone(),
+                        MigrationRecord {
+                            from: from.clone(),
+                            to: to.clone(),
+                            volumes: volumes.clone(),
+                            since_ms: now_ms,
+                        },
+                    );
+                    Response::Recorded
+                }
+            },
+            LeaseOp::EndMigration { vm, from, to } => match self.migrations.get(vm) {
+                Some(m) if m.from == *from && m.to == *to => {
+                    self.migrations.remove(vm);
+                    Response::Recorded
+                }
+                Some(m) => Response::Refused(format!(
+                    "VM '{}' is migrating from {} to {}",
+                    vm, m.from, m.to
+                )),
+                None => Response::Recorded,
+            },
             LeaseOp::SetServiceKey { key } => {
                 if self.service_key.is_none() {
                     self.service_key = Some(key.clone());

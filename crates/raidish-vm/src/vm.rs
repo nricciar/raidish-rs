@@ -1244,6 +1244,15 @@ impl Virsh {
         r.map(|_| ())
     }
 
+    /// Whether domain `name` has a libvirt job under way (a migration):
+    /// `virsh domjobinfo` says other than `Job type: None`.
+    pub async fn job_active(&self, name: &str) -> Result<bool, VmError> {
+        let out = self.run(&["domjobinfo", name]).await?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Job type:"))
+            .is_some_and(|t| t.trim() != "None"))
+    }
     pub async fn shutdown(&self, name: &str) -> Result<(), VmError> {
         self.run(&["shutdown", name]).await.map(|_| ())
     }

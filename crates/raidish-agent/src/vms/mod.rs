@@ -13,7 +13,7 @@ use crate::vm_store::DefSpec;
 use crate::volume::VolumeInfo;
 use crate::volumes::VolumeView;
 use crate::{Agent, peer_host, peer_url};
-use state::{StopStep, Stopping, VmState};
+use state::{Recovery, StandInStep, StopStep, Stopping, VmState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -301,6 +301,31 @@ impl Agent {
                 );
                 self.vms.states.remove(name);
                 continue;
+            }
+            // Ours, its volumes all written here, and no migration of it
+            // recorded: none of them should be attached anywhere.
+            let recorded = p.state.migrations.contains_key(name);
+            for x in state::leaked(&v.meta.volumes, recorded, |x| !p.attached(x).is_empty()) {
+                let op = crate::cluster::LeaseOp::SetAttached {
+                    volume: x.to_string(),
+                    nodes: Vec::new(),
+                };
+                match self.leases.call(&op).await {
+                    Ok(_) => self.note(
+                        Level::Warn,
+                        EventKind::VmMigrationRecovered,
+                        Subject::vm(name),
+                        format!(
+                            "volume '{}' of VM '{}' (running on {}) was attached to {} with no \
+                             migration under way; detached it from all",
+                            x,
+                            name,
+                            self.node,
+                            p.attached(&x).join(", ")
+                        ),
+                    ),
+                    Err(e) => eprintln!("agent: detaching '{}': {}", x, e),
+                }
             }
             let wanted = p.state.vms.contains_key(name.as_str())
                 && !vm.restarting(name)
@@ -686,6 +711,16 @@ impl Agent {
                     ok = false;
                 }
             }
+            // Detached from both: its record goes (tried again until it does).
+            if ok {
+                match migrate::end(&self.leases, &name, &self.node, &m.to).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("agent: ending VM '{}''s migration record: {}", name, e);
+                        ok = false;
+                    }
+                }
+            }
             if !ok {
                 self.vms.states.insert(name, VmState::HandingOffVolumes(m));
             }
@@ -707,6 +742,31 @@ impl Agent {
                 }),
                 None => Some(false),
             };
+            // Here, but libvirt may still be migrating it (a recovered
+            // one: libvirtd outlives this agent): not settled until it
+            // isn't, or that can be asked.
+            if here == Some(true)
+                && let Some(vm) = &self.vm
+            {
+                let job = vm.virsh.job_active(&name).await;
+                if !matches!(job, Ok(false)) {
+                    let why = match job {
+                        Ok(_) => "libvirt is still migrating it".to_string(),
+                        Err(e) => format!("whether libvirt still migrates it is unknown: {}", e),
+                    };
+                    self.note_once(
+                        Level::Warn,
+                        EventKind::VmMigrateFailed,
+                        Subject::vm(&name),
+                        format!(
+                            "VM '{}''s migration from {} to {} isn't settled: {}",
+                            name, self.node, u.to, why
+                        ),
+                    );
+                    self.vms.states.insert(name, VmState::Unsettled(u));
+                    continue;
+                }
+            }
             // B only matters if it isn't here.
             let there = if here == Some(false) {
                 self.ask_runs_there(&u.to, &name).await
@@ -732,15 +792,17 @@ impl Agent {
                 }
                 migrate::Whereabouts::There => {
                     self.facts.note_migration(&u.to, &Ok(()));
-                    self.note(
-                        Level::Info,
-                        EventKind::VmMigrated,
-                        Subject::vm(&name),
-                        format!(
+                    let msg = match u.recovered {
+                        true => format!(
+                            "VM '{}' runs on {}: finishing its migration from {} ({})",
+                            name, u.to, self.node, u.why
+                        ),
+                        false => format!(
                             "VM '{}' migrated live from {} to {} (though {} said it failed: {})",
                             name, self.node, u.to, self.node, u.why
                         ),
-                    );
+                    };
+                    self.note(Level::Info, EventKind::VmMigrated, Subject::vm(&name), msg);
                 }
                 migrate::Whereabouts::Here | migrate::Whereabouts::Neither => {
                     let at = if w == migrate::Whereabouts::Here {
@@ -758,16 +820,132 @@ impl Agent {
                             name, self.node, u.to, u.why, at
                         ),
                     );
+                    let mut ok = true;
                     for v in &u.volumes {
                         for node in [u.to.as_str(), self.node.as_str()] {
                             if let Err(e) = migrate::attach(&self.leases, v, node, false).await {
                                 eprintln!("agent: detaching '{}' from {}: {}", v, node, e);
+                                ok = false;
+                            }
+                        }
+                    }
+                    // Left recorded on failure: settled again once this
+                    // VM's stop is over (`recover_migrations`).
+                    if ok {
+                        match migrate::end(&self.leases, &name, &self.node, &u.to).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                eprintln!("agent: ending VM '{}''s migration record: {}", name, e)
                             }
                         }
                     }
                 }
             }
             self.vms.states.insert(name, state::settled(u, w));
+        }
+    }
+
+    /// Migrations recorded in the cluster state that nobody runs any more
+    /// (see `state::recovery`): this node's own, after a restart, are
+    /// settled again; a gone source's, if this node is their target, are
+    /// finished here in its place.
+    ///
+    /// Decided on a linearizable read, not on this tick's view: that may
+    /// lag behind the cluster (just restarted and still catching up, or
+    /// just ended a record that isn't applied here yet), and a record
+    /// that's over must not be finished again. The read is made only when
+    /// the view shows one to finish.
+    pub(crate) async fn recover_migrations(&mut self, p: &Placement) {
+        let me = self.node.as_str();
+        let states = &self.vms.states;
+        let to_finish = |s: &crate::cluster::state::ClusterState, live: &BTreeSet<String>| {
+            s.migrations.iter().any(|(n, r)| {
+                state::recovery(r, me, live, states.contains_key(n)) != Recovery::Nothing
+            })
+        };
+        if !to_finish(&p.state, &p.live) {
+            return;
+        }
+        let fresh = match self
+            .cluster
+            .linearizable_state(Duration::from_secs(5))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agent: reading the recorded migrations: {}", e);
+                return;
+            }
+        };
+        let now = crate::cluster::now_ms();
+        let live: BTreeSet<String> = fresh.live_nodes(now).map(|(n, _)| n.to_string()).collect();
+        for (name, rec) in &fresh.migrations {
+            let has_state = self.vms.states.contains_key(name);
+            match state::recovery(rec, &self.node, &live, has_state) {
+                Recovery::Nothing => {}
+                Recovery::Resettle => {
+                    println!(
+                        "agent: VM '{}''s migration from {} to {} is recorded but runs nowhere \
+                         here: settling it",
+                        name, rec.from, rec.to
+                    );
+                    self.vms.states.insert(
+                        name.clone(),
+                        VmState::Unsettled(migrate::Unsettled {
+                            to: rec.to.clone(),
+                            volumes: rec.volumes.clone(),
+                            why: format!("interrupted: the agent on {} restarted", self.node),
+                            told: false,
+                            recovered: true,
+                        }),
+                    );
+                }
+                Recovery::StandIn => {
+                    let step = state::stand_in_step(
+                        rec,
+                        &self.node,
+                        |v| fresh.attached.get(v.as_str()).cloned().unwrap_or_default(),
+                        |v| fresh.dataset_node(v, now).map(str::to_string),
+                    );
+                    match step {
+                        StandInStep::Wait => {}
+                        StandInStep::Detach(node, volumes) => {
+                            for v in &volumes {
+                                match migrate::attach(&self.leases, v, &node, false).await {
+                                    Ok(()) => println!(
+                                        "agent: VM '{}''s migration from {} (gone): detached \
+                                         '{}' from {}",
+                                        name, rec.from, v, node
+                                    ),
+                                    Err(e) => {
+                                        eprintln!("agent: detaching '{}' from {}: {}", v, node, e)
+                                    }
+                                }
+                            }
+                        }
+                        StandInStep::End => {
+                            match migrate::end(&self.leases, name, &rec.from, &rec.to).await {
+                                Ok(()) => {
+                                    self.note(
+                                        Level::Warn,
+                                        EventKind::VmMigrationRecovered,
+                                        Subject::vm(name),
+                                        format!(
+                                            "VM '{}''s migration from {} to {} was finished by {}: \
+                                         {} is gone",
+                                            name, rec.from, rec.to, self.node, rec.from
+                                        ),
+                                    );
+                                }
+                                Err(e) => eprintln!(
+                                    "agent: ending VM '{}''s migration record: {}",
+                                    name, e
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -16,9 +16,16 @@
 //!   HandingOffVolumes ── both detached ───────▶ (none: it runs there)
 //!   Stopping ── its domain is gone, or it's wanted here again ─▶ (none)
 //! ```
+//!
+//! What survives a restart is the migration's record in the cluster state
+//! (`ClusterState::migrations`, written before the volumes are attached to
+//! both nodes, cleared once they're detached): [`recovery`] says who
+//! finishes a migration nobody runs any more.
 
 use super::migrate::{Failure, Migrated, Migration, Unsettled, Whereabouts};
+use crate::cluster::state::MigrationRecord;
 use crate::types::DatasetName;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 /// What this node is doing with one VM.
@@ -113,6 +120,7 @@ pub(crate) fn finished(
             volumes,
             why,
             told: false,
+            recovered: false,
         }),
     }
 }
@@ -130,4 +138,105 @@ pub(crate) fn settled(u: Unsettled, w: Whereabouts) -> VmState {
         }),
         Whereabouts::Here | Whereabouts::Neither => VmState::Stopping(Stopping::cold(u.to)),
     }
+}
+
+/// What node `me` does about a recorded migration (`rec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// Nothing: it's under way, or it's someone else's to finish.
+    Nothing,
+    /// The source, with no job for it (it restarted): settle it again,
+    /// as a failed migration (`Unsettled`): where does the guest run?
+    Resettle,
+    /// The target, its source gone (no live `node/` lease): finish it in
+    /// the source's place ([`stand_in_step`]).
+    StandIn,
+}
+
+/// Who finishes `rec`: its source when it holds no state for the VM
+/// (`has_state`: a job, a handoff, a stop), its target only once the
+/// source isn't `live`. Never the target while the source is live: it
+/// can't tell an interrupted migration from one under way (the volumes
+/// are attached to both before the guest moves).
+pub(crate) fn recovery(
+    rec: &MigrationRecord,
+    me: &str,
+    live: &BTreeSet<String>,
+    has_state: bool,
+) -> Recovery {
+    if rec.from == me {
+        match has_state {
+            true => Recovery::Nothing,
+            false => Recovery::Resettle,
+        }
+    } else if rec.to == me && !live.contains(&rec.from) {
+        Recovery::StandIn
+    } else {
+        Recovery::Nothing
+    }
+}
+
+/// The next step of finishing `rec` on its target (`me`) in place of its
+/// gone source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StandInStep {
+    /// Detach these volumes from `node`.
+    Detach(String, Vec<DatasetName>),
+    /// The source's `ds/` leases are still live: wait for them to lapse.
+    Wait,
+    /// Detached from both: end the record.
+    End,
+}
+
+/// As the source would: detach it from the volumes, then, once it writes
+/// none of them, detach this node too and end the record. Where the guest
+/// runs doesn't matter: the source's agent is gone (whatever it ran can't
+/// reach its disks), and the VM is started wherever its volumes go.
+/// `attached` gives a volume's attached nodes, `writer` the node writing
+/// it.
+pub(crate) fn stand_in_step(
+    rec: &MigrationRecord,
+    me: &str,
+    attached: impl Fn(&DatasetName) -> Vec<String>,
+    writer: impl Fn(&DatasetName) -> Option<String>,
+) -> StandInStep {
+    let on = |node: &str| -> Vec<DatasetName> {
+        rec.volumes
+            .iter()
+            .filter(|v| attached(v).iter().any(|n| n == node))
+            .cloned()
+            .collect()
+    };
+    let from = on(&rec.from);
+    if !from.is_empty() {
+        return StandInStep::Detach(rec.from.clone(), from);
+    }
+    if rec
+        .volumes
+        .iter()
+        .any(|v| writer(v).as_deref() == Some(rec.from.as_str()))
+    {
+        return StandInStep::Wait;
+    }
+    let mine = on(me);
+    if !mine.is_empty() {
+        return StandInStep::Detach(me.to_string(), mine);
+    }
+    StandInStep::End
+}
+
+/// The safety net: a VM running here as this node's, writing all its
+/// `volumes` here. With no migration of it `recorded`, none of them should
+/// be attached anywhere (`attached`): those that are leaked (a migration
+/// from before records, a lost `EndMigration`) and go back to their own
+/// placement.
+pub(crate) fn leaked(
+    volumes: &[DatasetName],
+    recorded: bool,
+    attached: impl Fn(&DatasetName) -> bool,
+) -> Vec<DatasetName> {
+    if recorded {
+        return Vec::new();
+    }
+    volumes.iter().filter(|v| attached(v)).cloned().collect()
 }

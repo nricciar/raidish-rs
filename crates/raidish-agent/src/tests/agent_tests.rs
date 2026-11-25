@@ -689,6 +689,7 @@ fn vm_moving_cold_is_shut_down_at_once() {
         volumes: vec![vol()],
         why: "lost".into(),
         told: false,
+        recovered: false,
     };
     for st in [
         state::finished(
@@ -730,6 +731,7 @@ async fn vm_state_transitions() {
         volumes: vec![vol()],
         why: "lost".into(),
         told: false,
+        recovered: false,
     };
     // Done: its volumes are handed over, starting with this node detaching.
     let VmState::HandingOffVolumes(m) = state::finished("node-2".into(), vec![vol()], Ok(()))
@@ -774,4 +776,85 @@ async fn vm_state_transitions() {
     assert_eq!(state::keep_cold_to(to(), None), None);
     assert!(Stopping::default().idle());
     assert!(!Stopping::cold("node-2".into()).idle());
+}
+
+fn record(from: &str, to: &str) -> crate::cluster::state::MigrationRecord {
+    crate::cluster::state::MigrationRecord {
+        from: from.into(),
+        to: to.into(),
+        volumes: vec![vol()],
+        since_ms: 0,
+    }
+}
+
+/// Who finishes a recorded migration (I-29): its source once it has no
+/// job for it, its target only once the source is gone, nobody else.
+#[test]
+fn recorded_migrations_are_finished_by_their_source_or_a_gone_ones_target() {
+    use vms::state::{Recovery, recovery};
+    let rec = record("node-0", "node-1");
+    let live = |ns: &[&str]| {
+        ns.iter()
+            .map(|n| n.to_string())
+            .collect::<BTreeSet<String>>()
+    };
+    let both = live(&["node-0", "node-1", "node-2"]);
+    // The source: its job (or handoff, or stop) runs; or it restarted.
+    assert_eq!(recovery(&rec, "node-0", &both, true), Recovery::Nothing);
+    assert_eq!(recovery(&rec, "node-0", &both, false), Recovery::Resettle);
+    // The target: never while the source is live (it may be under way).
+    assert_eq!(recovery(&rec, "node-1", &both, false), Recovery::Nothing);
+    let gone = live(&["node-1", "node-2"]);
+    assert_eq!(recovery(&rec, "node-1", &gone, false), Recovery::StandIn);
+    // Anyone else: never.
+    assert_eq!(recovery(&rec, "node-2", &gone, false), Recovery::Nothing);
+}
+
+/// A target finishing a gone source's migration: the source detached
+/// first, then (its leases lapsed) the target, then the record.
+#[test]
+fn a_stand_in_detaches_the_source_then_itself() {
+    use vms::state::{StandInStep, stand_in_step};
+    let rec = record("node-0", "node-1");
+    let at = |ns: &'static [&'static str]| {
+        move |_: &DatasetName| -> Vec<String> { ns.iter().map(|n| n.to_string()).collect() }
+    };
+    let writer = |n: Option<&'static str>| move |_: &DatasetName| n.map(str::to_string);
+    assert_eq!(
+        stand_in_step(
+            &rec,
+            "node-1",
+            at(&["node-0", "node-1"]),
+            writer(Some("node-0"))
+        ),
+        StandInStep::Detach("node-0".into(), vec![vol()])
+    );
+    // Its `ds/` lease hasn't lapsed yet.
+    assert_eq!(
+        stand_in_step(&rec, "node-1", at(&["node-1"]), writer(Some("node-0"))),
+        StandInStep::Wait
+    );
+    for w in [None, Some("node-1")] {
+        assert_eq!(
+            stand_in_step(&rec, "node-1", at(&["node-1"]), writer(w)),
+            StandInStep::Detach("node-1".into(), vec![vol()])
+        );
+    }
+    assert_eq!(
+        stand_in_step(&rec, "node-1", at(&[]), writer(None)),
+        StandInStep::End
+    );
+}
+
+/// The safety net picks a running VM's attached volumes, unless a
+/// migration of it is recorded.
+#[test]
+fn the_safety_net_skips_recorded_migrations() {
+    use vms::state::leaked;
+    let other = DatasetName::from_static("other");
+    let vols = vec![vol(), other.clone()];
+    let attached = |v: &DatasetName| *v == other;
+    assert_eq!(leaked(&vols, false, attached), vec![other.clone()]);
+    assert!(leaked(&vols, true, attached).is_empty());
+    assert!(leaked(&vols, false, |_| false).is_empty());
 }
