@@ -438,3 +438,102 @@ async fn an_exports_backend_switches_under_a_live_connection() {
     // The write, flush and read went through the new backend.
     assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
+
+/// Holds every request until opened, counting how many got in.
+pub(crate) struct Gate {
+    pub inner: Arc<dyn VolumeIo>,
+    pub entered: Arc<std::sync::atomic::AtomicUsize>,
+    pub open: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Gate {
+    async fn wait(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.open.subscribe().wait_for(|o| *o).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl VolumeIo for Gate {
+    async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
+        self.wait().await;
+        self.inner.read(offset, buf).await
+    }
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<usize, FileSystemError> {
+        self.wait().await;
+        self.inner.write(offset, data).await
+    }
+    async fn zero(&self, offset: u64, len: usize) -> Result<(), FileSystemError> {
+        self.wait().await;
+        self.inner.zero(offset, len).await
+    }
+    async fn flush(&self) -> Result<(), FileSystemError> {
+        self.wait().await;
+        self.inner.flush().await
+    }
+    async fn sync(&self) -> Result<(), FileSystemError> {
+        self.inner.sync().await
+    }
+}
+
+/// Wait until `n` stops changing (nothing more is coming in).
+pub(crate) async fn settled(n: &std::sync::atomic::AtomicUsize) -> usize {
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = n.load(std::sync::atomic::Ordering::SeqCst);
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// A client pipelining without limit gets `MAX_IN_FLIGHT` requests running
+/// at once; the rest wait unread until one replies. Every request used to
+/// get a task (and its payload a buffer) at once.
+#[tokio::test]
+async fn a_connection_has_at_most_so_many_requests_in_flight() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (c, _) = Client::connect(addr).await;
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let open = Arc::new(tokio::sync::watch::Sender::new(false));
+    server
+        .export_io("vol")
+        .unwrap()
+        .switch(Arc::new(Gate {
+            inner: Arc::new(crate::volume_io::LocalIo::new(fs.clone(), "vol")),
+            entered: entered.clone(),
+            open: open.clone(),
+        }))
+        .await;
+
+    let n = MAX_IN_FLIGHT + 50;
+    let (mut rd, mut wr) = c.s.into_split();
+    let send = tokio::spawn(async move {
+        for handle in 0..n as u64 {
+            let mut req = Vec::new();
+            req.extend_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
+            req.extend_from_slice(&0u16.to_be_bytes());
+            req.extend_from_slice(&NBD_CMD_WRITE.to_be_bytes());
+            req.extend_from_slice(&handle.to_be_bytes());
+            req.extend_from_slice(&(handle * 4096).to_be_bytes());
+            req.extend_from_slice(&4096u32.to_be_bytes());
+            req.extend_from_slice(&[handle as u8; 4096]);
+            wr.write_all(&req).await.unwrap();
+        }
+        wr
+    });
+    assert_eq!(settled(&entered).await, MAX_IN_FLIGHT);
+
+    open.send_replace(true);
+    for _ in 0..n {
+        assert_eq!(rd.read_u32().await.unwrap(), NBD_REPLY_MAGIC);
+        assert_eq!(rd.read_u32().await.unwrap(), 0, "write failed");
+        rd.read_u64().await.unwrap();
+    }
+    assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), n);
+    let _wr = send.await.unwrap();
+}

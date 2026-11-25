@@ -476,7 +476,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // replayed since this writer opened the pool.
         self.reload_root_index().await?;
         self.close_dataset(name);
-        self.open_dataset(name).await?;
+        self.load_dataset(name).await?;
         w.datasets.lock().unwrap().insert(
             name.to_string(),
             Attached {

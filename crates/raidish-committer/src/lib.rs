@@ -249,6 +249,28 @@ pub enum Orphan {
     Lapsed,
 }
 
+/// Whether the writer a metaslab is lent to is gone for good, so the
+/// metaslab may be taken back: its lease taken over (a newer epoch),
+/// released, or lapsed past the grace. As in `check_lease`, an older epoch
+/// in this view (or none at all) means the view lags, not that it's gone.
+pub fn writer_gone(state: &ClusterState, writer: &LeaseRef, now: u64) -> bool {
+    match state.leases.get(&writer.resource) {
+        Some(l) if l.epoch < writer.epoch => false,
+        Some(l) if l.epoch > writer.epoch => true,
+        Some(l) => l.released || l.expires_ms.saturating_add(RECLAIM_GRACE_MS) < now,
+        // Not visible here yet: a lend this node's view hasn't caught up with.
+        None => false,
+    }
+}
+
+/// Volume `name` is running (its `ds/` lease held by `by`).
+fn running(name: &str, by: &str) -> FileSystemError {
+    FileSystemError::InvalidArgument(format!(
+        "volume '{}' is running ({}); disable or stop it first",
+        name, by
+    ))
+}
+
 /// Like `check_lease`: an older epoch in this view means the view lags (a
 /// committer on a Raft follower, or just after a failover), not that the
 /// log's holder is gone.
@@ -282,6 +304,15 @@ pub struct Committer<D: BlockDevice> {
     /// `Return` of it names (see `LeaseOp::Lend`). This node's applied
     /// state may lag its own ops; epochs only grow, so the newer one wins.
     grants: std::sync::Mutex<std::collections::HashMap<MetaslabIdx, Epoch>>,
+    /// Per metaslab (by index), held across each of its transitions (lend,
+    /// settle, give back, reclaim): each reads `lends`, asks the cluster,
+    /// then writes `grants`, `lends` and the pool's `lent`, and two at once
+    /// on one metaslab interleave those steps. Two returns both answered
+    /// with the same epoch (a repeat is answered as the first: R4d), the
+    /// late one undid a lend made in between (structural triage I-12).
+    slots: Vec<tokio::sync::Mutex<()>>,
+    /// Numbers its admin holds of `ds/` leases apart (see `AdminHold`).
+    admin_holds: std::sync::atomic::AtomicU64,
     /// The activity log (opened, or made, on first use).
     events: tokio::sync::OnceCell<Arc<EventLog<D>>>,
     /// The VM definitions (opened, or made, on first use).
@@ -292,6 +323,57 @@ pub struct Committer<D: BlockDevice> {
     /// new committer reports the ones offline once).
     disks_online: std::sync::Mutex<Option<Vec<bool>>>,
 }
+
+/// A dataset's `ds/<name>` lease, taken by the committer for an admin
+/// operation that must not race its writer (delete, rollback, receive:
+/// structural triage I-14b). Taken through the cluster, so it's refused
+/// while any holder has it live, and no agent can take it while it's held.
+/// Renewed while held; released by `release`, or (dropped: an op given up
+/// on) by a task.
+struct AdminHold {
+    auth: Arc<dyn Authority>,
+    resource: LeaseResource,
+    holding: Holding,
+    renew: tokio::task::JoinHandle<()>,
+    released: bool,
+}
+
+impl AdminHold {
+    fn release_op(&self) -> LeaseOp {
+        LeaseOp::Release {
+            resource: self.resource.clone(),
+            holder: self.holding.clone(),
+        }
+    }
+
+    async fn release(mut self) {
+        self.renew.abort();
+        if let Err(e) = self.auth.propose(self.release_op()).await {
+            eprintln!("committer: releasing {}: {} (it lapses)", self.resource, e);
+        }
+        // Only now: dropped mid-release, `Drop` sends it (again: a
+        // release of a released grant is harmless).
+        self.released = true;
+    }
+}
+
+impl Drop for AdminHold {
+    fn drop(&mut self) {
+        self.renew.abort();
+        if self.released {
+            return;
+        }
+        let (auth, op) = (self.auth.clone(), self.release_op());
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move {
+                let _ = auth.propose(op).await;
+            });
+        }
+    }
+}
+
+/// A metaslab's transitions lock, held (see `Committer::slots`).
+type Slot<'a> = tokio::sync::MutexGuard<'a, ()>;
 
 /// A metaslab lent (or maybe lent) to a writer. A `Return` always names
 /// the lend's own epoch, however often it's sent: a resend after a lost
@@ -305,9 +387,14 @@ enum Lend {
     InDoubt { writer: LeaseRef, after: Epoch },
     /// Lent at `epoch`, and the writer knows.
     Active { writer: LeaseRef, epoch: Epoch },
-    /// Its `Return` was sent, maybe without an answer: `reclaim` sends it
-    /// again, live writer or not.
-    Returning { writer: LeaseRef, epoch: Epoch },
+    /// Its `Return` (or, `reclaim`: its `Reclaim`) was sent, maybe
+    /// without an answer: `reclaim` sends it again. A `Reclaim` stays one,
+    /// so the cluster still checks the writer is gone (I-13).
+    Returning {
+        writer: LeaseRef,
+        epoch: Epoch,
+        reclaim: bool,
+    },
 }
 
 impl Lend {
@@ -364,6 +451,9 @@ impl<D: BlockDevice> Committer<D> {
             .map(|(&i, g)| (i, g.epoch()))
             .collect();
         fs.mark_lent(lends.keys().copied()).await;
+        let slots = (0..fs.metaslabs.len())
+            .map(|_| Default::default())
+            .collect();
         // Writers' views of the TXG may lag a previous committer's: from
         // here on, blocks are born after any snapshot it took.
         if let Ok(t) = fs.open_txg().await {
@@ -376,6 +466,8 @@ impl<D: BlockDevice> Committer<D> {
             node,
             lends: std::sync::Mutex::new(lends),
             grants: std::sync::Mutex::new(grants),
+            slots,
+            admin_holds: Default::default(),
             events: Default::default(),
             vms: Default::default(),
             seen: Default::default(),
@@ -551,6 +643,12 @@ impl<D: BlockDevice> Committer<D> {
                 "no metaslab with free space to lend",
             ));
         };
+        // Picked, so not lent: whatever held it last (a return) is done
+        // with it but may not have let go yet (I-12).
+        let Some(_slot) = self.slot(idx).await else {
+            self.fs.lend_abort(idx).await;
+            return Err(CommitError::Retry(format!("metaslab {} out of range", idx)));
+        };
         let after = self.grant_epoch(idx);
         let op = LeaseOp::Lend {
             idx,
@@ -607,34 +705,43 @@ impl<D: BlockDevice> Committer<D> {
     /// lend's epoch, or None.
     async fn settle_lend(
         &self,
+        slot: &Slot<'_>,
         idx: MetaslabIdx,
         writer: &LeaseRef,
         after: Epoch,
     ) -> Result<Option<Epoch>, CommitError> {
-        let settled = self.settle_lend_once(idx, writer, after).await?;
-        let mut lends = self.lends.lock().unwrap();
-        let ours = |l: &Lend| matches!(l, Lend::InDoubt { writer: w, after: a } if w == writer && *a == after);
-        if lends.get(&idx).is_some_and(ours) {
-            match settled {
-                Some(epoch) => {
-                    lends.insert(
-                        idx,
-                        Lend::Active {
-                            writer: writer.clone(),
-                            epoch,
-                        },
-                    );
-                }
-                None => {
-                    lends.remove(&idx);
+        let settled = self.settle_lend_once(slot, idx, writer, after).await?;
+        {
+            let mut lends = self.lends.lock().unwrap();
+            let ours = |l: &Lend| matches!(l, Lend::InDoubt { writer: w, after: a } if w == writer && *a == after);
+            if lends.get(&idx).is_some_and(ours) {
+                match settled {
+                    Some(epoch) => {
+                        lends.insert(
+                            idx,
+                            Lend::Active {
+                                writer: writer.clone(),
+                                epoch,
+                            },
+                        );
+                    }
+                    None => {
+                        lends.remove(&idx);
+                    }
                 }
             }
+        }
+        // Not lent after all: back in use here, once the books say so (as
+        // `take_back` does: the books, then the pool).
+        if settled.is_none() {
+            self.fs.lend_abort(idx).await;
         }
         Ok(settled)
     }
 
     async fn settle_lend_once(
         &self,
+        _slot: &Slot<'_>,
         idx: MetaslabIdx,
         writer: &LeaseRef,
         after: Epoch,
@@ -666,35 +773,60 @@ impl<D: BlockDevice> Committer<D> {
                     return Ok(Some(epoch));
                 }
                 eprintln!("committer: metaslab {} wasn't lent after all: {}", idx, m);
-                self.fs.lend_abort(idx).await;
                 Ok(None)
             }
             other => Err(CommitError::Retry(format!("lend in doubt: {:?}", other))),
         }
     }
 
-    async fn take_back(&self, idx: MetaslabIdx) -> Result<(), CommitError> {
+    /// Metaslab `idx`'s transitions lock (None: there's no such metaslab).
+    async fn slot(&self, idx: MetaslabIdx) -> Option<Slot<'_>> {
+        Some(self.slots.get(idx.index())?.lock().await)
+    }
+
+    /// Take metaslab `idx` back, under its `slot` (I-12): given back by its
+    /// writer (`reclaim: false`, a `Return`), or reclaimed because it looked
+    /// gone (a `Reclaim`, which the cluster admits only if its writer isn't
+    /// live: I-13). A lend in doubt was never told to its writer, so it
+    /// goes back with a plain `Return` either way.
+    async fn take_back(
+        &self,
+        slot: &Slot<'_>,
+        idx: MetaslabIdx,
+        reclaim: bool,
+    ) -> Result<(), CommitError> {
         let Some(l) = self.lends.lock().unwrap().get(&idx).cloned() else {
             return Ok(());
         };
-        let (writer, lend) = match l {
-            Lend::Active { writer, epoch } | Lend::Returning { writer, epoch } => (writer, epoch),
-            Lend::InDoubt { writer, after } => match self.settle_lend(idx, &writer, after).await? {
-                Some(epoch) => (writer, epoch),
-                None => return Ok(()),
-            },
+        let (writer, lend, reclaim) = match l {
+            Lend::Active { writer, epoch } => (writer, epoch, reclaim),
+            // A reclaim resent stays a reclaim; the writer giving it back
+            // itself makes it a return.
+            Lend::Returning {
+                writer,
+                epoch,
+                reclaim: was,
+            } => (writer, epoch, was && reclaim),
+            Lend::InDoubt { writer, after } => {
+                match self.settle_lend(slot, idx, &writer, after).await? {
+                    Some(epoch) => (writer, epoch, false),
+                    None => return Ok(()),
+                }
+            }
         };
         self.lends.lock().unwrap().insert(
             idx,
             Lend::Returning {
-                writer,
+                writer: writer.clone(),
                 epoch: lend,
+                reclaim,
             },
         );
-        let op = LeaseOp::Return {
-            idx,
-            pool: self.pool.clone(),
-            lend,
+        let pool = self.pool.clone();
+        let op = if reclaim {
+            LeaseOp::Reclaim { idx, pool, lend }
+        } else {
+            LeaseOp::Return { idx, pool, lend }
         };
         match self.auth.propose(op).await {
             Ok(Response::Fenced { epoch }) => {
@@ -703,7 +835,20 @@ impl<D: BlockDevice> Committer<D> {
                 self.fs.unlend(idx, epoch).await;
                 Ok(())
             }
-            Ok(Response::Refused(m)) => Err(CommitError::refused(ErrorKind::Conflict, m)),
+            Ok(Response::Refused(m)) => {
+                // The cluster says its writer is live (this view lagged, or
+                // this clock runs ahead): still lent, and the writer's.
+                if reclaim {
+                    self.lends.lock().unwrap().insert(
+                        idx,
+                        Lend::Active {
+                            writer,
+                            epoch: lend,
+                        },
+                    );
+                }
+                Err(CommitError::refused(ErrorKind::Conflict, m))
+            }
             other => Err(CommitError::Retry(format!("return: {:?}", other))),
         }
     }
@@ -740,9 +885,14 @@ impl<D: BlockDevice> Committer<D> {
 
     /// A writer gives metaslab `idx` back.
     pub async fn give_back(&self, writer: &LeaseRef, idx: MetaslabIdx) -> Result<(), CommitError> {
+        // Decided and done under the slot: a reclaim or another give back
+        // of it may be halfway through (I-12).
+        let Some(slot) = self.slot(idx).await else {
+            return Ok(());
+        };
         let lent = self.lends.lock().unwrap().get(&idx).cloned();
         match lent.as_ref().map(Lend::writer) {
-            Some(w) if w == writer => self.take_back(idx).await,
+            Some(w) if w == writer => self.take_back(&slot, idx, false).await,
             // Already back (a resend): fine.
             None => Ok(()),
             Some(_) => Err(CommitError::refused(
@@ -804,13 +954,33 @@ impl<D: BlockDevice> Committer<D> {
             .await
             .map_err(|e| CommitError::failed(format!("volume '{}'", volume), &e))?;
         let log = vol.log.lock().unwrap().clone();
-        if let Some(l) = log
-            && l.ds != *ds
-        {
-            self.fs
-                .replay_dataset_log(volume, &l)
-                .await
-                .map_err(|e| CommitError::Retry(format!("replaying '{}': {}", volume, e)))?;
+        match log {
+            // A log of an older grant of the lease: its holder is gone, so
+            // replay it. Only that log (`replay_dataset_log` replays only
+            // if it's still the one in place, under the tx).
+            Some(l) if l.ds.epoch < ds.epoch => {
+                self.fs
+                    .replay_dataset_log(volume, &l)
+                    .await
+                    .map_err(|e| CommitError::Retry(format!("replaying '{}': {}", volume, e)))?;
+            }
+            // A newer grant's log: this claim is a late one, from a holder
+            // since superseded (its check above ran on a view, or before a
+            // wait). Never replay a newer holder's live log (I-14a).
+            Some(l) if l.ds.epoch > ds.epoch => {
+                return Err(CommitError::refused(
+                    ErrorKind::Conflict,
+                    format!(
+                        "'{}' has a log of a newer {} lease (epoch {}, not {})",
+                        volume,
+                        dataset_resource(volume),
+                        l.ds.epoch,
+                        ds.epoch
+                    ),
+                ));
+            }
+            // Its own (or none).
+            _ => {}
         }
         Ok(())
     }
@@ -884,29 +1054,55 @@ impl<D: BlockDevice> Committer<D> {
         }
     }
 
+    /// Whether no intent log written into `writer`'s lent space stands (its
+    /// replay failed, or couldn't be fenced yet, or its dataset's holder is
+    /// still live): such a log's records are in that space, so it stays
+    /// the writer's until the log is replayed (I-13). Not known: one may.
+    async fn no_log_of(&self, writer: &LeaseRef) -> bool {
+        match self.fs.dataset_logs().await {
+            Ok(logs) => !logs.iter().any(|(_, l)| l.writer == *writer),
+            Err(e) => {
+                eprintln!("committer: reading the intent logs: {}; not reclaiming", e);
+                false
+            }
+        }
+    }
+
     /// Take back metaslabs whose writer is gone (its lease taken over,
     /// released, or expired), after replaying any intent log it left.
     pub async fn reclaim(&self) {
         self.replay_orphaned_logs().await;
-        let state = self.auth.state();
-        let now = now_ms();
-        let lends = self.lends.lock().unwrap().clone();
-        for (idx, l) in lends {
-            // A lend in doubt goes back at once (its writer wasn't told), and
-            // a return that got no answer is sent again.
-            let gone = match &l {
-                Lend::InDoubt { .. } | Lend::Returning { .. } => true,
-                Lend::Active { writer, .. } => match state.leases.get(&writer.resource) {
-                    Some(l) => {
-                        l.epoch != writer.epoch
-                            || l.released
-                            || l.expires_ms.saturating_add(RECLAIM_GRACE_MS) < now
-                    }
-                    // Not visible here yet: a lend this node's view hasn't caught up with.
-                    None => false,
-                },
+        // In order: the same each time (and for tests to interleave with).
+        let mut lent: Vec<MetaslabIdx> = self.lends.lock().unwrap().keys().copied().collect();
+        lent.sort();
+        for idx in lent {
+            // Looked at again under the slot: it may have been given back
+            // (or lent again) since (I-12).
+            let Some(slot) = self.slot(idx).await else {
+                continue;
             };
-            if gone && let Err(e) = self.take_back(idx).await {
+            let Some(l) = self.lends.lock().unwrap().get(&idx).cloned() else {
+                continue;
+            };
+            // A lend in doubt goes back at once (its writer wasn't told), and
+            // a return that got no answer is sent again. A reclaim (sent, or
+            // to send) only if no intent log of its writer stands: asked
+            // now, under the slot, like the writer's lease (I-13 review).
+            let gone = match &l {
+                Lend::InDoubt { .. } | Lend::Returning { reclaim: false, .. } => true,
+                Lend::Returning {
+                    writer,
+                    reclaim: true,
+                    ..
+                } => self.no_log_of(writer).await,
+                // Asked now, under the slot: a state from before the wait
+                // may predate this very lend's writer (I-12 review).
+                Lend::Active { writer, .. } => {
+                    writer_gone(&self.auth.state(), writer, now_ms())
+                        && self.no_log_of(writer).await
+                }
+            };
+            if gone && let Err(e) = self.take_back(&slot, idx, true).await {
                 eprintln!("committer: taking back metaslab {}: {}", idx, e);
             }
         }
@@ -925,6 +1121,8 @@ impl<D: BlockDevice> Committer<D> {
             .map(|_| ())
     }
 
+    /// Who holds `name`'s `ds/` lease, as this node's view has it: only a
+    /// hint (it may lag); `hold_dataset` is the check that counts.
     fn in_use(&self, name: &str) -> Option<String> {
         let state = self.auth.state();
         state
@@ -932,21 +1130,82 @@ impl<D: BlockDevice> Committer<D> {
             .map(|l| l.holder.to_string())
     }
 
+    /// Take dataset `name`'s `ds/` lease for an admin op (`doing`, for who
+    /// asks who has it). Held live by anyone (an agent running it): `busy`
+    /// with its holder (I-14b).
+    async fn hold_dataset(
+        &self,
+        name: &str,
+        doing: &str,
+        busy: impl FnOnce(String) -> FileSystemError,
+    ) -> Result<AdminHold, FileSystemError> {
+        let resource = dataset_resource(name);
+        let n = self
+            .admin_holds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Its own owner each time: two holds can't share one grant.
+        let owner = format!("{} (admin {})", self.pool.owner, n);
+        let ttl = crate::cluster::lease::LEASE_TTL;
+        let op = LeaseOp::Acquire {
+            resource: resource.clone(),
+            owner: owner.clone(),
+            holder: Holder::new(HolderRole::Committer, Some(&self.node)).with_detail(doing),
+            ttl_ms: ttl.as_millis() as u64,
+        };
+        let epoch = match self.auth.propose(op).await {
+            Ok(Response::Granted { epoch, .. }) => epoch,
+            Ok(Response::Held { holder, .. }) => return Err(busy(holder.to_string())),
+            other => {
+                return Err(FileSystemError::Unavailable(format!(
+                    "taking {}: {:?}",
+                    resource, other
+                )));
+            }
+        };
+        let holding = Holding::new(owner, epoch);
+        let renew = tokio::spawn({
+            let (auth, resource, holder) = (self.auth.clone(), resource.clone(), holding.clone());
+            async move {
+                loop {
+                    tokio::time::sleep(ttl / 3).await;
+                    let op = LeaseOp::Renew {
+                        resource: resource.clone(),
+                        holder: holder.clone(),
+                        ttl_ms: ttl.as_millis() as u64,
+                    };
+                    if let Ok(Response::Lost) = auth.propose(op).await {
+                        eprintln!("committer: lost {} during an admin op", resource);
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(AdminHold {
+            auth: self.auth.clone(),
+            resource,
+            holding,
+            renew,
+            released: false,
+        })
+    }
+
     pub async fn delete_volume(&self, name: &str) -> Result<(), FileSystemError> {
-        if let Some(by) = self.in_use(name) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' is running ({}); disable or stop it first",
-                name, by
-            )));
+        let hold = self
+            .hold_dataset(name, "deleting it", |by| running(name, &by))
+            .await?;
+        let r = async {
+            if let Some(vm) = self.vm_store().await?.user_of(name).await? {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "volume '{}' is VM '{}''s disk; delete the VM (or take the disk out of it) first",
+                    name, vm
+                )));
+            }
+            self.fs.delete_volume(name).await?;
+            self.fs.sync().await
         }
-        if let Some(vm) = self.vm_store().await?.user_of(name).await? {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' is VM '{}''s disk; delete the VM (or take the disk out of it) first",
-                name, vm
-            )));
-        }
-        self.fs.delete_volume(name).await?;
-        self.fs.sync().await
+        .await;
+        hold.release().await;
+        r
     }
 
     pub async fn set_props(&self, name: &str, props: DatasetProps) -> Result<(), FileSystemError> {
@@ -1041,14 +1300,21 @@ impl<D: BlockDevice> Committer<D> {
                 e.format.name()
             )));
         }
-        if let Some(by) = self.in_use(name) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "dataset '{}' is running ({}); disable it first",
-                name, by
-            )));
+        let hold = self
+            .hold_dataset(name, "deleting it", |by| {
+                FileSystemError::InvalidArgument(format!(
+                    "dataset '{}' is running ({}); disable it first",
+                    name, by
+                ))
+            })
+            .await?;
+        let r = async {
+            self.fs.delete_dataset(name).await?;
+            self.fs.sync().await
         }
-        self.fs.delete_dataset(name).await?;
-        self.fs.sync().await
+        .await;
+        hold.release().await;
+        r
     }
 
     // ---- snapshots (see `crate::snapshot`) ----
@@ -1084,13 +1350,12 @@ impl<D: BlockDevice> Committer<D> {
         r: &mut R,
         force: bool,
     ) -> Result<StreamReport, FileSystemError> {
-        if let Some(by) = self.in_use(name) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' is running ({}); disable or stop it first",
-                name, by
-            )));
-        }
-        self.fs.recv_snapshot(name, r, force).await
+        let hold = self
+            .hold_dataset(name, "receiving a stream into it", |by| running(name, &by))
+            .await?;
+        let report = self.fs.recv_snapshot(name, r, force).await;
+        hold.release().await;
+        report
     }
 
     /// Whether a stream with `header` would be received into `name`.
@@ -1100,24 +1365,22 @@ impl<D: BlockDevice> Committer<D> {
         header: &crate::send::SendHeader,
         force: bool,
     ) -> Result<(), FileSystemError> {
+        // Only a check (nothing changes): the view will do; `recv` takes
+        // the lease.
         if let Some(by) = self.in_use(name) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' is running ({}); disable or stop it first",
-                name, by
-            )));
+            return Err(running(name, &by));
         }
         self.fs.recv_check(name, header, force).await
     }
 
     /// Roll `name` back to its newest snapshot (it must not be running).
     pub async fn rollback(&self, name: &str) -> Result<(), FileSystemError> {
-        if let Some(by) = self.in_use(name) {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "volume '{}' is running ({}); disable or stop it first",
-                name, by
-            )));
-        }
-        self.fs.rollback_volume(name).await
+        let hold = self
+            .hold_dataset(name, "rolling it back", |by| running(name, &by))
+            .await?;
+        let r = self.fs.rollback_volume(name).await;
+        hold.release().await;
+        r
     }
 }
 

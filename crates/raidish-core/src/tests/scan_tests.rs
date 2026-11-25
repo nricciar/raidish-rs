@@ -108,6 +108,66 @@ async fn replaced_disk_is_fenced_then_rebuilt() {
     check_files(&fs, "f", 1, 3).await;
 }
 
+/// I-21: a stripe with buffered (unflushed) writes is skipped by the
+/// scan: it'll be rewritten whole on flush, so nothing on disk was checked
+/// for it. A resilver that skipped one can't bring a disk back in sync.
+#[tokio::test]
+async fn a_resilver_that_skipped_a_stripe_clears_nothing() {
+    let fp = TestPool::new().await.faulty();
+    {
+        let fs = fp.format().await;
+        write_files(&fs, "f", 1, 3).await;
+    }
+    std::fs::File::create(&fp.pool.paths[2])
+        .unwrap()
+        .set_len(crate::test_util::DISK_BYTES)
+        .unwrap();
+
+    let fs = Arc::new(fp.load().await);
+    assert_eq!(fs.degraded_disks()[2], Some(Txg::ZERO));
+    // The vdevs see it too (I-20: a read-modify-write won't read it).
+    let disks = fs.dev.pool().unwrap().disks().clone();
+    assert!(disks.may_lag(2) && !disks.may_lag(0));
+    let lba = first_record(&fs, "/f0").await.lba;
+    let mut block = [0u8; BLOCK_SIZE];
+    fs.dev.read_block(lba, &mut block).await.unwrap();
+
+    // The walk reaches the record, then a write of its block (as it is)
+    // comes in: its stripe is buffered while the walk checks it.
+    let at = TestPool::stripe_offset(lba) / BLOCK_SIZE as u64;
+    for d in [0, 1, 3, 4] {
+        fp.disk(d).hold_reads(Some(at..at + 1));
+    }
+    let scan = tokio::spawn({
+        let fs = fs.clone();
+        async move { fs.resilver().await }
+    });
+    fp.disk(0).wait_reads_held(1).await;
+    fs.dev.write_block(lba, &block).await.unwrap();
+    for d in [0, 1, 3, 4] {
+        fp.disk(d).hold_reads(None);
+    }
+    let report = scan.await.unwrap().unwrap();
+    assert!(
+        report.shards.skipped > 0 && report.cleared.is_empty() && !report.certifies(),
+        "{}",
+        report
+    );
+    assert!(fs.degraded_disks()[2].is_some());
+
+    fs.dev.flush().await.unwrap();
+    let report = fs.resilver().await.unwrap();
+    assert_eq!(report.cleared, vec![2], "{}", report);
+    assert!(!disks.may_lag(2));
+    drop(report);
+    let fs = Arc::into_inner(fs).unwrap();
+    drop(fs);
+    fp.disk(0).set_offline(true);
+    fp.disk(4).set_offline(true);
+    let fs = fp.load().await;
+    check_files(&fs, "f", 1, 3).await;
+}
+
 #[tokio::test]
 async fn scrub_runs_safely_alongside_volume_writes() {
     let pool = TestPool::new().await;

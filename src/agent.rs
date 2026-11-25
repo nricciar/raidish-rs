@@ -656,18 +656,27 @@ impl Agent {
             // No takeover may publish onto this writer from here on (it
             // checks under this lock, and undoes itself); those that did
             // already are taken in with the rest (audit A1).
-            *self.shared.writer.lock().unwrap() = None;
+            let parts = self.shared.writer.lock().unwrap().take();
             self.drop_lost_adopted().await;
             let names: Vec<String> = self.running.keys().cloned().collect();
             self.destroy_vms_using(&names).await;
-            for name in names {
-                self.stop(&name, false).await;
-            }
+            // All at once: each waits out its clients' drain (I-27).
+            let taken: Vec<(String, Running)> = names
+                .into_iter()
+                .filter_map(|n| self.running.remove(&n).map(|r| (n, r)))
+                .collect();
+            let me = &*self;
+            futures::future::join_all(
+                taken
+                    .into_iter()
+                    .map(|(n, r)| async move { me.wind_down(&n, r, false).await }),
+            )
+            .await;
             let names: Vec<String> = self.services.running.keys().cloned().collect();
             for name in names {
                 self.stop_service(&name, false).await;
             }
-            self.drop_proxies();
+            self.drop_proxies(parts).await;
             self.writer = None;
             self.shared.writing.lock().unwrap().clear();
             *self.files.write().unwrap() = None;
@@ -955,7 +964,13 @@ impl Agent {
                 if let Err(e) = self.add_proxy(v, t, !p.for_vm(&v.name)).await {
                     eprintln!("agent: proxying volume '{}': {}", v.name, e);
                 }
-            } else if proxied && (!here || self.running.contains_key(&v.name)) {
+            } else if proxied
+                && (!here
+                    || self.running.contains_key(&v.name)
+                    || self.proxy_transport(&v.name) != p.transport(&v.name, &v.props))
+            {
+                // Gone from here, run here, or now over another transport
+                // (made again next tick).
                 self.remove_proxy(&v.name).await;
             }
         }
@@ -1340,7 +1355,15 @@ impl Agent {
         attach: bool,
     ) -> Result<(), StartError> {
         // Exported here already, proxied to a writer that's gone: that
-        // export is taken over (its clients keep their connections).
+        // export is taken over (its clients keep their connections). Over
+        // another transport it can't be (it would be served over one while
+        // recorded as the other, and never removed): it goes first (I-27).
+        if matches!(
+            self.shared.slots.lock().unwrap().get(&v.name),
+            Some(handoff::Slot::Proxy(p)) if p.transport != transport
+        ) {
+            self.remove_proxy(&v.name).await;
+        }
         let proxy = {
             let mut slots = self.shared.slots.lock().unwrap();
             match slots.remove(&v.name) {
@@ -1705,6 +1728,12 @@ impl Agent {
         let Some(r) = self.running.remove(name) else {
             return;
         };
+        self.wind_down(name, r, clean).await;
+    }
+
+    /// Stop volume `name` out of `running` already (see `stop`). Takes
+    /// only `&self`, so several can go at once.
+    async fn wind_down(&self, name: &str, r: Running, clean: bool) {
         self.shared.writing.lock().unwrap().remove(name);
         if r.info.attach.device().is_some()
             && let Err(e) = self.detach(name, r.info.transport).await
@@ -2230,6 +2259,26 @@ impl Agent {
         }
 
         let r = self.running.remove(name).ok_or("not running here")?;
+        if started.elapsed() > handoff::SENDER_BUDGET {
+            // The receiver stops waiting not long after: transferred now,
+            // the lease could go to an owner nobody renews. Synced, so let
+            // go of it instead: whoever's next starts it (I-27).
+            let _ = wr.write_all(b"ABORT\n").await;
+            let _ = wr.flush().await;
+            r.lease.release().await;
+            self.events.warn(
+                EventKind::VolumeHandoffFailed,
+                Subject::volume(name),
+                format!(
+                    "Volume '{}' took too long to hand from {} to {} ({:?}); stopped here instead",
+                    name,
+                    self.node,
+                    to,
+                    started.elapsed()
+                ),
+            );
+            return Ok(true);
+        }
         let mut transferred = r.lease.transfer(&owner, desc.clone()).await;
         if let Err(crate::cluster::lease::TransferError::NoAnswer(_)) = &transferred {
             // No answer may still have gone through: the same transfer
@@ -2362,32 +2411,72 @@ impl Agent {
                 None => return,
             }
         };
+        let parts = self.shared.writer.lock().unwrap().clone();
+        self.take_down_proxy(name, proxy, parts.as_ref()).await;
+        println!("agent: no longer exporting proxied volume '{}' here", name);
+    }
+
+    /// The transport volume `name` is proxied here over, if it is.
+    fn proxy_transport(&self, name: &str) -> Option<Transport> {
+        match self.shared.slots.lock().unwrap().get(name) {
+            Some(handoff::Slot::Proxy(p)) => Some(p.transport),
+            _ => None,
+        }
+    }
+
+    /// Stop serving `proxy` (out of the slots already): its device, then
+    /// its export (`Proxy::take_down`). It used to be unexported before it
+    /// was retired: the export's drain and last sync retried a writer
+    /// that's gone, `PROXY_RETRY` per request, the agent loop stuck behind
+    /// them (structural triage, `remove_proxy`).
+    async fn take_down_proxy(
+        &self,
+        name: &str,
+        proxy: handoff::Proxy,
+        parts: Option<&handoff::WriterParts>,
+    ) {
+        proxy.io.no_replacement();
+        proxy.peer.retire();
         if proxy.device.is_some()
             && let Err(e) = self.detach(name, proxy.transport).await
         {
             eprintln!("agent: detaching proxied '{}': {}", name, e);
         }
-        let parts = self.shared.writer.lock().unwrap().clone();
-        if let Some(parts) = parts
-            && let Err(e) = parts.remove_export(name, proxy.transport).await
-        {
-            eprintln!("agent: unexporting proxied '{}': {}", name, e);
-        }
-        proxy.peer.retire();
-        println!("agent: no longer exporting proxied volume '{}' here", name);
+        proxy.take_down(name, parts).await;
     }
 
-    /// The writer is gone: so are its exports, proxied ones included.
-    fn drop_proxies(&mut self) {
-        let mut slots = self.shared.slots.lock().unwrap();
-        for s in slots.values() {
-            if let handoff::Slot::Proxy(p) = s {
-                p.peer.retire();
-            }
-        }
-        // A handed-over volume is this node's to stop (`drop_lost_adopted`),
-        // not to forget: its export and VMs would run on.
-        slots.retain(|_, s| matches!(s, handoff::Slot::Adopted { .. }));
+    /// Writer `parts` is gone: so are its exports, proxied ones included,
+    /// devices and all (all at once). A takeover under way holds its
+    /// proxy; its claim goes here too, so it takes that proxy down itself
+    /// when it fails (`Shared::restore`) rather than put it back.
+    async fn drop_proxies(&mut self, parts: Option<handoff::WriterParts>) {
+        let proxies: Vec<(String, handoff::Proxy)> = {
+            let mut slots = self.shared.slots.lock().unwrap();
+            let names: Vec<String> = slots
+                .iter()
+                .filter(|(_, s)| matches!(s, handoff::Slot::Proxy(_)))
+                .map(|(n, _)| n.clone())
+                .collect();
+            let taken = names
+                .into_iter()
+                .filter_map(|n| match slots.remove(&n) {
+                    Some(handoff::Slot::Proxy(p)) => Some((n, p)),
+                    _ => None,
+                })
+                .collect();
+            // A handed-over volume is this node's to stop
+            // (`drop_lost_adopted`), not to forget: its export and VMs
+            // would run on.
+            slots.retain(|_, s| matches!(s, handoff::Slot::Adopted { .. }));
+            taken
+        };
+        let (me, parts) = (&*self, parts.as_ref());
+        futures::future::join_all(
+            proxies
+                .into_iter()
+                .map(|(n, p)| async move { me.take_down_proxy(&n, p, parts).await }),
+        )
+        .await;
     }
 
     async fn helper(&self, args: &[&str]) -> Result<Option<String>, String> {

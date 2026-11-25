@@ -48,7 +48,10 @@ pub fn spawn_health_monitor<D: BlockDevice + 'static>(
                             if let Some(ev) = &events {
                                 ev.clear(&Subject::Pool);
                                 let line = report.summary();
-                                if report.is_clean() {
+                                // Clean but not certifying (a stripe being
+                                // written, labels only on degraded disks):
+                                // nothing cleared yet, retried.
+                                if report.certifies() {
                                     ev.info(
                                         EventKind::ResilverDone,
                                         Subject::Pool,

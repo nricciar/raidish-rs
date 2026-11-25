@@ -64,6 +64,84 @@ enum SyncJob<'a> {
     Single(u64, &'a [u8]),
 }
 
+/// What a `build_tree` call has allocated so far: what it pushed to the
+/// caller's `allocated`, and the runs it reserved and hasn't written yet.
+/// Dropped armed (the call given up on partway, as in a commit whose
+/// caller hung up: structural triage I-1), all of it is given back as
+/// unsettled, since writes to it may still land (see `tx::Unwritten`).
+pub(crate) struct Unsettled<'a> {
+    pub(crate) ptrs: &'a mut Vec<BlockPtr>,
+    /// Where this call's pushes to `ptrs` start.
+    from: usize,
+    /// Runs allocated, neither written nor released yet.
+    reserved: Vec<(u64, u64)>,
+    metaslabs: Arc<Vec<Arc<tokio::sync::RwLock<crate::metaslab::MetaslabState>>>>,
+    layout: crate::metaslab::MetaslabLayout,
+    writer: bool,
+    armed: bool,
+}
+
+impl<'a> Unsettled<'a> {
+    /// Guard what's pushed to `ptrs` from now on (not what's already in
+    /// it): `build_tree`'s allocations.
+    pub(crate) fn added<D: BlockDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+        Self::from(fs, ptrs.len(), ptrs)
+    }
+
+    /// Guard everything in `ptrs`, as it is when dropped: a list the
+    /// caller works through, popping each one it's done with.
+    pub(crate) fn all<D: BlockDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+        Self::from(fs, 0, ptrs)
+    }
+
+    fn from<D: BlockDevice>(fs: &FileSystem<D>, from: usize, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+        Unsettled {
+            from,
+            ptrs,
+            reserved: Vec::new(),
+            metaslabs: fs.metaslabs.clone(),
+            layout: fs.layout,
+            writer: fs.writer.is_some(),
+            armed: true,
+        }
+    }
+
+    /// Nothing more to give back: the caller has it all.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// The run at `start` is written (its pointers pushed) or released.
+    fn settled(&mut self, start: u64) {
+        if let Some(i) = self.reserved.iter().position(|&(s, _)| s == start) {
+            self.reserved.swap_remove(i);
+        }
+    }
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Popped below where it started (`all`'s caller works through it).
+        let from = self.from.min(self.ptrs.len());
+        let ptrs = self.ptrs.drain(from..).map(|p| {
+            let e = p.extent();
+            (e.start, e.len)
+        });
+        for (start, len) in ptrs.chain(self.reserved.drain(..)) {
+            drop(crate::tx::Unwritten::new(
+                start,
+                len,
+                self.metaslabs.clone(),
+                self.layout,
+                self.writer,
+            ));
+        }
+    }
+}
+
 pub(crate) type Indirect = Vec<Option<BlockPtr>>;
 
 #[derive(Debug, Clone)]
@@ -903,10 +981,11 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Give back the space pre-allocated for runs that were never written.
-    async fn release_jobs(&self, jobs: &[SyncJob<'_>]) {
+    async fn release_jobs(&self, jobs: &[SyncJob<'_>], g: &mut Unsettled<'_>) {
         for job in jobs {
             if let SyncJob::Run { start, len, .. } = job {
                 self.unallocate(*start, *len).await;
+                g.settled(*start);
             }
         }
     }
@@ -958,6 +1037,21 @@ impl<D: BlockDevice> FileSystem<D> {
         allocated: &mut Vec<BlockPtr>,
         replaced: &mut Vec<BlockPtr>,
     ) -> Result<TreeRoot, FileSystemError> {
+        // Dropped before returning, what it allocated is given back (I-1).
+        let mut g = Unsettled::added(self, allocated);
+        let r = self.build_tree_in(obj, records, &mut g, replaced).await;
+        debug_assert!(g.reserved.is_empty(), "build_tree left runs reserved");
+        g.disarm();
+        r
+    }
+
+    async fn build_tree_in(
+        &self,
+        obj: &ObjTree,
+        records: &BTreeMap<u64, Dirty>,
+        g: &mut Unsettled<'_>,
+        replaced: &mut Vec<BlockPtr>,
+    ) -> Result<TreeRoot, FileSystemError> {
         let mut span = crate::trace::Span::new("build_tree");
         span.note("records", records.len());
         // 0. Make room for the highest index (growable objects only).
@@ -969,7 +1063,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 Sizing::Growable,
                 "fixed-size object outgrew its tree"
             );
-            self.grow_root(obj, committed.clone(), levels, allocated)
+            self.grow_root(obj, committed.clone(), levels, g.ptrs)
                 .await?
         } else {
             committed.clone()
@@ -1003,7 +1097,7 @@ impl<D: BlockDevice> FileSystem<D> {
             let hint = match self.run_hint(obj, &old_root, first, prev_end).await {
                 Ok(h) => h,
                 Err(e) => {
-                    self.release_jobs(&jobs).await;
+                    self.release_jobs(&jobs, g).await;
                     return Err(e);
                 }
             };
@@ -1016,6 +1110,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     let mut at = e.start;
                     for chunk in run.chunks(run_max) {
                         let len = chunk.len() as u64 * record_blocks;
+                        g.reserved.push((at, len));
                         jobs.push(SyncJob::Run {
                             start: at,
                             len,
@@ -1028,7 +1123,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 }
                 Err(FileSystemError::NoSpace(_)) => run.chunks(run_max).collect(),
                 Err(e) => {
-                    self.release_jobs(&jobs).await;
+                    self.release_jobs(&jobs, g).await;
                     return Err(e);
                 }
             };
@@ -1038,6 +1133,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 match self.allocate_run(len, hint).await {
                     Ok(e) => {
                         prev_end = Some((chunk[chunk.len() - 1].0, e.start + e.len));
+                        g.reserved.push((e.start, e.len));
                         jobs.push(SyncJob::Run {
                             start: e.start,
                             len: e.len,
@@ -1048,7 +1144,7 @@ impl<D: BlockDevice> FileSystem<D> {
                         jobs.extend(chunk.iter().map(|&(i, b)| SyncJob::Single(i, b)));
                     }
                     Err(e) => {
-                        self.release_jobs(&jobs).await;
+                        self.release_jobs(&jobs, g).await;
                         return Err(e);
                     }
                 }
@@ -1059,9 +1155,9 @@ impl<D: BlockDevice> FileSystem<D> {
         span.mark("alloc");
         // (Futures are boxed explicitly: a combinator chain over borrowed
         // records trips rustc's higher-ranked Send inference, #100013.)
-        type Job<'a> = Pin<
-            Box<dyn Future<Output = Result<Vec<(u64, BlockPtr)>, FileSystemError>> + Send + 'a>,
-        >;
+        // Each job says which reserved run it wrote, if any.
+        type Written = Result<Vec<(u64, BlockPtr)>, FileSystemError>;
+        type Job<'a> = Pin<Box<dyn Future<Output = (Option<(u64, u64)>, Written)> + Send + 'a>>;
         let mut pending = jobs.into_iter();
         let mut in_flight = FuturesUnordered::new();
         let mut failed = None;
@@ -1074,18 +1170,15 @@ impl<D: BlockDevice> FileSystem<D> {
                         records,
                     }) => Box::pin(async move {
                         let datas: Vec<&[u8]> = records.iter().map(|(_, b)| *b).collect();
-                        match self.write_records_at(start, record_blocks, &datas).await {
-                            Ok(ptrs) => Ok(records.iter().map(|(i, _)| *i).zip(ptrs).collect()),
-                            Err(e) => {
-                                // Some of the run may still land.
-                                self.release_unsettled(start, len).await;
-                                Err(e)
-                            }
-                        }
+                        let r = self.write_records_at(start, record_blocks, &datas).await;
+                        let written =
+                            r.map(|ptrs| records.iter().map(|(i, _)| *i).zip(ptrs).collect());
+                        (Some((start, len)), written)
                     }),
-                    Some(SyncJob::Single(idx, buf)) => {
-                        Box::pin(async move { Ok(vec![(idx, self.write_record(buf).await?)]) })
-                    }
+                    Some(SyncJob::Single(idx, buf)) => Box::pin(async move {
+                        let r = self.write_record(buf).await;
+                        (None, r.map(|ptr| vec![(idx, ptr)]))
+                    }),
                     None => break,
                 };
                 in_flight.push(job);
@@ -1093,13 +1186,21 @@ impl<D: BlockDevice> FileSystem<D> {
             // On failure stop scheduling, but drain what's in flight so every
             // successful allocation is recorded and can be released.
             match in_flight.next().await {
-                Some(Ok(written)) => {
+                Some((run, Ok(written))) => {
+                    if let Some((start, _)) = run {
+                        g.settled(start);
+                    }
                     for (idx, ptr) in written {
-                        allocated.push(ptr.clone());
+                        g.ptrs.push(ptr.clone());
                         leaves.push((idx, Some(ptr)));
                     }
                 }
-                Some(Err(e)) => {
+                Some((run, Err(e))) => {
+                    if let Some((start, len)) = run {
+                        // Some of the run may still land.
+                        self.release_unsettled(start, len).await;
+                        g.settled(start);
+                    }
                     failed.get_or_insert(e);
                 }
                 None => break,
@@ -1107,18 +1208,18 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         if let Some(e) = failed {
             let rest: Vec<SyncJob<'_>> = pending.collect();
-            self.release_jobs(&rest).await;
+            self.release_jobs(&rest, g).await;
             return Err(e);
         }
 
         span.mark("data");
         // 2. Indirect blocks, bottom up.
         let changes: BTreeMap<u64, Option<BlockPtr>> = leaves.into_iter().collect();
-        let before = allocated.len();
+        let before = g.ptrs.len();
         let r = self
-            .build_indirects(obj, &old_root, changes, allocated, replaced)
+            .build_indirects(obj, &old_root, changes, g.ptrs, replaced)
             .await;
-        span.note("indirects", allocated.len().saturating_sub(before));
+        span.note("indirects", g.ptrs.len().saturating_sub(before));
         span.mark("indirects");
         r
     }

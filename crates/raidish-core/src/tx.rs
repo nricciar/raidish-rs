@@ -13,11 +13,20 @@
 //! journal is forgotten. A commit that fails leaves its operations applied,
 //! for the next one (its uberblock may even have landed on some disks).
 //! Likewise `Tx::applied` keeps what's been done for a later commit.
+//!
+//! A commit's own in-memory steps aren't journaled but carried in the tx
+//! as its [`CommitTail`]: what the space-map sync took, and whether the
+//! uberblock landed. A commit given up on partway (a flush whose caller
+//! hung up) leaves it there, and the tx settles it as it drops, before the
+//! lock goes: no later commit sees the half (structural triage I-1).
 
 use crate::blkptr::BlockPtr;
-use crate::metaslab::{MetaslabLayout, MetaslabState};
+use crate::fs::Uberblock;
+use crate::metaslab::{MetaslabLayout, MetaslabState, SyncedMetaslab};
 use crate::object::{Dirty, ObjTree};
+use crate::types::Txg;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 type Metaslabs = Arc<Vec<Arc<RwLock<MetaslabState>>>>;
@@ -38,6 +47,20 @@ pub(crate) enum Undo {
 #[derive(Clone, Copy, Debug)]
 struct Savepoint(usize);
 
+/// A commit's in-memory steps past the point of no return (see the module
+/// docs): settled by `Tx::settle_commit`, or by the tx's drop if the commit
+/// was given up on first (`crate::metaslab::settle_tail`).
+pub(crate) struct CommitTail {
+    pub(crate) txg: Txg,
+    /// Metaslabs whose space maps were written for `txg`.
+    pub(crate) synced: Vec<SyncedMetaslab>,
+    /// The uberblock for `txg` is durable: advance to it. Otherwise what
+    /// `synced` took is put back.
+    pub(crate) landed: bool,
+    /// The landed uberblock, until it's in memory.
+    pub(crate) uberblock: Option<Uberblock>,
+}
+
 /// The commit lock, held, and the changes made under it since the last
 /// commit (see the module docs).
 pub struct Tx {
@@ -46,9 +69,14 @@ pub struct Tx {
     undo: Vec<Undo>,
     /// In a commit: nothing it does is journaled (or ever undone).
     committing: bool,
+    /// The running commit's unsettled steps.
+    tail: Option<CommitTail>,
     objects: Arc<ObjTree>,
     metaslabs: Metaslabs,
     layout: MetaslabLayout,
+    /// What settling a commit tail touches beyond the metaslabs.
+    scan_hold: Arc<AtomicUsize>,
+    uberblock: Arc<Mutex<Option<Uberblock>>>,
 }
 
 impl Tx {
@@ -57,6 +85,8 @@ impl Tx {
         objects: Arc<ObjTree>,
         metaslabs: Metaslabs,
         layout: MetaslabLayout,
+        scan_hold: Arc<AtomicUsize>,
+        uberblock: Arc<Mutex<Option<Uberblock>>>,
     ) -> Tx {
         let guard = lock.clone().lock_owned().await;
         Tx {
@@ -64,9 +94,12 @@ impl Tx {
             lock: lock.clone(),
             undo: Vec::new(),
             committing: false,
+            tail: None,
             objects,
             metaslabs,
             layout,
+            scan_hold,
+            uberblock,
         }
     }
 
@@ -117,7 +150,38 @@ impl Tx {
     }
 
     pub(crate) fn end_commit(&mut self) {
+        debug_assert!(self.tail.is_none(), "commit ended unsettled");
         self.committing = false;
+    }
+
+    /// The running commit's tail (for TXG `txg`), started if need be.
+    pub(crate) fn commit_tail(&mut self, txg: Txg) -> &mut CommitTail {
+        debug_assert!(self.committing, "commit tail outside a commit");
+        let tail = self.tail.get_or_insert_with(|| CommitTail {
+            txg,
+            synced: Vec::new(),
+            landed: false,
+            uberblock: None,
+        });
+        debug_assert_eq!(tail.txg, txg, "one tail per commit");
+        tail
+    }
+
+    /// The commit's uberblock is durable: settling advances to it. Call
+    /// with no await between the write finishing and this.
+    pub(crate) fn landed(&mut self, uberblock: Uberblock) {
+        let tail = self.commit_tail(uberblock.txg);
+        tail.landed = true;
+        tail.uberblock = Some(uberblock);
+    }
+
+    /// Settle the running commit's tail, if any (see `CommitTail`).
+    pub(crate) async fn settle_commit(&mut self) {
+        if let Some(tail) = self.tail.as_mut() {
+            crate::metaslab::settle_tail(tail, &self.metaslabs, &self.scan_hold, &self.uberblock)
+                .await;
+            self.tail = None;
+        }
     }
 
     /// Undo everything since `sp`.
@@ -152,17 +216,23 @@ impl Tx {
 
 impl Drop for Tx {
     fn drop(&mut self) {
-        if self.undo.is_empty() {
+        if self.undo.is_empty() && self.tail.is_none() {
             return;
         }
-        // Given up on with changes outstanding: undo them, and only then
-        // let the lock go (it moves into the task), so no commit sees them.
+        // Given up on with changes outstanding, or mid-commit: undo the
+        // changes, settle the commit, and only then let the lock go (it
+        // moves into the task), so no other operation or commit sees them.
         let mut undo = std::mem::take(&mut self.undo);
+        let mut tail = self.tail.take();
         let guard = self.guard.take();
         let (objects, metaslabs, layout) =
             (self.objects.clone(), self.metaslabs.clone(), self.layout);
+        let (scan_hold, uberblock) = (self.scan_hold.clone(), self.uberblock.clone());
         let task = async move {
             undo_to(&mut undo, 0, &objects, &metaslabs, layout).await;
+            if let Some(tail) = tail.as_mut() {
+                crate::metaslab::settle_tail(tail, &metaslabs, &scan_hold, &uberblock).await;
+            }
             drop(guard);
         };
         match tokio::runtime::Handle::try_current() {

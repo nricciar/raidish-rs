@@ -79,6 +79,12 @@ fn errno(e: &crate::fs::FileSystemError) -> u32 {
 
 /// Largest READ/WRITE payload we accept (the kernel caps NBD I/O at 32 MiB).
 const MAX_REQUEST_BYTES: u32 = 32 << 20;
+/// Requests one connection may have in flight, and the READ/WRITE payload
+/// they may hold between them (`crate::net::InFlight`). The kernel client
+/// queues up to 128 by default; past this, the connection isn't read until
+/// one finishes.
+pub(crate) const MAX_IN_FLIGHT: usize = 128;
+pub(crate) const MAX_IN_FLIGHT_BYTES: u32 = 128 << 20;
 /// Largest option payload we accept during haggling (names are <= 4 KiB).
 const MAX_OPTION_BYTES: u32 = 64 << 10;
 /// Address the block servers bind to unless told otherwise.
@@ -463,6 +469,7 @@ where
     let name = Arc::new(name.to_string());
     let mut tasks = JoinSet::new();
     let mut closed = Some(session.close_signal());
+    let budget = crate::net::InFlight::new(MAX_IN_FLIGHT, MAX_IN_FLIGHT_BYTES);
 
     loop {
         let (cmd, handle, offset, length) = tokio::select! {
@@ -501,10 +508,17 @@ where
             continue;
         }
 
+        // Room for it first (a WRITE's payload isn't read until then).
+        let payload = match cmd {
+            NBD_CMD_READ | NBD_CMD_WRITE => length as usize,
+            _ => 0,
+        };
+        let admitted = budget.admit(payload).await;
         let (io, writer) = (io.clone(), writer.clone());
         match cmd {
             NBD_CMD_READ => {
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let mut buf = vec![0u8; length as usize];
                     match io.read(offset, &mut buf).await {
                         Ok(n) => {
@@ -522,6 +536,7 @@ where
                 let mut buf = vec![0u8; length as usize];
                 reader.read_exact(&mut buf).await?;
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let error = match io.write(offset, &buf).await {
                         Ok(n) if n == buf.len() => 0,
                         Ok(_) => EIO,
@@ -535,6 +550,7 @@ where
             }
             NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES => {
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let error = match io.zero(offset, length as usize).await {
                         Ok(_) => 0,
                         Err(e) => {
@@ -547,6 +563,7 @@ where
             }
             NBD_CMD_FLUSH => {
                 tasks.spawn(async move {
+                    let _admitted = admitted;
                     let error = match io.flush().await {
                         Ok(()) => 0,
                         Err(e) => {
@@ -576,4 +593,4 @@ where
 
 #[cfg(test)]
 #[path = "tests/nbd_tests.rs"]
-mod tests;
+pub(crate) mod tests;

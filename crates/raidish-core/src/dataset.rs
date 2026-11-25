@@ -141,9 +141,9 @@ impl Dataset {
 
 /// Ends a sync that was given up on (records back to dirty), unless
 /// disarmed (`taken = None`) by the sync ending normally.
-struct EndSyncOnDrop<'a> {
-    obj: &'a ObjTree,
-    taken: Option<Arc<BTreeMap<u64, Dirty>>>,
+pub(crate) struct EndSyncOnDrop<'a> {
+    pub(crate) obj: &'a ObjTree,
+    pub(crate) taken: Option<Arc<BTreeMap<u64, Dirty>>>,
 }
 
 impl Drop for EndSyncOnDrop<'_> {
@@ -230,7 +230,42 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Tree dataset `name`, opened (once per process: later calls share it).
+    ///
+    /// A writer opens only the datasets it runs (`attach_dataset`). Its
+    /// lease is what makes writing one safe, and one let go of stays shut:
+    /// a client still draining when `detach_dataset` gave up on it would
+    /// otherwise open it again from disk and buffer writes nothing will
+    /// ever commit, which then fail every later unscoped `sync` and count
+    /// against the dirty limit (structural triage I-23).
     pub async fn open_dataset(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
+        if let Some(w) = &self.writer {
+            // Attached means open (`attach_dataset` opens before it records
+            // the attachment; only `abandon_dataset` closes one, after it
+            // drops the attachment). So it's looked up, never loaded, under
+            // the attachment's lock: loaded, a client that saw the
+            // attachment just before it went could open the volume again.
+            let attached = w.datasets.lock().unwrap();
+            if !attached.contains_key(name) {
+                return Err(FileSystemError::InvalidArgument(format!(
+                    "volume '{}' isn't attached",
+                    name
+                )));
+            }
+            return self
+                .open_datasets
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| {
+                    FileSystemError::InvalidArgument(format!("volume '{}' isn't open", name))
+                });
+        }
+        self.load_dataset(name).await
+    }
+
+    /// `open_dataset` without a writer's attachment check (for attaching).
+    pub(crate) async fn load_dataset(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
         if let Some(v) = self.open_datasets.lock().unwrap().get(name) {
             return Ok(v.clone());
         }
@@ -561,34 +596,40 @@ impl<D: BlockDevice> FileSystem<D> {
             }
         };
 
+        // Given up on before the dnode points at it, the new tree is
+        // given back (structural triage I-1).
+        let mut unsettled = crate::object::Unsettled::all(self, &mut allocated);
         // Point the dnode at the new tree; only then is anything freed.
         // Not folding: the log stays as the dnode has it, whatever `vol.log`
         // says (a replay clears that before the commit that makes its
         // writes durable: a holes-only retry mustn't drop the log under
         // writes it didn't commit, audit S4b).
-        if let Err(e) = self
+        let held = match self
             .update_dataset_dnode_with(tx, vol, new_root.ptr.clone(), !fold)
             .await
         {
-            self.release_ptrs(&allocated).await;
-            return Err(e);
-        }
+            Ok(held) => held,
+            Err(e) => {
+                unsettled.disarm();
+                self.release_ptrs(unsettled.ptrs).await;
+                return Err(e);
+            }
+        };
+        unsettled.disarm();
         // Readers switch to the new tree only now (they see `syncing` until then).
         vol.obj.set_root(new_root);
-        // What a snapshot still has stays (see `crate::snapshot`).
-        let held = self.held_txg_of(vol.id).await?;
-        self.free_unheld(
-            tx,
-            replaced
-                .iter()
-                .map(|p| crate::types::Born {
-                    extent: p.extent(),
-                    birth: p.birth_txg,
-                })
-                .collect(),
-            held,
-        )
-        .await
+        // What a snapshot still has stays (see `crate::snapshot`): dropped
+        // from the list before it's guarded, so a give back on cancel can
+        // never free a snapshot's block.
+        replaced.retain(|p| p.birth_txg > held);
+        // As in `sync_table`: the rest freed all the same if given up on (I-1).
+        let mut left = crate::object::Unsettled::all(self, &mut replaced);
+        while let Some(p) = left.ptrs.last().cloned() {
+            self.free(tx, p.lba, p.asize as u64).await?;
+            left.ptrs.pop();
+        }
+        left.disarm();
+        Ok(())
     }
 
     /// Rewrite `vol`'s dnode (in the open TXG) with tree root `root` and
@@ -599,19 +640,24 @@ impl<D: BlockDevice> FileSystem<D> {
         vol: &Dataset,
         root: Option<BlockPtr>,
     ) -> Result<(), FileSystemError> {
-        self.update_dataset_dnode_with(tx, vol, root, false).await
+        self.update_dataset_dnode_with(tx, vol, root, false)
+            .await
+            .map(|_| ())
     }
 
     /// `update_dataset_dnode`; with `keep_log`, the intent log stays as the
-    /// dnode has it rather than `vol.log`.
+    /// dnode has it rather than `vol.log`. Returns the dataset's held TXG
+    /// (`snapshot::held_txg`: blocks born at or before it are its
+    /// snapshots', not the head's to free), read from the same dnode.
     pub(crate) async fn update_dataset_dnode_with(
         &self,
         tx: &mut crate::tx::Tx,
         vol: &Dataset,
         root: Option<BlockPtr>,
         keep_log: bool,
-    ) -> Result<(), FileSystemError> {
+    ) -> Result<crate::types::Txg, FileSystemError> {
         let mut dnode = self.read_dnode(vol.id).await?;
+        let held = crate::snapshot::held_txg(&dnode);
         dnode.tree = crate::object::TreeRoot {
             ptr: root,
             levels: vol.obj.levels(),
@@ -626,7 +672,8 @@ impl<D: BlockDevice> FileSystem<D> {
         if !keep_log {
             head.log = vol.log.lock().unwrap().clone();
         }
-        self.write_dnode(tx, vol.id, Some(dnode)).await
+        self.write_dnode(tx, vol.id, Some(dnode)).await?;
+        Ok(held)
     }
 
     /// Forget an open dataset (on delete); its unsynced writes are discarded.

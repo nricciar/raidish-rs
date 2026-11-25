@@ -69,7 +69,12 @@ pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res
         Via::Token(id) => id.clone(),
         _ => keys::random_id(),
     };
-    let key = AccessKey { id, role, exp };
+    let key = AccessKey {
+        id,
+        role,
+        exp,
+        internal: false,
+    };
     let (access_key_id, secret_access_key) = keys::mint(service_key, &key).map_err(bad)?;
     Ok(KeyResponse {
         access_key_id,

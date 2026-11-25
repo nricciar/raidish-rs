@@ -165,3 +165,18 @@ async fn one_sync_loop_per_file_system() {
     ensure_sync_loop(&fs, "nbd");
     assert_eq!(count(&fs), 1);
 }
+
+/// I-24: a client hanging up syncs (`NBD_CMD_DISC`), and nobody sees that
+/// sync's error. It used to take the poison with it, so the next client's
+/// flush succeeded over writes that were lost. Only a flush takes it.
+#[tokio::test]
+async fn a_sync_leaves_the_poison_for_the_next_flush() {
+    let log = log();
+    let io = SwitchableIo::new(Fake::new("a", &log));
+    io.poison();
+    assert!(io.sync().await.is_err());
+    assert!(io.sync().await.is_err());
+    assert!(io.flush().await.is_err(), "the poison was taken by a sync");
+    io.flush().await.unwrap();
+    io.sync().await.unwrap();
+}

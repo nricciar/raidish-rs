@@ -358,6 +358,36 @@ async fn a_flush_after_an_unclean_writer_change_fails() {
     assert!(!p.lost() && !p.unflushed());
 }
 
+/// I-24 review: writes found lost on a writer change are reported by a
+/// sync (a client hanging up, the export going away) but left for the next
+/// client flush: nobody sees a sync's error, and taking them there let
+/// that flush vouch for writes that were lost.
+#[tokio::test]
+async fn a_sync_leaves_lost_writes_for_the_next_flush() {
+    let s = setup().await;
+    let e = epoch(7);
+    let p = Arc::new(s.proxy(e.clone()));
+    p.write(0, &[1u8; 4096]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), s.writer.nbd.remove_export("vol"))
+        .await
+        .unwrap()
+        .unwrap();
+    s.writer.nbd.add_export("vol").await.unwrap();
+    // A crash: the new writer started afresh, with that write unflushed.
+    s.writer.epoch.store(8, Ordering::SeqCst);
+    s.writer.from.store(0, Ordering::SeqCst);
+    e.store(8, Ordering::SeqCst);
+    let mut buf = [0u8; 4096];
+    p.read(0, &mut buf).await.unwrap();
+    assert!(p.lost());
+
+    assert!(p.sync().await.is_err());
+    assert!(p.lost(), "a sync took the lost writes");
+    assert!(p.flush().await.is_err());
+    p.flush().await.unwrap();
+    p.sync().await.unwrap();
+}
+
 /// I-22: an idle proxy whose last writer went before it reconnected never
 /// judged those writes (`reached` runs on a connection), so `lost` is
 /// still false. A clean handoff from a later writer, which never

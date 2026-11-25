@@ -1896,3 +1896,83 @@ async fn commit_client_remembers_where_the_committer_is() {
         (1, 1, 5)
     );
 }
+
+/// A status that refuses the request for good (auth, a malformed or
+/// oversized body: Rocket answers those in plain text, before the route)
+/// ends the call at once as Refused. It used to fail to parse as JSON and
+/// read as "no committer", so the call resent it: for 10 s here, and
+/// forever from a flush (`commit`). A 5xx still moves on to the next node.
+#[tokio::test]
+async fn commit_client_gives_up_on_a_status_that_refuses_for_good() {
+    use crate::committer::PoolAdmin;
+    use crate::test_util::fake_http_server;
+    use crate::types::ErrorKind;
+    use std::time::Duration;
+    let quick = Duration::ZERO;
+    let text = |s: &str| Some(s.to_string());
+    for (status, kind) in [
+        (401, ErrorKind::Forbidden),
+        (403, ErrorKind::Forbidden),
+        (400, ErrorKind::Invalid),
+        (413, ErrorKind::Invalid),
+        (422, ErrorKind::Invalid),
+    ] {
+        let (url, hits) = fake_http_server(status, text("no"), quick).await;
+        let client = CommitClient::new(vec![url]);
+        let r = tokio::time::timeout(Duration::from_secs(3), client.lease_metaslab(1))
+            .await
+            .unwrap_or_else(|_| panic!("{}: still resending", status));
+        match r {
+            Err(CommitError::Refused { kind: k, .. }) => assert_eq!(k, kind, "{}", status),
+            other => panic!("{}: {:?}", status, other.map(|_| ())),
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{}",
+            status
+        );
+    }
+
+    // A 5xx (perhaps applied: the resend is acknowledged) or a 404 is
+    // worth another try, here or at the next node.
+    for status in [500, 503, 404] {
+        let (url, _) = fake_http_server(status, text("later"), quick).await;
+        let client = CommitClient::new(vec![url.clone()]);
+        assert!(
+            matches!(client.report_events(&[]).await, Err(CommitError::Retry(_))),
+            "{}",
+            status
+        );
+        let here = serde_json::to_string(&Ok::<CommitterInfo, CommitError>(CommitterInfo {
+            node: "node-2".into(),
+            epoch: ep(3),
+        }))
+        .unwrap();
+        let (good, _) = fake_http_server(200, Some(here), quick).await;
+        let client = CommitClient::new(vec![url, good]);
+        assert_eq!(client.committer().await.unwrap().node, "node-2");
+    }
+}
+
+/// I-23: a client still writing after `detach_dataset` let the volume go
+/// (one the drain gave up on). Its write used to open the volume again
+/// from disk and be buffered there, acknowledged, with nothing ever to
+/// commit it: every later `sync` on that writer then failed, the other
+/// volumes' too. It must be refused, and the writer must go on.
+#[tokio::test]
+async fn a_write_after_detach_doesnt_reopen_the_volume() {
+    let s = setup(&["a", "b"]).await;
+    let w = writer(&s, s.pool.dev().await, "w").await;
+    attach(&s, &w, "a", "o").await;
+    attach(&s, &w, "b", "o").await;
+    w.fs.block_write("a", 0, &pattern(8192, 1)).await.unwrap();
+    w.fs.detach_dataset("a").await.unwrap();
+
+    assert!(w.fs.block_write("a", 0, &pattern(8192, 2)).await.is_err());
+    assert!(!w.fs.open_datasets.lock().unwrap().contains_key("a"));
+    w.fs.block_write("b", 0, &pattern(8192, 3)).await.unwrap();
+    w.fs.sync().await.unwrap();
+    assert_eq!(read(&s.committer.fs, "a", 0, 8192).await, pattern(8192, 1));
+    assert_eq!(read(&s.committer.fs, "b", 0, 8192).await, pattern(8192, 3));
+}

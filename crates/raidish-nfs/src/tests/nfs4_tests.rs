@@ -1507,3 +1507,35 @@ fn a_huge_set_time_saturates() {
     let s = attrs::decode(&mut r, 0).unwrap();
     assert_eq!(s.set.mtime_ns, Some(u64::MAX));
 }
+
+/// I-32: SETATTR(size) with the all-ones stateid is anonymous I/O, not a
+/// bypass: an open denying writes refuses it (RFC 8881 §8.2.3). It used to
+/// truncate the file anyway.
+#[tokio::test]
+async fn a_bypass_setattr_doesnt_truncate_a_file_opened_deny_write() {
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    fs.write_file(Path::new("f"), b"0123456789").await.unwrap();
+    let addr = serve(fs.clone()).await;
+    let mut a = V4::connect(addr, "client-a").await;
+    let mut b = V4::connect(addr, "client-b").await;
+    let res = a
+        .call(open(putroot(Ops::new()), a.clientid, "oa", "f", false, 2))
+        .await;
+    assert_eq!(res.status, 0);
+    let truncate = |o: Ops| {
+        o.op(op::LOOKUP, |w| {
+            w.string("f");
+        })
+        .op(op::SETATTR, |w| {
+            put_stateid(w, (u32::MAX, [0xff; 12]));
+            let mut vals = Writer::new();
+            vals.u64(0);
+            write_bitmap(w, &bitmap_of(&[attrs::SIZE]));
+            w.opaque(&vals.buf);
+        })
+    };
+    let res = b.call(truncate(putroot(Ops::new()))).await;
+    assert_eq!(res.status, err::LOCKED);
+    assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"0123456789");
+}

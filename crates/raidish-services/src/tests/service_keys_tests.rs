@@ -74,6 +74,7 @@ fn checking_keys() {
             id: "00112233aabbccdd".into(),
             role: Role::Admin,
             exp: None,
+            internal: false,
         },
     )
     .unwrap();
@@ -85,6 +86,7 @@ fn checking_keys() {
             id: keys::random_id(),
             role: Role::Admin,
             exp: Some(1000),
+            internal: false,
         },
     )
     .unwrap();
@@ -96,4 +98,30 @@ fn checking_keys() {
     // No service key yet: nothing is accepted.
     let none = ServiceAuth::new("us-east-1".into(), fx.verifier.clone(), Arc::new(|| None));
     assert_eq!(none.secret(&id), Err(AuthError::UnknownKey));
+}
+
+/// A node's own keys say so, and the flag is covered by the secret: a
+/// client's key with the flag set is another key, unknown to its secret.
+#[test]
+fn internal_keys_are_marked_and_the_mark_is_signed() {
+    let fx = Fixture::new(vec![]);
+    let k = fx.service_key.clone();
+    let auth = ServiceAuth::new(
+        "us-east-1".into(),
+        fx.verifier.clone(),
+        Arc::new(move || Some(k.clone())),
+    );
+    let (id, secret) = auth.internal().unwrap();
+    assert!(auth.is_internal(&id));
+    assert_eq!(auth.role(&id), crate::pki::Role::Admin);
+    assert_eq!(auth.secret(&id).unwrap(), secret);
+
+    let (user, user_secret) = fx.key(crate::pki::Role::Admin);
+    assert!(!auth.is_internal(&user));
+    let mut parsed = AccessKey::parse(&user).unwrap();
+    parsed.internal = true;
+    let flagged = parsed.encode().unwrap();
+    assert_ne!(flagged, user);
+    assert!(auth.is_internal(&flagged));
+    assert_ne!(auth.secret(&flagged).unwrap(), user_secret);
 }

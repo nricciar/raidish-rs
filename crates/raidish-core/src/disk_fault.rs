@@ -120,6 +120,10 @@ pub struct FaultDisk {
     hold_flushes: watch::Sender<bool>,
     /// How many flushes are waiting on `hold_flushes` right now.
     flushes_held: watch::Sender<usize>,
+    /// Reads overlapping these blocks wait while it's set (`hold_reads`).
+    hold_reads: watch::Sender<Option<Range<u64>>>,
+    /// How many reads are waiting on `hold_reads` right now.
+    reads_held: watch::Sender<usize>,
 }
 
 pub type FaultHandle = Arc<FaultDisk>;
@@ -148,6 +152,8 @@ impl FaultDisk {
             held: watch::channel(0).0,
             hold_flushes: watch::channel(false).0,
             flushes_held: watch::channel(0).0,
+            hold_reads: watch::channel(None).0,
+            reads_held: watch::channel(0).0,
         }))
     }
 
@@ -201,6 +207,21 @@ impl FaultDisk {
     /// New flushes wait until this is turned off (which releases them all).
     pub fn hold_flushes(&self, on: bool) {
         self.hold_flushes.send_replace(on);
+    }
+
+    /// New reads overlapping `blocks` wait until this is turned off
+    /// (`None`, which releases them all).
+    pub fn hold_reads(&self, blocks: Option<Range<u64>>) {
+        self.hold_reads.send_replace(blocks);
+    }
+
+    /// Wait until at least `n` reads are held (panics after 10 s).
+    pub async fn wait_reads_held(&self, n: usize) {
+        let mut rx = self.reads_held.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|&h| h >= n))
+            .await
+            .unwrap_or_else(|_| panic!("{}: never held {} reads", self.path.display(), n))
+            .unwrap();
     }
 
     /// Wait until `n` flushes are being held.
@@ -266,6 +287,7 @@ impl FaultDisk {
         st.target = None;
         drop(st);
         self.hold_flushes.send_replace(false);
+        self.hold_reads.send_replace(None);
     }
 
     // ---- held and deferred writes ----
@@ -412,7 +434,18 @@ impl FaultDisk {
         Ok(self.file.metadata()?.len() / BLOCK_SIZE as u64)
     }
 
-    pub(super) fn read(&self, start: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+    pub(super) async fn read(&self, start: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+        let n = (buf.len() / BLOCK_SIZE) as u64;
+        let mut gate = self.hold_reads.subscribe();
+        let holds = |r: &Option<Range<u64>>| {
+            r.as_ref()
+                .is_some_and(|r| start < r.end && r.start < start + n)
+        };
+        if holds(&gate.borrow_and_update()) {
+            self.reads_held.send_modify(|n| *n += 1);
+            let _ = gate.wait_for(|r| !holds(r)).await;
+            self.reads_held.send_modify(|n| *n -= 1);
+        }
         let mut st = self.st();
         if st.offline {
             return Err(OFFLINE.to_error());

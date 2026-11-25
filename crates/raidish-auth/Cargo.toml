@@ -9,7 +9,7 @@ testutil = ["dep:tempfile", "raidish-types/testutil"]
 
 [dependencies]
 raidish-types = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }

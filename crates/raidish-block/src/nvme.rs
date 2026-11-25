@@ -73,6 +73,15 @@ const C2H_CHUNK: usize = 128 * 1024;
 /// Entries per queue (CAP.MQES + 1).
 pub const QUEUE_ENTRIES: u16 = 128;
 pub const MAX_IO_QUEUES: u16 = 8;
+/// Data a queue's running commands may hold between them (their write
+/// payloads and read buffers, `crate::net::InFlight`). Past it, or past
+/// `QUEUE_ENTRIES` commands, the queue isn't read until one finishes.
+const IN_FLIGHT_BYTES: u32 = 64 << 20;
+/// Write data a queue may have asked for (R2T) and not yet received.
+/// Commands past it wait for their R2T, holding only their SQE.
+const R2T_BUDGET: usize = 16 << 20;
+/// The highest dynamic controller ID (0xfff0 and up are reserved).
+const MAX_CNTLID: u16 = 0xffef;
 
 // Admin opcodes.
 const ADM_GET_LOG_PAGE: u8 = 0x02;
@@ -233,6 +242,8 @@ struct Controller {
     cntlid: u16,
     export: Arc<Export>,
     regs: Mutex<CtrlRegs>,
+    /// Set when its admin queue goes: its I/O queues close too.
+    gone: watch::Sender<bool>,
 }
 
 /// One exported volume: a subsystem with a single namespace.
@@ -519,14 +530,44 @@ async fn handle_connection<D: BlockDevice + Send + Sync + 'static>(
 
     let result = connection_loop(&conn, &mut rd).await;
 
-    // An admin queue going away tears down its controller.
+    // An admin queue going away tears down its controller, and its I/O
+    // queues with it: they used to go on serving with no controller.
     if let Some(q) = conn.queue.lock().unwrap().as_ref()
         && q.qid == 0
     {
         conn.target.ctrls.lock().unwrap().remove(&q.ctrl.cntlid);
+        q.ctrl.gone.send_replace(true);
         trace!("nvme: {}: controller {} removed", conn.peer, q.ctrl.cntlid);
     }
     result
+}
+
+/// A controller ID that no live controller has, the next after the last
+/// one given out (`next`), wrapping within 1..=`MAX_CNTLID`. None when
+/// every one is taken. `next_cntlid` used to just count, and wrap onto
+/// live IDs (and the reserved ones).
+fn alloc_cntlid(next: &AtomicU16, taken: impl Fn(u16) -> bool) -> Option<u16> {
+    for _ in 0..MAX_CNTLID {
+        let mut id = next.load(Ordering::Relaxed);
+        if id == 0 || id > MAX_CNTLID {
+            id = 1;
+        }
+        next.store(if id == MAX_CNTLID { 1 } else { id + 1 }, Ordering::Relaxed);
+        if !taken(id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// The data a command will hold while it runs: its write payload, or
+/// what it reads.
+fn command_bytes(sqe: &Sqe, data: &[u8]) -> usize {
+    if sqe.host_to_ctrl() {
+        data.len()
+    } else {
+        sqe.data_len().min(MAX_TRANSFER)
+    }
 }
 
 async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
@@ -534,9 +575,15 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
     rd: &mut OwnedReadHalf,
 ) -> std::io::Result<()> {
     let mut pending: HashMap<u16, PendingWrite> = HashMap::new();
+    // Writes waiting for room under `R2T_BUDGET` before their R2T is sent.
+    let mut r2t_wait: std::collections::VecDeque<Sqe> = Default::default();
+    let mut r2t_bytes = 0usize;
     let mut tasks = JoinSet::new();
-    // Close signal of the export, once Connect has picked one.
+    let budget = crate::net::InFlight::new(QUEUE_ENTRIES as usize, IN_FLIGHT_BYTES);
+    // Close signal of the export, once Connect has picked one, and (an I/O
+    // queue) of its controller.
     let mut closed: Option<watch::Receiver<bool>> = None;
+    let mut ctrl_gone: Option<watch::Receiver<bool>> = None;
 
     let result = loop {
         while let Some(r) = tasks.try_join_next() {
@@ -555,11 +602,19 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
                     .unwrap()
                     .as_ref()
                     .map(|s| s.close_signal());
+                ctrl_gone = conn
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|q| q.qid != 0)
+                    .map(|q| q.ctrl.gone.subscribe());
             }
             let waiting = closed.is_none();
             tokio::select! {
                 r = &mut read => break Some(r),
                 _ = export_closed(&mut closed) => break None,
+                _ = export_closed(&mut ctrl_gone) => break None,
                 _ = conn.connected.notified(), if waiting => {}
             }
         };
@@ -568,7 +623,10 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
             Some(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
             Some(Err(e)) => break Err(e),
             None => {
-                trace!("nvme: {}: export removed, closing queue", conn.peer);
+                trace!(
+                    "nvme: {}: export or controller gone, closing queue",
+                    conn.peer
+                );
                 break Ok(());
             }
         };
@@ -591,24 +649,28 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
                 } else if need > 0 && inline.is_empty() {
                     // Ask the host for the data; the command runs once it's all here.
                     let ttag = sqe.cid();
-                    if pending.contains_key(&ttag) {
+                    if pending.contains_key(&ttag) || r2t_wait.iter().any(|w| w.cid() == ttag) {
                         break Err(invalid(format!("duplicate outstanding cid {}", ttag)));
                     }
-                    send_r2t(conn, sqe.cid(), ttag, 0, need as u32).await?;
-                    pending.insert(
-                        ttag,
-                        PendingWrite {
-                            sqe,
-                            buf: vec![0u8; need],
-                            received: 0,
-                        },
-                    );
+                    // Waiting on the host's data, these hold no permit, so
+                    // they're bounded here: a host keeps at most a queue's
+                    // worth outstanding.
+                    if pending.len() + r2t_wait.len() >= QUEUE_ENTRIES as usize {
+                        break Err(invalid("more writes outstanding than the queue holds"));
+                    }
+                    r2t_wait.push_back(sqe);
+                    send_r2ts(conn, &mut r2t_wait, &mut pending, &mut r2t_bytes).await?;
                 } else if need > 0 && inline.len() != need {
                     send_completion(conn, sqe.cid(), Completion::generic(SC_DATA_XFER_ERROR))
                         .await?;
                 } else {
-                    let (conn, data) = (conn.clone(), inline.to_vec());
-                    tasks.spawn(async move { execute(&conn, sqe, data).await });
+                    let data = inline.to_vec();
+                    let admitted = budget.admit(command_bytes(&sqe, &data)).await;
+                    let conn = conn.clone();
+                    tasks.spawn(async move {
+                        let _admitted = admitted;
+                        execute(&conn, sqe, data).await
+                    });
                 }
             }
             PDU_H2C_DATA => {
@@ -624,18 +686,29 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
                 let Some(p) = pending.get_mut(&ttag) else {
                     break Err(invalid(format!("H2C data for unknown ttag {}", ttag)));
                 };
+                // In order, as the transport requires: each PDU starts
+                // where the last ended. Overlapping ones used to count
+                // twice, and run the write with the tail never received
+                // (zeros) in it.
                 if data.len() != datal
+                    || datao != p.received
                     || datao + datal > p.buf.len()
                     || datal > MAX_H2C_DATA as usize
                 {
-                    break Err(invalid("H2C data out of range"));
+                    break Err(invalid("H2C data out of range or out of order"));
                 }
                 p.buf[datao..datao + datal].copy_from_slice(data);
                 p.received += datal;
-                if p.received >= p.buf.len() {
+                if p.received == p.buf.len() {
                     let p = pending.remove(&ttag).unwrap();
+                    r2t_bytes -= p.buf.len();
+                    send_r2ts(conn, &mut r2t_wait, &mut pending, &mut r2t_bytes).await?;
+                    let admitted = budget.admit(p.buf.len()).await;
                     let conn = conn.clone();
-                    tasks.spawn(async move { execute(&conn, p.sqe, p.buf).await });
+                    tasks.spawn(async move {
+                        let _admitted = admitted;
+                        execute(&conn, p.sqe, p.buf).await
+                    });
                 }
             }
             PDU_H2C_TERM => {
@@ -655,6 +728,35 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
         let _ = r;
     }
     result
+}
+
+/// Send R2Ts for the writes in `wait`, oldest first, while their data fits
+/// in `R2T_BUDGET` (one always may, when none is outstanding).
+async fn send_r2ts<D: BlockDevice>(
+    conn: &Conn<D>,
+    wait: &mut std::collections::VecDeque<Sqe>,
+    pending: &mut HashMap<u16, PendingWrite>,
+    bytes: &mut usize,
+) -> std::io::Result<()> {
+    while let Some(sqe) = wait.front() {
+        let need = sqe.data_len();
+        if *bytes > 0 && *bytes + need > R2T_BUDGET {
+            break;
+        }
+        let sqe = wait.pop_front().unwrap();
+        let ttag = sqe.cid();
+        send_r2t(conn, sqe.cid(), ttag, 0, need as u32).await?;
+        *bytes += need;
+        pending.insert(
+            ttag,
+            PendingWrite {
+                sqe,
+                buf: vec![0u8; need],
+                received: 0,
+            },
+        );
+    }
+    Ok(())
 }
 
 async fn send_r2t<D: BlockDevice>(
@@ -734,12 +836,24 @@ async fn execute<D: BlockDevice + Send + Sync + 'static>(
             && shutdown_requested(&sqe)
         {
             // Normal or abrupt shutdown (CC.SHN): what was written must be
-            // durable before shutdown is reported complete.
-            if let Err(e) = q.ctrl.export.io.flush().await {
-                eprintln!("nvme: {}: flush on shutdown failed: {}", conn.peer, e);
+            // durable before shutdown is reported complete. A sync, not a
+            // flush: its error goes nowhere but the log, so it mustn't take
+            // a lost-writes poison the next client's flush is owed (like
+            // `NBD_CMD_DISC`; structural triage I-24 review).
+            //
+            // A failed sync fails the Property Set and leaves CC.SHN and
+            // CSTS.SHST as they were: it used to report shutdown complete
+            // (SHST=2) over writes that weren't durable.
+            match q.ctrl.export.io.sync().await {
+                Ok(()) => fabrics(conn, &queue, &sqe, &data),
+                Err(e) => {
+                    eprintln!("nvme: {}: sync on shutdown failed: {}", conn.peer, e);
+                    Some(Completion::generic(SC_INTERNAL))
+                }
             }
+        } else {
+            fabrics(conn, &queue, &sqe, &data)
         }
-        fabrics(conn, &queue, &sqe, &data)
     } else {
         match &queue {
             None => Some(Completion::generic(SC_CMD_SEQ_ERROR)),
@@ -785,7 +899,12 @@ fn fabrics<D: BlockDevice>(
     let target = &conn.target;
     Some(match sqe.fctype() {
         FCT_CONNECT => {
-            if queue.is_some() {
+            // Checked and set under one lock: two Connects pipelined on one
+            // queue each used to see none yet, and make a controller, the
+            // first of them left in `ctrls` for good.
+            let _ = queue;
+            let mut slot = conn.queue.lock().unwrap();
+            if slot.is_some() {
                 return Some(Completion::generic(SC_CMD_SEQ_ERROR));
             }
             if data.len() < 1024 {
@@ -823,7 +942,11 @@ fn fabrics<D: BlockDevice>(
                 if cntlid != 0xffff && cntlid != 0xfffe {
                     return Some(bad(true, 16));
                 }
-                let id = target.next_cntlid.fetch_add(1, Ordering::Relaxed);
+                let mut ctrls = target.ctrls.lock().unwrap();
+                let Some(id) = alloc_cntlid(&target.next_cntlid, |id| ctrls.contains_key(&id))
+                else {
+                    return Some(Completion::generic(SC_INTERNAL));
+                };
                 let ctrl = Arc::new(Controller {
                     cntlid: id,
                     export: export.clone(),
@@ -833,8 +956,9 @@ fn fabrics<D: BlockDevice>(
                         io_queues: 0,
                         kato,
                     }),
+                    gone: watch::Sender::new(false),
                 });
-                target.ctrls.lock().unwrap().insert(id, ctrl.clone());
+                ctrls.insert(id, ctrl.clone());
                 ctrl
             } else {
                 let Some(ctrl) = target.ctrls.lock().unwrap().get(&cntlid).cloned() else {
@@ -854,7 +978,8 @@ fn fabrics<D: BlockDevice>(
             };
 
             let cntlid = ctrl.cntlid;
-            *conn.queue.lock().unwrap() = Some(QueueInfo { qid, sqsize, ctrl });
+            *slot = Some(QueueInfo { qid, sqsize, ctrl });
+            drop(slot);
             *conn.session.lock().unwrap() = Some(session);
             conn.connected.notify_one();
             conn.sqhd.store(0, Ordering::Relaxed);

@@ -23,6 +23,66 @@ pub fn disk_server_base(path: &str) -> Option<String> {
     })
 }
 
+/// A connection's budget for requests in flight: how many, and how many
+/// bytes of payload they hold. A server takes a permit (`admit`) before it
+/// reads or spawns the next request and the task holds it until it has
+/// replied, so a client that pipelines without limit just stops being
+/// read (TCP pushes back) instead of growing tasks and buffers without
+/// bound.
+pub struct InFlight {
+    requests: std::sync::Arc<tokio::sync::Semaphore>,
+    bytes: std::sync::Arc<tokio::sync::Semaphore>,
+    max_bytes: u32,
+}
+
+/// One admitted request's share of an [`InFlight`] budget, given back on drop.
+pub struct Admitted {
+    _request: tokio::sync::OwnedSemaphorePermit,
+    _bytes: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl InFlight {
+    /// At most `requests` at a time, holding at most `bytes` between them.
+    pub fn new(requests: usize, bytes: u32) -> Self {
+        InFlight {
+            requests: std::sync::Arc::new(tokio::sync::Semaphore::new(requests)),
+            bytes: std::sync::Arc::new(tokio::sync::Semaphore::new(bytes as usize)),
+            max_bytes: bytes,
+        }
+    }
+
+    /// Wait for room for one more request holding `bytes`. A request
+    /// larger than the whole budget still runs, once it has it all.
+    pub async fn admit(&self, bytes: usize) -> Admitted {
+        let request = self
+            .requests
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        let n = bytes.min(self.max_bytes as usize) as u32;
+        let bytes = match n {
+            0 => None,
+            n => Some(
+                self.bytes
+                    .clone()
+                    .acquire_many_owned(n)
+                    .await
+                    .expect("never closed"),
+            ),
+        };
+        Admitted {
+            _request: request,
+            _bytes: bytes,
+        }
+    }
+
+    /// How many more requests it would admit now.
+    pub fn available(&self) -> usize {
+        self.requests.available_permits()
+    }
+}
+
 /// How long a TLS handshake may take before the connection is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 

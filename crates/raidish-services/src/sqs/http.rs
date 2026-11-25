@@ -436,6 +436,16 @@ async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Resp
             message: "This access key is read-only.".into(),
         });
     }
+    // A dead-letter move carries a message's history (when it was sent,
+    // how often received): only a node moving one may claim that (I-34).
+    if target == MOVE_MESSAGE && !fe.auth().is_internal(&signed.access_key) {
+        return Err(ErrQ {
+            status: StatusCode::FORBIDDEN,
+            kind: "AccessDenied",
+            query: "AccessDenied",
+            message: format!("{} is internal.", MOVE_MESSAGE),
+        });
+    }
     let host = parts
         .headers
         .get("host")
@@ -818,13 +828,20 @@ fn failed(id: &str, e: ErrQ) -> Value {
     })
 }
 
+/// The internal action a dead-letter move sends a message with: a
+/// SendMessage that also carries `RaidishMoved` (its history), accepted
+/// only from a node's own key. SendMessage itself ignores `RaidishMoved`:
+/// any client could set it, and a `SentMs` of `u64::MAX` overflowed the
+/// retention arithmetic (I-34).
+pub const MOVE_MESSAGE: &str = "RaidishMoveMessage";
+
 fn new_msg(e: &Value, sender: &str) -> Result<NewMsg, ErrQ> {
     if e.get("MessageGroupId").is_some() || e.get("MessageDeduplicationId").is_some() {
         return Err(bad_value(
             "MessageGroupId and MessageDeduplicationId are for FIFO queues, which raidish doesn't support.",
         ));
     }
-    let mut m = NewMsg {
+    let m = NewMsg {
         body: s(e, "MessageBody")
             .ok_or_else(|| missing("MessageBody"))?
             .to_string(),
@@ -834,14 +851,27 @@ fn new_msg(e: &Value, sender: &str) -> Result<NewMsg, ErrQ> {
         sender: sender.to_string(),
         ..Default::default()
     };
-    // A move from a queue whose redrive policy sent it here.
+    Ok(m)
+}
+
+/// A message a dead-letter move sends (`MOVE_MESSAGE`): `new_msg`, with
+/// the history the source queue kept. Times are no later than now (a
+/// message can't have been sent in the future), counts saturate.
+fn moved_msg(e: &Value, sender: &str) -> Result<NewMsg, ErrQ> {
+    let mut m = new_msg(e, sender)?;
     if let Some(mv) = e.get("RaidishMoved") {
-        m.sent_ms = mv.get("SentMs").and_then(Value::as_u64);
-        m.receive_count = mv.get("ReceiveCount").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let now = super::now_ms();
+        m.sent_ms = mv.get("SentMs").and_then(Value::as_u64).map(|t| t.min(now));
+        m.receive_count = mv
+            .get("ReceiveCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
         m.first_receive_ms = mv
             .get("FirstReceiveMs")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(now);
         m.dead_from = s(mv, "From").map(str::to_string);
         if let Some(sd) = s(mv, "Sender") {
             m.sender = sd.to_string();
@@ -872,8 +902,12 @@ async fn queue_op(
     sender: &str,
 ) -> Result<Value, ErrQ> {
     match target {
-        "SendMessage" => {
-            let m = new_msg(input, sender)?;
+        "SendMessage" | MOVE_MESSAGE => {
+            let m = if target == MOVE_MESSAGE {
+                moved_msg(input, sender)?
+            } else {
+                new_msg(input, sender)?
+            };
             let sent = q.send(vec![m]).await?.remove(0)?;
             Ok(Value::Object(sent_json(&sent)))
         }
@@ -1218,7 +1252,7 @@ async fn move_dead(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, dead: Vec<super::De
         if !sys.is_empty() {
             input["MessageSystemAttributes"] = Value::Object(sys);
         }
-        match call(fe, &target, "SendMessage", input).await {
+        match call(fe, &target, MOVE_MESSAGE, input).await {
             Ok(_) => {
                 if let Err(e) = q
                     .remove(super::Receipt {

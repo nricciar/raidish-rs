@@ -516,9 +516,14 @@ impl<D: BlockDevice> FileSystem<D> {
             .collect();
         let mut out = Vec::new();
         for name in names {
-            if let Ok(vol) = self.open_dataset(&name).await
-                && let Some(log) = vol.log.lock().unwrap().clone()
-            {
+            // Gone since listed: no log. Anything else unread may hide one,
+            // and callers act on there being none (I-13 review).
+            let vol = match self.open_dataset(&name).await {
+                Ok(vol) => vol,
+                Err(FileSystemError::FileNotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            if let Some(log) = vol.log.lock().unwrap().clone() {
                 out.push((name, log));
             }
         }

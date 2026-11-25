@@ -12,6 +12,12 @@ use tokio::net::TcpListener;
 
 /// Largest record accepted (a 1 MiB WRITE plus its headers, with room).
 pub const MAX_RECORD: usize = 4 << 20;
+/// Calls one connection may have in flight, and the bytes their records
+/// may hold between them (`crate::net::InFlight`). A session's slots
+/// (`v4::state::MAX_SLOTS`) stay well inside it; past it, the connection
+/// isn't read until a call has replied.
+pub(crate) const MAX_IN_FLIGHT: usize = 256;
+pub(crate) const MAX_IN_FLIGHT_BYTES: u32 = 256 << 20;
 
 pub const AUTH_NONE: u32 = 0;
 pub const AUTH_SYS: u32 = 1;
@@ -204,14 +210,19 @@ async fn connection(
             }
         }
     });
+    let budget = crate::net::InFlight::new(MAX_IN_FLIGHT, MAX_IN_FLIGHT_BYTES);
     let result = loop {
         let record = match read_record(&mut rd).await {
             Ok(Some(r)) => r,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
         };
+        // Held until the reply is queued: the next record isn't read
+        // while there's no room.
+        let admitted = budget.admit(record.len()).await;
         let (dispatch, tx) = (dispatch.clone(), tx.clone());
         tokio::spawn(async move {
+            let _admitted = admitted;
             let mut r = Reader::new(&record);
             let reply = match parse_call(&mut r) {
                 Ok(call) => {
@@ -283,3 +294,7 @@ impl Client {
         (stat, rest)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/rpc_tests.rs"]
+mod tests;

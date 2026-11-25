@@ -138,12 +138,21 @@ pub struct FaultyDev<D> {
     inner: D,
     remaining: std::sync::Arc<std::sync::atomic::AtomicI64>,
     flush_fails: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stall: Stall,
 }
+
+/// Writes touching a block range wait (unacked, unwritten) until the
+/// range is cleared; how many have waited.
+type Stall = (
+    std::sync::Arc<tokio::sync::watch::Sender<Option<std::ops::Range<u64>>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+);
 
 #[derive(Clone)]
 pub struct FaultSwitch(
     std::sync::Arc<std::sync::atomic::AtomicI64>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Stall,
 );
 
 impl FaultSwitch {
@@ -164,20 +173,49 @@ impl FaultSwitch {
     pub fn tripped(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
+    /// Writes touching `range` (pool LBAs) wait until it's cleared
+    /// (`None` lets every waiting one through).
+    pub fn stall_writes(&self, range: Option<std::ops::Range<u64>>) {
+        self.2.0.send_replace(range);
+    }
+    /// Wait until `n` writes in all have stalled.
+    pub async fn wait_stalled(&self, n: usize) {
+        while self.2.1.load(std::sync::atomic::Ordering::SeqCst) < n {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
 }
 
 impl<D> FaultyDev<D> {
     pub fn new(inner: D) -> (Self, FaultSwitch) {
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
         let flush_fails = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stall: Stall = (
+            std::sync::Arc::new(tokio::sync::watch::Sender::new(None)),
+            Default::default(),
+        );
         (
             FaultyDev {
                 inner,
                 remaining: remaining.clone(),
                 flush_fails: flush_fails.clone(),
+                stall: stall.clone(),
             },
-            FaultSwitch(remaining, flush_fails),
+            FaultSwitch(remaining, flush_fails, stall),
         )
+    }
+
+    async fn stalled(&self, b: u64, n: u64) {
+        let hit = |r: &Option<std::ops::Range<u64>>| {
+            r.as_ref().is_some_and(|r| b < r.end && b + n > r.start)
+        };
+        let mut rx = self.stall.0.subscribe();
+        if hit(&rx.borrow_and_update()) {
+            self.stall
+                .1
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = rx.wait_for(|r| !hit(r)).await;
+        }
     }
 
     fn check(&self) -> Result<(), crate::disk::DiskError> {
@@ -225,6 +263,7 @@ impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
         b: u64,
         buf: &[u8; crate::disk::BLOCK_SIZE],
     ) -> Result<(), crate::disk::DiskError> {
+        self.stalled(b, 1).await;
         self.check()?;
         self.inner.write_block(b, buf).await
     }
@@ -233,6 +272,7 @@ impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
         b: u64,
         buf: &[crate::disk::Block],
     ) -> Result<(), crate::disk::DiskError> {
+        self.stalled(b, buf.len() as u64).await;
         self.check()?;
         self.inner.write_blocks(b, buf).await
     }
@@ -338,6 +378,16 @@ pub async fn fake_json_server(
     body: Option<String>,
     delay: std::time::Duration,
 ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    fake_http_server(200, body, delay).await
+}
+
+/// `fake_json_server`, answering with HTTP `status` (`body` is sent as
+/// JSON with a 200, as plain text otherwise, as Rocket's catchers do).
+pub async fn fake_http_server(
+    status: u16,
+    body: Option<String>,
+    delay: std::time::Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -376,7 +426,13 @@ pub async fn fake_json_server(
                     tokio::time::sleep(delay).await;
                     let Some(body) = &body else { return };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        "HTTP/1.1 {} Answer\r\ncontent-type: {}\r\ncontent-length: {}\r\n\r\n{}",
+                        status,
+                        if status == 200 {
+                            "application/json"
+                        } else {
+                            "text/plain"
+                        },
                         body.len(),
                         body
                     );

@@ -689,6 +689,26 @@ impl VolumeIo for PeerIo {
     async fn flush(&self) -> Result<(), FileSystemError> {
         self.call(NBD_CMD_FLUSH, 0, 0, &[]).await?;
         let lost = std::mem::take(&mut self.durability.lock().unwrap().lost);
+        self.lost_result(lost)
+    }
+    /// What this node has to commit for the volume: nothing (the writer
+    /// commits). A flush makes what was written here durable there. Like
+    /// `SwitchableIo::sync`, it reports writes known lost but leaves that
+    /// for a client's flush to take: a sync is a client hanging up or the
+    /// export going away, whose error nobody relying on the writes sees
+    /// (structural triage I-24 review).
+    async fn sync(&self) -> Result<(), FileSystemError> {
+        self.call(NBD_CMD_FLUSH, 0, 0, &[]).await?;
+        let lost = self.durability.lock().unwrap().lost;
+        self.lost_result(lost)
+    }
+    fn retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+}
+
+impl PeerIo {
+    fn lost_result(&self, lost: bool) -> Result<(), FileSystemError> {
         if lost {
             return Err(FileSystemError::Unavailable(format!(
                 "volume '{}': writes acknowledged by its previous writer were lost with it",
@@ -696,14 +716,6 @@ impl VolumeIo for PeerIo {
             )));
         }
         Ok(())
-    }
-    /// What this node has to commit for the volume: nothing (the writer
-    /// commits). A flush makes what was written here durable there.
-    async fn sync(&self) -> Result<(), FileSystemError> {
-        self.flush().await
-    }
-    fn retired(&self) -> bool {
-        self.retired.load(Ordering::SeqCst)
     }
 }
 

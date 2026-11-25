@@ -282,6 +282,15 @@ pub struct LabelScan {
     /// First block (in the caller's address space) of every unit for which
     /// no valid contents could be found.
     pub unrecoverable: Vec<u64>,
+    /// First block of every unit decided with stale members' copies voting
+    /// (too few current ones were readable to decide alone) while some
+    /// member's copy couldn't be read at all. That member may hold the
+    /// newer version the stale ones missed, so the decision is only the
+    /// best for now, and no disk is brought back in sync on such a scan:
+    /// a stale member can't vouch for itself (structural triage I-19).
+    /// With every copy read, the stale ones deciding is the best the pool
+    /// can ever do (every member was away at some point), so it counts.
+    pub stale_votes: Vec<u64>,
 }
 
 impl LabelScan {
@@ -289,6 +298,7 @@ impl LabelScan {
         self.check.add(&o.check);
         self.units += o.units;
         self.unrecoverable.extend(o.unrecoverable);
+        self.stale_votes.extend(o.stale_votes);
     }
 }
 

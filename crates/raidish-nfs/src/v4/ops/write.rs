@@ -117,10 +117,12 @@ impl<D: BlockDevice + 'static> Server<D> {
                 if a.kind == ObjType::Directory {
                     return Err(err::ISDIR);
                 }
+                // The all-ones stateid bypasses share reservations only
+                // for READ: with SETATTR it is the anonymous one, so an
+                // open denying writes refuses it (RFC 8881 §8.2.3). It used
+                // to skip the check, and truncate a file opened DENY_WRITE.
                 let sid = ctx.stateid(sid)?;
-                if sid != Stateid::BYPASS {
-                    self.check_io(ctx, &sid, id, true)?;
-                }
+                self.check_io(ctx, &sid, id, true)?;
                 self.backend
                     .setattr(id, &SetAttrs::default(), Some(size))
                     .await

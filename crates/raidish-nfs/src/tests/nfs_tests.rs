@@ -952,3 +952,193 @@ async fn the_forward_route_serves_this_nodes_backend() {
         .await;
     assert_eq!(r.status(), rocket::http::Status::BadRequest);
 }
+
+/// A `DirectSink` whose namespace changes can be made to fail.
+struct FlakySink {
+    inner: DirectSink<Pool>,
+    fail_fs: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl crate::writer::CommitSink for FlakySink {
+    fn writer(&self) -> LeaseRef {
+        self.inner.writer()
+    }
+    async fn lease_metaslab(
+        &self,
+        want: u64,
+    ) -> Result<crate::writer::LentMetaslab, crate::writer::CommitError> {
+        self.inner.lease_metaslab(want).await
+    }
+    async fn return_metaslab(
+        &self,
+        idx: crate::types::MetaslabIdx,
+    ) -> Result<(), crate::writer::CommitError> {
+        self.inner.return_metaslab(idx).await
+    }
+    async fn commit(
+        &self,
+        c: crate::writer::DatasetCommit,
+    ) -> Result<crate::writer::Committed, crate::writer::CommitError> {
+        self.inner.commit(c).await
+    }
+    async fn commit_fs(
+        &self,
+        c: crate::writer::FsCommit,
+    ) -> Result<crate::writer::FsCommitted, crate::writer::CommitError> {
+        if self.fail_fs.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::writer::CommitError::refused(
+                crate::types::ErrorKind::Unavailable,
+                "test: no namespace changes now",
+            ));
+        }
+        self.inner.commit_fs(c).await
+    }
+    async fn claim_dataset(
+        &self,
+        volume: &str,
+        ds: &Holding,
+    ) -> Result<(), crate::writer::CommitError> {
+        self.inner.claim_dataset(volume, ds).await
+    }
+}
+
+/// I-33: a REMOVE (or a RENAME over a file) that fails leaves the file
+/// this node writes as it was: still held, under its `obj/` lease. The
+/// lease used to go first, so the file and its unsynced writes stayed with
+/// no lease. One that succeeds is made under that lease (the committer
+/// refuses it otherwise), and lets it go.
+#[tokio::test]
+async fn a_failed_remove_keeps_the_files_lease() {
+    let pool = TestPool::new().await;
+    drop(pool.format().await);
+    let auth = Arc::new(LocalAuthority::default());
+    let epoch = grant(&auth, &POOL, "c").await;
+    let committer = Arc::new(
+        Committer::new(
+            Arc::new(pool.load().await),
+            auth.clone(),
+            "c".into(),
+            epoch,
+            "n0".into(),
+        )
+        .await,
+    );
+    let resource = "writer/a";
+    let epoch = grant(&auth, resource, "a").await;
+    let sink = Arc::new(FlakySink {
+        inner: DirectSink {
+            committer: committer.clone(),
+            writer: LeaseRef::new(crate::types::res(resource), epoch),
+        },
+        fail_fs: Default::default(),
+    });
+    let fs = Arc::new(
+        FileSystem::load_writer(pool.dev().await, sink.clone())
+            .await
+            .unwrap(),
+    );
+    let leases: Arc<dyn ObjectLeases> = Arc::new(TestLeases(auth.clone()));
+    let (mut a, backend) =
+        serve_with(fs, Some(leases), "a", std::time::Duration::from_secs(600)).await;
+    let (_, root) = a.mnt("/").await;
+    let held = |id| {
+        auth.state()
+            .leases
+            .get(&crate::committer::object_resource(id))
+            .is_some_and(|l| !l.released)
+    };
+
+    for replace in [false, true] {
+        let name = if replace { "g" } else { "f" };
+        let fh = a.make(&root, name, false, 0).await.unwrap();
+        let (st, ..) = a.write(&fh, 0, b"unstable", 0).await;
+        assert_eq!(st, 0);
+        let id = *backend.writing().await.first().expect("held after a write");
+        assert!(held(id));
+        if replace {
+            a.make(&root, "other", false, 0).await.unwrap();
+        }
+
+        sink.fail_fs
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let st = if replace {
+            a.rename(&root, "other", &root, name).await
+        } else {
+            a.remove(&root, name, false).await
+        };
+        assert_ne!(st, status::OK);
+        assert_eq!(backend.writing().await, vec![id], "{}: dropped", name);
+        assert!(held(id), "{}: the lease went with a failed op", name);
+
+        sink.fail_fs
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let st = if replace {
+            a.rename(&root, "other", &root, name).await
+        } else {
+            a.remove(&root, name, false).await
+        };
+        assert_eq!(st, status::OK, "{}: refused under our own lease", name);
+        assert!(backend.writing().await.is_empty());
+        assert!(!held(id), "{}: the lease outlived the file", name);
+    }
+}
+
+/// I-33: a stable WRITE whose sync finds the file gone from under this
+/// node (another node removed it) drops the unstable writes acknowledged
+/// before it: like a COMMIT that finds that, it changes the verifier, so
+/// clients resend them. It used to just answer JUKEBOX.
+#[tokio::test]
+async fn a_stable_write_that_finds_its_writes_dropped_changes_the_verifier() {
+    let pool = TestPool::new().await;
+    drop(pool.format().await);
+    let auth = Arc::new(LocalAuthority::default());
+    let epoch = grant(&auth, &POOL, "c").await;
+    let committer = Arc::new(
+        Committer::new(
+            Arc::new(pool.load().await),
+            auth.clone(),
+            "c".into(),
+            epoch,
+            "n0".into(),
+        )
+        .await,
+    );
+    let mut fss = Vec::new();
+    for id in ["a", "b"] {
+        let resource = format!("writer/{}", id);
+        let epoch = grant(&auth, &resource, id).await;
+        let sink = Arc::new(DirectSink {
+            committer: committer.clone(),
+            writer: LeaseRef::new(crate::types::res(&resource), epoch),
+        });
+        fss.push(Arc::new(
+            FileSystem::load_writer(pool.dev().await, sink)
+                .await
+                .unwrap(),
+        ));
+    }
+    // No object leases: nothing keeps b from removing what a writes.
+    let (mut a, backend) = serve_with(
+        fss[0].clone(),
+        None,
+        "a",
+        std::time::Duration::from_secs(600),
+    )
+    .await;
+    let (_, root) = a.mnt("/").await;
+    let fh = a.make(&root, "f", false, 0).await.unwrap();
+    let (st, _, _, before) = a.write(&fh, 0, b"unstable", 0).await;
+    assert_eq!(st, 0);
+
+    fss[1].refresh_root().await.unwrap();
+    fss[1].delete(Path::new("f")).await.unwrap();
+
+    let (st, ..) = a.write(&fh, 8, b"stable", 2).await;
+    assert_ne!(st, 0);
+    assert_ne!(
+        backend.verifier(),
+        before,
+        "unstable writes dropped under the same verifier"
+    );
+}

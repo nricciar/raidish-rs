@@ -537,3 +537,102 @@ async fn multipart_and_copies() {
         .await;
     assert_eq!(r.status, 404);
 }
+
+/// I-35: a DeleteBucket that ends any way but deleting (here: cancelled
+/// while the committer is out of reach) lets writes in again. The bucket
+/// used to stay closed, every write answered 503, for good.
+#[tokio::test]
+async fn a_cancelled_delete_bucket_reopens_it() {
+    let pool = TestPool::new().await;
+    let s = server(&pool).await;
+    let local = s._fe.local("b").unwrap();
+    let crate::frontend::Local::S3(bk) = &*local else {
+        panic!("b isn't served here");
+    };
+    // No committer endpoints: `delete_service` retries for seconds.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        delete_bucket(&s._fe, bk),
+    )
+    .await;
+    assert!(r.is_err(), "the delete finished");
+    assert!(bk.check_writable().is_ok(), "left closed");
+    let r = s.req("PUT", "/b/after", &[], b"data").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+}
+
+/// I-35: a service delete disables the service first. One that ends any
+/// way but deleting (here: cancelled while it waits for the service to
+/// stop being served) enables it again. It used to stay disabled for good.
+#[tokio::test]
+async fn a_cancelled_delete_service_enables_it_again() {
+    use crate::cluster::LeaseOp;
+    use crate::cluster::state::{POOL, Response};
+    use crate::committer::{Authority, PoolAdmin};
+    let pool = TestPool::new().await;
+    let fs = Arc::new(pool.format().await);
+    fs.create_service("b", DatasetFormat::S3, Default::default())
+        .await
+        .unwrap();
+    let auth = Arc::new(crate::committer::LocalAuthority::default());
+    let op = LeaseOp::Acquire {
+        resource: POOL.clone(),
+        owner: "c".into(),
+        holder: crate::types::Holder::default().with_detail("c"),
+        ttl_ms: 600_000,
+    };
+    let Response::Granted { epoch, .. } = auth.propose(op).await.unwrap() else {
+        panic!("pool lease");
+    };
+    let committer = Arc::new(
+        crate::committer::Committer::new(fs.clone(), auth, "c".into(), epoch, "n0".into()).await,
+    );
+    let slot: crate::committer::CommitterSlot =
+        Arc::new(tokio::sync::RwLock::new(Some(committer.clone())));
+    let fx = Fixture::new(vec![]);
+    let fe = fx.frontend_with(slot);
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "b".to_string(),
+        Route {
+            format: DatasetFormat::S3,
+            port: None,
+            created_ms: 1,
+            owner: Some(Owner {
+                node: "n1".into(),
+                addr: "127.0.0.1".into(),
+            }),
+        },
+    );
+    fe.set_routes(routes, BTreeMap::new());
+    let admin = crate::committer::LocalAdmin::new(committer, None);
+    let enabled = || async {
+        admin
+            .datasets()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "b")
+            .unwrap()
+            .props
+            .enabled
+    };
+    assert!(enabled().await);
+
+    // Still served: the delete waits for that to stop, and is cancelled.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fe.delete_service("b"),
+    )
+    .await;
+    assert!(r.is_err(), "the delete finished");
+    let mut back = false;
+    for _ in 0..100 {
+        if enabled().await {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(back, "left disabled");
+}
