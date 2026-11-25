@@ -3,12 +3,14 @@
 //! nodes (`handoff`). What it has of each is one table (`table`).
 
 pub(crate) mod handoff;
+pub(crate) mod plan;
 mod table;
 
 pub(crate) use table::*;
 
-/// What the VM side may know of the volumes here: read only, so it can't
-/// change what the volume side runs (and tests can give it their own).
+/// What the deciding code may know of the volumes here: read only, so it
+/// can't change what runs (and tests can give it their own). The VM side
+/// reads it, and so do the volume side's plans (`plan`).
 pub(crate) trait VolumeView {
     /// Whether this node has anything of `name` (writes, proxies, or is
     /// handing it to or from here).
@@ -17,6 +19,14 @@ pub(crate) trait VolumeView {
     fn writes(&self, name: &DatasetName) -> bool;
     /// The lease owner `name` is written here under, if it is.
     fn owner_of(&self, name: &DatasetName) -> Option<String>;
+    /// The volumes written here, and how each is exported.
+    fn running(&self) -> Vec<(DatasetName, Transport)>;
+    /// How `name` is exported, if it's written here.
+    fn export_transport(&self, name: &DatasetName) -> Option<Transport>;
+    /// How `name` is exported, if it's proxied here (written elsewhere).
+    fn proxy_transport(&self, name: &DatasetName) -> Option<Transport>;
+    /// The volumes proxied here.
+    fn proxied(&self) -> Vec<DatasetName>;
 }
 
 impl VolumeView for Volumes {
@@ -28,6 +38,18 @@ impl VolumeView for Volumes {
     }
     fn owner_of(&self, name: &DatasetName) -> Option<String> {
         self.owned(name, |o| o.lease.owner.clone())
+    }
+    fn running(&self) -> Vec<(DatasetName, Transport)> {
+        Volumes::running(self)
+    }
+    fn export_transport(&self, name: &DatasetName) -> Option<Transport> {
+        self.owned(name, |o| o.export.transport)
+    }
+    fn proxy_transport(&self, name: &DatasetName) -> Option<Transport> {
+        Volumes::proxy_transport(self, name)
+    }
+    fn proxied(&self) -> Vec<DatasetName> {
+        Volumes::proxied(self)
     }
 }
 
@@ -51,122 +73,88 @@ impl Agent {
     /// transport) once no VM here uses it, handing it over where it can
     /// be; start what belongs here.
     pub(crate) async fn reconcile_volumes(&mut self, p: &Placement) {
-        let running = self.shared.volumes.running();
-        let stop: Vec<DatasetName> = running
-            .iter()
-            .filter(|(name, t)| match p.volume(name) {
-                None => true,
-                Some(v) => {
-                    p.target(name, &v.props).as_deref() != Some(&self.node)
-                        || p.transport(name, &v.props) != Some(*t)
-                }
-            })
-            // In use by a VM here, or a VM's while libvirt can't say.
-            .filter(|(name, _)| !p.vm.pinned(name))
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in stop {
-            // Going to a live node it's attached to (or asked to move to):
-            // hand it over, connections and all. Otherwise stop it here
-            // and let the next node start it.
-            if let Some(v) = p.volume(&name)
-                && let Some(to) = p.target(&name, &v.props)
-                && p.peer_on
-                && to != self.node
-                && p.live.contains(&to)
-                && p.transport(&name, &v.props)
-                    == self.shared.volumes.owned(&name, |o| o.export.transport)
-                && (p.attached(&name).contains(&to)
-                    || v.props.move_to.as_deref() == Some(to.as_str()))
-            {
-                match self.hand_off(&name, &to).await {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => {
-                        eprintln!("agent: handing '{}' to {}: {}", name, to, e);
-                        continue; // still the writer: again next tick
-                    }
-                }
-                if !self.shared.volumes.writes(&name) {
-                    continue;
-                }
-            }
-            println!("agent: stopping volume '{}' here", name);
-            self.stop(&name, true).await;
-            self.note(
-                Level::Info,
-                EventKind::VolumeStopped,
-                Subject::volume(&name),
-                format!("Volume '{}' stopped on {}", name, self.node),
-            );
-        }
-        for v in p.volumes.values() {
-            if self.shared.volumes.writes(&v.name) {
-                continue;
-            }
-            if p.target(&v.name, &v.props).as_deref() != Some(&self.node) {
-                continue;
-            }
-            if p.state.dataset_held(&v.name, p.now) {
-                continue; // someone still has it: wait for them to let go
-            }
-            let Some(t) = p.transport(&v.name, &v.props) else {
-                continue;
-            };
-            if let Err(e) = self.start(v, t, !p.vm.for_vm(&v.name)).await {
-                let e = match e {
-                    StartError::Busy(e) => {
-                        eprintln!("agent: starting volume '{}': {}", v.name, e);
-                        continue;
-                    }
-                    StartError::Failed(e) => e,
-                };
-                self.note_once(
-                    Level::Error,
-                    EventKind::VolumeStartFailed,
-                    Subject::volume(&v.name),
-                    format!(
-                        "Volume '{}' failed to start on {}: {}",
-                        v.name, self.node, e
-                    ),
-                );
-            }
-        }
+        let actions = plan::plan_volumes(p, &self.shared.volumes);
+        self.act_on_volumes(p, actions).await;
     }
 
     /// Exports of volumes attached here and written elsewhere.
     pub(crate) async fn reconcile_proxies(&mut self, p: &Placement) {
-        for v in p.volumes.values() {
-            let here = p.attached(&v.name).contains(&self.node);
-            // Anything else there: written here, or being handed over.
-            let proxied = self.shared.volumes.proxy_transport(&v.name);
-            let slot = self.shared.volumes.has(&v.name);
-            // Only once another node writes it: proxying to nobody, the
-            // kernel's first reads (attaching) would just wait.
-            let elsewhere = p.holder(&v.name).is_some_and(|h| h != self.node);
-            if here && !slot && elsewhere {
-                let Some(t) = p.transport(&v.name, &v.props) else {
-                    continue;
-                };
-                if let Err(e) = self.add_proxy(v, t, !p.vm.for_vm(&v.name)).await {
-                    eprintln!("agent: proxying volume '{}': {}", v.name, e);
+        let actions = plan::plan_proxies(p, &self.shared.volumes);
+        self.act_on_volumes(p, actions).await;
+    }
+
+    /// Carry out what a plan decided. What a step finds when it runs (a
+    /// handoff that can't be done, a volume busy being handed) is handled
+    /// here; the rest was decided.
+    pub(crate) async fn act_on_volumes(&mut self, p: &Placement, actions: Vec<plan::VolumeAction>) {
+        for a in actions {
+            match a {
+                plan::VolumeAction::HandOff { name, to } => {
+                    match self.hand_off(&name, &to).await {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            eprintln!("agent: handing '{}' to {}: {}", name, to, e);
+                            continue; // still the writer: again next tick
+                        }
+                    }
+                    // Not handed over: stop it here, if it's still written here.
+                    if self.shared.volumes.writes(&name) {
+                        self.stop_volume(&name).await;
+                    }
                 }
-            } else if proxied.is_some() && (!here || proxied != p.transport(&v.name, &v.props)) {
-                // Gone from here, or now over another transport
-                // (made again next tick).
-                self.remove_proxy(&v.name).await;
+                plan::VolumeAction::Stop(name) => self.stop_volume(&name).await,
+                plan::VolumeAction::Start {
+                    name,
+                    transport,
+                    attach,
+                } => {
+                    let Some(v) = p.volume(&name) else {
+                        continue;
+                    };
+                    if let Err(e) = self.start(v, transport, attach).await {
+                        let e = match e {
+                            StartError::Busy(e) => {
+                                eprintln!("agent: starting volume '{}': {}", name, e);
+                                continue;
+                            }
+                            StartError::Failed(e) => e,
+                        };
+                        self.note_once(
+                            Level::Error,
+                            EventKind::VolumeStartFailed,
+                            Subject::volume(&name),
+                            format!("Volume '{}' failed to start on {}: {}", name, self.node, e),
+                        );
+                    }
+                }
+                plan::VolumeAction::AddProxy {
+                    name,
+                    transport,
+                    attach,
+                } => {
+                    let Some(v) = p.volume(&name) else {
+                        continue;
+                    };
+                    if let Err(e) = self.add_proxy(v, transport, attach).await {
+                        eprintln!("agent: proxying volume '{}': {}", name, e);
+                    }
+                }
+                plan::VolumeAction::RemoveProxy(name) => self.remove_proxy(&name).await,
             }
         }
-        let gone: Vec<DatasetName> = self
-            .shared
-            .volumes
-            .proxied()
-            .into_iter()
-            .filter(|n| p.volume(n).is_none())
-            .collect();
-        for name in gone {
-            self.remove_proxy(&name).await;
-        }
+    }
+
+    /// Stop volume `name` here, and say so.
+    async fn stop_volume(&mut self, name: &DatasetName) {
+        println!("agent: stopping volume '{}' here", name);
+        self.stop(name, true).await;
+        self.note(
+            Level::Info,
+            EventKind::VolumeStopped,
+            Subject::volume(name),
+            format!("Volume '{}' stopped on {}", name, self.node),
+        );
     }
 
     /// Run volume `v` here, exported over `transport`; `attach` the

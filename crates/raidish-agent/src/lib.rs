@@ -550,5 +550,8 @@ fn hold(lease: &Arc<HeldLease>, cancel: Option<Arc<AtomicBool>>) -> Lost {
 }
 
 #[cfg(test)]
+#[path = "tests/plan_tests.rs"]
+mod plan_tests;
+#[cfg(test)]
 #[path = "tests/agent_tests.rs"]
 mod tests;

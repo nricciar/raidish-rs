@@ -2,6 +2,7 @@
 //! rest, orphans, arrivals, and live migration (`migrate`).
 
 pub(crate) mod migrate;
+pub(crate) mod plan;
 pub(crate) mod state;
 
 use crate::committer::PoolAdmin;
@@ -21,7 +22,7 @@ use std::time::Duration;
 /// What the VMs here ask of the volumes: where theirs go, and which must
 /// stay where they are. Built by the VM side (`Agent::vm_demand`, then
 /// [`VmDemand::saw`]); the volume side only reads it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct VmDemand {
     /// VM volumes, placed by their VM's anchor: its settings (exported
     /// over NBD for qemu, not attached to the host kernel) and its holder.
@@ -260,126 +261,24 @@ impl Agent {
             s.cold_to = state::keep_cold_to(s.cold_to.take(), move_to);
             !s.idle()
         });
+        let now = std::time::Instant::now();
+        let mut actions = Vec::new();
         for v in ours {
-            let name = &v.name;
-            if self.vms.leaving(name) {
-                continue; // leaving: see `poll_migrations`
-            }
-            // Migrated here: left alone while its volumes are proxied here
-            // or being handed over, and made this node's once they run here.
-            if v.meta.owner == crate::vm::DomOwner::Migrating {
-                let vols = self.volumes_here();
-                let incoming = v.meta.volumes.iter().all(|x| vols.has(x));
-                let arrived = v.meta.volumes.iter().all(|x| vols.writes(x));
-                if arrived {
-                    self.arrived(vm, v).await;
-                    continue;
-                }
-                if incoming {
-                    continue;
-                }
-            }
-            // Running without this process holding its disks, or started
-            // under an earlier lease (an orphan of an earlier raidish here:
-            // its NBD connections go nowhere, its writes would be refused).
-            let vols = self.volumes_here();
-            let current = vols
-                .owner_of(&v.meta.anchor)
-                .is_some_and(|o| v.meta.owner.is(&o));
-            if !current || !v.meta.volumes.iter().all(|x| vols.writes(x)) {
-                if let Err(e) = vm.virsh.destroy(name).await {
-                    eprintln!("agent: {}", e);
-                }
-                self.note(
-                    Level::Warn,
-                    EventKind::VmOrphan,
-                    Subject::vm(name),
-                    format!(
-                        "VM '{}' was running on {} without its volumes held there; destroyed it",
-                        name, self.node
-                    ),
-                );
-                self.vms.states.remove(name);
-                continue;
-            }
-            // Ours, its volumes all written here, and no migration of it
-            // recorded: none of them should be attached anywhere.
-            let recorded = p.state.migrations.contains_key(name);
-            for x in state::leaked(&v.meta.volumes, recorded, |x| !p.attached(x).is_empty()) {
-                let op = crate::cluster::LeaseOp::SetAttached {
-                    volume: x.to_string(),
-                    nodes: Vec::new(),
-                };
-                match self.leases.call(&op).await {
-                    Ok(_) => self.note(
-                        Level::Warn,
-                        EventKind::VmMigrationRecovered,
-                        Subject::vm(name),
-                        format!(
-                            "volume '{}' of VM '{}' (running on {}) was attached to {} with no \
-                             migration under way; detached it from all",
-                            x,
-                            name,
-                            self.node,
-                            p.attached(&x).join(", ")
-                        ),
-                    ),
-                    Err(e) => eprintln!("agent: detaching '{}': {}", x, e),
-                }
-            }
-            let wanted = p.state.vms.contains_key(name.as_str())
-                && !vm.restarting(name)
-                && self
-                    .vms
-                    .specs
-                    .get(name)
-                    .is_some_and(|s| s.usable() && anchor_here(p, s));
-            if wanted {
-                self.vms.states.remove(name);
-                continue;
-            }
-            let stop = self.vms.stopping(name).cloned().unwrap_or_default();
-            // Asked to move: live if it can be, instead of shutting down
-            // (not once the shutdown is sent).
-            if stop.shutdown_sent.is_none() && self.start_migration(vm, v, p, &stop) {
-                continue;
-            }
-            let now = std::time::Instant::now();
-            match state::stop_step(stop.shutdown_sent, now, vm.shutdown_timeout) {
-                StopStep::Shutdown => {
-                    self.note(
-                        Level::Info,
-                        EventKind::VmStopping,
-                        Subject::vm(name),
-                        format!("VM '{}' shutting down on {}", name, self.node),
-                    );
-                    if let Err(e) = vm.virsh.shutdown(name).await {
-                        eprintln!("agent: {}", e);
-                    }
-                    self.vms.states.insert(
-                        name.clone(),
-                        VmState::Stopping(Stopping {
-                            shutdown_sent: Some(now),
-                            ..stop
-                        }),
-                    );
-                }
-                StopStep::ForceOff => {
-                    self.note(
-                        Level::Warn,
-                        EventKind::VmForcedOff,
-                        Subject::vm(name),
-                        format!(
-                            "VM '{}' didn't shut down in {:?}; forced it off",
-                            name, vm.shutdown_timeout
-                        ),
-                    );
-                    if let Err(e) = vm.virsh.destroy(name).await {
-                        eprintln!("agent: {}", e);
-                    }
-                }
-                StopStep::Wait => {}
-            }
+            let restarting = vm.restarting(&v.name);
+            let book = &self.vms;
+            let here = self.volumes_here();
+            actions.extend(plan::plan_domain(
+                p,
+                book,
+                here,
+                v,
+                restarting,
+                vm.shutdown_timeout,
+                now,
+            ));
+        }
+        for a in actions {
+            self.act_on_vm(vm, p, ours, a, now).await;
         }
         // Stopped: its domain is gone. (One moving cold whose shutdown
         // wasn't sent yet just goes: there was nothing here to stop.)
@@ -403,6 +302,120 @@ impl Agent {
         // Restarts are done once the old domain is gone (it's started again
         // by `start_wanted_vms`, from the current XML).
         vm.restarts_done(up);
+    }
+
+    /// Carry out one decision of `plan::plan_domain` for a domain in `ours`.
+    async fn act_on_vm(
+        &mut self,
+        vm: &Arc<crate::vm::VmRuntime>,
+        p: &Placement,
+        ours: &[crate::vm::LocalVm],
+        action: plan::VmAction,
+        now: std::time::Instant,
+    ) {
+        use plan::VmAction;
+        let name = match &action {
+            VmAction::Arrived(n)
+            | VmAction::DestroyOrphan(n)
+            | VmAction::DetachLeaked(n, _)
+            | VmAction::Keep(n)
+            | VmAction::Unwanted { vm: n, .. } => n.clone(),
+        };
+        let Some(v) = ours.iter().find(|v| v.name == name) else {
+            return;
+        };
+        match action {
+            VmAction::Arrived(_) => self.arrived(vm, v).await,
+            VmAction::DestroyOrphan(_) => {
+                if let Err(e) = vm.virsh.destroy(&name).await {
+                    eprintln!("agent: {}", e);
+                }
+                self.note(
+                    Level::Warn,
+                    EventKind::VmOrphan,
+                    Subject::vm(&name),
+                    format!(
+                        "VM '{}' was running on {} without its volumes held there; destroyed it",
+                        name, self.node
+                    ),
+                );
+                self.vms.states.remove(&name);
+            }
+            VmAction::DetachLeaked(_, volumes) => {
+                for x in volumes {
+                    let op = crate::cluster::LeaseOp::SetAttached {
+                        volume: x.to_string(),
+                        nodes: Vec::new(),
+                    };
+                    match self.leases.call(&op).await {
+                        Ok(_) => self.note(
+                            Level::Warn,
+                            EventKind::VmMigrationRecovered,
+                            Subject::vm(&name),
+                            format!(
+                                "volume '{}' of VM '{}' (running on {}) was attached to {} with \
+                                 no migration under way; detached it from all",
+                                x,
+                                name,
+                                self.node,
+                                p.attached(&x).join(", ")
+                            ),
+                        ),
+                        Err(e) => eprintln!("agent: detaching '{}': {}", x, e),
+                    }
+                }
+            }
+            VmAction::Keep(_) => {
+                self.vms.states.remove(&name);
+            }
+            VmAction::Unwanted {
+                migrate_to,
+                stop: step,
+                ..
+            } => {
+                if let Some(to) = migrate_to
+                    && self.start_migration(vm, v, &to)
+                {
+                    return;
+                }
+                let stop = self.vms.stopping(&name).cloned().unwrap_or_default();
+                match step {
+                    StopStep::Shutdown => {
+                        self.note(
+                            Level::Info,
+                            EventKind::VmStopping,
+                            Subject::vm(&name),
+                            format!("VM '{}' shutting down on {}", name, self.node),
+                        );
+                        if let Err(e) = vm.virsh.shutdown(&name).await {
+                            eprintln!("agent: {}", e);
+                        }
+                        self.vms.states.insert(
+                            name,
+                            VmState::Stopping(Stopping {
+                                shutdown_sent: Some(now),
+                                ..stop
+                            }),
+                        );
+                    }
+                    StopStep::ForceOff => {
+                        self.note(
+                            Level::Warn,
+                            EventKind::VmForcedOff,
+                            Subject::vm(&name),
+                            format!(
+                                "VM '{}' didn't shut down in {:?}; forced it off",
+                                name, vm.shutdown_timeout
+                            ),
+                        );
+                        if let Err(e) = vm.virsh.destroy(&name).await {
+                            eprintln!("agent: {}", e);
+                        }
+                    }
+                    StopStep::Wait => {}
+                }
+            }
+        }
     }
 
     /// Start the VMs that belong here once all their volumes run here, and
@@ -555,42 +568,20 @@ impl Agent {
         }
     }
 
-    /// Migrate VM `v` (being stopped as `stop` says) live to where its
-    /// anchor is asked to move, if it can be (see `migrate`): true if a
-    /// migration started, false to move it cold.
+    /// Migrate VM `v` live to `to` (`plan::migration_target` decided it
+    /// should): true if the migration started, false to move it cold (`to`
+    /// can't be reached).
     pub(crate) fn start_migration(
         &mut self,
         vm: &Arc<crate::vm::VmRuntime>,
         v: &crate::vm::LocalVm,
-        p: &Placement,
-        stop: &Stopping,
+        to: &str,
     ) -> bool {
         let name = &v.name;
-        if self.peer.is_none() || v.state != crate::vm::DomState::Running {
-            return false;
-        }
-        let Some(spec) = self.vms.specs.get(name).filter(|s| s.usable()) else {
+        let Some(spec) = self.vms.specs.get(name) else {
             return false;
         };
-        let Some((anchor_name, anchor)) = spec.anchor().and_then(|a| Some((a, p.volume(a)?)))
-        else {
-            return false;
-        };
-        // An explicit move to a live node, the VM still wanted running
-        // (not stopped, not restarted), all its disks here.
-        let Some(to) = anchor.props.move_to.clone() else {
-            return false;
-        };
-        if to == self.node
-            || !p.live.contains(&to)
-            || p.target(anchor_name, &anchor.props).as_deref() != Some(to.as_str())
-            || !p.state.vms.contains_key(name.as_str())
-            || vm.restarting(name)
-            || !spec.volumes().iter().all(|x| self.volumes_here().writes(x))
-            || stop.cold_to.as_deref() == Some(to.as_str())
-        {
-            return false;
-        }
+        let to = to.to_string();
         let peers = &self.cluster.members.peers;
         let (Some(url), Some(host)) = (peer_url(peers, &to), peer_host(peers, &to)) else {
             return false;

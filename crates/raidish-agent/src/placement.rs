@@ -84,6 +84,7 @@ pub fn place_on(
 }
 
 /// Where one tick wants each volume, from one look at the cluster state.
+#[derive(Clone)]
 pub(crate) struct Placement {
     /// This node.
     pub(crate) me: String,
