@@ -53,10 +53,9 @@ use crate::cluster::Cluster;
 use crate::cluster::lease::{HeldLease, LeaseClient};
 use crate::committer::PoolAccess;
 use crate::committer::PoolAdmin;
-use crate::events::{EventKind, EventSink, Subject};
+use crate::events::{EventKind, EventSink, Level, Subject};
 use crate::types::DatasetName;
 use crate::types::{Holder, HolderRole, LeaseResource};
-use crate::volume::VolumeInfo;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -163,6 +162,8 @@ pub struct Agent {
     peer: Option<PeerConf>,
     /// This node's facts (`crate::node_facts`).
     facts: crate::node_facts::FactsHandle,
+    /// Attaches volumes' kernel devices (the root helper).
+    attacher: Arc<dyn attach::Attacher>,
 }
 
 /// Peer I/O's TLS and address.
@@ -187,6 +188,7 @@ impl Agent {
         state.write().unwrap().node = node.clone();
         let events = EventSink::new(&node);
         let leases = LeaseClient::new(endpoints.clone());
+        let attacher = Arc::new(attach::Helper::new(&config));
         Agent {
             node,
             cluster,
@@ -203,6 +205,7 @@ impl Agent {
             vm: None,
             vms: VmBook::default(),
             facts: Default::default(),
+            attacher,
             services: Services::default(),
             events,
         }
@@ -325,6 +328,33 @@ impl Agent {
         }
     }
 
+    /// Say what happened, once: in this process's log (`agent: <message>`;
+    /// info to stdout, warnings and errors to stderr) and in the activity
+    /// log (see `events`).
+    pub(crate) fn note(&self, level: Level, kind: EventKind, subject: Subject, message: String) {
+        log(level, &message);
+        match level {
+            Level::Info => self.events.info(kind, subject, message),
+            Level::Warn => self.events.warn(kind, subject, message),
+            Level::Error => self.events.error(kind, subject, message),
+        }
+    }
+
+    /// The same for a condition that's retried (a volume or VM that won't
+    /// start, every tick): noted once, and again only when its message
+    /// changes or `subject` is cleared (`EventSink::once`).
+    pub(crate) fn note_once(
+        &self,
+        level: Level,
+        kind: EventKind,
+        subject: Subject,
+        message: String,
+    ) {
+        if self.events.once(level, kind, subject, message.clone()) {
+            log(level, &message);
+        }
+    }
+
     fn publish(&self) {
         self.state.write().unwrap().volumes = self.shared.volumes.published();
     }
@@ -345,13 +375,13 @@ impl Agent {
             eprintln!("agent: opening the pool as a writer: {}", e);
         }
         self.refresh_vms().await;
-        let place = self.placement(volumes);
+        let mut place = self.placement(volumes);
         // What was handed to this node since the last tick.
-        let handed: Vec<VolumeInfo> = place.volumes.values().cloned().collect();
-        self.adopt_handed_over(&handed).await;
+        self.adopt_handed_over(&place).await;
 
         let doms = self.domains().await;
-        self.reconcile_volumes(&place, &doms).await;
+        place.vm.saw(&doms);
+        self.reconcile_volumes(&place).await;
         if place.peer_on {
             self.reconcile_proxies(&place).await;
         }
@@ -377,8 +407,8 @@ impl Agent {
             self.destroy_vms_using(&lost).await;
         }
         for name in lost {
-            eprintln!("agent: lost the lease on volume '{}'", name);
-            self.events.error(
+            self.note(
+                Level::Error,
                 EventKind::VolumeLost,
                 Subject::volume(&name),
                 format!(
@@ -396,10 +426,10 @@ impl Agent {
             .map(|(n, _)| n.clone())
             .collect();
         for name in lost {
-            eprintln!("agent: lost the lease on dataset '{}'", name);
             let f = self.service_format(&name);
             let label = crate::events::label_of(f);
-            self.events.error(
+            self.note(
+                Level::Error,
                 EventKind::DatasetLost,
                 Subject::dataset(f, &name),
                 format!(
@@ -410,8 +440,8 @@ impl Agent {
             self.stop_service(&name, false).await;
         }
         if self.writer.as_ref().is_some_and(|w| w.lost.is_lost()) {
-            eprintln!("agent: lost the writer lease; dropping every volume");
-            self.events.error(
+            self.note(
+                Level::Error,
                 EventKind::NodeWriterLost,
                 Subject::node(&self.node),
                 format!(
@@ -458,6 +488,14 @@ impl Agent {
             self.writer = None;
             *self.files.write().unwrap() = None;
         }
+    }
+}
+
+/// `message` in this process's log, by `level`.
+fn log(level: Level, message: &str) {
+    match level {
+        Level::Info => println!("agent: {}", message),
+        Level::Warn | Level::Error => eprintln!("agent: {}", message),
     }
 }
 

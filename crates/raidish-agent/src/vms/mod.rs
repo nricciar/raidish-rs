@@ -5,13 +5,62 @@ pub(crate) mod migrate;
 
 use crate::committer::PoolAdmin;
 use crate::events::{EventKind, Level, Subject};
+use crate::inode::{DatasetProps, Transport};
 use crate::placement::Placement;
 use crate::types::DatasetName;
 use crate::vm_store::DefSpec;
+use crate::volume::VolumeInfo;
+use crate::volumes::VolumeView;
 use crate::{Agent, peer_host, peer_url};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// What the VMs here ask of the volumes: where theirs go, and which must
+/// stay where they are. Built by the VM side (`Agent::vm_demand`, then
+/// [`VmDemand::saw`]); the volume side only reads it.
+#[derive(Default)]
+pub(crate) struct VmDemand {
+    /// VM volumes, placed by their VM's anchor: its settings (exported
+    /// over NBD for qemu, not attached to the host kernel) and its holder.
+    pub(crate) place: BTreeMap<DatasetName, (DatasetProps, Option<String>)>,
+    /// Volumes of VMs migrating away from here: kept here until they're
+    /// gone (see `migrate`), whatever their placement says.
+    pub(crate) migrating: BTreeSet<DatasetName>,
+    /// Every volume a VM definition names (usable or not).
+    pub(crate) disks: BTreeSet<DatasetName>,
+    /// Volumes a VM of ours running here uses.
+    pub(crate) in_use: BTreeSet<DatasetName>,
+    /// libvirt couldn't be asked what runs here.
+    pub(crate) libvirt_unknown: bool,
+}
+
+impl VmDemand {
+    /// What libvirt runs here: its domains' volumes stay.
+    pub(crate) fn saw(&mut self, doms: &Domains) {
+        self.in_use = doms.in_use();
+        self.libvirt_unknown = doms.listed.is_err();
+    }
+
+    /// Whether `name` is a VM's volume (exported for qemu, not attached).
+    pub(crate) fn for_vm(&self, name: &DatasetName) -> bool {
+        self.place.contains_key(name)
+    }
+
+    /// Whether `name` must keep running where it is: a VM here uses it, or
+    /// it's a VM's and libvirt can't say whether one does.
+    pub(crate) fn pinned(&self, name: &DatasetName) -> bool {
+        self.in_use.contains(name) || (self.libvirt_unknown && self.for_vm(name))
+    }
+}
+
+/// Whether VM `spec`'s volumes belong on this node.
+pub(crate) fn anchor_here(p: &Placement, spec: &crate::vm::VmSpec) -> bool {
+    spec.anchor().is_some_and(|n| {
+        p.volume(n)
+            .is_some_and(|a| p.target(n, &a.props).as_deref() == Some(p.me.as_str()))
+    })
+}
 
 /// What libvirt runs on this node.
 pub(crate) struct Domains {
@@ -51,6 +100,59 @@ pub(crate) struct VmBook {
 }
 
 impl Agent {
+    /// The volumes here, as the VM side sees them (read only).
+    pub(crate) fn volumes_here(&self) -> &dyn VolumeView {
+        &self.shared.volumes
+    }
+
+    /// What the VMs ask of `volumes`, as far as their definitions and the
+    /// migrations from here say (libvirt's part comes later, `VmDemand::saw`).
+    pub(crate) fn vm_demand(
+        &self,
+        volumes: &BTreeMap<DatasetName, VolumeInfo>,
+        state: &crate::cluster::state::ClusterState,
+        now: u64,
+    ) -> VmDemand {
+        let mut place = BTreeMap::new();
+        if self.vm.is_some() {
+            for spec in self.vms.specs.values().filter(|s| s.usable()) {
+                let Some((anchor_name, anchor)) =
+                    spec.anchor().and_then(|a| Some((a, volumes.get(a)?)))
+                else {
+                    continue;
+                };
+                let props = DatasetProps {
+                    automount: Some(Transport::Nbd),
+                    ..anchor.props.clone()
+                };
+                let h = state.dataset_node(anchor_name, now).map(str::to_string);
+                for v in spec.volumes() {
+                    place
+                        .entry(v.clone())
+                        .or_insert_with(|| (props.clone(), h.clone()));
+                }
+            }
+        }
+        let migrating = self
+            .vms
+            .migrations
+            .values()
+            .flat_map(|m| m.volumes.iter().cloned())
+            .collect();
+        let disks = self
+            .vms
+            .specs
+            .values()
+            .flat_map(|s| s.volumes().iter().cloned())
+            .collect();
+        VmDemand {
+            place,
+            migrating,
+            disks,
+            ..Default::default()
+        }
+    }
+
     /// Which libvirt domains are this node's (those started for this pool,
     /// by its GUID, by this node), and the VM definitions. On a read error
     /// the last ones read are kept: losing them would look like every VM
@@ -139,7 +241,7 @@ impl Agent {
             // Migrated here: left alone while its volumes are proxied here
             // or being handed over, and made this node's once they run here.
             if v.meta.owner == crate::vm::DomOwner::Migrating {
-                let vols = &self.shared.volumes;
+                let vols = self.volumes_here();
                 let incoming = v.meta.volumes.iter().all(|x| vols.has(x));
                 let arrived = v.meta.volumes.iter().all(|x| vols.writes(x));
                 if arrived {
@@ -153,20 +255,16 @@ impl Agent {
             // Running without this process holding its disks, or started
             // under an earlier lease (an orphan of an earlier raidish here:
             // its NBD connections go nowhere, its writes would be refused).
-            let vols = &self.shared.volumes;
+            let vols = self.volumes_here();
             let current = vols
-                .owned(&v.meta.anchor, |o| v.meta.owner.is(&o.lease.owner))
-                .unwrap_or(false);
+                .owner_of(&v.meta.anchor)
+                .is_some_and(|o| v.meta.owner.is(&o));
             if !current || !v.meta.volumes.iter().all(|x| vols.writes(x)) {
-                eprintln!(
-                    "agent: VM '{}' runs here without this node's hold on its volumes \
-                     (an orphan); destroying it",
-                    name
-                );
                 if let Err(e) = vm.virsh.destroy(name).await {
                     eprintln!("agent: {}", e);
                 }
-                self.events.warn(
+                self.note(
+                    Level::Warn,
                     EventKind::VmOrphan,
                     Subject::vm(name),
                     format!(
@@ -183,7 +281,7 @@ impl Agent {
                     .vms
                     .specs
                     .get(name)
-                    .is_some_and(|s| s.usable() && p.anchor_here(s));
+                    .is_some_and(|s| s.usable() && anchor_here(p, s));
             if wanted {
                 self.vms.stopping.remove(name);
                 continue;
@@ -194,8 +292,8 @@ impl Agent {
             }
             match self.vms.stopping.get(name) {
                 None => {
-                    println!("agent: shutting VM '{}' down", name);
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::VmStopping,
                         Subject::vm(name),
                         format!("VM '{}' shutting down on {}", name, self.node),
@@ -208,11 +306,8 @@ impl Agent {
                         .insert(name.clone(), std::time::Instant::now());
                 }
                 Some(t) if t.elapsed() > vm.shutdown_timeout => {
-                    eprintln!(
-                        "agent: VM '{}' didn't shut down in {:?}; destroying it",
-                        name, vm.shutdown_timeout
-                    );
-                    self.events.warn(
+                    self.note(
+                        Level::Warn,
                         EventKind::VmForcedOff,
                         Subject::vm(name),
                         format!(
@@ -229,7 +324,8 @@ impl Agent {
         }
         let up = |n: &str| ours.iter().any(|v| v.name.as_str() == n);
         for n in self.vms.stopping.keys().filter(|n| !up(n)) {
-            self.events.info(
+            self.note(
+                Level::Info,
                 EventKind::VmStopped,
                 Subject::vm(n),
                 format!("VM '{}' stopped on {}", n, self.node),
@@ -252,7 +348,7 @@ impl Agent {
     ) {
         let mut errors = BTreeMap::new();
         for spec in self.vms.specs.values() {
-            if !p.state.vms.contains_key(spec.name.as_str()) || !p.anchor_here(spec) {
+            if !p.state.vms.contains_key(spec.name.as_str()) || !anchor_here(p, spec) {
                 continue;
             }
             // Leaving, or just left, by migration: it runs elsewhere even
@@ -265,7 +361,7 @@ impl Agent {
                 continue;
             }
             if let Some(e) = spec.error() {
-                self.events.once(
+                self.note_once(
                     Level::Warn,
                     EventKind::VmInvalid,
                     Subject::vm(&spec.name),
@@ -283,7 +379,7 @@ impl Agent {
                         "a domain '{}' this node didn't start is running on its libvirt",
                         d.name
                     );
-                    self.events.once(
+                    self.note_once(
                         Level::Warn,
                         EventKind::VmConflict,
                         Subject::vm(&spec.name),
@@ -298,10 +394,10 @@ impl Agent {
             let Some(anchor) = spec.anchor() else {
                 continue;
             };
-            if !spec.volumes().iter().all(|v| self.shared.volumes.writes(v)) {
+            if !spec.volumes().iter().all(|v| self.volumes_here().writes(v)) {
                 continue; // its disks aren't all here yet
             }
-            let Some(owner) = self.shared.volumes.owned(anchor, |o| o.lease.owner.clone()) else {
+            let Some(owner) = self.volumes_here().owner_of(anchor) else {
                 continue;
             };
             let Some(ident) = vm.ident() else {
@@ -315,17 +411,16 @@ impl Agent {
             };
             match started {
                 Ok(()) => {
-                    println!("agent: started VM '{}' here", spec.name);
                     self.events.clear(&Subject::vm(&spec.name));
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::VmStarted,
                         Subject::vm(&spec.name),
                         format!("VM '{}' started on {}", spec.name, self.node),
                     );
                 }
                 Err(e) => {
-                    eprintln!("agent: starting VM '{}': {}", spec.name, e);
-                    self.events.once(
+                    self.note_once(
                         Level::Error,
                         EventKind::VmStartFailed,
                         Subject::vm(&spec.name),
@@ -376,11 +471,8 @@ impl Agent {
             if !uses {
                 continue;
             }
-            eprintln!(
-                "agent: destroying VM '{}' (its volume lease is gone)",
-                d.name
-            );
-            self.events.error(
+            self.note(
+                Level::Error,
                 EventKind::VmKilled,
                 Subject::vm(&d.name),
                 format!(
@@ -425,7 +517,7 @@ impl Agent {
             || p.target(anchor_name, &anchor.props).as_deref() != Some(to.as_str())
             || !p.state.vms.contains_key(name.as_str())
             || vm.restarting(name)
-            || !spec.volumes().iter().all(|x| self.shared.volumes.writes(x))
+            || !spec.volumes().iter().all(|x| self.volumes_here().writes(x))
             || self.vms.migrate_failed.get(name) == Some(&to)
         {
             return false;
@@ -492,13 +584,8 @@ impl Agent {
             }
             match result {
                 Ok(()) => {
-                    println!(
-                        "agent: migrated VM '{}' to {} in {:?}",
-                        name,
-                        m.to,
-                        m.started.elapsed()
-                    );
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::VmMigrated,
                         Subject::vm(&name),
                         format!(
@@ -519,11 +606,8 @@ impl Agent {
                     );
                 }
                 Err(migrate::Failure::NotLive(why)) => {
-                    println!(
-                        "agent: VM '{}' can't move to {} live: {} (moving it cold)",
-                        name, m.to, why
-                    );
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::VmMovingCold,
                         Subject::vm(&name),
                         format!(
@@ -564,7 +648,7 @@ impl Agent {
                 self.vms.migrated.insert(name, m);
                 continue;
             }
-            if m.volumes.iter().any(|v| self.shared.volumes.writes(v)) {
+            if m.volumes.iter().any(|v| self.volumes_here().writes(v)) {
                 self.vms.migrated.insert(name, m);
                 continue;
             }
@@ -604,12 +688,8 @@ impl Agent {
                 migrate::Whereabouts::Unknown => {
                     if !u.told {
                         u.told = true;
-                        eprintln!(
-                            "agent: migrating VM '{}' to {} failed ({}) and it isn't here: \
-                             waiting for {} to say whether it runs there",
-                            name, u.to, u.why, u.to
-                        );
-                        self.events.warn(
+                        self.note(
+                            Level::Warn,
                             EventKind::VmMigrateFailed,
                             Subject::vm(&name),
                             format!(
@@ -623,13 +703,9 @@ impl Agent {
                     self.vms.unsettled.insert(name, u);
                 }
                 migrate::Whereabouts::There => {
-                    println!(
-                        "agent: migrating VM '{}' to {} failed ({}) but it runs there: \
-                         handing its volumes over",
-                        name, u.to, u.why
-                    );
                     self.facts.note_migration(&u.to, &Ok(()));
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::VmMigrated,
                         Subject::vm(&name),
                         format!(
@@ -652,12 +728,9 @@ impl Agent {
                     } else {
                         "it runs nowhere".to_string()
                     };
-                    eprintln!(
-                        "agent: migrating VM '{}' to {} failed: {}; {} (moving it cold)",
-                        name, u.to, u.why, at
-                    );
                     self.facts.note_migration(&u.to, &Err(u.why.clone()));
-                    self.events.warn(
+                    self.note(
+                        Level::Warn,
                         EventKind::VmMigrateFailed,
                         Subject::vm(&name),
                         format!(
@@ -707,8 +780,8 @@ impl Agent {
         };
         match vm.virsh.set_meta(name, &meta).await {
             Ok(()) => {
-                println!("agent: VM '{}' migrated here", name);
-                self.events.info(
+                self.note(
+                    Level::Info,
                     EventKind::VmArrived,
                     Subject::vm(name),
                     format!("VM '{}' now runs on {} (migrated)", name, self.node),

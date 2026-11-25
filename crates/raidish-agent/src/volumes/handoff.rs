@@ -31,7 +31,7 @@ use crate::Agent;
 use crate::api_types::Attach;
 use crate::cluster::lease::{HeldLease, LeaseClient, owner_id};
 use crate::committer::dataset_resource;
-use crate::events::{EventKind, Subject};
+use crate::events::{EventKind, Level, Subject};
 use crate::inode::Transport;
 use crate::peer_io::{PeerExport, PeerLines, PeerOut, PeerVolumes, read_line};
 use crate::types::Holder;
@@ -41,7 +41,7 @@ use crate::{Lost, hold};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// How long either end waits on the other for a reply that needs no work
 /// (READY, DONE).
@@ -60,6 +60,82 @@ pub(crate) const TRANSFER_WAIT: Duration = Duration::from_secs(SENDER_BUDGET.as_
 /// How long a proxied request keeps retrying (the writer failing over
 /// takes a lease TTL or so).
 pub(crate) const PROXY_RETRY: Duration = Duration::from_secs(20);
+
+/// What either end of a handoff says after A's ask (one line each; the ask,
+/// [`ask`], is read by the peer I/O listener, see `peer_io::HANDOFF`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Msg {
+    /// B is paused and ready: `READY <owner>\t<holder JSON>`, the lease
+    /// owner and holder it will hold the volume's lease as.
+    Ready { owner: String, holder: Holder },
+    /// A transferred the lease to B: `TRANSFERRED <epoch>`, its new epoch.
+    Transferred(Epoch),
+    /// B took the volume over: `DONE`.
+    Done,
+    /// A calls the handoff off: `ABORT`.
+    Abort,
+    /// B won't take it: `ERR <why>`.
+    Err(String),
+}
+
+impl Msg {
+    pub fn parse(line: &str) -> Result<Msg, String> {
+        let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+        match word {
+            "READY" => {
+                let (owner, holder) = rest
+                    .split_once('\t')
+                    .ok_or_else(|| format!("no holder in '{}'", line))?;
+                let holder = serde_json::from_str(holder).map_err(|e| format!("holder: {}", e))?;
+                Ok(Msg::Ready {
+                    owner: owner.to_string(),
+                    holder,
+                })
+            }
+            "TRANSFERRED" => rest
+                .parse()
+                .map(Msg::Transferred)
+                .map_err(|_| format!("bad epoch in '{}'", line)),
+            "DONE" if rest.is_empty() => Ok(Msg::Done),
+            "ABORT" if rest.is_empty() => Ok(Msg::Abort),
+            "ERR" => Ok(Msg::Err(rest.to_string())),
+            _ => Err(format!("unexpected '{}'", line)),
+        }
+    }
+
+    /// Send it, as one line.
+    pub async fn send<W: AsyncWrite + Unpin>(&self, wr: &mut W) -> std::io::Result<()> {
+        wr.write_all(format!("{}\n", self).as_bytes()).await?;
+        wr.flush().await
+    }
+}
+
+impl std::fmt::Display for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Msg::Ready { owner, holder } => {
+                let holder = serde_json::to_string(holder).map_err(|_| std::fmt::Error)?;
+                write!(f, "READY {}\t{}", owner, holder)
+            }
+            Msg::Transferred(e) => write!(f, "TRANSFERRED {}", e),
+            Msg::Done => f.write_str("DONE"),
+            Msg::Abort => f.write_str("ABORT"),
+            // One line: a reason with a newline in it would end it early.
+            Msg::Err(why) => write!(f, "ERR {}", why.replace('\n', " ")),
+        }
+    }
+}
+
+/// A's ask: `RAIDISH-HANDOFF/1 <volume> <epoch> <transport>`.
+pub(crate) fn ask(volume: &DatasetName, epoch: Epoch, transport: Transport) -> String {
+    format!(
+        "{} {} {} {}\n",
+        crate::peer_io::HANDOFF,
+        volume,
+        epoch,
+        transport
+    )
+}
 
 /// What the agent shares with its peer I/O listener.
 pub(crate) struct Shared {
@@ -135,8 +211,7 @@ impl PeerVolumes for Shared {
             ($($why:tt)*) => {{
                 let why = format!($($why)*);
                 eprintln!("agent: not taking '{}' over: {}", volume, why);
-                let _ = wr.write_all(format!("ERR {}\n", why).as_bytes()).await;
-                let _ = wr.flush().await;
+                let _ = Msg::Err(why).send(&mut wr).await;
                 return;
             }};
         }
@@ -161,23 +236,21 @@ impl PeerVolumes for Shared {
             None => None,
         };
         let owner = owner_id();
-        let desc = serde_json::to_string(&*self.desc.lock().unwrap()).unwrap_or_default();
-        if wr
-            .write_all(format!("READY {}\t{}\n", owner, desc).as_bytes())
-            .await
-            .is_err()
-            || wr.flush().await.is_err()
-        {
+        let ready = Msg::Ready {
+            owner: owner.clone(),
+            holder: self.desc.lock().unwrap().clone(),
+        };
+        if ready.send(&mut wr).await.is_err() {
             // Unpaused first: taking a dead proxy down syncs through it.
             drop(paused);
             guard.abort().await;
             return;
         }
         let line = tokio::time::timeout(TRANSFER_WAIT, read_line(&mut rd)).await;
-        let new_epoch = match line {
-            Ok(Ok(l)) => l
-                .strip_prefix("TRANSFERRED ")
-                .and_then(|e| e.parse::<Epoch>().ok()),
+        // Anything else (ABORT, a closed connection, nothing in time): it's
+        // called off.
+        let new_epoch = match line.map(|l| l.map(|l| Msg::parse(&l))) {
+            Ok(Ok(Ok(Msg::Transferred(e)))) => Some(e),
             _ => None,
         };
         let Some(new_epoch) = new_epoch else {
@@ -257,8 +330,7 @@ impl PeerVolumes for Shared {
         }
         drop(paused);
         println!("agent: took volume '{}' over (epoch {})", volume, new_epoch);
-        let _ = wr.write_all(b"DONE\n").await;
-        let _ = wr.flush().await;
+        let _ = Msg::Done.send(&mut wr).await;
     }
 }
 
@@ -268,7 +340,7 @@ impl Agent {
     /// stopped cleanly when the handoff failed after this node let go);
     /// Ok(false): no peer I/O, stop it instead; Err: still run here.
     pub(crate) async fn hand_off(&mut self, name: &DatasetName, to: &str) -> Result<bool, String> {
-        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::io::BufReader;
         let Some(p) = &self.peer else {
             return Ok(false);
         };
@@ -287,14 +359,7 @@ impl Agent {
         let tls = crate::peer_io::dial(&connector, &addr, port).await?;
         let (rd, mut wr) = tokio::io::split(tls);
         let mut rd = BufReader::new(rd);
-        let ask = format!(
-            "{} {} {} {}\n",
-            crate::peer_io::HANDOFF,
-            name,
-            epoch,
-            transport
-        );
-        wr.write_all(ask.as_bytes())
+        wr.write_all(ask(name, epoch, transport).as_bytes())
             .await
             .map_err(|e| e.to_string())?;
         wr.flush().await.map_err(|e| e.to_string())?;
@@ -302,15 +367,11 @@ impl Agent {
             .await
             .map_err(|_| format!("{} didn't answer", to))?
             .map_err(|e| format!("{}: {}", to, e))?;
-        let Some((owner, desc)) = answer
-            .strip_prefix("READY ")
-            .and_then(|r| r.split_once('\t'))
-        else {
-            return Err(format!("{} said: {}", to, answer));
+        let (owner, desc) = match Msg::parse(&answer) {
+            Ok(Msg::Ready { owner, holder }) => (owner, holder),
+            Ok(_) => return Err(format!("{} said: {}", to, answer)),
+            Err(e) => return Err(format!("{}: {}", to, e)),
         };
-        let desc: Holder =
-            serde_json::from_str(desc).map_err(|e| format!("{}'s holder: {}", to, e))?;
-        let owner = owner.to_string();
         // From here it's the handoff's: peers aren't pointed at it any more,
         // nothing else claims it, and it comes back whole if called off.
         let Some(vol) = self.shared.volumes.begin_handoff(name, parts.wgen) else {
@@ -330,7 +391,7 @@ impl Agent {
             attach_tried,
         } = vol;
         if attach.device().is_some()
-            && let Err(e) = self.detach(name, transport).await
+            && let Err(e) = self.attacher.detach(name, transport).await
         {
             eprintln!("agent: detaching '{}': {}", name, e);
         }
@@ -339,8 +400,7 @@ impl Agent {
         }
         if let Err(e) = parts.fs.detach_dataset(name).await {
             // Not all of it is committed: keep it, call the handoff off.
-            let _ = wr.write_all(b"ABORT\n").await;
-            let _ = wr.flush().await;
+            let _ = Msg::Abort.send(&mut wr).await;
             let export = match parts.add_export(name, transport).await {
                 Ok(x) => x,
                 Err(e2) => {
@@ -386,10 +446,10 @@ impl Agent {
             // The receiver stops waiting not long after: transferred now,
             // the lease could go to an owner nobody renews. Synced, so let
             // go of it instead: whoever's next starts it (I-27).
-            let _ = wr.write_all(b"ABORT\n").await;
-            let _ = wr.flush().await;
+            let _ = Msg::Abort.send(&mut wr).await;
             lease.release().await;
-            self.events.warn(
+            self.note(
+                Level::Warn,
                 EventKind::VolumeHandoffFailed,
                 Subject::volume(name),
                 format!(
@@ -412,10 +472,10 @@ impl Agent {
             Ok(e) => e,
             Err(e) => {
                 // Synced and let go of: whoever's next starts it.
-                let _ = wr.write_all(b"ABORT\n").await;
-                let _ = wr.flush().await;
+                let _ = Msg::Abort.send(&mut wr).await;
                 lease.release().await;
-                self.events.warn(
+                self.note(
+                    Level::Warn,
                     EventKind::VolumeHandoffFailed,
                     Subject::volume(name),
                     format!(
@@ -426,23 +486,21 @@ impl Agent {
                 return Ok(true);
             }
         };
-        let _ = wr
-            .write_all(format!("TRANSFERRED {}\n", new_epoch).as_bytes())
-            .await;
-        let _ = wr.flush().await;
+        let _ = Msg::Transferred(new_epoch).send(&mut wr).await;
         let done = tokio::time::timeout(HANDOFF_TIMEOUT, crate::peer_io::read_line(&mut rd)).await;
         match done {
-            Ok(Ok(l)) if l == "DONE" => {
-                println!(
-                    "agent: handed volume '{}' to {} in {:?}",
-                    name,
-                    to,
-                    started.elapsed()
-                );
-                self.events.info(
+            Ok(Ok(l)) if Msg::parse(&l) == Ok(Msg::Done) => {
+                self.note(
+                    Level::Info,
                     EventKind::VolumeHandedOff,
                     Subject::volume(name),
-                    format!("Volume '{}' was handed from {} to {}", name, self.node, to),
+                    format!(
+                        "Volume '{}' was handed from {} to {} in {:.1}s",
+                        name,
+                        self.node,
+                        to,
+                        started.elapsed().as_secs_f64()
+                    ),
                 );
             }
             other => {

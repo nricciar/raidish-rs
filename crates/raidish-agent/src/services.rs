@@ -94,7 +94,8 @@ impl Agent {
             let f = self.service_format(&name);
             let label = crate::events::label_of(f);
             self.stop_service(&name, true).await;
-            self.events.info(
+            self.note(
+                Level::Info,
                 EventKind::DatasetStopped,
                 Subject::dataset(f, &name),
                 format!("{} '{}' stopped on {}", label, name, self.node),
@@ -108,9 +109,9 @@ impl Agent {
             let subject = Subject::dataset(Some(format), &name);
             match self.start_service(&fe, &name, format).await {
                 Ok(()) => {
-                    println!("agent: serving {} dataset '{}' here", format.name(), name);
                     self.events.clear(&subject);
-                    self.events.info(
+                    self.note(
+                        Level::Info,
                         EventKind::DatasetStarted,
                         subject,
                         format!("{} '{}' started on {}", label, name, self.node),
@@ -120,8 +121,7 @@ impl Agent {
                     eprintln!("agent: starting dataset '{}': {}", name, e);
                 }
                 Err(StartError::Failed(e)) => {
-                    eprintln!("agent: starting dataset '{}': {}", name, e);
-                    self.events.once(
+                    self.note_once(
                         Level::Error,
                         EventKind::DatasetStartFailed,
                         subject,

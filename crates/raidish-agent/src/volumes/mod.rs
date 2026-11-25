@@ -7,6 +7,30 @@ mod table;
 
 pub(crate) use table::*;
 
+/// What the VM side may know of the volumes here: read only, so it can't
+/// change what the volume side runs (and tests can give it their own).
+pub(crate) trait VolumeView {
+    /// Whether this node has anything of `name` (writes, proxies, or is
+    /// handing it to or from here).
+    fn has(&self, name: &DatasetName) -> bool;
+    /// Whether this node writes `name`.
+    fn writes(&self, name: &DatasetName) -> bool;
+    /// The lease owner `name` is written here under, if it is.
+    fn owner_of(&self, name: &DatasetName) -> Option<String>;
+}
+
+impl VolumeView for Volumes {
+    fn has(&self, name: &DatasetName) -> bool {
+        Volumes::has(self, name)
+    }
+    fn writes(&self, name: &DatasetName) -> bool {
+        Volumes::writes(self, name)
+    }
+    fn owner_of(&self, name: &DatasetName) -> Option<String> {
+        self.owned(name, |o| o.lease.owner.clone())
+    }
+}
+
 use crate::cluster::lease::HeldLease;
 use crate::committer::PoolAdmin;
 use crate::committer::dataset_resource;
@@ -14,7 +38,6 @@ use crate::events::{EventKind, Level, Subject};
 use crate::inode::{DatasetProps, Transport};
 use crate::placement::Placement;
 use crate::types::DatasetName;
-use crate::vms::Domains;
 use crate::volume::VolumeInfo;
 use crate::{Agent, Attach, StartError, hold, peer_host};
 use std::sync::Arc;
@@ -27,8 +50,7 @@ impl Agent {
     /// Stop what no longer belongs here (deleted, disabled, moved, changed
     /// transport) once no VM here uses it, handing it over where it can
     /// be; start what belongs here.
-    pub(crate) async fn reconcile_volumes(&mut self, p: &Placement, doms: &Domains) {
-        let in_use = doms.in_use();
+    pub(crate) async fn reconcile_volumes(&mut self, p: &Placement) {
         let running = self.shared.volumes.running();
         let stop: Vec<DatasetName> = running
             .iter()
@@ -39,10 +61,8 @@ impl Agent {
                         || p.transport(name, &v.props) != Some(*t)
                 }
             })
-            .filter(|(name, _)| !in_use.contains(name))
-            // Libvirt unknown: VM volumes stay where they are, they may be
-            // in use.
-            .filter(|(name, _)| doms.listed.is_ok() || !p.for_vm(name))
+            // In use by a VM here, or a VM's while libvirt can't say.
+            .filter(|(name, _)| !p.vm.pinned(name))
             .map(|(n, _)| n.clone())
             .collect();
         for name in stop {
@@ -73,7 +93,8 @@ impl Agent {
             }
             println!("agent: stopping volume '{}' here", name);
             self.stop(&name, true).await;
-            self.events.info(
+            self.note(
+                Level::Info,
                 EventKind::VolumeStopped,
                 Subject::volume(&name),
                 format!("Volume '{}' stopped on {}", name, self.node),
@@ -92,12 +113,15 @@ impl Agent {
             let Some(t) = p.transport(&v.name, &v.props) else {
                 continue;
             };
-            if let Err(e) = self.start(v, t, !p.for_vm(&v.name)).await {
-                eprintln!("agent: starting volume '{}': {}", v.name, e);
-                let StartError::Failed(e) = e else {
-                    continue;
+            if let Err(e) = self.start(v, t, !p.vm.for_vm(&v.name)).await {
+                let e = match e {
+                    StartError::Busy(e) => {
+                        eprintln!("agent: starting volume '{}': {}", v.name, e);
+                        continue;
+                    }
+                    StartError::Failed(e) => e,
                 };
-                self.events.once(
+                self.note_once(
                     Level::Error,
                     EventKind::VolumeStartFailed,
                     Subject::volume(&v.name),
@@ -124,7 +148,7 @@ impl Agent {
                 let Some(t) = p.transport(&v.name, &v.props) else {
                     continue;
                 };
-                if let Err(e) = self.add_proxy(v, t, !p.for_vm(&v.name)).await {
+                if let Err(e) = self.add_proxy(v, t, !p.vm.for_vm(&v.name)).await {
                     eprintln!("agent: proxying volume '{}': {}", v.name, e);
                 }
             } else if proxied.is_some() && (!here || proxied != p.transport(&v.name, &v.props)) {
@@ -250,7 +274,7 @@ impl Agent {
             return Err(StartError::Busy("this node's writer went away".into()));
         }
         let attached = if needs_attach {
-            let a = Attach::of(self.attach(&v.name, transport).await);
+            let a = Attach::of(self.attacher.attach(&v.name, transport).await);
             self.shared.volumes.set_attach(&v.name, a.clone());
             a
         } else {
@@ -259,14 +283,9 @@ impl Agent {
                 .owned(&v.name, |o| o.attach.clone())
                 .unwrap_or_default()
         };
-        println!(
-            "agent: running volume '{}' here ({}{})",
-            v.name,
-            transport,
-            attached.on()
-        );
         self.events.clear(&Subject::volume(&v.name));
-        self.events.info(
+        self.note(
+            Level::Info,
             EventKind::VolumeStarted,
             Subject::volume(&v.name),
             format!(
@@ -278,11 +297,8 @@ impl Agent {
             ),
         );
         if let Some(n) = attached.error() {
-            eprintln!(
-                "agent: volume '{}' exported but not attached: {}",
-                v.name, n
-            );
-            self.events.warn(
+            self.note(
+                Level::Warn,
                 EventKind::VolumeNotAttached,
                 Subject::volume(&v.name),
                 format!(
@@ -309,7 +325,7 @@ impl Agent {
     /// error), so whatever waits for the device (see `crate::csi`) gets it.
     pub(crate) async fn retry_attach(&mut self) {
         for (name, t) in self.shared.volumes.attach_due(ATTACH_RETRY) {
-            let attach = Attach::of(self.attach(&name, t).await);
+            let attach = Attach::of(self.attacher.attach(&name, t).await);
             if attach.error().is_none() {
                 println!("agent: attached volume '{}'{}", name, attach.on());
             }
@@ -330,7 +346,7 @@ impl Agent {
     /// only `&self`, so several can go at once.
     pub(crate) async fn wind_down(&self, name: &DatasetName, v: Owned, clean: bool) {
         if v.attach.device().is_some()
-            && let Err(e) = self.detach(name, v.export.transport).await
+            && let Err(e) = self.attacher.detach(name, v.export.transport).await
         {
             eprintln!("agent: detaching '{}': {}", name, e);
         }
@@ -380,19 +396,19 @@ impl Agent {
     }
 
     /// Put what was handed to this node (see `handoff`) with what it runs.
-    pub(crate) async fn adopt_handed_over(&mut self, volumes: &[VolumeInfo]) {
+    pub(crate) async fn adopt_handed_over(&mut self, p: &Placement) {
         for (name, transport, attach) in self.shared.volumes.pick_up() {
-            let vm_disk = self.vms.specs.values().any(|s| s.volumes().contains(&name));
-            if attach.device().is_none() && !vm_disk {
-                let a = Attach::of(self.attach(&name, transport).await);
+            if attach.device().is_none() && !p.vm.disks.contains(&name) {
+                let a = Attach::of(self.attacher.attach(&name, transport).await);
                 self.shared.volumes.set_attach(&name, a);
             }
-            self.events.info(
+            self.note(
+                Level::Info,
                 EventKind::VolumeHandedOver,
                 Subject::volume(&name),
                 format!("Volume '{}' was handed over to {}", name, self.node),
             );
-            if let Some(v) = volumes.iter().find(|v| v.name == name)
+            if let Some(v) = p.volume(&name)
                 && v.props.move_to.as_deref() == Some(&self.node)
             {
                 let props = DatasetProps {
@@ -433,7 +449,7 @@ impl Agent {
             attach: Attach::Exported,
         };
         let proxy = if attach {
-            match self.attach(&v.name, t).await {
+            match self.attacher.attach(&v.name, t).await {
                 Ok(d) => Proxied {
                     attach: Attach::device_of(d),
                     ..proxy
@@ -477,7 +493,7 @@ impl Agent {
     pub(crate) async fn take_down_proxy(&self, name: &DatasetName, proxy: Proxied) {
         proxy.retire();
         if proxy.attach.device().is_some()
-            && let Err(e) = self.detach(name, proxy.export.transport).await
+            && let Err(e) = self.attacher.detach(name, proxy.export.transport).await
         {
             eprintln!("agent: detaching proxied '{}': {}", name, e);
         }

@@ -4,6 +4,7 @@
 use crate::Agent;
 use crate::inode::{DatasetProps, Transport};
 use crate::types::DatasetName;
+use crate::vms::VmDemand;
 use crate::volume::VolumeInfo;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,12 +94,8 @@ pub(crate) struct Placement {
     /// Peer I/O is on: volumes can be proxied and handed over.
     pub(crate) peer_on: bool,
     pub(crate) volumes: BTreeMap<DatasetName, VolumeInfo>,
-    /// VM volumes: placed by their VM's anchor (its settings, over NBD, and
-    /// its holder).
-    pub(crate) vm_place: BTreeMap<DatasetName, (DatasetProps, Option<String>)>,
-    /// Volumes of VMs migrating away from here: kept here until they're
-    /// gone.
-    pub(crate) migrating: BTreeSet<DatasetName>,
+    /// What the VMs here ask of the volumes (see `VmDemand`).
+    pub(crate) vm: VmDemand,
 }
 
 impl Placement {
@@ -124,17 +121,12 @@ impl Placement {
         }
     }
 
-    /// Whether `name` is a VM's volume (exported for qemu, not attached).
-    pub(crate) fn for_vm(&self, name: &DatasetName) -> bool {
-        self.vm_place.contains_key(name)
-    }
-
     /// The node volume `name` (with settings `own`) should run on.
     pub(crate) fn target(&self, name: &DatasetName, own: &DatasetProps) -> Option<String> {
-        if self.migrating.contains(name) {
+        if self.vm.migrating.contains(name) {
             return Some(self.me.clone());
         }
-        let (props, holder) = match self.vm_place.get(name) {
+        let (props, holder) = match self.vm.place.get(name) {
             Some((p, h)) => (p, h.clone()),
             None => (own, self.holder(name)),
         };
@@ -143,60 +135,23 @@ impl Placement {
 
     /// How volume `name` (with settings `own`) is exported.
     pub(crate) fn transport(&self, name: &DatasetName, own: &DatasetProps) -> Option<Transport> {
-        match self.vm_place.get(name) {
+        match self.vm.place.get(name) {
             Some((p, _)) => p.automount,
             None => own.automount,
         }
     }
-
-    /// Whether VM `spec`'s volumes belong on this node.
-    pub(crate) fn anchor_here(&self, spec: &crate::vm::VmSpec) -> bool {
-        spec.anchor().is_some_and(|n| {
-            self.volume(n)
-                .is_some_and(|a| self.target(n, &a.props).as_deref() == Some(self.me.as_str()))
-        })
-    }
 }
 
 impl Agent {
-    /// Where `volumes` belong, from one look at the cluster state.
+    /// Where `volumes` belong, from one look at the cluster state. What
+    /// libvirt runs isn't in it yet (`VmDemand::saw`).
     pub(crate) fn placement(&self, volumes: Vec<VolumeInfo>) -> Placement {
         let state = self.cluster.status().state;
         let now = crate::cluster::now_ms();
         let live = state.live_nodes(now).map(|(n, _)| n.to_string()).collect();
         let volumes: BTreeMap<DatasetName, VolumeInfo> =
             volumes.into_iter().map(|v| (v.name.clone(), v)).collect();
-        // A VM's volumes are placed by its anchor's settings and holder, so
-        // they all land on one node, exported over NBD for qemu (and not
-        // attached to the host kernel).
-        let mut vm_place = BTreeMap::new();
-        if self.vm.is_some() {
-            for spec in self.vms.specs.values().filter(|s| s.usable()) {
-                let Some((anchor_name, anchor)) =
-                    spec.anchor().and_then(|a| Some((a, volumes.get(a)?)))
-                else {
-                    continue;
-                };
-                let props = DatasetProps {
-                    automount: Some(Transport::Nbd),
-                    ..anchor.props.clone()
-                };
-                let h = state.dataset_node(anchor_name, now).map(str::to_string);
-                for v in spec.volumes() {
-                    vm_place
-                        .entry(v.clone())
-                        .or_insert_with(|| (props.clone(), h.clone()));
-                }
-            }
-        }
-        // A migrating VM's volumes stay here until it's gone (see
-        // `migrate`), whatever their placement says.
-        let migrating = self
-            .vms
-            .migrations
-            .values()
-            .flat_map(|m| m.volumes.iter().cloned())
-            .collect();
+        let vm = self.vm_demand(&volumes, &state, now);
         Placement {
             me: self.node.clone(),
             state,
@@ -204,8 +159,7 @@ impl Agent {
             live,
             peer_on: self.peer.is_some(),
             volumes,
-            vm_place,
-            migrating,
+            vm,
         }
     }
 }

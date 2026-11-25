@@ -637,3 +637,40 @@ fn the_receiver_outwaits_the_sender() {
     // The drain alone takes up to 30 s (`DRAIN_TIMEOUT`).
     assert!(volumes::handoff::SENDER_BUDGET > Duration::from_secs(30));
 }
+
+/// Every handoff message reads back as itself, an error stays one line,
+/// and a garbled line is refused.
+#[test]
+fn handoff_messages_round_trip() {
+    use volumes::handoff::Msg;
+    let holder = crate::types::Holder {
+        role: crate::types::HolderRole::Agent,
+        node: Some("node-2".into()),
+        addr: Some("10.0.0.2:7000".into()),
+        detail: String::new(),
+    };
+    for m in [
+        Msg::Ready {
+            owner: "agent:node-2".into(),
+            holder,
+        },
+        Msg::Transferred(crate::types::Epoch::from(7)),
+        Msg::Done,
+        Msg::Abort,
+        Msg::Err("pool busy".into()),
+    ] {
+        assert_eq!(Msg::parse(&m.to_string()), Ok(m));
+    }
+    let e = Msg::Err("one\ntwo".into()).to_string();
+    assert!(!e.contains('\n'));
+    assert_eq!(Msg::parse(&e), Ok(Msg::Err("one two".into())));
+    for bad in [
+        "",
+        "READY agent:node-2",
+        "READY x\t{",
+        "TRANSFERRED x",
+        "HELLO",
+    ] {
+        assert!(Msg::parse(bad).is_err(), "{:?} parsed", bad);
+    }
+}
