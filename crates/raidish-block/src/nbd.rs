@@ -132,7 +132,8 @@ where
     D: BlockDevice + Send + Sync + 'static,
 {
     let server = NbdServer::with_bind(fs, DEFAULT_BIND, port);
-    server
+    // Served until the process ends.
+    let _export = server
         .add_export(&zvol_name)
         .await
         .map_err(|e| std::io::Error::other(format!("volume '{}': {}", zvol_name, e)))?;
@@ -188,7 +189,10 @@ impl<D> BlockExporter for NbdServer<D>
 where
     D: BlockDevice + Send + Sync + 'static,
 {
-    async fn add_export(&self, name: &DatasetName) -> Result<(), FileSystemError> {
+    async fn add_export(
+        &self,
+        name: &DatasetName,
+    ) -> Result<crate::export::ExportHandle, FileSystemError> {
         let size = self.fs.open_dataset(name).await?.size_bytes;
         let io = Arc::new(LocalIo::new(self.fs.clone(), name));
         self.add_export_io(name, size, io)
@@ -199,7 +203,7 @@ where
         name: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
-    ) -> Result<(), FileSystemError> {
+    ) -> Result<crate::export::ExportHandle, FileSystemError> {
         self.exports.insert(Export {
             name: name.to_string(),
             size,
@@ -214,10 +218,6 @@ where
 
     fn peer_export(&self, name: &DatasetName) -> Option<crate::peer_io::PeerExport> {
         self.exports.peer_export(name)
-    }
-
-    async fn remove_export(&self, name: &DatasetName) -> Result<bool, FileSystemError> {
-        self.exports.remove(name).await
     }
 
     #[cfg(test)]

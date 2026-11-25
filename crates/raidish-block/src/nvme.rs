@@ -337,6 +337,8 @@ pub struct NvmeTcpServer<D: BlockDevice> {
     target: Arc<Target<D>>,
     bind: String,
     port: u16,
+    /// The export `new` made, up for as long as the server.
+    single: Option<crate::export::ExportHandle>,
 }
 
 /// The NVMe/TCP port.
@@ -351,8 +353,8 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
         volume: DatasetName,
         port: u16,
     ) -> Result<Self, FileSystemError> {
-        let server = Self::with_bind(fs, DEFAULT_BIND, port);
-        server.add_export(&volume).await?;
+        let mut server = Self::with_bind(fs, DEFAULT_BIND, port);
+        server.single = Some(server.add_export(&volume).await?);
         Ok(server)
     }
 
@@ -367,6 +369,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
             }),
             bind: bind.into(),
             port,
+            single: None,
         }
     }
 
@@ -404,7 +407,10 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
 #[async_trait::async_trait]
 impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
     /// Exported as subsystem `subsystem_nqn(volume)`.
-    async fn add_export(&self, volume: &DatasetName) -> Result<(), FileSystemError> {
+    async fn add_export(
+        &self,
+        volume: &DatasetName,
+    ) -> Result<crate::export::ExportHandle, FileSystemError> {
         let size = self.target.fs.open_dataset(volume).await?.size_bytes;
         let io = Arc::new(LocalIo::new(self.target.fs.clone(), volume));
         self.add_export_io(volume, size, io)
@@ -415,7 +421,7 @@ impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> 
         volume: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
-    ) -> Result<(), FileSystemError> {
+    ) -> Result<crate::export::ExportHandle, FileSystemError> {
         self.target.exports.insert(Export::new(volume, size, io))
     }
 
@@ -425,10 +431,6 @@ impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> 
 
     fn peer_export(&self, volume: &DatasetName) -> Option<crate::peer_io::PeerExport> {
         self.target.exports.peer_export(volume)
-    }
-
-    async fn remove_export(&self, volume: &DatasetName) -> Result<bool, FileSystemError> {
-        self.target.exports.remove(volume).await
     }
 
     /// Sorted by NQN.

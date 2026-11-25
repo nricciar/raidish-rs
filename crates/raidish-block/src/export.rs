@@ -1,7 +1,8 @@
 //! Exporting volumes as block devices, whatever the protocol: the table
 //! of exports both servers keep (`ExportTable`), how an export's
 //! connections are wound down (`ExportLife`), and the contract the agent
-//! drives them through (`BlockExporter`). NBD (`crate::nbd`) and
+//! drives them through (`BlockExporter`), and the handle that owns one
+//! (`ExportHandle`). NBD (`crate::nbd`) and
 //! NVMe/TCP (`crate::nvme`) differ only in their wire protocol and in
 //! what they call an export (a name, a subsystem NQN).
 
@@ -20,24 +21,21 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// The agent's view of a block server.
 #[async_trait::async_trait]
 pub trait BlockExporter: Send + Sync {
-    /// Export volume `volume`, written by this node.
-    async fn add_export(&self, volume: &DatasetName) -> Result<(), FileSystemError>;
+    /// Export volume `volume`, written by this node, for as long as the
+    /// handle is held (see [`ExportHandle`]).
+    async fn add_export(&self, volume: &DatasetName) -> Result<ExportHandle, FileSystemError>;
     /// Export `volume`, `size` bytes, with its I/O going to `io`.
     fn add_export_io(
         &self,
         volume: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
-    ) -> Result<(), FileSystemError>;
+    ) -> Result<ExportHandle, FileSystemError>;
     /// The backend of `volume`'s export, to pause or switch it.
     fn export_io(&self, volume: &DatasetName) -> Option<Arc<SwitchableIo>>;
     /// `volume`'s export for another node's proxy (see `crate::peer_io`):
     /// its connections count as the export's, so removing it drains them.
     fn peer_export(&self, volume: &DatasetName) -> Option<PeerExport>;
-    /// Stop exporting `volume`: new connections are refused, current ones
-    /// closed once their in-flight requests finish, then everything is
-    /// committed. False: it wasn't exported.
-    async fn remove_export(&self, volume: &DatasetName) -> Result<bool, FileSystemError>;
     /// The exported volumes (what tests check).
     #[cfg(test)]
     fn exports(&self) -> Vec<String>;
@@ -54,7 +52,8 @@ pub(crate) trait Exported: Send + Sync + 'static {
 /// A server's exports, by its protocol's name for them (`key` of the
 /// volume).
 pub(crate) struct ExportTable<E> {
-    by_key: StdMutex<BTreeMap<String, Arc<E>>>,
+    /// Shared with the handles, which take their own entry out.
+    by_key: Arc<StdMutex<BTreeMap<String, Arc<E>>>>,
     key: fn(&str) -> String,
     /// Names the server in log messages.
     label: &'static str,
@@ -69,14 +68,32 @@ impl<E: Exported> ExportTable<E> {
         }
     }
 
-    pub fn insert(&self, export: E) -> Result<(), FileSystemError> {
+    /// Add `export`, for as long as the handle returned is held. Refused
+    /// while the volume is exported, or still draining (see
+    /// [`ExportHandle`]).
+    pub fn insert(&self, export: E) -> Result<ExportHandle, FileSystemError> {
         let k = (self.key)(export.volume());
-        let mut m = self.by_key.lock().unwrap();
-        if m.contains_key(&k) {
-            return Err(FileSystemError::AlreadyExists);
+        let e = Arc::new(export);
+        {
+            let mut m = self.by_key.lock().unwrap();
+            if m.contains_key(&k) {
+                return Err(FileSystemError::AlreadyExists);
+            }
+            m.insert(k.clone(), e.clone());
         }
-        m.insert(k, Arc::new(export));
-        Ok(())
+        let (map, mine, key) = (self.by_key.clone(), e.clone(), k.clone());
+        Ok(ExportHandle {
+            entry: Some(Entry {
+                what: format!("{}: {}", self.label, k),
+                export: e,
+                unlist: Box::new(move || {
+                    let mut m = map.lock().unwrap();
+                    if m.get(&key).is_some_and(|x| Arc::ptr_eq(x, &mine)) {
+                        m.remove(&key);
+                    }
+                }),
+            }),
+        })
     }
 
     /// By the protocol's name for it.
@@ -117,31 +134,124 @@ impl<E: Exported> ExportTable<E> {
     }
 
     pub fn peer_export(&self, volume: &DatasetName) -> Option<PeerExport> {
-        let e = self.get(volume)?;
-        Some(PeerExport {
-            size: e.size(),
-            io: e.io().clone(),
-            session: e.life().join()?,
-            from: crate::types::Epoch::NONE,
-        })
+        peer_export_of(&*self.get(volume)?)
+    }
+}
+
+fn peer_export_of(e: &dyn Exported) -> Option<PeerExport> {
+    Some(PeerExport {
+        size: e.size(),
+        io: e.io().clone(),
+        session: e.life().join()?,
+        from: crate::types::Epoch::NONE,
+    })
+}
+
+/// One export, owned: it's served for as long as this is held.
+///
+/// [`ExportHandle::close`] takes it down: new connections are refused,
+/// current ones closed once their in-flight requests finish, everything is
+/// committed, and only then is it out of its server's table (a new export
+/// of the volume meanwhile would be written alongside the old connections).
+///
+/// Dropped without `close`, it does the same in the background: refused and
+/// signalled at once, drained, synced and unlisted by a task of its own.
+/// Nothing else takes an export down, so none can be left behind by whoever
+/// forgot it, nor taken down from under its owner.
+#[must_use = "the export is taken down once its handle is dropped"]
+pub struct ExportHandle {
+    entry: Option<Entry>,
+}
+
+struct Entry {
+    /// Names it in log messages (`nbd: <volume>`).
+    what: String,
+    export: Arc<dyn Exported>,
+    /// Takes it out of its table (if it's still the one there).
+    unlist: Box<dyn FnOnce() + Send + Sync>,
+}
+
+impl Entry {
+    async fn close(self) -> Result<(), FileSystemError> {
+        self.export.life().close(&self.what).await;
+        let synced = self.export.io().sync().await;
+        (self.unlist)();
+        synced
+    }
+}
+
+impl ExportHandle {
+    fn entry(&self) -> &Entry {
+        self.entry
+            .as_ref()
+            .expect("an export handle has its entry until closed")
     }
 
-    pub async fn remove(&self, volume: &str) -> Result<bool, FileSystemError> {
-        let k = (self.key)(volume);
-        let Some(e) = self.by_key(&k) else {
-            return Ok(false);
+    /// Its backend, to pause, switch or poison.
+    pub fn io(&self) -> &Arc<SwitchableIo> {
+        self.entry().export.io()
+    }
+
+    /// It for another node's proxy (see `crate::peer_io`); None once closing.
+    pub fn peer_export(&self) -> Option<PeerExport> {
+        peer_export_of(&*self.entry().export)
+    }
+
+    /// Take it down (see the type's docs), and say whether its last sync
+    /// went through.
+    ///
+    /// Cancel-safe: the handle keeps its entry until the drain and the sync
+    /// are done, so a `close` dropped partway leaves it to `Drop`, which
+    /// finishes them (and unlists it) in the background. Taken out first, a
+    /// cancelled close would leave the export in its table for good, the
+    /// volume never exportable again.
+    pub async fn close(mut self) -> Result<(), FileSystemError> {
+        let synced = match &self.entry {
+            Some(e) => {
+                e.export.life().close(&e.what).await;
+                e.export.io().sync().await
+            }
+            None => return Ok(()),
         };
-        // Kept in the table until its connections are gone: a new export
-        // of the volume meanwhile would be written alongside them.
-        e.life().close(&format!("{}: {}", self.label, k)).await;
-        let synced = e.io().sync().await;
-        let mut m = self.by_key.lock().unwrap();
-        if m.get(&k).is_some_and(|x| Arc::ptr_eq(x, &e)) {
-            m.remove(&k);
+        if let Some(e) = self.entry.take() {
+            (e.unlist)();
         }
-        drop(m);
-        synced?;
-        Ok(true)
+        synced
+    }
+}
+
+impl Drop for ExportHandle {
+    fn drop(&mut self) {
+        let Some(e) = self.entry.take() else {
+            return;
+        };
+        // No new connections from now on, and the current ones are told.
+        e.export.life().shut();
+        eprintln!(
+            "{}: export dropped unclosed; draining it in the background",
+            e.what
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let what = e.what.clone();
+                    if let Err(err) = e.close().await {
+                        eprintln!("{}: last sync: {}", what, err);
+                    }
+                });
+            }
+            // No runtime: nothing runs its connections any more either.
+            Err(_) => (e.unlist)(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ExportHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.entry {
+            Some(e) => write!(f, "ExportHandle({})", e.what),
+            None => write!(f, "ExportHandle(closed)"),
+        }
     }
 }
 
@@ -194,11 +304,16 @@ impl ExportLife {
         })
     }
 
-    /// Refuse new connections, tell current ones to stop, and wait (up to
-    /// `DRAIN_TIMEOUT`) for them to finish their in-flight requests.
-    pub(crate) async fn close(&self, what: &str) {
+    /// Refuse new connections and tell current ones to stop.
+    pub(crate) fn shut(&self) {
         self.alive.lock().unwrap().take();
         self.closed.send_replace(true);
+    }
+
+    /// `shut`, then wait (up to `DRAIN_TIMEOUT`) for the connections to
+    /// finish their in-flight requests.
+    pub(crate) async fn close(&self, what: &str) {
+        self.shut();
         let mut drained = self.drained.lock().await;
         if tokio::time::timeout(DRAIN_TIMEOUT, drained.recv())
             .await
