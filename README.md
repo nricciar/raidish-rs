@@ -21,6 +21,7 @@ RAIDish is organized as a Cargo workspace with library crates under `crates/`, t
 | [`raidish-services`](crates/raidish-services/README.md) | B+tree-backed S3 (`9000`) and SQS (`9324`), AWS SigV4, stateless `RDK1` keys, and multi-node S3/SQS/`etcd` routing frontend |
 | [`raidish-vm`](crates/raidish-vm/README.md) | Libvirt domain XML validation, transient rendering, `virsh` lifecycle/migration, and the `.vms` store |
 | [`raidish-csi`](crates/raidish-csi/README.md) | Kubernetes CSI (`csi.raidish.io`) gRPC driver for `ext4`/`xfs` and `ReadWriteMany` raw block volumes |
+| [`raidish-agent`](crates/raidish-agent/README.md) | Per-node placement controller: volumes, services, VMs, kernel auto-mount, volume handoff, live migration, and host facts |
 
 ## Setup
 
