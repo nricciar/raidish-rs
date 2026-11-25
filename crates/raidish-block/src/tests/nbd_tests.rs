@@ -272,6 +272,32 @@ async fn a_dropped_export_drains_before_it_can_come_back() {
     assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
 }
 
+/// A `close` given up on partway (its future dropped, a timeout) still
+/// takes the export down: the handle's drop finishes it in the background,
+/// and the volume can be exported again once it has.
+#[tokio::test]
+async fn a_cancelled_close_still_takes_the_export_down() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr, mut held) = serve_many(&pool, &[("alpha", 16 * MB)]).await;
+    let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
+    let data = vec![0x6Du8; 4096];
+    assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
+
+    // Polled once (shut, then waiting on the connected client), then dropped.
+    let close = held.remove("alpha").unwrap().close();
+    assert!(tokio::time::timeout(Duration::ZERO, close).await.is_err());
+    assert_hung_up(&mut a.s).await;
+    let start = std::time::Instant::now();
+    while !server.exports().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10), "never unlisted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!fs.has_dirty_datasets(), "the background close commits");
+    let _again = server.add_export(&ds("alpha")).await.unwrap();
+    let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
+    assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
+}
+
 #[tokio::test]
 async fn remove_export_flushes_and_closes_its_connections() {
     let pool = TestPool::new().await;

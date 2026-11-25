@@ -199,11 +199,24 @@ impl ExportHandle {
 
     /// Take it down (see the type's docs), and say whether its last sync
     /// went through.
+    ///
+    /// Cancel-safe: the handle keeps its entry until the drain and the sync
+    /// are done, so a `close` dropped partway leaves it to `Drop`, which
+    /// finishes them (and unlists it) in the background. Taken out first, a
+    /// cancelled close would leave the export in its table for good, the
+    /// volume never exportable again.
     pub async fn close(mut self) -> Result<(), FileSystemError> {
-        match self.entry.take() {
-            Some(e) => e.close().await,
-            None => Ok(()),
+        let synced = match &self.entry {
+            Some(e) => {
+                e.export.life().close(&e.what).await;
+                e.export.io().sync().await
+            }
+            None => return Ok(()),
+        };
+        if let Some(e) = self.entry.take() {
+            (e.unlist)();
         }
+        synced
     }
 }
 

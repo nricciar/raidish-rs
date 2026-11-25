@@ -2185,7 +2185,6 @@ impl Agent {
                 // Synced and let go of: whoever's next starts it.
                 let _ = wr.write_all(b"ABORT\n").await;
                 let _ = wr.flush().await;
-                let _ = wr.flush().await;
                 lease.release().await;
                 self.events.warn(
                     EventKind::VolumeHandoffFailed,
