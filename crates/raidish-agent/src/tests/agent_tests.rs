@@ -1,5 +1,10 @@
 use super::*;
+use crate::committer::dataset_resource;
+use crate::inode::{DatasetProps, Transport};
+use crate::nbd::NbdServer;
+use crate::nvme::NvmeTcpServer;
 use crate::test_util::dsn;
+use std::collections::BTreeSet;
 
 fn props(nodes: &[&str]) -> DatasetProps {
     DatasetProps {
@@ -162,7 +167,7 @@ fn a_move_within_the_attached_nodes_wins_and_off_is_off() {
 /// leaves it alone (never moved cold, so never started twice).
 #[test]
 fn a_failed_migration_is_settled_by_where_its_guest_runs() {
-    use migrate::{Whereabouts::*, whereabouts};
+    use vms::migrate::{Whereabouts::*, whereabouts};
     assert_eq!(whereabouts(Some(true), None), Here);
     assert_eq!(whereabouts(Some(true), Some(true)), Here);
     assert_eq!(whereabouts(Some(true), Some(false)), Here);
@@ -195,8 +200,8 @@ async fn answer_once(status: &'static str, body: String) -> String {
 
 #[tokio::test]
 async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
+    use crate::vm::LocalView;
     use crate::vm::{DomMeta, DomOwner, DomState, LocalVm};
-    use crate::vms_api::LocalView;
     let http = reqwest::Client::new();
     let vm = |name: &str| LocalVm {
         name: name.parse().unwrap(),
@@ -226,19 +231,25 @@ async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
         .unwrap()
     };
     let url = answer_once("200 OK", view(vec![vm("web")], None)).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(true));
+    assert_eq!(
+        vms::migrate::runs_there(&http, &url, "web").await,
+        Some(true)
+    );
     let url = answer_once("200 OK", view(vec![vm("db")], None)).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, Some(false));
+    assert_eq!(
+        vms::migrate::runs_there(&http, &url, "web").await,
+        Some(false)
+    );
     // Its libvirt couldn't be asked: not "it doesn't run there".
     let url = answer_once("200 OK", view(vec![], Some("libvirt down"))).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
     let url = answer_once("503 Service Unavailable", "{}".into()).await;
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
     // Nobody there.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     drop(l);
-    assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
+    assert_eq!(vms::migrate::runs_there(&http, &url, "web").await, None);
 }
 
 // ---- volume slots (structural triage I-27, Phase B) ----
@@ -249,7 +260,7 @@ use volumes::{Claim, Owned, Proxied, Took, WriterGen, WriterParts};
 struct Node {
     _pool: crate::test_util::TestPool,
     parts: WriterParts,
-    shared: Arc<handoff::Shared>,
+    shared: Arc<volumes::handoff::Shared>,
     pki: raidish_auth::testing::Pki,
 }
 
@@ -266,7 +277,7 @@ async fn node() -> Node {
         .await
         .unwrap();
     let parts = writer_on(fs);
-    let shared = Arc::new(handoff::Shared::new(LeaseClient::new(vec![])));
+    let shared = Arc::new(volumes::handoff::Shared::new(LeaseClient::new(vec![])));
     shared.volumes.set_writer(parts.clone());
     Node {
         _pool: pool,
@@ -287,7 +298,7 @@ fn writer_on(fs: Arc<crate::fs::FileSystem<crate::vdev::Pool>>) -> WriterParts {
 }
 
 impl Node {
-    fn vols(&self) -> &volumes::Volumes {
+    fn vols(&self) -> &Arc<volumes::Volumes> {
         &self.shared.volumes
     }
 
@@ -492,7 +503,7 @@ async fn takeovers_are_checked_against_the_writer_and_the_slot() {
 /// A handoff from here holds the volume whole while it runs: peers aren't
 /// pointed at it, nothing claims it. Called off, it runs here again as it
 /// was, device and all; with its writer gone meanwhile, it's the caller's
-/// to stop instead.
+/// to stop instead. Its marker outlives the writer until the handoff ends.
 #[tokio::test]
 async fn an_aborted_handoff_puts_the_volume_back_whole() {
     let n = node().await;
@@ -508,7 +519,7 @@ async fn an_aborted_handoff_puts_the_volume_back_whole() {
     assert!(at(5).is_ok());
     assert!(at(4).is_err(), "answered for another epoch");
 
-    let o = n.vols().begin_handoff(&vol(), w).unwrap();
+    let (o, m) = n.vols().begin_handoff(&vol(), w).unwrap();
     assert_eq!(n.state(), Some("handing off"));
     assert!(
         at(5).is_err(),
@@ -518,17 +529,150 @@ async fn an_aborted_handoff_puts_the_volume_back_whole() {
         n.vols().begin_takeover(&vol(), w, Transport::Nbd),
         Err(Claim::Busy)
     ));
-    assert!(n.vols().abort_handoff(&vol(), w, o).is_ok());
+    assert!(m.abort_handoff(o).is_ok());
     assert_eq!(n.state(), Some("running"));
     assert_eq!(n.vols().owned(&vol(), |o| o.attach.clone()), Some(dev));
     assert!(at(5).is_ok());
 
-    let o = n.vols().begin_handoff(&vol(), w).unwrap();
-    n.vols().drop_writer(w);
-    let back = n.vols().abort_handoff(&vol(), w, o);
+    let (o, m) = n.vols().begin_handoff(&vol(), w).unwrap();
+    let dropped = n.vols().drop_writer(w);
+    assert!(dropped.owned.is_empty());
+    assert_eq!(n.state(), Some("handing off"), "the marker went first");
+    let back = m.abort_handoff(o);
     assert!(back.is_err(), "put back onto a dropped writer");
     assert_eq!(n.state(), None);
     back.err().unwrap().export.close().await.unwrap();
+}
+
+/// A clean stop in the background holds the volume's slot (`Stopping`)
+/// until it ends: not written here any more, not claimed by a takeover
+/// (the listener's or the loop's), not dropped with its writer, so a new
+/// writer can't start it while the old task still detaches it. However
+/// the task ends, the marker goes, and the loop is poked.
+#[tokio::test]
+async fn a_stop_marker_outlives_its_writer_until_the_stop_ends() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    n.run(5, Attach::Exported).await;
+    let wake = n.vols().wake().clone();
+    assert!(n.vols().begin_stop(&vol(), WriterGen::next()).is_none());
+    let (o, m) = n.vols().begin_stop(&vol(), w).unwrap();
+    assert_eq!(n.state(), Some("stopping"));
+    assert!(n.vols().has(&vol()));
+    assert!(!n.vols().writes(&vol()));
+    assert!(n.vols().published().is_empty());
+    assert!(n.vols().lost().is_empty());
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+
+    // Its writer dropped and replaced: still there, still refused.
+    let dropped = n.vols().drop_writer(w);
+    assert!(dropped.owned.is_empty() && dropped.proxies.is_empty());
+    assert_eq!(n.state(), Some("stopping"));
+    let w2 = writer_on(n.parts.fs.clone());
+    n.vols().set_writer(w2.clone());
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w2.wgen, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+
+    // The task ends (here: dropped, as by a panic or an abort).
+    o.export.close().await.unwrap();
+    drop(m);
+    assert_eq!(n.state(), None);
+    tokio::time::timeout(Duration::from_secs(1), wake.notified())
+        .await
+        .expect("the loop wasn't poked");
+    assert!(
+        n.vols()
+            .begin_takeover(&vol(), w2.wgen, Transport::Nbd)
+            .is_ok()
+    );
+}
+
+/// A volume handed over to this node pokes the loop: its device is
+/// attached at once, not a tick later.
+#[tokio::test]
+async fn a_finished_handoff_to_here_pokes_the_loop() {
+    let n = node().await;
+    let wake = n.vols().wake().clone();
+    let g = n
+        .vols()
+        .begin_takeover(&vol(), n.parts.wgen, Transport::Nbd)
+        .unwrap();
+    let o = n.owned(6, Attach::Exported).await;
+    assert!(g.finish(o, Took::Adopted).is_ok());
+    tokio::time::timeout(Duration::from_secs(1), wake.notified())
+        .await
+        .expect("the loop wasn't poked");
+    for (_, o) in n.vols().drop_writer(n.parts.wgen).owned {
+        o.export.close().await.unwrap();
+    }
+}
+
+/// The background work: a volume's busy while its task runs; the fence
+/// waits for the dropped writer's tasks only; finished ones are collected
+/// once, a panicked one as an error.
+#[tokio::test]
+async fn background_work_is_collected_and_joined_by_writer() {
+    use crate::volumes::background::{Background, Work};
+    let (a, b) = (dsn("a"), dsn("b"));
+    let (w1, w2) = (WriterGen::next(), WriterGen::next());
+    let mut bg = Background::default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    bg.spawn(&a, w1, Work::Stop, async { Ok(()) });
+    bg.spawn(&b, w2, Work::Stop, async move {
+        let _ = rx.await;
+        Err("late".into())
+    });
+    assert!(bg.busy(&a) && bg.busy(&b));
+    bg.join(w1).await;
+    assert!(!bg.busy(&a) && bg.busy(&b));
+    assert!(bg.collect().await.is_empty(), "b isn't done");
+    tx.send(()).unwrap();
+    let t = std::time::Instant::now();
+    let done = loop {
+        let d = bg.collect().await;
+        if !d.is_empty() {
+            break d;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(done, vec![(b.clone(), Work::Stop, Err("late".into()))]);
+    assert!(!bg.busy(&b));
+    bg.spawn(&a, w1, Work::Stop, async { panic!("boom") });
+    bg.join(w1).await;
+    bg.spawn(&a, w1, Work::Stop, async { panic!("boom") });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let done = bg.collect().await;
+    assert!(matches!(&done[..], [(_, Work::Stop, Err(e))] if e.contains("failed")));
+}
+
+/// What a background task waits on ends once either lease is lost, and
+/// not before.
+#[tokio::test]
+async fn waits_end_on_either_lost_lease() {
+    let (a, b) = (
+        Lost(Arc::new(watch::Sender::new(false))),
+        Lost(Arc::new(watch::Sender::new(false))),
+    );
+    assert_eq!(or_lost(async { 7 }, &a, &b).await, Some(7));
+    let b2 = b.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        b2.0.send_replace(true);
+    });
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        or_lost(std::future::pending::<()>(), &a, &b),
+    )
+    .await;
+    assert_eq!(r, Ok(None));
+    // Lost already: at once.
+    assert_eq!(or_lost(std::future::pending::<()>(), &b, &a).await, None);
 }
 
 /// What was handed over is written here at once (peers proxy to it, with
@@ -619,7 +763,313 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
 /// transfer: else the lease could go to an owner that stopped waiting.
 #[test]
 fn the_receiver_outwaits_the_sender() {
-    assert!(handoff::TRANSFER_WAIT >= handoff::SENDER_BUDGET + Duration::from_secs(20));
+    assert!(
+        volumes::handoff::TRANSFER_WAIT
+            >= volumes::handoff::SENDER_BUDGET + Duration::from_secs(20)
+    );
     // The drain alone takes up to 30 s (`DRAIN_TIMEOUT`).
-    assert!(handoff::SENDER_BUDGET > Duration::from_secs(30));
+    assert!(volumes::handoff::SENDER_BUDGET > Duration::from_secs(30));
+}
+
+/// Every handoff message reads back as itself, an error stays one line,
+/// and a garbled line is refused.
+#[test]
+fn handoff_messages_round_trip() {
+    use volumes::handoff::Msg;
+    let holder = crate::types::Holder {
+        role: crate::types::HolderRole::Agent,
+        node: Some("node-2".into()),
+        addr: Some("10.0.0.2:7000".into()),
+        detail: String::new(),
+    };
+    for m in [
+        Msg::Ready {
+            owner: "agent:node-2".into(),
+            holder,
+        },
+        Msg::Transferred(crate::types::Epoch::from(7)),
+        Msg::Done,
+        Msg::Abort,
+        Msg::Err("pool busy".into()),
+    ] {
+        assert_eq!(Msg::parse(&m.to_string()), Ok(m));
+    }
+    let e = Msg::Err("one\ntwo".into()).to_string();
+    assert!(!e.contains('\n'));
+    assert_eq!(Msg::parse(&e), Ok(Msg::Err("one two".into())));
+    for bad in [
+        "",
+        "READY agent:node-2",
+        "READY x\t{",
+        "TRANSFERRED x",
+        "HELLO",
+    ] {
+        assert!(Msg::parse(bad).is_err(), "{:?} parsed", bad);
+    }
+}
+
+/// A VM that can't move live is shut down at once: `NotLive` (and a failed
+/// migration found still here) leave it `Stopping` with no shutdown sent,
+/// so the next stop pass sends it instead of waiting out the timeout.
+#[test]
+fn vm_moving_cold_is_shut_down_at_once() {
+    use vms::migrate::{Failure, Unsettled, Whereabouts};
+    use vms::state::{self, StopStep, Stopping, VmState};
+    let timeout = Duration::from_secs(120);
+    let now = std::time::Instant::now();
+    let unsettled = || Unsettled {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        why: "lost".into(),
+        told: false,
+        recovered: false,
+    };
+    for st in [
+        state::finished(
+            "node-2".into(),
+            vec![vol()],
+            Err(Failure::NotLive("no shared CPU".into())),
+        ),
+        state::settled(unsettled(), Whereabouts::Here),
+        state::settled(unsettled(), Whereabouts::Neither),
+    ] {
+        let VmState::Stopping(s) = st else {
+            panic!("not stopping");
+        };
+        assert_eq!(s, Stopping::cold("node-2".into()));
+        assert_eq!(
+            state::stop_step(s.shutdown_sent, now, timeout),
+            StopStep::Shutdown
+        );
+    }
+    // Sent: it gets the timeout, then it's forced off.
+    let sent = Some(now);
+    assert_eq!(
+        state::stop_step(sent, now + timeout / 2, timeout),
+        StopStep::Wait
+    );
+    assert_eq!(
+        state::stop_step(sent, now + timeout + Duration::from_secs(1), timeout),
+        StopStep::ForceOff
+    );
+}
+
+/// Where a migration leaves a VM, and the cold move's memo.
+#[tokio::test]
+async fn vm_state_transitions() {
+    use vms::migrate::{self, Failure, Unsettled, Whereabouts};
+    use vms::state::{self, Stopping, VmState};
+    let u = Unsettled {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        why: "lost".into(),
+        told: false,
+        recovered: false,
+    };
+    // Done: its volumes are handed over, starting with this node detaching.
+    let VmState::HandingOffVolumes(m) = state::finished("node-2".into(), vec![vol()], Ok(()))
+    else {
+        panic!("not handing off");
+    };
+    assert_eq!(
+        (m.to.as_str(), m.volumes, m.detached),
+        ("node-2", vec![vol()], false)
+    );
+    // Failed: unsettled until where the guest runs is known.
+    let st = state::finished(
+        "node-2".into(),
+        vec![vol()],
+        Err(Failure::Failed("lost".into())),
+    );
+    assert!(matches!(&st, VmState::Unsettled(x) if x.why == "lost" && !x.told));
+    assert!(st.leaving());
+    // B can't be asked: still unsettled, and the operator was told.
+    let st = state::settled(u, Whereabouts::Unknown);
+    let VmState::Unsettled(u) = st else {
+        panic!("settled");
+    };
+    assert!(u.told);
+    // It switched over after all: handed over like a success.
+    let st = state::settled(u, Whereabouts::There);
+    assert!(matches!(&st, VmState::HandingOffVolumes(m) if !m.detached));
+    assert!(st.leaving());
+    // A migration under way is leaving; a stop isn't.
+    let running = migrate::Migration {
+        to: "node-2".into(),
+        volumes: vec![vol()],
+        started: std::time::Instant::now(),
+        task: tokio::spawn(async { Ok(()) }),
+    };
+    assert!(VmState::Migrating(running).leaving());
+    assert!(!VmState::Stopping(Stopping::default()).leaving());
+    // The memo lasts while the anchor is asked to move there.
+    let to = || Some("node-2".to_string());
+    assert_eq!(state::keep_cold_to(to(), Some("node-2")), to());
+    assert_eq!(state::keep_cold_to(to(), Some("node-3")), None);
+    assert_eq!(state::keep_cold_to(to(), None), None);
+    assert!(Stopping::default().idle());
+    assert!(!Stopping::cold("node-2".into()).idle());
+}
+
+fn record(from: &str, to: &str) -> crate::cluster::state::MigrationRecord {
+    crate::cluster::state::MigrationRecord {
+        from: from.into(),
+        to: to.into(),
+        volumes: vec![vol()],
+        since_ms: 0,
+    }
+}
+
+/// Who finishes a recorded migration (I-29): its source once it has no
+/// job for it, its target only once the source is gone, nobody else.
+#[test]
+fn recorded_migrations_are_finished_by_their_source_or_a_gone_ones_target() {
+    use vms::state::{Recovery, recovery};
+    let rec = record("node-0", "node-1");
+    let live = |ns: &[&str]| {
+        ns.iter()
+            .map(|n| n.to_string())
+            .collect::<BTreeSet<String>>()
+    };
+    let both = live(&["node-0", "node-1", "node-2"]);
+    // The source: its job (or handoff, or stop) runs; or it restarted.
+    assert_eq!(recovery(&rec, "node-0", &both, true), Recovery::Nothing);
+    assert_eq!(recovery(&rec, "node-0", &both, false), Recovery::Resettle);
+    // The target: never while the source is live (it may be under way).
+    assert_eq!(recovery(&rec, "node-1", &both, false), Recovery::Nothing);
+    let gone = live(&["node-1", "node-2"]);
+    assert_eq!(recovery(&rec, "node-1", &gone, false), Recovery::StandIn);
+    // Anyone else: never.
+    assert_eq!(recovery(&rec, "node-2", &gone, false), Recovery::Nothing);
+}
+
+/// A target finishing a gone source's migration: the source detached
+/// first, then (its leases lapsed) the target, then the record.
+#[test]
+fn a_stand_in_detaches_the_source_then_itself() {
+    use vms::state::{StandInStep, stand_in_step};
+    let rec = record("node-0", "node-1");
+    let at = |ns: &'static [&'static str]| {
+        move |_: &DatasetName| -> Vec<String> { ns.iter().map(|n| n.to_string()).collect() }
+    };
+    let writer = |n: Option<&'static str>| move |_: &DatasetName| n.map(str::to_string);
+    assert_eq!(
+        stand_in_step(
+            &rec,
+            "node-1",
+            at(&["node-0", "node-1"]),
+            writer(Some("node-0"))
+        ),
+        StandInStep::Detach("node-0".into(), vec![vol()])
+    );
+    // Its `ds/` lease hasn't lapsed yet.
+    assert_eq!(
+        stand_in_step(&rec, "node-1", at(&["node-1"]), writer(Some("node-0"))),
+        StandInStep::Wait
+    );
+    for w in [None, Some("node-1")] {
+        assert_eq!(
+            stand_in_step(&rec, "node-1", at(&["node-1"]), writer(w)),
+            StandInStep::Detach("node-1".into(), vec![vol()])
+        );
+    }
+    assert_eq!(
+        stand_in_step(&rec, "node-1", at(&[]), writer(None)),
+        StandInStep::End
+    );
+}
+
+/// The safety net picks a running VM's attached volumes, unless a
+/// migration of it is recorded.
+#[test]
+fn the_safety_net_skips_recorded_migrations() {
+    use vms::state::leaked;
+    let other = DatasetName::from_static("other");
+    let vols = vec![vol(), other.clone()];
+    let attached = |v: &DatasetName| *v == other;
+    assert_eq!(leaked(&vols, false, attached), vec![other.clone()]);
+    assert!(leaked(&vols, true, attached).is_empty());
+    assert!(leaked(&vols, false, |_| false).is_empty());
+}
+
+/// A frontend with nothing to serve, for `Served`.
+fn frontend(pki: &raidish_auth::testing::Pki) -> Arc<crate::frontend::Frontend> {
+    use crate::frontend::{Frontend, ServiceTls, ServicesConfig, keys::ServiceAuth};
+    let auth = ServiceAuth::new(
+        "us-east-1".into(),
+        pki.verifier.clone(),
+        Arc::new(|| Some(vec![7; 32])),
+    );
+    Frontend::new(
+        "node-0".into(),
+        ServicesConfig::default(),
+        auth,
+        ServiceTls::new(&pki.tls).unwrap(),
+        crate::committer::Admin::new(
+            Default::default(),
+            crate::committer::CommitClient::new(vec![]),
+        ),
+    )
+}
+
+/// The services follow the writer by its generation: a writer dropped and
+/// opened again between two looks (a `watch` shows only the newest, never
+/// the None between) still takes down what ran on the old one first. The
+/// same writer, looked at again, leaves them be.
+#[tokio::test]
+async fn services_go_with_their_writers_generation() {
+    use crate::services::{RunningService, Served};
+    let n = node().await;
+    let mut s = Served {
+        node: "node-0".into(),
+        frontend: frontend(&n.pki),
+        events: crate::events::EventSink::new("node-0"),
+        ran_on: None,
+        running: Default::default(),
+    };
+    let w1 = n.parts.clone();
+    s.follow(Some(w1.clone())).await;
+    let lease = |e| {
+        Arc::new(HeldLease::adopt(
+            LeaseClient::new(vec![]),
+            dataset_resource(&dsn("b")),
+            "owner",
+            crate::types::Epoch::from_raw(e),
+            std::time::Instant::now(),
+        ))
+    };
+    let running = |e| RunningService {
+        lease: lease(e),
+        lost: Lost(Arc::new(watch::Sender::new(false))),
+        format: crate::dataset::DatasetFormat::S3,
+    };
+    s.running.insert(dsn("b"), running(1));
+    s.follow(Some(w1.clone())).await;
+    assert_eq!(s.running.len(), 1, "the same writer: kept");
+
+    let w2 = writer_on(n.parts.fs.clone());
+    s.follow(Some(w2.clone())).await;
+    assert!(
+        s.running.is_empty(),
+        "ran on the old writer, kept on the new"
+    );
+    assert_eq!(s.ran_on.as_ref().map(|w| w.wgen), Some(w2.wgen));
+
+    s.running.insert(dsn("b"), running(2));
+    s.follow(None).await;
+    assert!(s.running.is_empty());
+    assert!(s.ran_on.is_none());
+
+    // Its own lease lost: stopped, the rest kept.
+    s.follow(Some(w2.clone())).await;
+    let r = running(3);
+    let lost = r.lost.clone();
+    s.running.insert(dsn("b"), r);
+    s.running.insert(dsn("c"), running(4));
+    lost.0.send_replace(true);
+    s.drop_lost().await;
+    assert_eq!(
+        s.running.keys().cloned().collect::<Vec<_>>(),
+        vec![dsn("c")]
+    );
 }

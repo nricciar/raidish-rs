@@ -130,6 +130,7 @@ event_kinds! {
     VmMigrateFailed => "vm.migrate_failed",
     VmMovingCold => "vm.moving_cold",
     VmArrived => "vm.arrived",
+    VmMigrationRecovered => "vm.migration_recovered",
 }
 
 impl std::fmt::Display for EventKind {

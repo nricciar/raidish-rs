@@ -604,3 +604,9 @@ pub fn ds(s: &str) -> crate::types::DatasetName {
 pub fn vmn(s: &str) -> crate::types::VmName {
     s.parse().unwrap()
 }
+
+/// Dataset name `s`, which a test knows is valid.
+#[track_caller]
+pub fn dsn(s: &str) -> crate::types::DatasetName {
+    s.parse().unwrap()
+}
