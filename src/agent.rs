@@ -14,6 +14,8 @@
 mod handoff;
 #[path = "agent_migrate.rs"]
 mod migrate;
+#[path = "agent_volume.rs"]
+mod volumes;
 
 use crate::cluster::Cluster;
 use crate::cluster::lease::{HeldLease, LeaseClient};
@@ -169,7 +171,7 @@ pub fn place_on(
     }
 }
 
-pub use crate::api_types::{AgentStatus, Attach, RunningVolume};
+pub use crate::api_types::{AgentStatus, Attach};
 
 pub type AgentState = Arc<std::sync::RwLock<AgentStatus>>;
 
@@ -190,15 +192,6 @@ impl std::fmt::Display for StartError {
     }
 }
 
-struct Running {
-    lease: Arc<HeldLease>,
-    lost: Lost,
-    info: RunningVolume,
-    /// When its kernel device was last attached, or tried (a failed
-    /// attach is tried again `ATTACH_RETRY` later).
-    attach_tried: std::time::Instant,
-}
-
 /// How long after a failed attach the agent tries again.
 const ATTACH_RETRY: Duration = Duration::from_secs(10);
 
@@ -215,14 +208,15 @@ struct NodeWriter {
     /// Held (and renewed) for as long as this writer exists.
     _lease: Arc<HeldLease>,
     lost: Lost,
-    /// Its file system and block servers (`w.fs`, `w.exporter(t)`).
-    parts: handoff::WriterParts,
+    /// Its file system and block servers (`w.fs`, `w.exporter(t)`), and
+    /// its generation (`w.wgen`).
+    parts: volumes::WriterParts,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl std::ops::Deref for NodeWriter {
-    type Target = handoff::WriterParts;
-    fn deref(&self) -> &handoff::WriterParts {
+    type Target = volumes::WriterParts;
+    fn deref(&self) -> &volumes::WriterParts {
         &self.parts
     }
 }
@@ -342,7 +336,6 @@ pub struct Agent {
     writer: Option<NodeWriter>,
     /// Where this node's file API finds the writer.
     files: WriterSlot,
-    running: BTreeMap<DatasetName, Running>,
     /// Running VMs here (None: this node runs none).
     vm: Option<Arc<crate::vm::VmRuntime>>,
     /// What it knows and has under way about VMs.
@@ -420,7 +413,6 @@ impl Agent {
             state,
             writer: None,
             files,
-            running: BTreeMap::new(),
             vm: None,
             vms: VmBook::default(),
             facts: Default::default(),
@@ -548,19 +540,7 @@ impl Agent {
     }
 
     fn publish(&self) {
-        let mut volumes: Vec<RunningVolume> =
-            self.running.values().map(|r| r.info.clone()).collect();
-        for (name, slot) in self.shared.slots.lock().unwrap().iter() {
-            if let handoff::Slot::Proxy(p) = slot {
-                volumes.push(RunningVolume {
-                    name: name.clone(),
-                    transport: p.transport,
-                    attach: Attach::device_of(p.device.clone()),
-                    proxied: true,
-                });
-            }
-        }
-        self.state.write().unwrap().volumes = volumes;
+        self.state.write().unwrap().volumes = self.shared.volumes.published();
     }
 
     /// One pass of the placement loop: let go of what this node lost, then
@@ -605,13 +585,9 @@ impl Agent {
     /// are fenced already; this keeps it from running on with I/O errors
     /// while another node starts it).
     async fn drop_lost(&mut self) {
-        self.drop_lost_adopted().await;
-        let lost: Vec<DatasetName> = self
-            .running
-            .iter()
-            .filter(|(_, r)| r.lost.is_lost())
-            .map(|(n, _)| n.clone())
-            .collect();
+        // Handed over but not picked up yet counts too: their exports and
+        // VMs must go once their lease does (audit A1).
+        let lost = self.shared.volumes.lost();
         if !lost.is_empty() {
             self.destroy_vms_using(&lost).await;
         }
@@ -658,99 +634,44 @@ impl Agent {
                     self.node
                 ),
             );
-            // No takeover may publish onto this writer from here on (it
-            // checks under this lock, and undoes itself); those that did
-            // already are taken in with the rest (audit A1).
-            let parts = self.shared.writer.lock().unwrap().take();
-            self.drop_lost_adopted().await;
-            let names: Vec<DatasetName> = self.running.keys().cloned().collect();
+            // Everything that ran on it, handed over or not: no takeover
+            // may finish onto this writer from here on (it checks under the
+            // same lock, and undoes itself), and those that did are taken
+            // with the rest (audit A1).
+            let wgen = self.writer.as_ref().map(|w| w.wgen);
+            let dropped = match wgen {
+                Some(g) => self.shared.volumes.drop_writer(g),
+                None => volumes::Dropped {
+                    owned: Vec::new(),
+                    proxies: Vec::new(),
+                },
+            };
+            let names: Vec<DatasetName> = dropped.owned.iter().map(|(n, _)| n.clone()).collect();
             self.destroy_vms_using(&names).await;
             // All at once: each waits out its clients' drain (I-27).
-            let taken: Vec<(DatasetName, Running)> = names
-                .into_iter()
-                .filter_map(|n| self.running.remove(&n).map(|r| (n, r)))
-                .collect();
             let me = &*self;
             futures::future::join_all(
-                taken
+                dropped
+                    .owned
                     .into_iter()
-                    .map(|(n, r)| async move { me.wind_down(&n, r, false).await }),
+                    .map(|(n, v)| async move { me.wind_down(&n, v, false).await }),
             )
             .await;
             let names: Vec<DatasetName> = self.services.running.keys().cloned().collect();
             for name in names {
                 self.stop_service(&name, false).await;
             }
-            self.drop_proxies(parts).await;
+            // Its proxied exports too, devices and all.
+            let me = &*self;
+            futures::future::join_all(
+                dropped
+                    .proxies
+                    .into_iter()
+                    .map(|(n, p)| async move { me.take_down_proxy(&n, p).await }),
+            )
+            .await;
             self.writer = None;
-            self.shared.writing.lock().unwrap().clear();
             *self.files.write().unwrap() = None;
-        }
-    }
-
-    /// Volumes handed over to this node but not adopted yet (that's in
-    /// `tick`, which doesn't run without the node lease) are run all the
-    /// same: their exports and VMs must go once their lease does, or the
-    /// writer's (audit A1). Those that must go are put with the running
-    /// ones, for the rest of `drop_lost` to stop. With no writer at all
-    /// (a takeover that finished after it was dropped), they're stopped
-    /// here: nothing else would.
-    async fn drop_lost_adopted(&mut self) {
-        let writer = match &self.writer {
-            None => WriterStanding::Gone,
-            Some(w) if w.lost.is_lost() => WriterStanding::Lost,
-            Some(_) => WriterStanding::Held,
-        };
-        let taken: Vec<(DatasetName, handoff::Slot)> = {
-            let mut slots = self.shared.slots.lock().unwrap();
-            let adopted = slots.iter().filter_map(|(n, s)| match s {
-                handoff::Slot::Adopted { lost, .. } => Some((n, lost.is_lost())),
-                _ => None,
-            });
-            adopted_to_drop(adopted, writer)
-                .into_iter()
-                .filter_map(|n| slots.remove(&n).map(|s| (n, s)))
-                .collect()
-        };
-        let mut names = Vec::new();
-        for (name, slot) in taken {
-            let handoff::Slot::Adopted {
-                lease,
-                lost,
-                transport,
-                device,
-            } = slot
-            else {
-                continue;
-            };
-            eprintln!(
-                "agent: dropping volume '{}', handed over but not adopted",
-                name
-            );
-            self.running.insert(
-                name.clone(),
-                Running {
-                    lease,
-                    lost,
-                    attach_tried: std::time::Instant::now(),
-                    info: RunningVolume {
-                        name: name.clone(),
-                        transport,
-                        attach: match device {
-                            Some(device) => Attach::Attached { device },
-                            None => Attach::Exported,
-                        },
-                        proxied: false,
-                    },
-                },
-            );
-            names.push(name);
-        }
-        if writer == WriterStanding::Gone && !names.is_empty() {
-            self.destroy_vms_using(&names).await;
-            for name in names {
-                self.stop(&name, false).await;
-            }
         }
     }
 
@@ -870,17 +791,17 @@ impl Agent {
     /// be; start what belongs here.
     async fn reconcile_volumes(&mut self, p: &Placement, doms: &Domains) {
         let in_use = doms.in_use();
-        let stop: Vec<DatasetName> = self
-            .running
+        let running = self.shared.volumes.running();
+        let stop: Vec<DatasetName> = running
             .iter()
-            .filter(|(name, r)| match p.volume(name) {
+            .filter(|(name, t)| match p.volume(name) {
                 None => true,
                 Some(v) => {
                     p.target(name, &v.props).as_deref() != Some(&self.node)
-                        || p.transport(name, &v.props) != Some(r.info.transport)
+                        || p.transport(name, &v.props) != Some(*t)
                 }
             })
-            .filter(|(name, _)| !in_use.contains(*name))
+            .filter(|(name, _)| !in_use.contains(name))
             // Libvirt unknown: VM volumes stay where they are, they may be
             // in use.
             .filter(|(name, _)| doms.listed.is_ok() || !p.for_vm(name))
@@ -895,7 +816,8 @@ impl Agent {
                 && p.peer_on
                 && to != self.node
                 && p.live.contains(&to)
-                && p.transport(&name, &v.props) == self.running.get(&name).map(|r| r.info.transport)
+                && p.transport(&name, &v.props)
+                    == self.shared.volumes.owned(&name, |o| o.export.transport)
                 && (p.attached(&name).contains(&to)
                     || v.props.move_to.as_deref() == Some(to.as_str()))
             {
@@ -907,7 +829,7 @@ impl Agent {
                         continue; // still the writer: again next tick
                     }
                 }
-                if !self.running.contains_key(&name) {
+                if !self.shared.volumes.writes(&name) {
                     continue;
                 }
             }
@@ -920,7 +842,7 @@ impl Agent {
             );
         }
         for v in p.volumes.values() {
-            if self.running.contains_key(&v.name) {
+            if self.shared.volumes.writes(&v.name) {
                 continue;
             }
             if p.target(&v.name, &v.props).as_deref() != Some(&self.node) {
@@ -954,39 +876,31 @@ impl Agent {
     async fn reconcile_proxies(&mut self, p: &Placement) {
         for v in p.volumes.values() {
             let here = p.attached(&v.name).contains(&self.node);
-            let (proxied, slot) = match self.shared.slots.lock().unwrap().get(&v.name) {
-                Some(handoff::Slot::Proxy(_)) => (true, true),
-                Some(_) => (false, true), // being (or just) handed over
-                None => (false, false),
-            };
+            // Anything else there: written here, or being handed over.
+            let proxied = self.shared.volumes.proxy_transport(&v.name);
+            let slot = self.shared.volumes.has(&v.name);
             // Only once another node writes it: proxying to nobody, the
             // kernel's first reads (attaching) would just wait.
             let elsewhere = p.holder(&v.name).is_some_and(|h| h != self.node);
-            if here && !slot && elsewhere && !self.running.contains_key(&v.name) {
+            if here && !slot && elsewhere {
                 let Some(t) = p.transport(&v.name, &v.props) else {
                     continue;
                 };
                 if let Err(e) = self.add_proxy(v, t, !p.for_vm(&v.name)).await {
                     eprintln!("agent: proxying volume '{}': {}", v.name, e);
                 }
-            } else if proxied
-                && (!here
-                    || self.running.contains_key(&v.name)
-                    || self.proxy_transport(&v.name) != p.transport(&v.name, &v.props))
-            {
-                // Gone from here, run here, or now over another transport
+            } else if proxied.is_some() && (!here || proxied != p.transport(&v.name, &v.props)) {
+                // Gone from here, or now over another transport
                 // (made again next tick).
                 self.remove_proxy(&v.name).await;
             }
         }
         let gone: Vec<DatasetName> = self
             .shared
-            .slots
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(n, s)| matches!(s, handoff::Slot::Proxy(_)) && p.volume(n).is_none())
-            .map(|(n, _)| n.clone())
+            .volumes
+            .proxied()
+            .into_iter()
+            .filter(|n| p.volume(n).is_none())
             .collect();
         for name in gone {
             self.remove_proxy(&name).await;
@@ -1020,14 +934,9 @@ impl Agent {
             // Migrated here: left alone while its volumes are proxied here
             // or being handed over, and made this node's once they run here.
             if v.meta.owner == crate::vm::DomOwner::Migrating {
-                let incoming = {
-                    let slots = self.shared.slots.lock().unwrap();
-                    v.meta
-                        .volumes
-                        .iter()
-                        .all(|x| self.running.contains_key(x) || slots.contains_key(x))
-                };
-                let arrived = v.meta.volumes.iter().all(|x| self.running.contains_key(x));
+                let vols = &self.shared.volumes;
+                let incoming = v.meta.volumes.iter().all(|x| vols.has(x));
+                let arrived = v.meta.volumes.iter().all(|x| vols.writes(x));
                 if arrived {
                     self.arrived(vm, v).await;
                     continue;
@@ -1039,11 +948,11 @@ impl Agent {
             // Running without this process holding its disks, or started
             // under an earlier lease (an orphan of an earlier raidish here:
             // its NBD connections go nowhere, its writes would be refused).
-            let current = self
-                .running
-                .get(&v.meta.anchor)
-                .is_some_and(|r| v.meta.owner.is(&r.lease.owner));
-            if !current || !v.meta.volumes.iter().all(|x| self.running.contains_key(x)) {
+            let vols = &self.shared.volumes;
+            let current = vols
+                .owned(&v.meta.anchor, |o| v.meta.owner.is(&o.lease.owner))
+                .unwrap_or(false);
+            if !current || !v.meta.volumes.iter().all(|x| vols.writes(x)) {
                 eprintln!(
                     "agent: VM '{}' runs here without this node's hold on its volumes \
                      (an orphan); destroying it",
@@ -1184,10 +1093,12 @@ impl Agent {
             let Some(anchor) = spec.anchor() else {
                 continue;
             };
-            if !spec.volumes().iter().all(|v| self.running.contains_key(v)) {
+            if !spec.volumes().iter().all(|v| self.shared.volumes.writes(v)) {
                 continue; // its disks aren't all here yet
             }
-            let owner = self.running[anchor].lease.owner.clone();
+            let Some(owner) = self.shared.volumes.owned(anchor, |o| o.lease.owner.clone()) else {
+                continue;
+            };
             let Some(ident) = vm.ident() else {
                 continue;
             };
@@ -1339,8 +1250,13 @@ impl Agent {
                 }
             }));
             *self.files.write().unwrap() = Some(fs.clone());
-            let parts = handoff::WriterParts { fs, nbd, nvme };
-            *self.shared.writer.lock().unwrap() = Some(parts.clone());
+            let parts = volumes::WriterParts {
+                wgen: volumes::WriterGen::next(),
+                fs,
+                nbd,
+                nvme,
+            };
+            self.shared.volumes.set_writer(parts.clone());
             self.writer = Some(NodeWriter {
                 _lease: lease,
                 lost,
@@ -1359,59 +1275,53 @@ impl Agent {
         transport: Transport,
         attach: bool,
     ) -> Result<(), StartError> {
+        let parts = self
+            .ensure_writer()
+            .await
+            .map_err(StartError::Failed)?
+            .parts
+            .clone();
         // Exported here already, proxied to a writer that's gone: that
         // export is taken over (its clients keep their connections). Over
         // another transport it can't be (it would be served over one while
         // recorded as the other, and never removed): it goes first (I-27).
-        if matches!(
-            self.shared.slots.lock().unwrap().get(&v.name),
-            Some(handoff::Slot::Proxy(p)) if p.transport != transport
-        ) {
+        if self
+            .shared
+            .volumes
+            .proxy_transport(&v.name)
+            .is_some_and(|t| t != transport)
+        {
             self.remove_proxy(&v.name).await;
         }
-        let proxy = {
-            let mut slots = self.shared.slots.lock().unwrap();
-            match slots.remove(&v.name) {
-                Some(handoff::Slot::Proxy(p)) => Some(p),
-                None => None,
-                Some(other) => {
-                    slots.insert(v.name.clone(), other);
-                    return Err(StartError::Busy("a handoff is under way".into()));
-                }
-            }
-        };
-        let restore = |shared: &handoff::Shared, proxy: Option<handoff::Proxy>| {
-            if let Some(p) = proxy {
-                shared
-                    .slots
-                    .lock()
-                    .unwrap()
-                    .insert(v.name.clone(), handoff::Slot::Proxy(p));
-            }
-        };
+        let mut guard = self
+            .shared
+            .volumes
+            .begin_takeover(&v.name, parts.wgen, transport)
+            .map_err(|e| StartError::Busy(e.to_string()))?;
         let lease =
             match HeldLease::acquire(self.leases.clone(), dataset_resource(&v.name), self.desc())
                 .await
             {
                 Ok(l) => Arc::new(l),
                 Err(e) => {
-                    restore(&self.shared, proxy);
+                    guard.abort().await;
                     return Err(StartError::Busy(e));
                 }
             };
         let lost = hold(&lease, None);
-        let started = async {
-            let w = self.ensure_writer().await?;
+        let started: Result<(volumes::Export, Option<Attach>), String> = async {
             let l = lease.clone();
-            w.fs.attach_dataset_leased(
-                &v.name,
-                lease.holding(),
-                Some(lost.watch()),
-                Some(Arc::new(move || l.fresh())),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            match &proxy {
+            parts
+                .fs
+                .attach_dataset_leased(
+                    &v.name,
+                    lease.holding(),
+                    Some(lost.watch()),
+                    Some(Arc::new(move || l.fresh())),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            match guard.prior.take() {
                 Some(p) => {
                     // Its writer is gone (that's why this node starts it):
                     // requests stuck retrying it let go now and wait for
@@ -1420,42 +1330,56 @@ impl Agent {
                     // it (only its intent log is replayed): say so at the
                     // next flush (audit A2).
                     p.peer.retire();
-                    let mut paused = p.io.pause_owned().await;
+                    let mut paused = p.export.io().pause_owned().await;
                     // Asked once paused: a write acknowledged while the
                     // pause drained requests counts too.
                     if p.peer.unflushed() {
-                        p.io.poison();
+                        p.export.io().poison();
                     }
                     paused.set(Arc::new(crate::volume_io::LocalIo::new(
-                        w.fs.clone(),
+                        parts.fs.clone(),
                         &v.name,
                     )));
                     p.peer.retire();
-                    Ok(())
+                    drop(paused);
+                    Ok((p.export, Some(p.attach)))
                 }
-                None => w.add_export(&v.name, transport).await,
+                None => Ok((parts.add_export(&v.name, transport).await?, None)),
             }
         }
         .await;
-        if let Err(e) = started {
-            if let Some(w) = &self.writer {
-                w.fs.abandon_dataset(&v.name);
+        let (export, prior_attach) = match started {
+            Ok(x) => x,
+            Err(e) => {
+                parts.fs.abandon_dataset(&v.name);
+                lease.release().await;
+                guard.abort().await;
+                return Err(StartError::Failed(e));
             }
-            lease.release().await;
-            restore(&self.shared, proxy);
-            return Err(StartError::Failed(e));
+        };
+        let needs_attach = prior_attach.is_none() && attach;
+        let vol = volumes::Owned {
+            lease,
+            lost,
+            handed_from: None,
+            export,
+            attach: prior_attach.unwrap_or_default(),
+            attach_tried: std::time::Instant::now(),
+        };
+        // Written here from now on (peers may proxy to it); the device next.
+        if let Err(vol) = guard.finish(vol, volumes::Took::Running) {
+            self.wind_down(&v.name, vol, true).await;
+            return Err(StartError::Busy("this node's writer went away".into()));
         }
-        self.shared
-            .writing
-            .lock()
-            .unwrap()
-            .insert(v.name.clone(), lease.epoch);
-        let attached = if let Some(p) = &proxy {
-            Attach::device_of(p.device.clone())
-        } else if !attach {
-            Attach::Exported
+        let attached = if needs_attach {
+            let a = Attach::of(self.attach(&v.name, transport).await);
+            self.shared.volumes.set_attach(&v.name, a.clone());
+            a
         } else {
-            Attach::of(self.attach(&v.name, transport).await)
+            self.shared
+                .volumes
+                .owned(&v.name, |o| o.attach.clone())
+                .unwrap_or_default()
         };
         println!(
             "agent: running volume '{}' here ({}{})",
@@ -1499,20 +1423,6 @@ impl Agent {
                 eprintln!("agent: clearing the move of '{}': {}", v.name, e);
             }
         }
-        self.running.insert(
-            v.name.clone(),
-            Running {
-                lease,
-                lost,
-                attach_tried: std::time::Instant::now(),
-                info: RunningVolume {
-                    name: v.name.clone(),
-                    transport,
-                    attach: attached,
-                    proxied: false,
-                },
-            },
-        );
         Ok(())
     }
 
@@ -1520,25 +1430,12 @@ impl Agent {
     /// failed (the helper or a kernel module was missing, a transient
     /// error), so whatever waits for the device (see `crate::csi`) gets it.
     async fn retry_attach(&mut self) {
-        let due: Vec<(DatasetName, Transport)> = self
-            .running
-            .iter()
-            .filter(|(_, r)| {
-                matches!(r.info.attach, Attach::Failed { .. })
-                    && r.attach_tried.elapsed() >= ATTACH_RETRY
-            })
-            .map(|(n, r)| (n.clone(), r.info.transport))
-            .collect();
-        for (name, t) in due {
-            let result = self.attach(&name, t).await;
-            let Some(r) = self.running.get_mut(&name) else {
-                continue;
-            };
-            r.info.attach = Attach::of(result);
-            r.attach_tried = std::time::Instant::now();
-            if r.info.attach.error().is_none() {
-                println!("agent: attached volume '{}'{}", name, r.info.attach.on());
+        for (name, t) in self.shared.volumes.attach_due(ATTACH_RETRY) {
+            let attach = Attach::of(self.attach(&name, t).await);
+            if attach.error().is_none() {
+                println!("agent: attached volume '{}'{}", name, attach.on());
             }
+            self.shared.volumes.set_attach(&name, attach);
         }
     }
 
@@ -1730,23 +1627,22 @@ impl Agent {
     /// Stop running `name`: detach, unexport, and (`clean`) sync and release
     /// the lease; otherwise (lease lost) drop it without writing.
     async fn stop(&mut self, name: &DatasetName, clean: bool) {
-        let Some(r) = self.running.remove(name) else {
+        let Some(v) = self.shared.volumes.take_owned(name) else {
             return;
         };
-        self.wind_down(name, r, clean).await;
+        self.wind_down(name, v, clean).await;
     }
 
-    /// Stop volume `name` out of `running` already (see `stop`). Takes
+    /// Stop volume `name`, out of `Volumes` already (see `stop`). Takes
     /// only `&self`, so several can go at once.
-    async fn wind_down(&self, name: &DatasetName, r: Running, clean: bool) {
-        self.shared.writing.lock().unwrap().remove(name);
-        if r.info.attach.device().is_some()
-            && let Err(e) = self.detach(name, r.info.transport).await
+    async fn wind_down(&self, name: &DatasetName, v: volumes::Owned, clean: bool) {
+        if v.attach.device().is_some()
+            && let Err(e) = self.detach(name, v.export.transport).await
         {
             eprintln!("agent: detaching '{}': {}", name, e);
         }
+        let removed = v.export.close().await;
         if let Some(w) = &self.writer {
-            let removed = w.exporter(r.info.transport).remove_export(name).await;
             if clean {
                 if let Err(e) = removed {
                     eprintln!("agent: unexporting '{}': {}", name, e);
@@ -1761,7 +1657,7 @@ impl Agent {
             }
         }
         if clean {
-            r.lease.release().await;
+            v.lease.release().await;
         }
     }
 
@@ -1821,7 +1717,7 @@ impl Agent {
             || p.target(anchor_name, &anchor.props).as_deref() != Some(to.as_str())
             || !p.state.vms.contains_key(name.as_str())
             || vm.restarting(name)
-            || !spec.volumes().iter().all(|x| self.running.contains_key(x))
+            || !spec.volumes().iter().all(|x| self.shared.volumes.writes(x))
             || self.vms.migrate_failed.get(name) == Some(&to)
         {
             return false;
@@ -1960,7 +1856,7 @@ impl Agent {
                 self.vms.migrated.insert(name, m);
                 continue;
             }
-            if m.volumes.iter().any(|v| self.running.contains_key(v)) {
+            if m.volumes.iter().any(|v| self.shared.volumes.writes(v)) {
                 self.vms.migrated.insert(name, m);
                 continue;
             }
@@ -2085,11 +1981,15 @@ impl Agent {
     /// node's (its metadata names this node's lease owner).
     async fn arrived(&mut self, vm: &Arc<crate::vm::VmRuntime>, v: &crate::vm::LocalVm) {
         let name = &v.name;
-        let Some(r) = self.running.get(&v.meta.anchor) else {
+        let Some(owner) = self
+            .shared
+            .volumes
+            .owned(&v.meta.anchor, |o| o.lease.owner.clone())
+        else {
             return;
         };
         let meta = crate::vm::DomMeta {
-            owner: crate::vm::DomOwner::Lease(r.lease.owner.clone()),
+            owner: crate::vm::DomOwner::Lease(owner),
             node: self.node.clone(),
             ..v.meta.clone()
         };
@@ -2108,34 +2008,12 @@ impl Agent {
 
     /// Put what was handed to this node (see `handoff`) with what it runs.
     async fn adopt_handed_over(&mut self, volumes: &[VolumeInfo]) {
-        let adopted: Vec<(DatasetName, handoff::Slot)> = {
-            let mut slots = self.shared.slots.lock().unwrap();
-            let names: Vec<DatasetName> = slots
-                .iter()
-                .filter(|(_, s)| matches!(s, handoff::Slot::Adopted { .. }))
-                .map(|(n, _)| n.clone())
-                .collect();
-            names
-                .into_iter()
-                .filter_map(|n| slots.remove(&n).map(|s| (n, s)))
-                .collect()
-        };
-        for (name, slot) in adopted {
-            let handoff::Slot::Adopted {
-                lease,
-                lost,
-                transport,
-                device,
-            } = slot
-            else {
-                continue;
-            };
+        for (name, transport, attach) in self.shared.volumes.pick_up() {
             let vm_disk = self.vms.specs.values().any(|s| s.volumes().contains(&name));
-            let attached = match device {
-                Some(device) => Attach::Attached { device },
-                None if vm_disk => Attach::Exported,
-                None => Attach::of(self.attach(&name, transport).await),
-            };
+            if attach.device().is_none() && !vm_disk {
+                let a = Attach::of(self.attach(&name, transport).await);
+                self.shared.volumes.set_attach(&name, a);
+            }
             self.events.info(
                 EventKind::VolumeHandedOver,
                 Subject::volume(&name),
@@ -2152,20 +2030,6 @@ impl Agent {
                     eprintln!("agent: clearing the move of '{}': {}", name, e);
                 }
             }
-            self.running.insert(
-                name.clone(),
-                Running {
-                    lease,
-                    lost,
-                    attach_tried: std::time::Instant::now(),
-                    info: RunningVolume {
-                        name,
-                        transport,
-                        attach: attached,
-                        proxied: false,
-                    },
-                },
-            );
         }
     }
 
@@ -2180,20 +2044,15 @@ impl Agent {
         };
         let (connector, port) = (p.connector.clone(), p.port);
         let addr = self.peer_addr(to)?;
-        let (epoch, transport, device) = {
-            let r = self.running.get(name).ok_or("not running here")?;
-            (
-                r.lease.epoch,
-                r.info.transport,
-                r.info.attach.device().map(str::to_string),
-            )
-        };
-        let parts = self
+        let (epoch, transport) = self
             .shared
+            .volumes
+            .owned(name, |o| (o.lease.epoch, o.export.transport))
+            .ok_or("not running here")?;
+        let parts = self
             .writer
-            .lock()
-            .unwrap()
-            .clone()
+            .as_ref()
+            .map(|w| w.parts.clone())
             .ok_or("no writer here")?;
         let tls = crate::peer_io::dial(&connector, &addr, port).await?;
         let (rd, mut wr) = tokio::io::split(tls);
@@ -2223,52 +2082,84 @@ impl Agent {
         let desc: Holder =
             serde_json::from_str(desc).map_err(|e| format!("{}'s holder: {}", to, e))?;
         let owner = owner.to_string();
+        // From here it's the handoff's: peers aren't pointed at it any more,
+        // nothing else claims it, and it comes back whole if called off.
+        let Some(vol) = self.shared.volumes.begin_handoff(name, parts.wgen) else {
+            return Err("not running here any more".into());
+        };
         println!("agent: handing volume '{}' to {}", name, to);
         let started = std::time::Instant::now();
 
         // Stop serving it here: clients (the peer's proxy too) drain, then
         // the last sync.
-        if device.is_some()
+        let volumes::Owned {
+            lease,
+            lost,
+            handed_from,
+            export,
+            attach,
+            attach_tried,
+        } = vol;
+        if attach.device().is_some()
             && let Err(e) = self.detach(name, transport).await
         {
             eprintln!("agent: detaching '{}': {}", name, e);
         }
-        if let Err(e) = parts.remove_export(name, transport).await {
+        if let Err(e) = export.close().await {
             eprintln!("agent: unexporting '{}': {}", name, e);
         }
-        self.shared.writing.lock().unwrap().remove(name);
         if let Err(e) = parts.fs.detach_dataset(name).await {
             // Not all of it is committed: keep it, call the handoff off.
             let _ = wr.write_all(b"ABORT\n").await;
             let _ = wr.flush().await;
-            let _ = parts.add_export(name, transport).await;
-            self.shared
-                .writing
-                .lock()
-                .unwrap()
-                .insert(name.clone(), epoch);
-            if let Some(r) = self.running.get_mut(name)
-                && r.info.attach.device().is_some()
-            {
-                // Detached for the handoff: attach it again right away.
-                r.info.attach = Attach::Failed {
-                    error: "detached for a handoff that failed".into(),
-                };
-                r.attach_tried = std::time::Instant::now()
-                    .checked_sub(ATTACH_RETRY)
-                    .unwrap_or_else(std::time::Instant::now);
+            let export = match parts.add_export(name, transport).await {
+                Ok(x) => x,
+                Err(e2) => {
+                    // Not served, it can't run here: let go, and whoever's
+                    // next replays its intent log.
+                    parts.fs.abandon_dataset(name);
+                    lease.release().await;
+                    self.shared.volumes.finish_handoff(name, parts.wgen);
+                    return Err(format!(
+                        "last sync: {}; exporting it again: {}; stopped here",
+                        e, e2
+                    ));
+                }
+            };
+            let (attach, attach_tried) = match attach.device() {
+                // Detached for the handoff: attached again right away.
+                Some(_) => (
+                    Attach::Failed {
+                        error: "detached for a handoff that failed".into(),
+                    },
+                    std::time::Instant::now()
+                        .checked_sub(ATTACH_RETRY)
+                        .unwrap_or_else(std::time::Instant::now),
+                ),
+                None => (attach, attach_tried),
+            };
+            let vol = volumes::Owned {
+                lease,
+                lost,
+                handed_from,
+                export,
+                attach,
+                attach_tried,
+            };
+            if let Err(vol) = self.shared.volumes.abort_handoff(name, parts.wgen, vol) {
+                self.wind_down(name, vol, true).await;
             }
             return Err(format!("last sync: {}", e));
         }
+        self.shared.volumes.finish_handoff(name, parts.wgen);
 
-        let r = self.running.remove(name).ok_or("not running here")?;
         if started.elapsed() > handoff::SENDER_BUDGET {
             // The receiver stops waiting not long after: transferred now,
             // the lease could go to an owner nobody renews. Synced, so let
             // go of it instead: whoever's next starts it (I-27).
             let _ = wr.write_all(b"ABORT\n").await;
             let _ = wr.flush().await;
-            r.lease.release().await;
+            lease.release().await;
             self.events.warn(
                 EventKind::VolumeHandoffFailed,
                 Subject::volume(name),
@@ -2282,11 +2173,11 @@ impl Agent {
             );
             return Ok(true);
         }
-        let mut transferred = r.lease.transfer(&owner, desc.clone()).await;
+        let mut transferred = lease.transfer(&owner, desc.clone()).await;
         if let Err(crate::cluster::lease::TransferError::NoAnswer(_)) = &transferred {
             // No answer may still have gone through: the same transfer
             // again says which.
-            transferred = r.lease.transfer(&owner, desc.clone()).await;
+            transferred = lease.transfer(&owner, desc.clone()).await;
         }
         let new_epoch = match transferred {
             Ok(e) => e,
@@ -2295,7 +2186,7 @@ impl Agent {
                 let _ = wr.write_all(b"ABORT\n").await;
                 let _ = wr.flush().await;
                 let _ = wr.flush().await;
-                r.lease.release().await;
+                lease.release().await;
                 self.events.warn(
                     EventKind::VolumeHandoffFailed,
                     Subject::volume(name),
@@ -2352,134 +2243,70 @@ impl Agent {
             return Ok(());
         };
         let (connector, port) = (p.connector.clone(), p.port);
-        self.ensure_writer().await?;
-        let parts = self
-            .shared
-            .writer
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("no writer here")?;
+        let parts = self.ensure_writer().await?.parts.clone();
         let locate = self.locator(&v.name, port);
         let peer = Arc::new(
             crate::peer_io::PeerIo::new(&v.name, connector, locate).retry_for(handoff::PROXY_RETRY),
         );
-        let exporter = parts.exporter(t);
-        exporter
+        let handle = parts
+            .exporter(t)
             .add_export_io(&v.name, v.size_bytes, peer.clone())
             .map_err(|e| e.to_string())?;
-        let io = exporter.export_io(&v.name).ok_or("the export vanished")?;
-        let device = if attach {
+        let proxy = volumes::Proxied {
+            peer,
+            export: volumes::Export::new(t, handle),
+            attach: Attach::Exported,
+        };
+        let proxy = if attach {
             match self.attach(&v.name, t).await {
-                Ok(d) => d,
+                Ok(d) => volumes::Proxied {
+                    attach: Attach::device_of(d),
+                    ..proxy
+                },
                 Err(e) => {
                     // Not exported without its device: the next tick tries
                     // the whole thing again.
-                    peer.retire();
-                    if let Err(e) = parts.remove_export(&v.name, t).await {
-                        eprintln!("agent: unexporting proxied '{}': {}", v.name, e);
-                    }
+                    proxy.take_down(&v.name).await;
                     return Err(format!("attaching: {}", e));
                 }
             }
         } else {
-            None
+            proxy
         };
+        if let Err(proxy) = self.shared.volumes.add_proxied(&v.name, parts.wgen, proxy) {
+            // Claimed meanwhile (a handoff to here), or its writer's gone.
+            self.take_down_proxy(&v.name, proxy).await;
+            return Err("taken meanwhile".into());
+        }
         println!(
             "agent: exporting volume '{}' here ({}), proxied to its writer",
             v.name, t
-        );
-        self.shared.slots.lock().unwrap().insert(
-            v.name.clone(),
-            handoff::Slot::Proxy(handoff::Proxy {
-                peer,
-                io,
-                transport: t,
-                device,
-            }),
         );
         Ok(())
     }
 
     /// Stop exporting the proxied volume `name` here.
     async fn remove_proxy(&mut self, name: &DatasetName) {
-        let proxy = {
-            let mut slots = self.shared.slots.lock().unwrap();
-            match slots.remove(name) {
-                Some(handoff::Slot::Proxy(p)) => p,
-                Some(other) => {
-                    slots.insert(name.clone(), other);
-                    return;
-                }
-                None => return,
-            }
+        let Some(proxy) = self.shared.volumes.take_proxied(name) else {
+            return;
         };
-        let parts = self.shared.writer.lock().unwrap().clone();
-        self.take_down_proxy(name, proxy, parts.as_ref()).await;
+        self.take_down_proxy(name, proxy).await;
         println!("agent: no longer exporting proxied volume '{}' here", name);
     }
 
-    /// The transport volume `name` is proxied here over, if it is.
-    fn proxy_transport(&self, name: &DatasetName) -> Option<Transport> {
-        match self.shared.slots.lock().unwrap().get(name) {
-            Some(handoff::Slot::Proxy(p)) => Some(p.transport),
-            _ => None,
-        }
-    }
-
-    /// Stop serving `proxy` (out of the slots already): its device, then
-    /// its export (`Proxy::take_down`). It used to be unexported before it
-    /// was retired: the export's drain and last sync retried a writer
-    /// that's gone, `PROXY_RETRY` per request, the agent loop stuck behind
+    /// Stop serving `proxy` (out of `Volumes` already): its device, then
+    /// its export (`Proxied::take_down`). Retired first: unexported while
+    /// it still retried a writer that's gone, the export's drain and last
+    /// sync waited `PROXY_RETRY` per request, the agent loop stuck behind
     /// them (structural triage, `remove_proxy`).
-    async fn take_down_proxy(
-        &self,
-        name: &DatasetName,
-        proxy: handoff::Proxy,
-        parts: Option<&handoff::WriterParts>,
-    ) {
-        proxy.io.no_replacement();
-        proxy.peer.retire();
-        if proxy.device.is_some()
-            && let Err(e) = self.detach(name, proxy.transport).await
+    async fn take_down_proxy(&self, name: &DatasetName, proxy: volumes::Proxied) {
+        proxy.retire();
+        if proxy.attach.device().is_some()
+            && let Err(e) = self.detach(name, proxy.export.transport).await
         {
             eprintln!("agent: detaching proxied '{}': {}", name, e);
         }
-        proxy.take_down(name, parts).await;
-    }
-
-    /// Writer `parts` is gone: so are its exports, proxied ones included,
-    /// devices and all (all at once). A takeover under way holds its
-    /// proxy; its claim goes here too, so it takes that proxy down itself
-    /// when it fails (`Shared::restore`) rather than put it back.
-    async fn drop_proxies(&mut self, parts: Option<handoff::WriterParts>) {
-        let proxies: Vec<(DatasetName, handoff::Proxy)> = {
-            let mut slots = self.shared.slots.lock().unwrap();
-            let names: Vec<DatasetName> = slots
-                .iter()
-                .filter(|(_, s)| matches!(s, handoff::Slot::Proxy(_)))
-                .map(|(n, _)| n.clone())
-                .collect();
-            let taken = names
-                .into_iter()
-                .filter_map(|n| match slots.remove(&n) {
-                    Some(handoff::Slot::Proxy(p)) => Some((n, p)),
-                    _ => None,
-                })
-                .collect();
-            // A handed-over volume is this node's to stop
-            // (`drop_lost_adopted`), not to forget: its export and VMs
-            // would run on.
-            slots.retain(|_, s| matches!(s, handoff::Slot::Adopted { .. }));
-            taken
-        };
-        let (me, parts) = (&*self, parts.as_ref());
-        futures::future::join_all(
-            proxies
-                .into_iter()
-                .map(|(n, p)| async move { me.take_down_proxy(&n, p, parts).await }),
-        )
-        .await;
+        proxy.take_down(name).await;
     }
 
     async fn helper(&self, args: &[&str]) -> Result<Option<String>, String> {
@@ -2539,28 +2366,6 @@ impl Agent {
         };
         self.helper(&[cmd, name]).await.map(|_| ())
     }
-}
-
-/// Where this node's writer lease stands, for what it runs under it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriterStanding {
-    Held,
-    Lost,
-    /// No writer (dropped after a loss, or not opened yet).
-    Gone,
-}
-
-/// Of the handed-over volumes not adopted yet, `(name, its lease lost)`,
-/// those to drop: every one once the writer is lost or gone (they ran
-/// under it), else those whose own lease is lost (audit A1).
-fn adopted_to_drop<'a>(
-    adopted: impl Iterator<Item = (&'a DatasetName, bool)>,
-    writer: WriterStanding,
-) -> Vec<DatasetName> {
-    adopted
-        .filter(|&(_, lost)| lost || writer != WriterStanding::Held)
-        .map(|(n, _)| n.clone())
-        .collect()
 }
 
 /// Set once a held lease is lost.

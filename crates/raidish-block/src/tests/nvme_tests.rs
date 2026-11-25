@@ -301,6 +301,9 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 /// Export `volumes` (name, size) from one target on an ephemeral port.
+/// The exports `serve_many` made, by volume: each is up while held.
+type Held = std::collections::BTreeMap<String, crate::export::ExportHandle>;
+
 async fn serve_many(
     pool: &TestPool,
     volumes: &[(&str, u64)],
@@ -308,21 +311,23 @@ async fn serve_many(
     Arc<FileSystem<Pool>>,
     Arc<NvmeTcpServer<Pool>>,
     std::net::SocketAddr,
+    Held,
 ) {
     let fs = Arc::new(pool.format().await);
     let server = Arc::new(NvmeTcpServer::with_bind(fs.clone(), DEFAULT_BIND, 0));
+    let mut held = Held::new();
     for &(name, size) in volumes {
         let name = &ds(name);
         fs.create_block(name, size, DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
-        server.add_export(name).await.unwrap();
+        held.insert(name.to_string(), server.add_export(name).await.unwrap());
     }
     let listener = TcpListener::bind((DEFAULT_BIND, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let s = server.clone();
     tokio::spawn(async move { s.serve(listener).await });
-    (fs, server, addr)
+    (fs, server, addr, held)
 }
 
 async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::SocketAddr) {
@@ -359,7 +364,8 @@ fn nqns_and_serials() {
 #[tokio::test]
 async fn two_volumes_on_one_target() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 32 * MB)]).await;
+    let (fs, server, addr, _held) =
+        serve_many(&pool, &[("alpha", 16 * MB), ("beta", 32 * MB)]).await;
     assert_eq!(server.exports(), vec!["alpha", "beta"]);
     let (alpha, beta) = (subsystem_nqn("alpha"), subsystem_nqn("beta"));
 
@@ -424,7 +430,7 @@ async fn two_volumes_on_one_target() {
 #[tokio::test]
 async fn add_export_validation() {
     let pool = TestPool::new().await;
-    let (_fs, server, _addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, server, _addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     assert!(matches!(
         server.add_export(&ds("vol")).await,
         Err(FileSystemError::AlreadyExists)
@@ -452,7 +458,8 @@ async fn assert_hung_up(h: &mut Host) {
 #[tokio::test]
 async fn remove_export_flushes_and_closes_its_queues() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 16 * MB)]).await;
+    let (fs, server, addr, mut held) =
+        serve_many(&pool, &[("alpha", 16 * MB), ("beta", 16 * MB)]).await;
     let (alpha, beta) = (subsystem_nqn("alpha"), subsystem_nqn("beta"));
 
     let mut admin_a = Host::connect(addr).await;
@@ -470,7 +477,7 @@ async fn remove_export_flushes_and_closes_its_queues() {
     assert!(qa.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
     assert!(fs.has_dirty_datasets(), "write not yet committed");
 
-    assert!(server.remove_export(&ds("alpha")).await.unwrap());
+    held.remove("alpha").unwrap().close().await.unwrap();
     assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut qa).await;
     assert_hung_up(&mut admin_a).await;
@@ -482,7 +489,6 @@ async fn remove_export_flushes_and_closes_its_queues() {
     assert!(qb.io(IO_WRITE, 0, 1, &data, 0, true).await.ok());
     assert!(qb.io(IO_READ, 0, 1, &[], 4096, false).await.data == data);
     assert!(admin_b.admin(ADM_KEEP_ALIVE, 0, 0, 0, 0).await.ok());
-    assert!(!server.remove_export(&ds("alpha")).await.unwrap());
 
     // The committed write survives a reload, and the volume can come back.
     let mut buf = vec![0u8; 4096];
@@ -492,7 +498,7 @@ async fn remove_export_flushes_and_closes_its_queues() {
         .await
         .unwrap();
     assert!(buf == data);
-    server.add_export(&ds("alpha")).await.unwrap();
+    let _again = server.add_export(&ds("alpha")).await.unwrap();
     let mut admin_a = Host::connect(addr).await;
     let cntlid_a = admin_a.bring_up_admin_of(&alpha, 1).await;
     let mut qa = Host::connect(addr).await;
@@ -791,7 +797,7 @@ impl VolumeIo for Counting {
 #[tokio::test]
 async fn an_exports_backend_switches_under_a_connected_queue() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(1).await;
     let mut q = Host::connect(addr).await;
@@ -857,7 +863,7 @@ async fn admin_lengths_and_counts_are_bounded() {
 #[tokio::test]
 async fn a_shutdown_leaves_lost_writes_for_the_next_hosts_flush() {
     let pool = TestPool::new().await;
-    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     admin.bring_up_admin(1).await;
     server.export_io(&ds("vol")).unwrap().poison();
@@ -895,7 +901,7 @@ async fn a_shutdown_leaves_lost_writes_for_the_next_hosts_flush() {
 #[tokio::test]
 async fn overlapping_h2c_data_is_refused_not_written() {
     let pool = TestPool::new().await;
-    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, _server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(1).await;
     let mut q = Host::connect(addr).await;
@@ -926,7 +932,7 @@ async fn overlapping_h2c_data_is_refused_not_written() {
 #[tokio::test]
 async fn a_second_connect_on_a_queue_is_refused() {
     let pool = TestPool::new().await;
-    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut h = Host::connect(addr).await;
     let a = h.send_connect(0, 0xffff, VOL_NQN).await;
     let b = h.send_connect(0, 0xffff, VOL_NQN).await;
@@ -948,7 +954,7 @@ async fn a_second_connect_on_a_queue_is_refused() {
 #[tokio::test]
 async fn controller_ids_skip_live_and_reserved_ones() {
     let pool = TestPool::new().await;
-    let (_fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut first = Host::connect(addr).await;
     assert_eq!(first.bring_up_admin(1).await, 1);
     server
@@ -969,7 +975,7 @@ async fn controller_ids_skip_live_and_reserved_ones() {
 #[tokio::test]
 async fn closing_the_admin_queue_closes_its_io_queues() {
     let pool = TestPool::new().await;
-    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, _server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(2).await;
     let mut q1 = Host::connect(addr).await;
@@ -988,7 +994,7 @@ async fn closing_the_admin_queue_closes_its_io_queues() {
 #[tokio::test]
 async fn r2ts_ask_for_at_most_the_budget_at_once() {
     let pool = TestPool::new().await;
-    let (_fs, _server, addr) = serve_many(&pool, &[("vol", 64 * MB)]).await;
+    let (_fs, _server, addr, _held) = serve_many(&pool, &[("vol", 64 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(1).await;
     let mut q = Host::connect(addr).await;
@@ -1091,7 +1097,7 @@ impl VolumeIo for Gate {
 #[tokio::test]
 async fn a_queue_has_at_most_its_depth_of_commands_running() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let mut admin = Host::connect(addr).await;
     let cntlid = admin.bring_up_admin(1).await;
     let mut q = Host::connect(addr).await;

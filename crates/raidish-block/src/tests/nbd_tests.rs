@@ -109,28 +109,39 @@ impl Client {
 type Fs = Arc<FileSystem<crate::vdev::Pool>>;
 
 /// Serve `volumes` (name, size) from one NBD server on an ephemeral port.
+/// The exports `serve_many` made, by volume: each is up while held.
+type Held = std::collections::BTreeMap<String, crate::export::ExportHandle>;
+
 async fn serve_many(
     pool: &TestPool,
     volumes: &[(&str, u64)],
-) -> (Fs, Arc<NbdServer<crate::vdev::Pool>>, std::net::SocketAddr) {
+) -> (
+    Fs,
+    Arc<NbdServer<crate::vdev::Pool>>,
+    std::net::SocketAddr,
+    Held,
+) {
     let fs = Arc::new(pool.format().await);
     let server = Arc::new(NbdServer::with_bind(fs.clone(), DEFAULT_BIND, 0));
+    let mut held = Held::new();
     for &(name, size) in volumes {
         let name = &ds(name);
         fs.create_block(name, size, DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
-        server.add_export(name).await.unwrap();
+        held.insert(name.to_string(), server.add_export(name).await.unwrap());
     }
     let listener = TcpListener::bind((DEFAULT_BIND, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let s = server.clone();
     tokio::spawn(async move { s.serve(listener).await });
-    (fs, server, addr)
+    (fs, server, addr, held)
 }
 
 async fn serve(pool: &TestPool, size: u64) -> (Fs, std::net::SocketAddr) {
-    let (fs, _server, addr) = serve_many(pool, &[("vol", size)]).await;
+    let (fs, _server, addr, held) = serve_many(pool, &[("vol", size)]).await;
+    // Up for the rest of the test (dropped, it would be taken down).
+    std::mem::forget(held);
     (fs, addr)
 }
 
@@ -146,7 +157,8 @@ async fn assert_hung_up(s: &mut TcpStream) {
 #[tokio::test]
 async fn two_exports_on_one_server() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 32 * MB)]).await;
+    let (fs, server, addr, _held) =
+        serve_many(&pool, &[("alpha", 16 * MB), ("beta", 32 * MB)]).await;
     assert_eq!(server.exports(), vec!["alpha", "beta"]);
 
     // Each name reaches its own volume.
@@ -212,7 +224,7 @@ async fn two_exports_on_one_server() {
 #[tokio::test]
 async fn add_export_validation() {
     let pool = TestPool::new().await;
-    let (_fs, server, _addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (_fs, server, _addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     assert!(matches!(
         server.add_export(&ds("vol")).await,
         Err(FileSystemError::AlreadyExists)
@@ -223,17 +235,55 @@ async fn add_export_validation() {
     assert_eq!(server.exports(), vec!["vol"]);
 }
 
+/// An export whose handle is dropped (not closed) is still taken down
+/// properly, in the background: refused to new clients at once, but kept in
+/// the table, so the volume can't be exported again, until its connected
+/// client has drained and what it wrote is committed.
+#[tokio::test]
+async fn a_dropped_export_drains_before_it_can_come_back() {
+    let pool = TestPool::new().await;
+    let (fs, server, addr, mut held) = serve_many(&pool, &[("alpha", 16 * MB)]).await;
+    let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
+    let data = vec![0x3Cu8; 4096];
+    assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
+    assert!(fs.has_dirty_datasets(), "write not yet committed");
+
+    drop(held.remove("alpha"));
+    // Still listed while it drains: a second export would write alongside
+    // the client that hasn't gone yet.
+    assert!(matches!(
+        server.add_export(&ds("alpha")).await,
+        Err(FileSystemError::AlreadyExists)
+    ));
+    assert_eq!(
+        Client::connect_to(addr, "alpha").await.err(),
+        Some(NBD_REP_ERR_UNKNOWN),
+        "a new client got in while it drained"
+    );
+    assert_hung_up(&mut a.s).await;
+    let start = std::time::Instant::now();
+    while !server.exports().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10), "never unlisted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!fs.has_dirty_datasets(), "the background close commits");
+    let _again = server.add_export(&ds("alpha")).await.unwrap();
+    let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
+    assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
+}
+
 #[tokio::test]
 async fn remove_export_flushes_and_closes_its_connections() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("alpha", 16 * MB), ("beta", 16 * MB)]).await;
+    let (fs, server, addr, mut held) =
+        serve_many(&pool, &[("alpha", 16 * MB), ("beta", 16 * MB)]).await;
     let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
     let (mut b, _) = Client::connect_to(addr, "beta").await.unwrap();
     let data = vec![0x5Au8; 4096];
     assert_eq!(a.cmd(NBD_CMD_WRITE, 0, 4096, &data).await.0, 0);
     assert!(fs.has_dirty_datasets(), "write not yet committed");
 
-    assert!(server.remove_export(&ds("alpha")).await.unwrap());
+    held.remove("alpha").unwrap().close().await.unwrap();
     assert!(!fs.has_dirty_datasets(), "removal commits");
     assert_hung_up(&mut a.s).await;
     assert_eq!(server.exports(), vec!["beta"]);
@@ -249,8 +299,6 @@ async fn remove_export_flushes_and_closes_its_connections() {
     let (_, size) = Client::connect(addr).await;
     assert_eq!(size, 16 * MB);
 
-    assert!(!server.remove_export(&ds("alpha")).await.unwrap());
-
     // The committed write survives a reload, and the volume can come back.
     let mut buf = vec![0u8; 4096];
     pool.load()
@@ -259,7 +307,7 @@ async fn remove_export_flushes_and_closes_its_connections() {
         .await
         .unwrap();
     assert!(buf == data);
-    server.add_export(&ds("alpha")).await.unwrap();
+    let _again = server.add_export(&ds("alpha")).await.unwrap();
     let (mut a, _) = Client::connect_to(addr, "alpha").await.unwrap();
     assert!(a.cmd(NBD_CMD_READ, 0, 4096, &[]).await.1 == data);
 }
@@ -403,7 +451,7 @@ impl VolumeIo for Counting {
 #[tokio::test]
 async fn an_exports_backend_switches_under_a_live_connection() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let (mut c, _) = Client::connect(addr).await;
     let before = vec![1u8; 8192];
     assert_eq!(c.cmd(NBD_CMD_WRITE, 0, 8192, &before).await.0, 0);
@@ -499,7 +547,7 @@ pub(crate) async fn settled(n: &std::sync::atomic::AtomicUsize) -> usize {
 #[tokio::test]
 async fn a_connection_has_at_most_so_many_requests_in_flight() {
     let pool = TestPool::new().await;
-    let (fs, server, addr) = serve_many(&pool, &[("vol", 16 * MB)]).await;
+    let (fs, server, addr, _held) = serve_many(&pool, &[("vol", 16 * MB)]).await;
     let (c, _) = Client::connect(addr).await;
     let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let open = Arc::new(tokio::sync::watch::Sender::new(false));

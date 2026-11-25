@@ -6,8 +6,8 @@
 //! which volumes get a proxied export here, and when to hand one this node
 //! writes to another node. The receiving end of a handoff runs outside that
 //! loop, in the peer I/O listener ([`Shared::handoff`]), so what it needs
-//! of this node lives in [`Shared`], and what it takes over is left in a
-//! [`Slot`] for the loop to pick up.
+//! of this node lives in [`Shared`], and what it takes over is left in
+//! [`Volumes`] for the loop to pick up.
 //!
 //! A handoff, A (the writer) to B:
 //!
@@ -25,21 +25,16 @@
 //! B gives up and unpauses (its export proxying again) if A stops short
 //! of step 3; A never stops serving before B is paused and ready.
 
+use super::volumes::{Export, Owned, Took, Volumes, WriterParts};
 use super::{Lost, hold};
+use crate::api_types::Attach;
 use crate::cluster::lease::{HeldLease, LeaseClient, owner_id};
 use crate::committer::dataset_resource;
-use crate::export::BlockExporter;
-use crate::fs::FileSystem;
 use crate::inode::Transport;
-use crate::nbd::NbdServer;
-use crate::nvme::NvmeTcpServer;
-use crate::peer_io::{PeerExport, PeerIo, PeerLines, PeerOut, PeerVolumes, read_line};
-use crate::types::DatasetName;
-use crate::types::Epoch;
-use crate::vdev::Pool;
-use crate::volume_io::{LocalIo, OwnedPaused, SwitchableIo};
+use crate::peer_io::{PeerExport, PeerLines, PeerOut, PeerVolumes, read_line};
+use crate::types::{DatasetName, Epoch};
+use crate::volume_io::LocalIo;
 use async_trait::async_trait;
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -62,91 +57,13 @@ pub(super) const TRANSFER_WAIT: Duration = Duration::from_secs(SENDER_BUDGET.as_
 /// takes a lease TTL or so).
 pub(super) const PROXY_RETRY: Duration = Duration::from_secs(20);
 
-/// This node's writer, as the handoff handler needs it.
-#[derive(Clone)]
-pub(super) struct WriterParts {
-    pub fs: Arc<FileSystem<Pool>>,
-    pub nbd: Arc<NbdServer<Pool>>,
-    pub nvme: Arc<NvmeTcpServer<Pool>>,
-}
-
-impl WriterParts {
-    /// The server exporting over `t`.
-    pub fn exporter(&self, t: Transport) -> &dyn BlockExporter {
-        match t {
-            Transport::Nbd => &*self.nbd,
-            Transport::Nvme => &*self.nvme,
-        }
-    }
-
-    pub async fn add_export(&self, name: &DatasetName, t: Transport) -> Result<(), String> {
-        self.exporter(t)
-            .add_export(name)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    pub async fn remove_export(&self, name: &DatasetName, t: Transport) -> Result<bool, String> {
-        self.exporter(t)
-            .remove_export(name)
-            .await
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// A volume exported here but written by another node.
-pub(super) struct Proxy {
-    pub peer: Arc<PeerIo>,
-    pub io: Arc<SwitchableIo>,
-    pub transport: Transport,
-    /// The kernel device attached to the export, if any.
-    pub device: Option<String>,
-}
-
-impl Proxy {
-    /// Take its export down for good (`device`, if any, detached first by
-    /// whoever can): retired, so requests stuck retrying a writer that's
-    /// gone let go, with no replacement to wait for, so they and the
-    /// export's last sync fail at once instead of stalling the caller.
-    pub(super) async fn take_down(&self, volume: &DatasetName, w: Option<&WriterParts>) {
-        self.io.no_replacement();
-        self.peer.retire();
-        if let Some(w) = w
-            && let Err(e) = w.remove_export(volume, self.transport).await
-        {
-            eprintln!("agent: unexporting proxied '{}': {}", volume, e);
-        }
-    }
-}
-
-/// What this node has of a volume it doesn't (yet) run as its writer.
-pub(super) enum Slot {
-    Proxy(Proxy),
-    /// A handoff to this node is under way.
-    TakingOver,
-    /// Handed over: this node writes it now, for the agent loop to pick up.
-    Adopted {
-        lease: Arc<HeldLease>,
-        lost: Lost,
-        transport: Transport,
-        device: Option<String>,
-    },
-}
-
 /// What the agent shares with its peer I/O listener.
 pub(super) struct Shared {
     pub leases: LeaseClient,
     /// What this node's leases say of it.
     pub desc: Mutex<crate::types::Holder>,
-    pub writer: Mutex<Option<WriterParts>>,
-    pub slots: Mutex<BTreeMap<DatasetName, Slot>>,
-    /// The volumes this node writes, by `ds/` lease epoch: what peers may
-    /// proxy to.
-    pub writing: Mutex<BTreeMap<DatasetName, Epoch>>,
-    /// Volumes taken over here in a clean handoff: name → (the epoch this
-    /// node writes it at, the epoch of the writer it came from). What peer
-    /// proxies are told (see `PeerExport::from`).
-    pub handed_from: Mutex<BTreeMap<DatasetName, (Epoch, Epoch)>>,
+    /// This node's writer, and what it has of each volume.
+    pub volumes: Volumes,
 }
 
 impl Shared {
@@ -154,63 +71,21 @@ impl Shared {
         Shared {
             leases,
             desc: Mutex::new(Default::default()),
-            writer: Mutex::new(None),
-            slots: Mutex::new(BTreeMap::new()),
-            writing: Mutex::new(BTreeMap::new()),
-            handed_from: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    /// Put back what a failed takeover on writer `w` took: its claim on
-    /// the slot, and the proxy if it had one. Only while the claim still
-    /// stands and `w` is still this node's writer: a writer dropped meanwhile
-    /// (`drop_proxies`) took the claim with it, and its proxies are dead.
-    /// Such a proxy isn't put back (it would serve again, to nobody) but
-    /// taken down here, where it's still at hand (structural triage I-27).
-    pub(super) async fn restore(
-        &self,
-        volume: &DatasetName,
-        proxy: Option<Proxy>,
-        w: &WriterParts,
-    ) {
-        let dead = {
-            let cur = self.writer.lock().unwrap();
-            let live = cur.as_ref().is_some_and(|c| Arc::ptr_eq(&c.fs, &w.fs));
-            let mut slots = self.slots.lock().unwrap();
-            let ours = matches!(slots.get(volume), Some(Slot::TakingOver));
-            if ours {
-                slots.remove(volume);
-            }
-            match proxy {
-                Some(p) if ours && live => {
-                    slots.insert(volume.clone(), Slot::Proxy(p));
-                    None
-                }
-                p => p,
-            }
-        };
-        if let Some(p) = dead {
-            p.take_down(volume, Some(w)).await;
+            volumes: Volumes::default(),
         }
     }
 }
 
-/// Take volume `name` over on this node's writer `w`, holding its lease as
-/// `owner` at `epoch` (granted no earlier than `asked`): attach the
-/// dataset and serve the export locally, the paused proxied one if there
-/// is one (`proxy`, `paused`), else a new one over `transport`. `from`:
-/// the epoch of the writer handing it over.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn take_over(
+/// Hold volume `name`'s lease as `owner` at `epoch` (granted no earlier
+/// than `asked`) and attach its dataset on writer `w`: the first half of
+/// taking it over (the export is the caller's).
+pub(super) async fn take_lease(
     leases: &LeaseClient,
     w: &WriterParts,
     name: &DatasetName,
-    transport: Transport,
     owner: &str,
     epoch: Epoch,
     asked: Instant,
-    from: Epoch,
-    proxy: Option<(&Proxy, &mut OwnedPaused)>,
 ) -> Result<(Arc<HeldLease>, Lost), String> {
     let lease = Arc::new(HeldLease::adopt(
         leases.clone(),
@@ -234,58 +109,13 @@ pub(super) async fn take_over(
         lease.release().await;
         return Err(format!("attaching: {}", e));
     }
-    match proxy {
-        Some((p, paused)) => {
-            // Taken over cleanly from its writer, which made what it
-            // acknowledged durable; but writes an earlier, unclean writer
-            // change lost are still owed a failed flush (audit A2), and so
-            // are writes an earlier writer acknowledged that this proxy,
-            // idle since, never found out about (I-22).
-            if p.peer.owed_on_handoff(from) {
-                p.io.poison();
-            }
-            paused.set(Arc::new(LocalIo::new(w.fs.clone(), name)));
-            p.peer.retire();
-        }
-        None => {
-            if let Err(e) = w.add_export(name, transport).await {
-                w.fs.abandon_dataset(name);
-                lease.release().await;
-                return Err(format!("exporting: {}", e));
-            }
-        }
-    }
     Ok((lease, lost))
 }
 
 #[async_trait]
 impl PeerVolumes for Shared {
     fn export(&self, volume: &DatasetName, epoch: Epoch) -> Result<PeerExport, String> {
-        match self.writing.lock().unwrap().get(volume) {
-            Some(e) if *e == epoch => {}
-            Some(e) => {
-                return Err(format!(
-                    "{} is written here at epoch {}, not {}",
-                    volume, e, epoch
-                ));
-            }
-            None => return Err(format!("{} isn't written here", volume)),
-        }
-        let w = self
-            .writer
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("no writer here")?;
-        let from = match self.handed_from.lock().unwrap().get(volume) {
-            Some(&(now, from)) if now == epoch => from,
-            _ => Epoch::NONE,
-        };
-        [Transport::Nbd, Transport::Nvme]
-            .into_iter()
-            .find_map(|t| w.exporter(t).peer_export(volume))
-            .map(|e| PeerExport { from, ..e })
-            .ok_or_else(|| format!("{} isn't exported here", volume))
+        self.volumes.peer_export(volume, epoch)
     }
 
     async fn handoff(
@@ -309,45 +139,21 @@ impl PeerVolumes for Shared {
         let Ok(transport) = transport.parse::<Transport>() else {
             refuse!("unknown transport '{}'", transport)
         };
-        let Some(w) = self.writer.lock().unwrap().clone() else {
+        let Some(w) = self.volumes.writer() else {
             refuse!("no writer here yet")
         };
         // Claim the volume's slot: nothing else happens to it meanwhile.
-        let claimed = {
-            let mut slots = self.slots.lock().unwrap();
-            match slots.remove(volume) {
-                Some(Slot::Proxy(p)) => {
-                    slots.insert(volume.clone(), Slot::TakingOver);
-                    Ok(Some(p))
-                }
-                None => {
-                    slots.insert(volume.clone(), Slot::TakingOver);
-                    Ok(None)
-                }
-                Some(other) => {
-                    slots.insert(volume.clone(), other);
-                    Err(())
-                }
-            }
+        // Refused, nothing was changed (a proxy over another transport
+        // stays as it is: taken over, it would be served over the proxy's
+        // while recorded as `transport`, its export never removed).
+        let mut guard = match self.volumes.begin_takeover(volume, w.wgen, transport) {
+            Ok(g) => g,
+            Err(e) => refuse!("{}", e),
         };
-        let Ok(proxy) = claimed else { refuse!("busy") };
-        if let Some(p) = &proxy
-            && p.transport != transport
-        {
-            // Taken over, it would be served over the proxy's transport
-            // while recorded as `transport`, and its export never removed.
-            let t = p.transport;
-            self.restore(volume, proxy, &w).await;
-            refuse!("exported here over {}, not {}", t, transport);
-        }
-        if self.writing.lock().unwrap().contains_key(volume) {
-            self.restore(volume, proxy, &w).await;
-            refuse!("already written here");
-        }
         // Requests in flight finish (the writer still serves them); new
         // ones wait until it's handed over, or not.
-        let mut paused = match &proxy {
-            Some(p) => Some(p.io.pause_owned().await),
+        let mut paused = match &guard.prior {
+            Some(p) => Some(p.export.io().pause_owned().await),
             None => None,
         };
         let owner = owner_id();
@@ -360,7 +166,7 @@ impl PeerVolumes for Shared {
         {
             // Unpaused first: taking a dead proxy down syncs through it.
             drop(paused);
-            self.restore(volume, proxy, &w).await;
+            guard.abort().await;
             return;
         }
         let line = tokio::time::timeout(TRANSFER_WAIT, read_line(&mut rd)).await;
@@ -372,86 +178,82 @@ impl PeerVolumes for Shared {
         };
         let Some(new_epoch) = new_epoch else {
             drop(paused);
-            self.restore(volume, proxy, &w).await;
+            guard.abort().await;
             eprintln!(
                 "agent: the handoff of '{}' (epoch {}) was called off",
                 volume, epoch
             );
             return;
         };
-        let pair = match (&proxy, paused.as_mut()) {
-            (Some(p), Some(g)) => Some((p, g)),
-            _ => None,
-        };
-        let taken = take_over(
-            &self.leases,
-            &w,
-            volume,
-            transport,
-            &owner,
-            new_epoch,
-            asked,
-            epoch,
-            pair,
-        )
-        .await;
-        match taken {
-            Ok((lease, lost)) => {
-                let device = proxy.as_ref().and_then(|p| p.device.clone());
-                // Published only while `w` is still this node's writer, under
-                // its lock: the agent clears it before it stops what ran on
-                // it, so a takeover finishing after that is undone here,
-                // where `w` is still at hand (audit A1).
-                let orphaned = {
-                    let cur = self.writer.lock().unwrap();
-                    if cur.as_ref().is_some_and(|c| Arc::ptr_eq(&c.fs, &w.fs)) {
-                        self.writing
-                            .lock()
-                            .unwrap()
-                            .insert(volume.clone(), new_epoch);
-                        self.handed_from
-                            .lock()
-                            .unwrap()
-                            .insert(volume.clone(), (new_epoch, epoch));
-                        self.slots.lock().unwrap().insert(
-                            volume.clone(),
-                            Slot::Adopted {
-                                lease,
-                                lost,
-                                transport,
-                                device,
-                            },
-                        );
-                        None
-                    } else {
-                        Some(lease)
-                    }
-                };
-                if let Some(lease) = orphaned {
-                    // Writes acked on the proxy since the pause, and not
-                    // flushed, go with the dataset: owed a failed flush.
-                    if let Some(p) = &proxy {
-                        p.io.poison();
-                    }
+        let (lease, lost) =
+            match take_lease(&self.leases, &w, volume, &owner, new_epoch, asked).await {
+                Ok(l) => l,
+                Err(e) => {
                     drop(paused);
-                    if let Err(e) = w.remove_export(volume, transport).await {
-                        eprintln!("agent: unexporting '{}': {}", volume, e);
-                    }
-                    w.fs.abandon_dataset(volume);
-                    lease.release().await;
-                    self.restore(volume, None, &w).await;
-                    refuse!("this node's writer went away meanwhile")
+                    guard.abort().await;
+                    refuse!("{}", e)
                 }
-                drop(paused);
-                println!("agent: took volume '{}' over (epoch {})", volume, new_epoch);
-                let _ = wr.write_all(b"DONE\n").await;
-                let _ = wr.flush().await;
+            };
+        // Serve it from here: the paused proxied export switched to local
+        // I/O (its clients keep their connections), or a new one.
+        let had_proxy = guard.prior.is_some();
+        let (export, attach): (Export, Attach) = match (guard.prior.take(), paused.as_mut()) {
+            (Some(p), Some(g)) => {
+                // Taken over cleanly from its writer, which made what it
+                // acknowledged durable; but writes an earlier, unclean
+                // writer change lost are still owed a failed flush (audit
+                // A2), and so are writes an earlier writer acknowledged that
+                // this proxy, idle since, never found out about (I-22).
+                if p.peer.owed_on_handoff(epoch) {
+                    p.export.io().poison();
+                }
+                g.set(Arc::new(LocalIo::new(w.fs.clone(), volume)));
+                p.peer.retire();
+                (p.export, p.attach)
             }
-            Err(e) => {
-                drop(paused);
-                self.restore(volume, proxy, &w).await;
-                refuse!("{}", e)
+            (prior, _) => {
+                // No proxy (one is always paused when there is).
+                guard.prior = prior;
+                match w.add_export(volume, transport).await {
+                    Ok(e) => (e, Attach::Exported),
+                    Err(e) => {
+                        drop(paused);
+                        w.fs.abandon_dataset(volume);
+                        lease.release().await;
+                        guard.abort().await;
+                        refuse!("exporting: {}", e)
+                    }
+                }
             }
+        };
+        let vol = Owned {
+            lease,
+            lost,
+            handed_from: Some(epoch),
+            export,
+            attach,
+            attach_tried: Instant::now(),
+        };
+        // Published only while `w` is still this node's writer: dropping it
+        // turns a takeover finishing after that away, undone here, where
+        // `w` is still at hand (audit A1).
+        if let Err(vol) = guard.finish(vol, Took::Adopted) {
+            // Writes acked on the proxy since the pause, and not flushed,
+            // go with the dataset: owed a failed flush.
+            if had_proxy {
+                vol.export.io().poison();
+            }
+            drop(paused);
+            if let Err(e) = vol.export.close().await {
+                eprintln!("agent: unexporting '{}': {}", volume, e);
+            }
+            w.fs.abandon_dataset(volume);
+            vol.lease.release().await;
+            refuse!("this node's writer went away meanwhile")
         }
+        drop(paused);
+        println!("agent: took volume '{}' over (epoch {})", volume, new_epoch);
+        let _ = wr.write_all(b"DONE\n").await;
+        let _ = wr.flush().await;
     }
 }

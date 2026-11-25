@@ -18,6 +18,8 @@ const MB: u64 = 1 << 20;
 struct Writer {
     fs: Arc<FileSystem<Pool>>,
     nbd: Arc<NbdServer<Pool>>,
+    /// The volume's export (None: taken down).
+    held: std::sync::Mutex<Option<crate::export::ExportHandle>>,
     epoch: AtomicU64,
     /// The epoch it took the volume over from cleanly (0: none).
     from: AtomicU64,
@@ -40,6 +42,19 @@ impl PeerVolumes for Writer {
     }
 }
 
+impl Writer {
+    /// Take the export down (its connections drain).
+    async fn unexport(&self) -> Result<(), FileSystemError> {
+        let h = self.held.lock().unwrap().take().expect("exported");
+        h.close().await
+    }
+
+    async fn export_again(&self) {
+        let h = self.nbd.add_export(&ds("vol")).await.unwrap();
+        *self.held.lock().unwrap() = Some(h);
+    }
+}
+
 struct Setup {
     _pool: TestPool,
     fixture: crate::testing::Pki,
@@ -54,10 +69,11 @@ async fn setup() -> Setup {
         .await
         .unwrap();
     let nbd = Arc::new(NbdServer::with_bind(fs.clone(), "127.0.0.1", 0));
-    nbd.add_export(&ds("vol")).await.unwrap();
+    let held = std::sync::Mutex::new(Some(nbd.add_export(&ds("vol")).await.unwrap()));
     let writer = Arc::new(Writer {
         fs,
         nbd,
+        held,
         epoch: AtomicU64::new(7),
         from: AtomicU64::new(0),
     });
@@ -193,18 +209,15 @@ async fn a_closed_connection_is_reconnected() {
     let p = Arc::new(s.proxy(epoch(7)));
     p.write(0, &[1u8; 4096]).await.unwrap();
     // Removing the export drains the proxy's connection like any client's.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        s.writer.nbd.remove_export(&ds("vol")),
-    )
-    .await
-    .expect("the proxy's connection held the export open")
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), s.writer.unexport())
+        .await
+        .expect("the proxy's connection held the export open")
+        .unwrap();
     let w = p.clone();
     let mut write = tokio::spawn(async move { w.write(4096, &[2u8; 4096]).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!write.is_finished(), "a write went through with no export");
-    s.writer.nbd.add_export(&ds("vol")).await.unwrap();
+    s.writer.export_again().await;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(10), &mut write)
             .await
@@ -322,14 +335,11 @@ async fn a_flush_after_an_unclean_writer_change_fails() {
         e.store(to, Ordering::SeqCst);
     };
     let reconnect = async |s: &Setup| {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            s.writer.nbd.remove_export(&ds("vol")),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        s.writer.nbd.add_export(&ds("vol")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), s.writer.unexport())
+            .await
+            .unwrap()
+            .unwrap();
+        s.writer.export_again().await;
     };
 
     p.write(0, &[1u8; 4096]).await.unwrap();
@@ -376,14 +386,11 @@ async fn a_sync_leaves_lost_writes_for_the_next_flush() {
     let e = epoch(7);
     let p = Arc::new(s.proxy(e.clone()));
     p.write(0, &[1u8; 4096]).await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        s.writer.nbd.remove_export(&ds("vol")),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    s.writer.nbd.add_export(&ds("vol")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), s.writer.unexport())
+        .await
+        .unwrap()
+        .unwrap();
+    s.writer.export_again().await;
     // A crash: the new writer started afresh, with that write unflushed.
     s.writer.epoch.store(8, Ordering::SeqCst);
     s.writer.from.store(0, Ordering::SeqCst);

@@ -157,18 +157,6 @@ fn a_move_within_the_attached_nodes_wins_and_off_is_off() {
     assert_eq!(place_attached(&p, Some("node-1"), &all, &att), None);
 }
 
-/// Audit A1: a handed-over volume not adopted yet goes with its own lease,
-/// and with the writer's: lost, or gone already (a takeover that finished
-/// after the writer was dropped).
-#[test]
-fn handed_over_volumes_go_with_their_lease_or_the_writers() {
-    let slots = [(dsn("kept"), false), (dsn("lapsed"), true)];
-    let drop = |w| adopted_to_drop(slots.iter().map(|(n, l)| (n, *l)), w);
-    assert_eq!(drop(WriterStanding::Held), vec!["lapsed"]);
-    assert_eq!(drop(WriterStanding::Lost), vec!["kept", "lapsed"]);
-    assert_eq!(drop(WriterStanding::Gone), vec!["kept", "lapsed"]);
-}
-
 /// A6: a failed migration's guest may have switched over before the
 /// failure; only where it runs decides what's done, and not knowing
 /// leaves it alone (never moved cold, so never started twice).
@@ -253,15 +241,20 @@ async fn runs_there_says_none_unless_the_target_could_really_be_asked() {
     assert_eq!(migrate::runs_there(&http, &url, "web").await, None);
 }
 
-// ---- handoff slots (structural triage I-27) ----
+// ---- volume slots (structural triage I-27, Phase B) ----
 
 use crate::export::BlockExporter;
+use volumes::{Claim, Owned, Proxied, Took, WriterGen, WriterParts};
 
 struct Node {
     _pool: crate::test_util::TestPool,
-    parts: handoff::WriterParts,
+    parts: WriterParts,
     shared: Arc<handoff::Shared>,
     pki: raidish_auth::testing::Pki,
+}
+
+fn vol() -> DatasetName {
+    dsn("vol")
 }
 
 /// A standalone pool with volume "vol", its NBD and NVMe servers (not
@@ -269,16 +262,12 @@ struct Node {
 async fn node() -> Node {
     let pool = crate::test_util::TestPool::new().await;
     let fs = Arc::new(pool.format().await);
-    fs.create_block(&dsn("vol"), 16 << 20, fs.default_volblocksize())
+    fs.create_block(&vol(), 16 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    let parts = handoff::WriterParts {
-        nbd: Arc::new(NbdServer::with_bind(fs.clone(), "127.0.0.1", 0)),
-        nvme: Arc::new(NvmeTcpServer::with_bind(fs.clone(), "127.0.0.1", 0)),
-        fs,
-    };
+    let parts = writer_on(fs);
     let shared = Arc::new(handoff::Shared::new(LeaseClient::new(vec![])));
-    *shared.writer.lock().unwrap() = Some(parts.clone());
+    shared.volumes.set_writer(parts.clone());
     Node {
         _pool: pool,
         parts,
@@ -287,71 +276,114 @@ async fn node() -> Node {
     }
 }
 
+/// A writer (new servers, new generation) on `fs`.
+fn writer_on(fs: Arc<crate::fs::FileSystem<crate::vdev::Pool>>) -> WriterParts {
+    WriterParts {
+        wgen: WriterGen::next(),
+        nbd: Arc::new(NbdServer::with_bind(fs.clone(), "127.0.0.1", 0)),
+        nvme: Arc::new(NvmeTcpServer::with_bind(fs.clone(), "127.0.0.1", 0)),
+        fs,
+    }
+}
+
 impl Node {
-    /// "vol" exported over `t`, proxied to a writer that's nowhere.
-    fn proxy(&self, t: Transport) -> handoff::Proxy {
+    fn vols(&self) -> &volumes::Volumes {
+        &self.shared.volumes
+    }
+
+    fn state(&self) -> Option<&'static str> {
+        self.vols().state(&vol())
+    }
+
+    /// "vol" exported over `t` on `w`, proxied to a writer that's nowhere.
+    fn proxy_on(&self, w: &WriterParts, t: Transport) -> Proxied {
         let connector =
             tokio_rustls::TlsConnector::from(Arc::new(self.pki.tls.client_config().unwrap()));
         let nowhere = || None::<(String, u16, crate::types::Epoch)>;
         let peer = Arc::new(
-            crate::peer_io::PeerIo::new(&dsn("vol"), connector, Arc::new(nowhere))
+            crate::peer_io::PeerIo::new(&vol(), connector, Arc::new(nowhere))
                 .retry_for(Duration::from_millis(200)),
         );
-        let exporter = self.parts.exporter(t);
-        exporter
-            .add_export_io(&dsn("vol"), 16 << 20, peer.clone())
+        let handle = w
+            .exporter(t)
+            .add_export_io(&vol(), 16 << 20, peer.clone())
             .unwrap();
-        handoff::Proxy {
-            io: exporter.export_io(&dsn("vol")).unwrap(),
+        Proxied {
             peer,
-            transport: t,
-            device: None,
+            export: volumes::Export::new(t, handle),
+            attach: Attach::Exported,
         }
     }
 
-    fn slot(&self) -> Option<&'static str> {
-        self.shared
-            .slots
-            .lock()
-            .unwrap()
-            .get("vol")
-            .map(|s| match s {
-                handoff::Slot::Proxy(_) => "proxy",
-                handoff::Slot::TakingOver => "taking over",
-                handoff::Slot::Adopted { .. } => "adopted",
-            })
+    fn proxy(&self, t: Transport) -> Proxied {
+        self.proxy_on(&self.parts, t)
+    }
+
+    /// "vol" as written here at `epoch`, exported over NBD.
+    async fn owned(&self, epoch: u64, attach: Attach) -> Owned {
+        let lease = Arc::new(HeldLease::adopt(
+            LeaseClient::new(vec![]),
+            dataset_resource(&vol()),
+            "owner",
+            crate::types::Epoch::from_raw(epoch),
+            std::time::Instant::now(),
+        ));
+        Owned {
+            lease,
+            lost: Lost(Arc::new(watch::Sender::new(false))),
+            handed_from: None,
+            export: self.parts.add_export(&vol(), Transport::Nbd).await.unwrap(),
+            attach,
+            attach_tried: std::time::Instant::now(),
+        }
+    }
+
+    fn exported(&self, w: &WriterParts) -> bool {
+        w.nbd.export_io(&vol()).is_some()
+    }
+
+    /// "vol" running here (taken over by the loop) at `epoch`.
+    async fn run(&self, epoch: u64, attach: Attach) {
+        let g = self
+            .vols()
+            .begin_takeover(&vol(), self.parts.wgen, Transport::Nbd)
+            .unwrap();
+        let o = self.owned(epoch, attach).await;
+        assert!(g.finish(o, Took::Running).is_ok());
     }
 }
 
 /// A takeover that fails puts its proxy back, but only while its claim on
 /// the slot stands and its writer is still this node's. Once the writer
-/// was dropped meanwhile (`drop_proxies` took the claim), the proxy is
-/// dead: it used to be put back, served again to nobody, its export never
-/// removed. Now it's taken down instead; and a slot made since is left be.
+/// was dropped meanwhile, the proxy is dead: it used to be put back, served
+/// again to nobody, its export never removed. Now it's taken down instead;
+/// and a slot made since (a new writer's) is left be.
 #[tokio::test]
 async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
     let n = node().await;
-    let set = |s: handoff::Slot| {
-        n.shared.slots.lock().unwrap().insert(dsn("vol"), s);
-    };
+    let w = n.parts.wgen;
+    assert!(
+        n.vols()
+            .add_proxied(&vol(), w, n.proxy(Transport::Nbd))
+            .is_ok()
+    );
 
     // Writer still here, claim standing: put back.
-    let p = n.proxy(Transport::Nbd);
-    set(handoff::Slot::TakingOver);
-    n.shared.restore(&dsn("vol"), Some(p), &n.parts).await;
-    assert_eq!(n.slot(), Some("proxy"));
-    assert!(n.parts.nbd.export_io(&dsn("vol")).is_some());
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    assert!(g.prior.is_some());
+    assert_eq!(n.state(), Some("taking over"));
+    g.abort().await;
+    assert_eq!(n.state(), Some("proxied"));
+    assert!(n.exported(&n.parts));
 
     // The writer dropped while the takeover ran: taken down, not back.
-    let Some(handoff::Slot::Proxy(p)) = n.shared.slots.lock().unwrap().remove("vol") else {
-        panic!("no proxy");
-    };
-    let peer = p.peer.clone();
-    set(handoff::Slot::TakingOver);
-    *n.shared.writer.lock().unwrap() = None;
-    n.shared.slots.lock().unwrap().clear();
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    let peer = g.prior.as_ref().unwrap().peer.clone();
+    let dropped = n.vols().drop_writer(w);
+    assert!(dropped.owned.is_empty() && dropped.proxies.is_empty());
+    assert_eq!(n.state(), None, "the claim went with its writer");
     let t = std::time::Instant::now();
-    n.shared.restore(&dsn("vol"), Some(p), &n.parts).await;
+    g.abort().await;
     // And at once: its last sync doesn't wait for a replacement backend
     // (`REPLACE_WAIT`, 30 s) nor retry the writer that's gone.
     assert!(
@@ -359,19 +391,187 @@ async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
         "took {:?}",
         t.elapsed()
     );
-    assert_eq!(n.slot(), None, "a dead proxy was put back");
-    assert!(
-        n.parts.nbd.export_io(&dsn("vol")).is_none(),
-        "its export stayed up"
-    );
+    assert_eq!(n.state(), None, "a dead proxy was put back");
+    assert!(!n.exported(&n.parts), "its export stayed up");
     assert!(crate::volume_io::VolumeIo::retired(&*peer));
 
-    // A slot made since (a new writer's proxy) isn't the claim's to undo.
-    *n.shared.writer.lock().unwrap() = Some(n.parts.clone());
-    let p2 = n.proxy(Transport::Nvme);
-    set(handoff::Slot::Proxy(p2));
-    n.shared.restore(&dsn("vol"), None, &n.parts).await;
-    assert_eq!(n.slot(), Some("proxy"));
+    // A claim made under a writer since replaced: refused outright.
+    let w2 = writer_on(n.parts.fs.clone());
+    n.vols().set_writer(w2.clone());
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w, Transport::Nbd),
+        Err(Claim::StaleWriter)
+    ));
+    // A slot made since (the new writer's proxy) isn't an old claim's to
+    // undo: one taken under the new writer, then that writer dropped and
+    // replaced again, leaves the newest one's slot alone.
+    let g = n
+        .vols()
+        .begin_takeover(&vol(), w2.wgen, Transport::Nbd)
+        .unwrap();
+    n.vols().drop_writer(w2.wgen);
+    let w3 = writer_on(n.parts.fs.clone());
+    n.vols().set_writer(w3.clone());
+    assert!(
+        n.vols()
+            .add_proxied(&vol(), w3.wgen, n.proxy_on(&w3, Transport::Nbd))
+            .is_ok()
+    );
+    g.abort().await;
+    assert_eq!(n.state(), Some("proxied"));
+    assert!(n.exported(&w3));
+}
+
+/// A takeover task cancelled (or erring out) without saying so gives its
+/// claim up all the same: dropped, the guard puts a live proxy back at
+/// once, and takes a dead one down in the background.
+#[tokio::test]
+async fn a_dropped_takeover_guard_gives_its_claim_up() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    assert!(
+        n.vols()
+            .add_proxied(&vol(), w, n.proxy(Transport::Nbd))
+            .is_ok()
+    );
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    drop(g);
+    assert_eq!(n.state(), Some("proxied"));
+
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    let peer = g.prior.as_ref().unwrap().peer.clone();
+    n.vols().drop_writer(w);
+    drop(g);
+    assert_eq!(n.state(), None);
+    assert!(crate::volume_io::VolumeIo::retired(&*peer));
+    let t = std::time::Instant::now();
+    while n.exported(&n.parts) {
+        assert!(t.elapsed() < Duration::from_secs(10), "never taken down");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A takeover that finishes after its writer was dropped is turned away
+/// (its volume would run on a writer nothing renews or stops): the caller
+/// gets it back, to undo. A volume is never claimed twice, nor over a
+/// proxy of another transport (I-27: served over one, recorded as the
+/// other), and a refused claim changes nothing.
+#[tokio::test]
+async fn takeovers_are_checked_against_the_writer_and_the_slot() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+    let o = n.owned(4, Attach::Exported).await;
+    n.vols().drop_writer(w);
+    let back = g.finish(o, Took::Adopted);
+    assert!(back.is_err(), "finished onto a dropped writer");
+    assert_eq!(n.state(), None);
+    back.err().unwrap().export.close().await.unwrap();
+
+    let w2 = writer_on(n.parts.fs.clone());
+    n.vols().set_writer(w2.clone());
+    assert!(
+        n.vols()
+            .add_proxied(&vol(), w2.wgen, n.proxy_on(&w2, Transport::Nbd))
+            .is_ok()
+    );
+    assert_eq!(
+        n.vols()
+            .begin_takeover(&vol(), w2.wgen, Transport::Nvme)
+            .err(),
+        Some(Claim::Transport(Transport::Nbd))
+    );
+    assert_eq!(n.state(), Some("proxied"));
+    assert_eq!(n.vols().proxy_transport(&vol()), Some(Transport::Nbd));
+}
+
+/// A handoff from here holds the volume whole while it runs: peers aren't
+/// pointed at it, nothing claims it. Called off, it runs here again as it
+/// was, device and all; with its writer gone meanwhile, it's the caller's
+/// to stop instead.
+#[tokio::test]
+async fn an_aborted_handoff_puts_the_volume_back_whole() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    let dev = Attach::Attached {
+        device: "/dev/nbd3".into(),
+    };
+    n.run(5, dev.clone()).await;
+    let at = |e| {
+        n.vols()
+            .peer_export(&vol(), crate::types::Epoch::from_raw(e))
+    };
+    assert!(at(5).is_ok());
+    assert!(at(4).is_err(), "answered for another epoch");
+
+    let o = n.vols().begin_handoff(&vol(), w).unwrap();
+    assert_eq!(n.state(), Some("handing off"));
+    assert!(
+        at(5).is_err(),
+        "peers still pointed at a volume being handed off"
+    );
+    assert!(matches!(
+        n.vols().begin_takeover(&vol(), w, Transport::Nbd),
+        Err(Claim::Busy)
+    ));
+    assert!(n.vols().abort_handoff(&vol(), w, o).is_ok());
+    assert_eq!(n.state(), Some("running"));
+    assert_eq!(n.vols().owned(&vol(), |o| o.attach.clone()), Some(dev));
+    assert!(at(5).is_ok());
+
+    let o = n.vols().begin_handoff(&vol(), w).unwrap();
+    n.vols().drop_writer(w);
+    let back = n.vols().abort_handoff(&vol(), w, o);
+    assert!(back.is_err(), "put back onto a dropped writer");
+    assert_eq!(n.state(), None);
+    back.err().unwrap().export.close().await.unwrap();
+}
+
+/// What was handed over is written here at once (peers proxy to it, with
+/// the epoch it came from), and running once the loop picks it up; it goes
+/// with its own lease and with its writer, picked up or not (audit A1).
+#[tokio::test]
+async fn a_handed_over_volume_is_written_here_until_its_lease_or_writer_goes() {
+    let n = node().await;
+    let w = n.parts.wgen;
+    let g = n.vols().begin_takeover(&vol(), w, Transport::Nbd).unwrap();
+    let mut o = n.owned(6, Attach::Exported).await;
+    o.handed_from = Some(crate::types::Epoch::from_raw(5));
+    let lost = o.lost.clone();
+    assert!(g.finish(o, Took::Adopted).is_ok());
+    assert_eq!(n.state(), Some("adopted"));
+    let e = n
+        .vols()
+        .peer_export(&vol(), crate::types::Epoch::from_raw(6))
+        .unwrap();
+    assert_eq!(e.from, crate::types::Epoch::from_raw(5));
+    // A peer's session on the export: its close would wait for it.
+    drop(e);
+    assert!(
+        n.vols().running().is_empty(),
+        "running before it's picked up"
+    );
+    assert_eq!(n.vols().published().len(), 1);
+
+    lost.0.send_replace(true);
+    assert_eq!(n.vols().lost(), vec![vol()]);
+    lost.0.send_replace(false);
+
+    let picked = n.vols().pick_up();
+    assert_eq!(picked.len(), 1);
+    assert_eq!(n.vols().running(), vec![(vol(), Transport::Nbd)]);
+
+    let dropped = n.vols().drop_writer(w);
+    assert_eq!(dropped.owned.len(), 1);
+    assert_eq!(n.state(), None);
+    assert!(n.vols().writer().is_none());
+    for (_, o) in dropped.owned {
+        o.export.close().await.unwrap();
+    }
 }
 
 /// I-27: asked to take a volume over a transport other than the one it's
@@ -382,19 +582,18 @@ async fn a_failed_takeover_puts_back_only_a_proxy_whose_writer_is_still_here() {
 async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
     use tokio::io::{AsyncWriteExt, BufReader};
     let n = node().await;
-    let p = n.proxy(Transport::Nbd);
-    n.shared
-        .slots
-        .lock()
-        .unwrap()
-        .insert(dsn("vol"), handoff::Slot::Proxy(p));
+    assert!(
+        n.vols()
+            .add_proxied(&vol(), n.parts.wgen, n.proxy(Transport::Nbd))
+            .is_ok()
+    );
 
     let acceptor =
         tokio_rustls::TlsAcceptor::from(Arc::new(n.pki.tls.server_config(true, &[]).unwrap()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let volumes: Arc<dyn crate::peer_io::PeerVolumes> = n.shared.clone();
-    tokio::spawn(crate::peer_io::serve(listener, acceptor, volumes));
+    let peers: Arc<dyn crate::peer_io::PeerVolumes> = n.shared.clone();
+    tokio::spawn(crate::peer_io::serve(listener, acceptor, peers));
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(n.pki.tls.client_config().unwrap()));
     let tls = crate::peer_io::dial(&connector, "127.0.0.1", port)
@@ -411,8 +610,8 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
         .unwrap()
         .unwrap();
     assert!(answer.starts_with("ERR "), "{}", answer);
-    assert_eq!(n.slot(), Some("proxy"));
-    assert!(n.parts.nbd.export_io(&dsn("vol")).is_some());
+    assert_eq!(n.state(), Some("proxied"));
+    assert!(n.exported(&n.parts));
 }
 
 /// The receiver waits for the transfer longer than the sender may take
