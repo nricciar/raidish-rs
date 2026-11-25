@@ -1518,7 +1518,7 @@ async fn copy_object(
         .h("x-amz-metadata-directive")
         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
     let (sb, sk, src, body) = open_source(fe, r, None).await?;
-    if sb == bk.tree.name && sk == key && !replace {
+    if sb == bk.tree.name.as_str() && sk == key && !replace {
         return Err(e3(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",

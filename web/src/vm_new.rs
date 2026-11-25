@@ -206,9 +206,13 @@ impl Component for NewVmDialog {
 impl NewVmDialog {
     /// The form's VM, and its disk's size.
     fn new_vm(&self, name: &str) -> Result<(NewVm, u64), String> {
-        if !api::valid_vm_name(name) {
+        let Ok(name) = raidish_types::types::VmName::try_from(name) else {
             return Err("name it: letters, digits, '-', '_', '.'".into());
-        }
+        };
+        let iso = match self.iso.as_str() {
+            "" => None,
+            v => Some(raidish_types::types::DatasetName::try_from(v).map_err(|e| e.to_string())?),
+        };
         let vcpus: u32 = self
             .vcpus
             .trim()
@@ -225,11 +229,11 @@ impl NewVmDialog {
         let network = self.network.trim();
         Ok((
             NewVm {
-                name: name.to_string(),
+                disk: raidish_types::vm_def::disk_volume(&name),
+                name,
                 vcpus,
                 memory: raidish_types::types::Bytes::new(memory),
-                disk: raidish_types::vm_def::disk_volume(name),
-                iso: (!self.iso.is_empty()).then(|| self.iso.clone()),
+                iso,
                 network: (!network.is_empty()).then(|| network.to_string()),
             },
             disk,
@@ -266,10 +270,9 @@ impl NewVmDialog {
             )
         });
         let name = self.name.trim();
-        let disk = if name.is_empty() {
-            "<name>-disk0".to_string()
-        } else {
-            raidish_types::vm_def::disk_volume(name)
+        let disk = match raidish_types::types::VmName::try_from(name) {
+            Ok(n) => raidish_types::vm_def::disk_volume(&n).to_string(),
+            Err(_) => "<name>-disk0".to_string(),
         };
         html! {
             <>
@@ -283,7 +286,7 @@ impl NewVmDialog {
                     <select {onchange}>
                         <option value="" selected={self.iso.is_empty()}>{ "None" }</option>
                         { for self.volumes.iter().map(|v| html! {
-                            <option value={v.info.name.clone()} selected={v.info.name == self.iso}>
+                            <option value={v.info.name.to_string()} selected={v.info.name.as_str() == self.iso}>
                                 { format!("{} ({})", v.info.name, crate::fmt::bytes(v.info.size_bytes)) }
                             </option>
                         }) }

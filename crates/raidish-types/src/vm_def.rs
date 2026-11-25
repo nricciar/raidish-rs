@@ -2,7 +2,7 @@
 //! what a domain XML configures, and the XML a new VM starts from. No XML
 //! parser here (this builds for wasm); `crate::vm` does the parsing.
 
-use crate::types::Bytes;
+use crate::types::{Bytes, DatasetName, VmName};
 use serde::{Deserialize, Serialize};
 
 /// The hardware a domain XML configures, for showing it (libvirt decides
@@ -112,8 +112,8 @@ pub enum VmDisks {
     /// `anchor` (its first raidish disk) places it; `volumes` are all of
     /// them, the anchor first.
     Usable {
-        anchor: String,
-        volumes: Vec<String>,
+        anchor: DatasetName,
+        volumes: Vec<DatasetName>,
     },
     Unusable {
         error: String,
@@ -122,7 +122,7 @@ pub enum VmDisks {
 
 impl VmDisks {
     /// From the raidish disks in XML order: unusable without one.
-    pub fn of(volumes: Vec<String>) -> Self {
+    pub fn of(volumes: Vec<DatasetName>) -> Self {
         match volumes.first() {
             Some(a) => VmDisks::Usable {
                 anchor: a.clone(),
@@ -134,7 +134,7 @@ impl VmDisks {
         }
     }
 
-    pub fn anchor(&self) -> Option<&str> {
+    pub fn anchor(&self) -> Option<&DatasetName> {
         match self {
             VmDisks::Usable { anchor, .. } => Some(anchor),
             VmDisks::Unusable { .. } => None,
@@ -142,7 +142,7 @@ impl VmDisks {
     }
 
     /// Every raidish volume (none if unusable).
-    pub fn volumes(&self) -> &[String] {
+    pub fn volumes(&self) -> &[DatasetName] {
         match self {
             VmDisks::Usable { volumes, .. } => volumes,
             VmDisks::Unusable { .. } => &[],
@@ -161,13 +161,13 @@ impl VmDisks {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewVm {
     /// A valid VM name (`crate::types::VmName`).
-    pub name: String,
+    pub name: VmName,
     pub vcpus: u32,
     pub memory: Bytes,
     /// The volume for its disk (`<name>-disk0`, see `disk_volume`).
-    pub disk: String,
+    pub disk: DatasetName,
     /// A volume holding an install ISO, attached as a cdrom.
-    pub iso: Option<String>,
+    pub iso: Option<DatasetName>,
     /// A libvirt network for one virtio NIC; None: no network.
     pub network: Option<String>,
 }
@@ -192,8 +192,11 @@ pub fn libvirt_memory(n: &str, unit: Option<&str>) -> Option<Bytes> {
 }
 
 /// The volume a new VM `name`'s disk gets.
-pub fn disk_volume(name: &str) -> String {
-    format!("{}-disk0", name)
+pub fn disk_volume(name: &VmName) -> DatasetName {
+    const _: () =
+        assert!(crate::types::MAX_VM_NAME + "-disk0".len() <= crate::types::MAX_DATASET_NAME);
+    // A VM name's characters are a dataset name's, and it fits (above).
+    DatasetName::user(&format!("{}-disk0", name)).expect("a VM name makes a volume name")
 }
 
 /// The domain XML for a new VM: a q35 KVM guest with one virtio disk (and
@@ -262,7 +265,7 @@ pub fn template(vm: &NewVm) -> String {
 /// A VM as its XML defines it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VmSpec {
-    pub name: String,
+    pub name: VmName,
     /// The definition's change number (see `crate::vm_store`): a running
     /// VM started from an older one has a restart pending.
     pub change: u64,
@@ -282,12 +285,12 @@ impl VmSpec {
     }
 
     /// The volume that places it (its first raidish disk), if usable.
-    pub fn anchor(&self) -> Option<&str> {
+    pub fn anchor(&self) -> Option<&DatasetName> {
         self.disks.anchor()
     }
 
     /// Every raidish volume it uses, the anchor first (none if unusable).
-    pub fn volumes(&self) -> &[String] {
+    pub fn volumes(&self) -> &[DatasetName] {
         self.disks.volumes()
     }
 

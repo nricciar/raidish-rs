@@ -31,6 +31,7 @@ use crate::dataset::DatasetFormat;
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
+use crate::types::DatasetName;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -265,7 +266,7 @@ impl<D: BlockDevice + 'static> Bucket<D> {
     /// server are dropped.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
-        name: &str,
+        name: &DatasetName,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
         let b = Arc::new(Bucket {
             tree: ServiceTree::open(fs, name, DatasetFormat::S3).await?,

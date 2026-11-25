@@ -52,12 +52,12 @@ enum Commands {
     },
     Load,
     Nbd {
-        name: String,
+        name: DatasetName,
         /// Ignored; the size comes from the volume. Kept for compatibility.
         size: Option<u64>,
     },
     Nvme {
-        name: String,
+        name: DatasetName,
     },
     Block {
         name: DatasetName,
@@ -112,7 +112,7 @@ enum Commands {
     },
     /// Rewrite a volume so its records are contiguous on disk.
     Defrag {
-        name: String,
+        name: DatasetName,
         /// Records rewritten per commit.
         #[arg(long, default_value_t = 2048)]
         batch: usize,
@@ -197,7 +197,7 @@ enum VolumeCommands {
     /// Snapshot a volume as last committed: `volume@snapshot`.
     Snapshot { name: SnapshotRef },
     /// List a volume's snapshots.
-    Snapshots { name: String },
+    Snapshots { name: DatasetName },
     /// Make volume `name` from snapshot `snapshot` (`volume@snapshot`).
     Clone {
         snapshot: SnapshotRef,
@@ -205,7 +205,7 @@ enum VolumeCommands {
     },
     /// Roll a volume back to its newest snapshot, discarding every write
     /// since (it must not be running).
-    Rollback { name: String },
+    Rollback { name: DatasetName },
     /// Write snapshot `volume@snapshot` to stdout as a stream: all of it,
     /// or (`--from`) what changed since an older snapshot of it.
     Send {
@@ -218,7 +218,7 @@ enum VolumeCommands {
     /// Receive a stream from stdin into volume `name`: a full stream makes
     /// the volume, an incremental one goes onto its newest snapshot.
     Recv {
-        name: String,
+        name: DatasetName,
         /// Roll the volume back to its newest snapshot first if it was
         /// written since.
         #[arg(long)]
@@ -228,7 +228,7 @@ enum VolumeCommands {
     List,
     /// Change where and how a volume runs.
     Set {
-        name: String,
+        name: DatasetName,
         /// Nodes that may run it, most preferred first (comma separated;
         /// empty: any node).
         #[arg(long, value_delimiter = ',')]
@@ -242,7 +242,7 @@ enum VolumeCommands {
         disable: bool,
     },
     /// Move a running volume to `node` (and keep it there).
-    Move { name: String, node: String },
+    Move { name: DatasetName, node: String },
 }
 
 #[derive(Subcommand)]
@@ -252,7 +252,7 @@ enum DatasetCommands {
     /// Create a service dataset: `--format etcd --port 2379`, `--format
     /// s3` (a bucket) or `--format queue`.
     Create {
-        name: String,
+        name: DatasetName,
         #[arg(long)]
         format: String,
         /// An etcd dataset's client port (every node listens on it).
@@ -263,10 +263,10 @@ enum DatasetCommands {
         nodes: Option<Vec<String>>,
     },
     /// Delete a service dataset and everything in it (stopped first).
-    Delete { name: String },
+    Delete { name: DatasetName },
     /// Change where and how a dataset runs.
     Set {
-        name: String,
+        name: DatasetName,
         #[arg(long, value_delimiter = ',')]
         nodes: Option<Vec<String>>,
         #[arg(long)]
@@ -287,7 +287,7 @@ enum ClusterCommands {
     /// proxy to it; a writer taken off the list hands it to the next. No
     /// nodes: back to its own placement.
     Attach {
-        volume: String,
+        volume: DatasetName,
         #[arg(long, value_delimiter = ',', default_value = "")]
         nodes: Vec<String>,
     },
@@ -569,7 +569,7 @@ pub async fn main() -> std::io::Result<()> {
             ClusterCommands::Attach { volume, nodes } => {
                 let nodes: Vec<String> = nodes.iter().filter(|n| !n.is_empty()).cloned().collect();
                 let op = cluster::LeaseOp::SetAttached {
-                    volume: volume.clone(),
+                    volume: volume.to_string(),
                     nodes: nodes.clone(),
                 };
                 cluster::lease::LeaseClient::new(endpoints)
@@ -869,15 +869,24 @@ pub async fn main() -> std::io::Result<()> {
 trait VolumeAdmin: Sync {
     async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError>;
     async fn create_volume(&self, name: &DatasetName, size: u64) -> Result<(), CommitError>;
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError>;
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError>;
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError>;
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError>;
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError>;
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError>;
-    async fn rollback(&self, name: &str) -> Result<(), CommitError>;
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError>;
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError>;
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError>;
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError>;
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError>;
+    async fn clone_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        new: &DatasetName,
+    ) -> Result<(), CommitError>;
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError>;
     /// Receive the stream on stdin into `name`.
-    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError>;
+    async fn recv_stdin(
+        &self,
+        name: &DatasetName,
+        force: bool,
+    ) -> Result<StreamReport, CommitError>;
     /// For `volume list`: who commits, and the cluster (where volumes run).
     async fn cluster_view(&self) -> Option<(String, Option<cluster::Status>)> {
         None
@@ -894,29 +903,38 @@ impl<D: BlockDevice + 'static> VolumeAdmin for FileSystem<D> {
         self.create_block(name, size, vbs).await?;
         Ok(())
     }
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError> {
         Ok(FileSystem::delete_volume(self, name).await?)
     }
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError> {
         Ok(self.set_dataset_props(name, props.clone()).await?)
     }
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError> {
         Ok(self.list_snapshots(name).await?)
     }
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError> {
         Ok(FileSystem::create_snapshot(self, name, snap).await?)
     }
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError> {
         Ok(FileSystem::destroy_snapshot(self, name, snap).await?)
     }
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+    async fn clone_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        new: &DatasetName,
+    ) -> Result<(), CommitError> {
         FileSystem::clone_snapshot(self, name, snap, new).await?;
         Ok(())
     }
-    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError> {
         Ok(self.rollback_volume(name).await?)
     }
-    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError> {
+    async fn recv_stdin(
+        &self,
+        name: &DatasetName,
+        force: bool,
+    ) -> Result<StreamReport, CommitError> {
         Ok(self
             .recv_snapshot(name, &mut tokio::io::stdin(), force)
             .await?)
@@ -938,28 +956,37 @@ impl VolumeAdmin for Remote<'_> {
     async fn create_volume(&self, name: &DatasetName, size: u64) -> Result<(), CommitError> {
         self.client.create_volume(name, size).await
     }
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError> {
         self.client.delete_volume(name).await
     }
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError> {
         self.client.set_props(name, props).await
     }
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError> {
         self.client.snapshots(name).await
     }
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError> {
         self.client.create_snapshot(name, snap).await
     }
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError> {
         self.client.destroy_snapshot(name, snap).await
     }
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+    async fn clone_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        new: &DatasetName,
+    ) -> Result<(), CommitError> {
         self.client.clone_snapshot(name, snap, new).await
     }
-    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError> {
         self.client.rollback(name).await
     }
-    async fn recv_stdin(&self, name: &str, force: bool) -> Result<StreamReport, CommitError> {
+    async fn recv_stdin(
+        &self,
+        name: &DatasetName,
+        force: bool,
+    ) -> Result<StreamReport, CommitError> {
         self.client.recv(name, force, tokio::io::stdin()).await
     }
     async fn cluster_view(&self) -> Option<(String, Option<cluster::Status>)> {
@@ -980,14 +1007,15 @@ async fn volume_command(cmd: &VolumeCommands, pool: &impl VolumeAdmin) {
         VolumeCommands::Create { name, size } => ok(pool.create_volume(name, *size).await),
         VolumeCommands::Delete { name } if name.contains('@') => {
             let r: SnapshotRef = name.parse().unwrap_or_else(|e| fail(e));
-            ok(pool
-                .destroy_snapshot(r.volume.as_str(), r.snap.as_str())
-                .await)
+            ok(pool.destroy_snapshot(&r.volume, r.snap.as_str()).await)
         }
-        VolumeCommands::Delete { name } => ok(pool.delete_volume(name).await),
+        VolumeCommands::Delete { name } => {
+            let name: DatasetName = name.parse().unwrap_or_else(|e| fail(e));
+            ok(pool.delete_volume(&name).await)
+        }
         VolumeCommands::Snapshot { name } => {
             let txg = pool
-                .create_snapshot(name.volume.as_str(), name.snap.as_str())
+                .create_snapshot(&name.volume, name.snap.as_str())
                 .await
                 .unwrap_or_else(|e| fail(e));
             println!("{} at TXG {}", name, txg);
@@ -996,7 +1024,7 @@ async fn volume_command(cmd: &VolumeCommands, pool: &impl VolumeAdmin) {
             print_snapshots(&pool.snapshots(name).await.unwrap_or_else(|e| fail(e)))
         }
         VolumeCommands::Clone { snapshot, name } => ok(pool
-            .clone_snapshot(snapshot.volume.as_str(), snapshot.snap.as_str(), name)
+            .clone_snapshot(&snapshot.volume, snapshot.snap.as_str(), name)
             .await),
         VolumeCommands::Rollback { name } => ok(pool.rollback(name).await),
         VolumeCommands::Recv { name, force } => {
@@ -1030,7 +1058,7 @@ async fn volume_command(cmd: &VolumeCommands, pool: &impl VolumeAdmin) {
 fn change_props(
     cmd: &VolumeCommands,
     vols: &[crate::volume::VolumeInfo],
-) -> (String, crate::inode::DatasetProps) {
+) -> (DatasetName, crate::inode::DatasetProps) {
     let name = match cmd {
         VolumeCommands::Set { name, .. } | VolumeCommands::Move { name, .. } => name,
         _ => unreachable!(),
@@ -1087,7 +1115,7 @@ async fn send_to_stdout(
     if std::io::stdout().is_terminal() {
         fail("refusing to write a send stream to a terminal (redirect or pipe it)");
     }
-    let (v, s) = (snapshot.volume.as_str(), snapshot.snap.as_str());
+    let (v, s) = (&snapshot.volume, snapshot.snap.as_str());
 
     let from = from.map(|f| f.rsplit('@').next().unwrap_or_default().to_string());
     let mut out = tokio::io::BufWriter::with_capacity(4 << 20, tokio::io::stdout());
@@ -1392,7 +1420,7 @@ impl VolumeWriter {
         endpoints: &[String],
         spec: crate::config::PoolSpec,
         opts: crate::disk::DiskOptions,
-        volume: &str,
+        volume: &DatasetName,
         desc: crate::types::Holder,
     ) -> Result<Self, String> {
         let leases = cluster::lease::LeaseClient::new(endpoints.to_vec());

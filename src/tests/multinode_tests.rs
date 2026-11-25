@@ -6,6 +6,7 @@ use crate::cluster::state::{ClusterState, POOL};
 use crate::committer::*;
 use crate::fence::FenceMap;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::test_util::dsn;
 use crate::test_util::{TestDiskServer, TestPool};
 use crate::types::Txg;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx, ep};
@@ -62,7 +63,7 @@ async fn setup(volumes: &[&str]) -> Setup {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     for v in volumes {
-        fs.create_block(v, 8 * MB as u64, fs.default_volblocksize())
+        fs.create_block(&dsn(v), 8 * MB as u64, fs.default_volblocksize())
             .await
             .unwrap();
     }
@@ -101,6 +102,7 @@ async fn writer(s: &Setup, dev: Pool, id: &str) -> Writer {
 
 /// Take `ds/<name>` as `owner` and run it on `w`.
 async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> Epoch {
+    let vol = &dsn(vol);
     let epoch = lease(&s.auth, &dataset_resource(vol), owner).await;
     w.fs.attach_dataset(vol, Holding::new(owner, epoch))
         .await
@@ -109,6 +111,7 @@ async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> Epoch {
 }
 
 async fn read(fs: &FileSystem<Pool>, vol: &str, offset: u64, len: usize) -> Vec<u8> {
+    let vol = &dsn(vol);
     let mut buf = vec![0xEEu8; len];
     let n = fs.block_read(vol, offset, &mut buf).await.unwrap();
     buf.truncate(n);
@@ -127,11 +130,11 @@ async fn two_writers_two_volumes() {
     let db = pattern(2 * MB + 12345, 2);
     let (r1, r2) = tokio::join!(
         async {
-            w1.fs.block_write("a", 0, &da).await?;
+            w1.fs.block_write(&dsn("a"), 0, &da).await?;
             w1.fs.sync().await
         },
         async {
-            w2.fs.block_write("b", 4096, &db).await?;
+            w2.fs.block_write(&dsn("b"), 4096, &db).await?;
             w2.fs.sync().await
         }
     );
@@ -142,11 +145,11 @@ async fn two_writers_two_volumes() {
     let patch = pattern(200_000, 9);
     for round in 0..3u64 {
         w1.fs
-            .block_write("a", 1000 + round * 4096, &patch)
+            .block_write(&dsn("a"), 1000 + round * 4096, &patch)
             .await
             .unwrap();
         w2.fs
-            .block_write("b", 50_000 + round, &patch)
+            .block_write(&dsn("b"), 50_000 + round, &patch)
             .await
             .unwrap();
         w1.fs.sync().await.unwrap();
@@ -167,8 +170,8 @@ async fn two_writers_two_volumes() {
     // everything goes back.
     w1.fs.return_metaslabs().await;
     assert!(!s.committer.fs.lent_metaslabs().await.is_empty());
-    w1.fs.detach_dataset("a").await.unwrap();
-    w2.fs.detach_dataset("b").await.unwrap();
+    w1.fs.detach_dataset(&dsn("a")).await.unwrap();
+    w2.fs.detach_dataset(&dsn("b")).await.unwrap();
     w1.fs.return_metaslabs().await;
     w2.fs.return_metaslabs().await;
     assert!(s.committer.fs.lent_metaslabs().await.is_empty());
@@ -208,7 +211,11 @@ impl CommitSink for Recording {
         *self.last_fs.lock().unwrap() = Some(c.clone());
         self.inner.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -230,10 +237,12 @@ async fn commits_are_compare_and_swap() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
-    fs.attach_dataset("a", Holding::new("o", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o", ds_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(300_000, 3)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(300_000, 3))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     let first = sink.last.lock().unwrap().clone().unwrap();
 
@@ -241,7 +250,9 @@ async fn commits_are_compare_and_swap() {
     let again = s.committer.commit(&first).await.unwrap();
     assert!(again.txg > 0);
     // Built on a root that has moved on: refused.
-    fs.block_write("a", 0, &pattern(1000, 4)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(1000, 4))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     // The first commit again, now that the root has moved on: refused.
     assert!(matches!(
@@ -269,14 +280,14 @@ async fn a_writer_without_its_leases_cannot_commit() {
     let s = setup(&["a"]).await;
     let w = writer(&s, s.pool.dev().await, "1").await;
     let ds_epoch = attach(&s, &w, "a", "o").await;
-    w.fs.block_write("a", 0, &pattern(100_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w.fs.sync().await.unwrap();
 
     // The volume lease is released (moved elsewhere): the next sync is refused.
     release(&s.auth, &dataset_resource("a"), "o", ds_epoch).await;
-    w.fs.block_write("a", 0, &pattern(100_000, 2))
+    w.fs.block_write(&dsn("a"), 0, &pattern(100_000, 2))
         .await
         .unwrap();
     assert!(w.fs.sync().await.is_err());
@@ -316,7 +327,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     let a = writer(&s, s.pool.dev_remote(&server, &all).await, "a").await;
     let a_vol = attach(&s, &a, "a", "oa").await;
     let first = pattern(400_000, 1);
-    a.fs.block_write("a", 0, &first).await.unwrap();
+    a.fs.block_write(&dsn("a"), 0, &first).await.unwrap();
     a.fs.sync().await.unwrap();
     sync_fence(&server, &s);
 
@@ -330,7 +341,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
 
     // A wakes up and writes into the metaslab it still thinks it has: the
     // disk servers refuse.
-    a.fs.block_write("a", 0, &pattern(400_000, 2))
+    a.fs.block_write(&dsn("a"), 0, &pattern(400_000, 2))
         .await
         .unwrap();
     assert!(a.fs.sync().await.is_err());
@@ -340,7 +351,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     attach(&s, &b, "a", "ob").await;
     assert_eq!(read(&b.fs, "a", 0, first.len()).await, first);
     let second = pattern(10_000, 3);
-    b.fs.block_write("a", 0, &second).await.unwrap();
+    b.fs.block_write(&dsn("a"), 0, &second).await.unwrap();
     b.fs.sync().await.unwrap();
     b.fs.return_metaslabs().await;
 
@@ -408,12 +419,12 @@ async fn a_writers_repairs_pin_its_lent_space() {
     let s = setup(&["a"]).await;
     let a = writer(&s, s.pool.dev().await, "a").await;
     attach(&s, &a, "a", "oa").await;
-    a.fs.block_write("a", 0, &pattern(100_000, 1))
+    a.fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
     a.fs.sync().await.unwrap();
     // Done with the volume: its intent log no longer pins its metaslab.
-    a.fs.detach_dataset("a").await.unwrap();
+    a.fs.detach_dataset(&dsn("a")).await.unwrap();
     let w = a.fs.writer.clone().unwrap();
     let lent = w.lent.lock().unwrap().clone();
     assert!(w.pinned.lock().unwrap().is_empty());
@@ -485,17 +496,21 @@ async fn a_lagging_view_doesnt_take_back_fresh_lends() {
     let fs = FileSystem::load_writer(s.pool.dev().await, sink)
         .await
         .unwrap();
-    fs.attach_dataset("a", Holding::new("o", v_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o", v_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(200_000, 5)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(200_000, 5))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
     committer.reclaim().await;
     assert!(
         !committer.fs.lent_metaslabs().await.is_empty(),
         "not taken back"
     );
-    fs.block_write("a", 0, &pattern(1000, 6)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(1000, 6))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
 }
 
@@ -527,7 +542,11 @@ impl CommitSink for Retrying {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.0.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.0.claim_dataset(volume, ds).await
     }
 }
@@ -556,14 +575,18 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
         panic!("volume lease not granted");
     };
     let (lost, rx) = tokio::sync::watch::channel(false);
-    fs.attach_dataset_until("a", Holding::new("o", v_epoch), Some(rx))
+    fs.attach_dataset_until(&dsn("a"), Holding::new("o", v_epoch), Some(rx))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
-    fs.block_write("a", 0, &pattern(100_000, 2)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 2))
+        .await
+        .unwrap();
     let fs = Arc::new(fs);
     let syncing = tokio::spawn({
         let fs = fs.clone();
@@ -579,7 +602,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
         .expect("sync still waiting after the lease was lost")
         .unwrap();
     assert!(r.is_err());
-    fs.abandon_dataset("a");
+    fs.abandon_dataset(&dsn("a"));
 
     // Only what was committed is there.
     let fs = s.pool.load().await;
@@ -860,7 +883,11 @@ impl CommitSink for HoldingSink {
         self.held.lock().unwrap().push(c);
         Err(CommitError::Retry("held".into()))
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -1038,7 +1065,7 @@ async fn object_numbers_are_pool_wide_and_never_reused() {
     w.fs.mkdir(Path::new("a")).await.unwrap();
     w.fs.mkdir(Path::new("b")).await.unwrap();
     let mut ids = vec![
-        s.committer.fs.dataset_id("vol").await.ok(),
+        s.committer.fs.dataset_id(&dsn("vol")).await.ok(),
         w.fs.create_file(Path::new("a/x")).await.ok(),
         w.fs.create_file(Path::new("b/x")).await.ok(),
         w.fs.create_file(Path::new("x")).await.ok(),
@@ -1264,12 +1291,12 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
     let s = setup(&["vol"]).await;
     let w = writer(&s, s.pool.dev().await, "1").await;
     attach(&s, &w, "vol", "o1").await;
-    w.fs.block_write("vol", 0, &pattern(200_000, 1))
+    w.fs.block_write(&dsn("vol"), 0, &pattern(200_000, 1))
         .await
         .unwrap();
     w.fs.sync().await.unwrap();
     let data = pattern(200_000, 2);
-    w.fs.block_write("vol", 0, &data).await.unwrap();
+    w.fs.block_write(&dsn("vol"), 0, &data).await.unwrap();
     let floor = lag_and_raise(&s).await;
     assert!(
         w.fs.open_txg().await.unwrap() < floor,
@@ -1277,7 +1304,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
     );
 
     w.fs.sync().await.unwrap();
-    let vol = s.committer.fs.open_dataset("vol").await.unwrap();
+    let vol = s.committer.fs.open_dataset(&dsn("vol")).await.unwrap();
     let b = births(&s.committer.fs, &vol.obj.root()).await;
     assert!(
         !b.is_empty() && b.iter().all(|&t| t >= floor),
@@ -1286,7 +1313,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
         floor
     );
     assert_eq!(read(&s.committer.fs, "vol", 0, data.len()).await, data);
-    w.fs.detach_dataset("vol").await.unwrap();
+    w.fs.detach_dataset(&dsn("vol")).await.unwrap();
     w.fs.return_metaslabs().await;
     drop(w);
     let report = s.pool.load().await.fsck(false).await.unwrap();
@@ -1432,12 +1459,16 @@ async fn snapshots_of_a_volume_a_writer_runs() {
     let w = writer(&s, s.pool.dev().await, "1").await;
     attach(&s, &w, "vol", "o1").await;
     let a = pattern(200_000, 1);
-    w.fs.block_write("vol", 0, &a).await.unwrap();
+    w.fs.block_write(&dsn("vol"), 0, &a).await.unwrap();
     w.fs.sync().await.unwrap();
     // Not yet committed by the writer: not in the snapshot.
     let b = pattern(100_000, 2);
-    w.fs.block_write("vol", 0, &b).await.unwrap();
-    s.committer.fs.create_snapshot("vol", "s").await.unwrap();
+    w.fs.block_write(&dsn("vol"), 0, &b).await.unwrap();
+    s.committer
+        .fs
+        .create_snapshot(&dsn("vol"), "s")
+        .await
+        .unwrap();
     w.fs.sync().await.unwrap();
 
     let mut want = a.clone();
@@ -1446,24 +1477,28 @@ async fn snapshots_of_a_volume_a_writer_runs() {
     let mut snap = vec![0u8; a.len()];
     s.committer
         .fs
-        .snapshot_read("vol", "s", 0, &mut snap)
+        .snapshot_read(&dsn("vol"), "s", 0, &mut snap)
         .await
         .unwrap();
     assert_eq!(snap, a);
     let c = pattern(200_000, 3);
-    w.fs.block_write("vol", 0, &c).await.unwrap();
+    w.fs.block_write(&dsn("vol"), 0, &c).await.unwrap();
     w.fs.sync().await.unwrap();
     s.committer
         .fs
-        .snapshot_read("vol", "s", 0, &mut snap)
+        .snapshot_read(&dsn("vol"), "s", 0, &mut snap)
         .await
         .unwrap();
     assert_eq!(snap, a);
     let report = s.pool.load().await.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
 
-    s.committer.fs.destroy_snapshot("vol", "s").await.unwrap();
-    w.fs.detach_dataset("vol").await.unwrap();
+    s.committer
+        .fs
+        .destroy_snapshot(&dsn("vol"), "s")
+        .await
+        .unwrap();
+    w.fs.detach_dataset(&dsn("vol")).await.unwrap();
     w.fs.return_metaslabs().await;
     drop(w);
     assert_eq!(read(&s.committer.fs, "vol", 0, c.len()).await, c);
@@ -1507,7 +1542,11 @@ impl CommitSink for SlowAnswers {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.inner.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -1531,12 +1570,14 @@ async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o").await;
-    fs.attach_dataset("a", Holding::new("o", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o", ds_epoch))
         .await
         .unwrap();
 
     // A sync whose answer is slow to come back...
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
     let first = tokio::spawn({
         let fs = fs.clone();
         async move { fs.sync().await }
@@ -1544,7 +1585,7 @@ async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(!first.is_finished());
     // ...and more writes, and another sync, meanwhile.
-    fs.block_write("a", 200_000, &pattern(100_000, 2))
+    fs.block_write(&dsn("a"), 200_000, &pattern(100_000, 2))
         .await
         .unwrap();
     let second = tokio::spawn({
@@ -1558,7 +1599,7 @@ async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
     eprintln!("first sync: {:?}, second sync: {:?}", r1, r2);
 
     // Whatever happened to those two, the volume carries on.
-    fs.block_write("a", 400_000, &pattern(100_000, 3))
+    fs.block_write(&dsn("a"), 400_000, &pattern(100_000, 3))
         .await
         .unwrap();
     fs.sync().await.expect("a later sync");
@@ -1598,7 +1639,11 @@ impl CommitSink for RefuseOne {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.inner.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -1622,31 +1667,37 @@ async fn one_datasets_refused_sync_doesnt_fail_anothers_flush() {
     );
     for name in ["a", "b"] {
         let e = lease(&s.auth, &dataset_resource(name), "o").await;
-        fs.attach_dataset(name, Holding::new("o", e)).await.unwrap();
+        fs.attach_dataset(&dsn(name), Holding::new("o", e))
+            .await
+            .unwrap();
     }
 
     // Both written; only `b`'s commits are refused.
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
-    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
-    fs.flush_for("a").await.expect("a's flush, b refused");
-    assert!(fs.flush_for("b").await.is_err());
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    fs.block_write(&dsn("b"), 0, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    fs.flush_for(&dsn("a")).await.expect("a's flush, b refused");
+    assert!(fs.flush_for(&dsn("b")).await.is_err());
     assert!(
         fs.flush().await.is_err(),
         "a flush of everything includes b"
     );
 
     // Again, now that `a` has an intent log and `b` still has none.
-    fs.block_write("a", 200_000, &pattern(100_000, 3))
+    fs.block_write(&dsn("a"), 200_000, &pattern(100_000, 3))
         .await
         .unwrap();
-    fs.block_write("b", 200_000, &pattern(100_000, 4))
+    fs.block_write(&dsn("b"), 200_000, &pattern(100_000, 4))
         .await
         .unwrap();
-    fs.flush_for("a").await.expect("a's second flush");
-    fs.block_write("a", 400_000, &pattern(100_000, 5))
+    fs.flush_for(&dsn("a")).await.expect("a's second flush");
+    fs.block_write(&dsn("a"), 400_000, &pattern(100_000, 5))
         .await
         .unwrap();
-    fs.sync_for("a").await.expect("a's sync");
+    fs.sync_for(&dsn("a")).await.expect("a's sync");
     assert!(fs.sync().await.is_err());
 
     let fs = s.pool.load().await;
@@ -1680,29 +1731,38 @@ async fn a_sync_given_up_on_after_the_committer_applied_it_doesnt_wedge_the_volu
     );
     for name in ["a", "b"] {
         let e = lease(&s.auth, &dataset_resource(name), "o").await;
-        fs.attach_dataset(name, Holding::new("o", e)).await.unwrap();
+        fs.attach_dataset(&dsn(name), Holding::new("o", e))
+            .await
+            .unwrap();
     }
 
     // Applied by the committer, answered too late: the caller is gone.
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
-    fs.block_write("b", 0, &pattern(100_000, 2)).await.unwrap();
-    let gave_up =
-        tokio::time::timeout(std::time::Duration::from_millis(300), fs.flush_for("a")).await;
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    fs.block_write(&dsn("b"), 0, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    let gave_up = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        fs.flush_for(&dsn("a")),
+    )
+    .await;
     assert!(gave_up.is_err(), "the flush should still be waiting");
     hold.send_replace(false);
 
     // Later writes and syncs carry on, on both datasets.
-    fs.block_write("a", 200_000, &pattern(100_000, 3))
+    fs.block_write(&dsn("a"), 200_000, &pattern(100_000, 3))
         .await
         .unwrap();
-    fs.block_write("b", 200_000, &pattern(100_000, 4))
+    fs.block_write(&dsn("b"), 200_000, &pattern(100_000, 4))
         .await
         .unwrap();
     fs.sync().await.expect("the next sync");
-    fs.block_write("a", 400_000, &pattern(100_000, 5))
+    fs.block_write(&dsn("a"), 400_000, &pattern(100_000, 5))
         .await
         .unwrap();
-    fs.flush_for("a").await.expect("a later flush");
+    fs.flush_for(&dsn("a")).await.expect("a later flush");
     fs.sync().await.expect("a later sync");
 
     let fs = s.pool.load().await;
@@ -1743,7 +1803,11 @@ impl CommitSink for LosesRetireAnswer {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.inner.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -1768,20 +1832,28 @@ async fn a_detach_whose_answer_was_lost_doesnt_ack_into_the_retired_log() {
         .await
         .unwrap();
     let e = lease(&s.auth, &dataset_resource("a"), "o").await;
-    fs.attach_dataset("a", Holding::new("o", e)).await.unwrap();
+    fs.attach_dataset(&dsn("a"), Holding::new("o", e))
+        .await
+        .unwrap();
     // A log with a region flushes append to.
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
-    fs.flush_for("a").await.unwrap();
-    fs.block_write("a", 0, &pattern(100_000, 2)).await.unwrap();
-    fs.flush_for("a").await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
+    fs.flush_for(&dsn("a")).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 2))
+        .await
+        .unwrap();
+    fs.flush_for(&dsn("a")).await.unwrap();
 
     assert!(
-        fs.detach_dataset("a").await.is_err(),
+        fs.detach_dataset(&dsn("a")).await.is_err(),
         "the retire's outcome is unknown"
     );
     // Served on: an acked flush, then a crash (no sync).
-    fs.block_write("a", 0, &pattern(100_000, 3)).await.unwrap();
-    fs.flush_for("a").await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 3))
+        .await
+        .unwrap();
+    fs.flush_for(&dsn("a")).await.unwrap();
     drop(fs);
 
     let fs = s.pool.load().await;
@@ -1814,13 +1886,17 @@ async fn a_sync_given_up_on_before_it_reached_the_committer_is_sent_again() {
             .unwrap(),
     );
     let e = lease(&s.auth, &dataset_resource("a"), "o").await;
-    fs.attach_dataset("a", Holding::new("o", e)).await.unwrap();
+    fs.attach_dataset(&dsn("a"), Holding::new("o", e))
+        .await
+        .unwrap();
 
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
     let gave_up = tokio::time::timeout(std::time::Duration::from_millis(300), fs.sync()).await;
     assert!(gave_up.is_err());
     hold.send_replace(false);
-    fs.block_write("a", 200_000, &pattern(100_000, 2))
+    fs.block_write(&dsn("a"), 200_000, &pattern(100_000, 2))
         .await
         .unwrap();
     fs.sync().await.expect("the next sync");
@@ -1856,7 +1932,11 @@ impl CommitSink for HeldBack {
     async fn commit_fs(&self, c: FsCommit) -> Result<FsCommitted, CommitError> {
         self.inner.commit_fs(c).await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(
+        &self,
+        volume: &crate::types::DatasetName,
+        ds: &Holding,
+    ) -> Result<(), CommitError> {
         self.inner.claim_dataset(volume, ds).await
     }
 }
@@ -1966,12 +2046,20 @@ async fn a_write_after_detach_doesnt_reopen_the_volume() {
     let w = writer(&s, s.pool.dev().await, "w").await;
     attach(&s, &w, "a", "o").await;
     attach(&s, &w, "b", "o").await;
-    w.fs.block_write("a", 0, &pattern(8192, 1)).await.unwrap();
-    w.fs.detach_dataset("a").await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(8192, 1))
+        .await
+        .unwrap();
+    w.fs.detach_dataset(&dsn("a")).await.unwrap();
 
-    assert!(w.fs.block_write("a", 0, &pattern(8192, 2)).await.is_err());
+    assert!(
+        w.fs.block_write(&dsn("a"), 0, &pattern(8192, 2))
+            .await
+            .is_err()
+    );
     assert!(!w.fs.open_datasets.lock().unwrap().contains_key("a"));
-    w.fs.block_write("b", 0, &pattern(8192, 3)).await.unwrap();
+    w.fs.block_write(&dsn("b"), 0, &pattern(8192, 3))
+        .await
+        .unwrap();
     w.fs.sync().await.unwrap();
     assert_eq!(read(&s.committer.fs, "a", 0, 8192).await, pattern(8192, 1));
     assert_eq!(read(&s.committer.fs, "b", 0, 8192).await, pattern(8192, 3));

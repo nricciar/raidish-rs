@@ -4,6 +4,7 @@
 use super::*;
 use crate::cluster::state::{ClusterState, Lease};
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::types::{Epoch, ep};
 
 fn ev(node: &str, msg: &str) -> NewEvent {
@@ -40,7 +41,7 @@ async fn append_read_and_reopen() {
         // Not a dataset users see.
         assert!(fs.list_btree_datasets().await.unwrap().is_empty());
         let seen = Observed {
-            leader: Some(1),
+            leader: Some(crate::types::NodeId::from_raw(1)),
             ..Default::default()
         };
         log.append(vec![ev("n2", "e10")], Some(&seen))
@@ -50,7 +51,10 @@ async fn append_read_and_reopen() {
     // Committed: a new committer finds it all.
     let fs = Arc::new(pool.load().await);
     let log = EventLog::open(fs.clone()).await.unwrap();
-    assert_eq!(log.seen().await.unwrap().unwrap().leader, Some(1));
+    assert_eq!(
+        log.seen().await.unwrap().unwrap().leader,
+        Some(crate::types::NodeId::from_raw(1))
+    );
     // The newest, oldest first.
     let p = log
         .read(&EventQuery {
@@ -157,7 +161,12 @@ fn nodes_and_datasets_coming_and_going() {
         ("ds/v1", lease("b", ep(4), true, false)),
         ("ds/v2", lease("c", ep(5), true, false)),
     ]);
-    let o0 = observe(&s0, NOW, me("a", ep(9)), Some(1));
+    let o0 = observe(
+        &s0,
+        NOW,
+        me("a", ep(9)),
+        Some(crate::types::NodeId::from_raw(1)),
+    );
     assert_eq!(o0.datasets["v1"], me("b", ep(4)));
     // b went quiet (and v1 with it); c shut down cleanly (and let go of
     // v2: its agent says so); d is new; a restarted.
@@ -169,7 +178,12 @@ fn nodes_and_datasets_coming_and_going() {
         ("ds/v1", lease("b", ep(4), false, false)),
         ("ds/v2", lease("c", ep(5), false, true)),
     ]);
-    let o1 = observe(&s1, NOW, me("a", ep(9)), Some(4));
+    let o1 = observe(
+        &s1,
+        NOW,
+        me("a", ep(9)),
+        Some(crate::types::NodeId::from_raw(4)),
+    );
     let mut got = kinds(&diff(Some(&o0), &o1, &s1, &label));
     got.sort_by(|a, b| (a.0.as_str(), &a.1).cmp(&(b.0.as_str(), &b.1)));
     assert_eq!(
@@ -192,7 +206,12 @@ fn nodes_and_datasets_coming_and_going() {
         ("node/c", lease("c", ep(3), false, true)),
         ("node/d", lease("d", ep(7), true, false)),
     ]);
-    let o2 = observe(&s2, NOW, me("a", ep(9)), Some(4));
+    let o2 = observe(
+        &s2,
+        NOW,
+        me("a", ep(9)),
+        Some(crate::types::NodeId::from_raw(4)),
+    );
     assert_eq!(
         kinds(&diff(Some(&o1), &o2, &s2, &label)),
         vec![(EventKind::NodeUp, "node/b".to_string())]
@@ -372,8 +391,8 @@ async fn the_committer_records_what_it_sees() {
     assert_eq!(msgs(&p), vec!["from n1", "Volume 'v' created"]);
     assert_eq!(p.events[1].event.by.as_deref(), Some("dave"));
     // Users can't take the log's name, or delete it.
-    assert!(c.create_volume(".events", 1 << 20).await.is_err());
-    assert!(c.delete_dataset(EVENTS_DATASET).await.is_err());
+    assert!(c.create_volume(&ds(".events"), 1 << 20).await.is_err());
+    assert!(c.delete_dataset(&ds(EVENTS_DATASET)).await.is_err());
     // A new committer (a new epoch) picks up where this one was.
     drop(c);
     let c = Committer::new(fs, auth, "id-n0".into(), ep(2), "n0".into()).await;
@@ -450,7 +469,7 @@ async fn admin_changes_are_logged_as_their_callers() {
     let dave = LocalAdmin::new(c.clone(), Some("dave".into()));
     let v = DatasetName::user("v").unwrap();
     dave.create_volume(&v, 1 << 20).await.unwrap();
-    dave.create_snapshot("v", "s1").await.unwrap();
+    dave.create_snapshot(&ds("v"), "s1").await.unwrap();
     // Already there: refused as such, and nothing recorded.
     let e = dave.create_volume(&v, 1 << 20).await.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Exists);

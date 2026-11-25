@@ -1,7 +1,7 @@
 //! The VM definition store: what it refuses, change numbers, reopening.
 
 use super::*;
-use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
+use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool, ds, vmn};
 
 fn xml(vols: &[&str]) -> String {
     let disks: String = vols
@@ -18,7 +18,7 @@ fn xml(vols: &[&str]) -> String {
 
 async fn store_with_volumes(fs: &Arc<FileSystem<crate::vdev::Pool>>, vols: &[&str]) {
     for v in vols {
-        fs.create_block(v, 1 << 20, DEFAULT_VOLBLOCKSIZE)
+        fs.create_block(&crate::test_util::ds(v), 1 << 20, DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
     }
@@ -35,48 +35,58 @@ async fn stores_checks_and_reopens() {
         // Not a dataset users see.
         assert!(fs.list_btree_datasets().await.unwrap().is_empty());
 
-        let one = st.put("one", &xml(&["a", "b"]), true, None).await.unwrap();
+        let one = st
+            .put(&vmn("one"), &xml(&["a", "b"]), true, None)
+            .await
+            .unwrap();
         assert_eq!(one.change, 1);
         // Exists.
         assert!(matches!(
-            st.put("one", &xml(&["a"]), true, None).await,
+            st.put(&vmn("one"), &xml(&["a"]), true, None).await,
             Err(FileSystemError::Conflict(_))
         ));
         // A volume is one VM's.
         let e = st
-            .put("two", &xml(&["c", "b"]), true, None)
+            .put(&vmn("two"), &xml(&["c", "b"]), true, None)
             .await
             .unwrap_err();
         assert!(e.to_string().contains("VM 'one'"), "{}", e);
         // No such volume.
-        assert!(st.put("two", &xml(&["nope"]), true, None).await.is_err());
+        assert!(
+            st.put(&vmn("two"), &xml(&["nope"]), true, None)
+                .await
+                .is_err()
+        );
         // Reaches the host.
         let host = "<domain><devices><disk device='disk'><source file='raidish:c'/></disk>\
                     <hostdev mode='subsystem' type='pci'/></devices></domain>";
-        assert!(st.put("two", host, true, None).await.is_err());
+        assert!(st.put(&vmn("two"), host, true, None).await.is_err());
         // Bad names.
-        assert!(st.put("../x", &xml(&["c"]), true, None).await.is_err());
+        assert!(crate::types::VmName::try_from("../x").is_err());
 
         // Changing: a stale change number is refused, the current one isn't.
-        let two = st.put("two", &xml(&["c"]), true, None).await.unwrap();
+        let two = st.put(&vmn("two"), &xml(&["c"]), true, None).await.unwrap();
         assert_eq!(two.change, 2);
         assert!(matches!(
-            st.put("one", &xml(&["a"]), false, Some(7)).await,
+            st.put(&vmn("one"), &xml(&["a"]), false, Some(7)).await,
             Err(FileSystemError::Conflict(_))
         ));
-        let one = st.put("one", &xml(&["a"]), false, Some(1)).await.unwrap();
+        let one = st
+            .put(&vmn("one"), &xml(&["a"]), false, Some(1))
+            .await
+            .unwrap();
         assert_eq!(one.change, 3);
         // `b` is free again.
-        assert_eq!(st.user_of("b").await.unwrap(), None);
-        assert_eq!(st.user_of("c").await.unwrap().as_deref(), Some("two"));
+        assert_eq!(st.user_of(&ds("b")).await.unwrap(), None);
+        assert_eq!(st.user_of(&ds("c")).await.unwrap().as_deref(), Some("two"));
 
-        st.delete("two", Some(2)).await.unwrap();
+        st.delete(&vmn("two"), Some(2)).await.unwrap();
         assert!(matches!(
-            st.delete("two", None).await,
+            st.delete(&vmn("two"), None).await,
             Err(FileSystemError::FileNotFound)
         ));
         // Defined again: a new number, never an old one.
-        let two = st.put("two", &xml(&["c"]), true, None).await.unwrap();
+        let two = st.put(&vmn("two"), &xml(&["c"]), true, None).await.unwrap();
         assert_eq!(two.change, 4);
     }
     let fs = Arc::new(pool.load().await);
@@ -94,7 +104,7 @@ async fn node_facts_next_to_the_definitions() {
     let fs = Arc::new(pool.format().await);
     store_with_volumes(&fs, &["a"]).await;
     let st = VmStore::open(fs.clone()).await.unwrap();
-    st.put("one", &xml(&["a"]), true, None).await.unwrap();
+    st.put(&vmn("one"), &xml(&["a"]), true, None).await.unwrap();
     let mut f = crate::api_types::NodeFacts {
         node: "node-1".into(),
         ..Default::default()

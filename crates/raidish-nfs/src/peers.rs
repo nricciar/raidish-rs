@@ -31,7 +31,7 @@ pub struct ClusterPeers {
     /// The `nfs4` lease (owner, epoch), while this node holds it.
     nfs4: std::sync::Mutex<Option<(String, Epoch)>>,
     /// Every node's NFS address (see `with_locations`), by node id.
-    locations: Vec<(u64, String)>,
+    locations: Vec<(crate::types::NodeId, String)>,
     /// The NFS port (the same on every node).
     port: u16,
     /// Those of them resolved to IP addresses so far.
@@ -67,7 +67,7 @@ impl ClusterPeers {
     /// the other members' hosts (from their URLs in the pool config), all
     /// serving NFS on `port`.
     pub fn with_locations(mut self, me: Option<String>, port: u16) -> Self {
-        let mut all: Vec<(u64, String)> = me
+        let mut all: Vec<(crate::types::NodeId, String)> = me
             .into_iter()
             .map(|h| (self.cluster.members.me, h))
             .collect();
@@ -190,8 +190,8 @@ impl V4Cluster for ClusterPeers {
         self.locations
             .iter()
             .map(|(id, h)| v4::Device {
-                id: *id,
-                node: crate::cluster::members::node_name(*id),
+                id: id.get(),
+                node: id.name(),
                 addr: self.resolve(h),
                 port: self.port,
             })

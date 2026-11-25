@@ -17,6 +17,7 @@ use crate::disk::BlockDevice;
 use crate::export::{BlockExporter, ExportLife, ExportTable, Exported};
 pub(crate) use crate::export::{ExportSession, export_closed};
 use crate::fs::{FileSystem, FileSystemError};
+use crate::types::DatasetName;
 use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo, ensure_sync_loop};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -124,7 +125,7 @@ pub struct NbdServer<D: BlockDevice> {
 /// Serve the single volume `zvol_name` on `127.0.0.1:port` (the CLI's `nbd`).
 pub async fn serve_nbd<D>(
     fs: Arc<FileSystem<D>>,
-    zvol_name: String,
+    zvol_name: DatasetName,
     port: u16,
 ) -> std::io::Result<()>
 where
@@ -152,16 +153,6 @@ where
             port,
             exports: Arc::new(ExportTable::new("nbd", str::to_string)),
         }
-    }
-
-    fn check_name(name: &str) -> Result<(), FileSystemError> {
-        if name.is_empty() || name.len() > 4096 {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "bad export name '{}'",
-                name
-            )));
-        }
-        Ok(())
     }
 
     /// Bind `bind:port` and serve until the listener fails.
@@ -197,8 +188,7 @@ impl<D> BlockExporter for NbdServer<D>
 where
     D: BlockDevice + Send + Sync + 'static,
 {
-    async fn add_export(&self, name: &str) -> Result<(), FileSystemError> {
-        Self::check_name(name)?;
+    async fn add_export(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let size = self.fs.open_dataset(name).await?.size_bytes;
         let io = Arc::new(LocalIo::new(self.fs.clone(), name));
         self.add_export_io(name, size, io)
@@ -206,11 +196,10 @@ where
 
     fn add_export_io(
         &self,
-        name: &str,
+        name: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
     ) -> Result<(), FileSystemError> {
-        Self::check_name(name)?;
         self.exports.insert(Export {
             name: name.to_string(),
             size,
@@ -219,15 +208,15 @@ where
         })
     }
 
-    fn export_io(&self, name: &str) -> Option<Arc<SwitchableIo>> {
+    fn export_io(&self, name: &DatasetName) -> Option<Arc<SwitchableIo>> {
         self.exports.export_io(name)
     }
 
-    fn peer_export(&self, name: &str) -> Option<crate::peer_io::PeerExport> {
+    fn peer_export(&self, name: &DatasetName) -> Option<crate::peer_io::PeerExport> {
         self.exports.peer_export(name)
     }
 
-    async fn remove_export(&self, name: &str) -> Result<bool, FileSystemError> {
+    async fn remove_export(&self, name: &DatasetName) -> Result<bool, FileSystemError> {
         self.exports.remove(name).await
     }
 

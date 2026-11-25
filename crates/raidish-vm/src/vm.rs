@@ -132,7 +132,7 @@ pub struct VmRuntime {
     pool: std::sync::RwLock<Option<String>>,
     /// VMs to shut down (destroyed after the timeout) and start again from
     /// their current XML.
-    restart: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    restart: std::sync::Mutex<std::collections::BTreeSet<crate::types::VmName>>,
     /// See `VmConfig::migrate_uri`, `migrate_host`, `migrate_timeout_s`.
     pub migrate_uri: Option<String>,
     pub migrate_host: Option<String>,
@@ -222,12 +222,12 @@ impl VmRuntime {
     }
 
     /// Shut VM `name` down and start it again from its current XML.
-    pub fn restart(&self, name: &str) {
-        self.restart.lock().unwrap().insert(name.to_string());
+    pub fn restart(&self, name: &crate::types::VmName) {
+        self.restart.lock().unwrap().insert(name.clone());
     }
 
     /// Whether VM `name` is to be restarted.
-    pub fn restarting(&self, name: &str) -> bool {
+    pub fn restarting(&self, name: &crate::types::VmName) -> bool {
         self.restart.lock().unwrap().contains(name)
     }
 
@@ -265,8 +265,8 @@ impl VmRuntime {
     pub async fn exported_volumes_of(
         &self,
         name: &str,
-        volumes: &[String],
-    ) -> Result<Vec<String>, VmError> {
+        volumes: &[crate::types::DatasetName],
+    ) -> Result<Vec<crate::types::DatasetName>, VmError> {
         let xml = self.virsh.dumpxml_live(name).await?;
         exported_volumes(&xml, (&self.nbd.0, self.nbd.1), volumes)
     }
@@ -362,9 +362,9 @@ fn hardware(root: &El) -> VmHardware {
 
 /// A VM definition as stored: its XML checked (`VmDisks::Unusable` if
 /// it isn't one raidish runs) and its hardware read.
-pub fn parse_spec(name: &str, xml: &str, change: u64) -> VmSpec {
+pub fn parse_spec(name: &crate::types::VmName, xml: &str, change: u64) -> VmSpec {
     let mut spec = VmSpec {
-        name: name.to_string(),
+        name: name.clone(),
         change,
         disks: VmDisks::Unusable {
             error: String::new(),
@@ -392,8 +392,8 @@ pub fn parse_spec(name: &str, xml: &str, change: u64) -> VmSpec {
 /// as unusable: two guests writing one disk corrupt it. The store refuses
 /// such definitions (`crate::vm_store`); this keeps any that got past it
 /// from being started.
-pub fn mark_conflicts(specs: &mut BTreeMap<String, VmSpec>) {
-    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+pub fn mark_conflicts(specs: &mut BTreeMap<crate::types::VmName, VmSpec>) {
+    let mut owner: BTreeMap<crate::types::DatasetName, crate::types::VmName> = BTreeMap::new();
     for spec in specs.values_mut() {
         if !spec.usable() {
             continue;
@@ -505,8 +505,8 @@ fn no_such_meta(reason: &str) -> bool {
 pub fn exported_volumes(
     xml: &str,
     nbd: (&str, u16),
-    volumes: &[String],
-) -> Result<Vec<String>, VmError> {
+    volumes: &[crate::types::DatasetName],
+) -> Result<Vec<crate::types::DatasetName>, VmError> {
     let root = parse_domain(xml)?;
     let Some(devices) = root.child("devices") else {
         return Ok(Vec::new());
@@ -524,8 +524,11 @@ pub fn exported_volumes(
         let here = src.elements().any(|h| {
             h.name == "host" && h.attr("name") == Some(nbd.0) && h.attr("port") == Some(&port)
         });
-        if here && volumes.iter().any(|x| x == v) && !out.iter().any(|x| x == v) {
-            out.push(v.to_string());
+        if here
+            && let Some(x) = volumes.iter().find(|x| *x == v)
+            && !out.contains(x)
+        {
+            out.push(x.clone());
         }
     }
     Ok(out)
@@ -837,14 +840,14 @@ fn check_domain(root: &El) -> Result<(), VmError> {
 
 /// Every raidish volume in the domain's disks, the anchor (first non-cdrom
 /// one) first.
-fn raidish_disks(root: &El) -> Result<Vec<String>, VmError> {
+fn raidish_disks(root: &El) -> Result<Vec<crate::types::DatasetName>, VmError> {
     let Some(devices) = root.child("devices") else {
         return Ok(Vec::new());
     };
-    let mut disks: Vec<(bool, String)> = Vec::new();
+    let mut disks: Vec<(bool, crate::types::DatasetName)> = Vec::new();
     for d in devices.elements().filter(|e| e.name == "disk") {
         if let Some(v) = disk_volume(d) {
-            crate::types::DatasetName::user(&v).map_err(VmError::invalid)?;
+            let v = crate::types::DatasetName::user(&v).map_err(VmError::invalid)?;
             if disks.iter().any(|(_, x)| *x == v) {
                 return invalid(format!("volume '{}' is used twice", v));
             }
@@ -996,8 +999,8 @@ pub fn render(
 /// What raidish's metadata on a running domain says.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DomMeta {
-    pub anchor: String,
-    pub volumes: Vec<String>,
+    pub anchor: crate::types::DatasetName,
+    pub volumes: Vec<crate::types::DatasetName>,
     pub change: u64,
     /// Whose it is (see `DomOwner`).
     pub owner: DomOwner,
@@ -1063,14 +1066,17 @@ fn parse_meta(xml: &str) -> Option<DomMeta> {
         return None;
     }
     Some(DomMeta {
-        anchor: el.attr("anchor")?.to_string(),
+        // Only raidish writes these: a name that doesn't parse is no
+        // metadata of ours.
+        anchor: el.attr("anchor")?.parse().ok()?,
         volumes: el
             .attr("volumes")
             .unwrap_or_default()
             .split(',')
             .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .collect(),
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?,
         change: el.attr("change").and_then(|c| c.parse().ok()).unwrap_or(0),
         owner: match el.attr("migrating") {
             Some("1") => DomOwner::Migrating,
@@ -1175,8 +1181,10 @@ pub struct Domain {
 /// A domain this node runs for raidish, as `/api/v1/vm/local` reports it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LocalVm {
-    #[serde(flatten)]
-    pub domain: Domain,
+    /// Its domain's name (and id and state: the fields of a [`Domain`]).
+    pub name: crate::types::VmName,
+    pub id: Option<u32>,
+    pub state: DomState,
     pub meta: DomMeta,
     pub vcpus: Option<u32>,
     pub memory: Option<crate::types::Bytes>,
@@ -1413,6 +1421,10 @@ impl Virsh {
     /// The domain with its details, if raidish started it (any node, any
     /// pool: see `VmRuntime::our_vm`). Err: whether it did is unknown.
     pub async fn local_vm(&self, d: Domain) -> Result<Option<LocalVm>, VmError> {
+        // Raidish only defines domains under VM names.
+        let Ok(name) = crate::types::VmName::try_from(d.name.as_str()) else {
+            return Ok(None);
+        };
         let Some(meta) = self.meta(&d.name).await? else {
             return Ok(None);
         };
@@ -1437,7 +1449,9 @@ impl Virsh {
                 }),
             cpu_s: field("CPU time:").and_then(|v| v.trim_end_matches('s').parse().ok()),
             vnc_port,
-            domain: d,
+            name,
+            id: d.id,
+            state: d.state,
             meta,
         }))
     }

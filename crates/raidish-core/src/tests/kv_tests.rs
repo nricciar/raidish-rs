@@ -4,9 +4,11 @@
 use super::*;
 use crate::disk::BlockDevice;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use std::ops::Bound;
 
 async fn fill<D: BlockDevice>(fs: &FileSystem<D>, name: &str, n: u64, tag: &str) {
+    let name = &ds(name);
     for i in 0..n {
         let k = format!("k{:05}", i);
         let v = format!("{}-{}-{}", tag, i, "x".repeat((i % 50) as usize));
@@ -15,6 +17,7 @@ async fn fill<D: BlockDevice>(fs: &FileSystem<D>, name: &str, n: u64, tag: &str)
 }
 
 async fn all<D: BlockDevice>(fs: &FileSystem<D>, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let name = &ds(name);
     fs.kv_range(name, Bound::Unbounded, Bound::Unbounded, usize::MAX)
         .await
         .unwrap()
@@ -30,8 +33,8 @@ async fn survives_a_reload_and_is_a_tree_dataset() {
     let pool = TestPool::new().await;
     let before = {
         let fs = pool.format().await;
-        fs.create_kv("kv").await.unwrap();
-        let e = fs.dataset_entry("kv").await.unwrap();
+        fs.create_kv(&ds("kv")).await.unwrap();
+        let e = fs.dataset_entry(&ds("kv")).await.unwrap();
         assert_eq!(e.format, DatasetFormat::Kv);
         assert!(e.format.is_tree());
         fill(&fs, "kv", 3000, "a").await;
@@ -40,10 +43,10 @@ async fn survives_a_reload_and_is_a_tree_dataset() {
     };
     let fs = pool.load().await;
     assert_eq!(all(&fs, "kv").await, before);
-    assert_eq!(fs.kv_len("kv").await.unwrap(), 3000);
+    assert_eq!(fs.kv_len(&ds("kv")).await.unwrap(), 3000);
     clean(&fs).await;
     // Uncommitted changes don't survive a crash (no sync).
-    fs.kv_put("kv", b"k00000", b"changed").await.unwrap();
+    fs.kv_put(&ds("kv"), b"k00000", b"changed").await.unwrap();
     drop(fs);
     let fs = pool.load().await;
     assert_eq!(all(&fs, "kv").await, before);
@@ -55,14 +58,14 @@ async fn survives_a_reload_and_is_a_tree_dataset() {
 /// commit made.
 async fn crash_rewrite(pool: &TestPool, k: i64) -> (bool, Vec<(Vec<u8>, Vec<u8>)>, i64) {
     let (fs, faults) = pool.format_faulty().await;
-    fs.create_kv_with("kv", fs.volblock_align(), 1 << 16)
+    fs.create_kv_with(&ds("kv"), fs.volblock_align(), 1 << 16)
         .await
         .unwrap();
     fill(&fs, "kv", 1500, "a").await;
     fs.sync().await.unwrap();
     fill(&fs, "kv", 1500, "b").await;
     for i in 0..400 {
-        fs.kv_delete("kv", format!("k{:05}", i * 3).as_bytes())
+        fs.kv_delete(&ds("kv"), format!("k{:05}", i * 3).as_bytes())
             .await
             .unwrap();
     }
@@ -77,7 +80,7 @@ async fn a_crash_mid_commit_keeps_a_whole_tree() {
     let before = {
         let pool = TestPool::new().await;
         let fs = pool.format().await;
-        fs.create_kv_with("kv", fs.volblock_align(), 1 << 16)
+        fs.create_kv_with(&ds("kv"), fs.volblock_align(), 1 << 16)
             .await
             .unwrap();
         fill(&fs, "kv", 1500, "a").await;
@@ -112,31 +115,33 @@ async fn a_crash_mid_commit_keeps_a_whole_tree() {
 async fn snapshots_clones_and_rollback() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_kv("kv").await.unwrap();
+    fs.create_kv(&ds("kv")).await.unwrap();
     fill(&fs, "kv", 1500, "a").await;
     fs.sync().await.unwrap();
     let a = all(&fs, "kv").await;
-    fs.create_snapshot("kv", "s1").await.unwrap();
+    fs.create_snapshot(&ds("kv"), "s1").await.unwrap();
     fill(&fs, "kv", 2500, "b").await;
-    fs.kv_delete("kv", b"k00007").await.unwrap();
+    fs.kv_delete(&ds("kv"), b"k00007").await.unwrap();
     fs.sync().await.unwrap();
     let b = all(&fs, "kv").await;
     assert_ne!(a, b);
 
-    fs.clone_snapshot("kv", "s1", "copy").await.unwrap();
+    fs.clone_snapshot(&ds("kv"), "s1", &ds("copy"))
+        .await
+        .unwrap();
     assert_eq!(
-        fs.dataset_entry("copy").await.unwrap().format,
+        fs.dataset_entry(&ds("copy")).await.unwrap().format,
         DatasetFormat::Kv
     );
     assert_eq!(all(&fs, "copy").await, a);
     // The clone and its origin diverge independently.
-    fs.kv_put("copy", b"only-in-copy", b"1").await.unwrap();
+    fs.kv_put(&ds("copy"), b"only-in-copy", b"1").await.unwrap();
     fs.sync().await.unwrap();
-    assert_eq!(fs.kv_get("kv", b"only-in-copy").await.unwrap(), None);
+    assert_eq!(fs.kv_get(&ds("kv"), b"only-in-copy").await.unwrap(), None);
     clean(&fs).await;
 
-    fs.delete_dataset("copy").await.unwrap();
-    fs.rollback_volume("kv").await.unwrap();
+    fs.delete_dataset(&ds("copy")).await.unwrap();
+    fs.rollback_volume(&ds("kv")).await.unwrap();
     assert_eq!(all(&fs, "kv").await, a);
     clean(&fs).await;
 }
@@ -145,50 +150,54 @@ async fn snapshots_clones_and_rollback() {
 async fn send_and_receive() {
     let src = TestPool::new().await;
     let fs = src.format().await;
-    fs.create_kv("kv").await.unwrap();
+    fs.create_kv(&ds("kv")).await.unwrap();
     fill(&fs, "kv", 1200, "a").await;
     fs.sync().await.unwrap();
-    fs.create_snapshot("kv", "s1").await.unwrap();
+    fs.create_snapshot(&ds("kv"), "s1").await.unwrap();
     let s1 = all(&fs, "kv").await;
     fill(&fs, "kv", 1800, "b").await;
-    fs.kv_put("kv", b"big", &vec![7u8; 300_000]).await.unwrap();
+    fs.kv_put(&ds("kv"), b"big", &vec![7u8; 300_000])
+        .await
+        .unwrap();
     fs.sync().await.unwrap();
-    fs.create_snapshot("kv", "s2").await.unwrap();
+    fs.create_snapshot(&ds("kv"), "s2").await.unwrap();
     let s2 = all(&fs, "kv").await;
 
     let mut full = Vec::new();
-    fs.send_snapshot("kv", "s1", None, &mut full).await.unwrap();
+    fs.send_snapshot(&ds("kv"), "s1", None, &mut full)
+        .await
+        .unwrap();
     let mut incr = Vec::new();
-    fs.send_snapshot("kv", "s2", Some("s1"), &mut incr)
+    fs.send_snapshot(&ds("kv"), "s2", Some("s1"), &mut incr)
         .await
         .unwrap();
 
     let dst = TestPool::new().await;
     let other = dst.format().await;
     other
-        .recv_snapshot("kv", &mut full.as_slice(), false)
+        .recv_snapshot(&ds("kv"), &mut full.as_slice(), false)
         .await
         .unwrap();
     assert_eq!(
-        other.dataset_entry("kv").await.unwrap().format,
+        other.dataset_entry(&ds("kv")).await.unwrap().format,
         DatasetFormat::Kv
     );
     assert_eq!(all(&other, "kv").await, s1);
     other
-        .recv_snapshot("kv", &mut incr.as_slice(), false)
+        .recv_snapshot(&ds("kv"), &mut incr.as_slice(), false)
         .await
         .unwrap();
     assert_eq!(all(&other, "kv").await, s2);
     clean(&other).await;
     // A kv stream doesn't land on a volume.
     other
-        .create_block("vol", 1 << 20, other.default_volblocksize())
+        .create_block(&ds("vol"), 1 << 20, other.default_volblocksize())
         .await
         .unwrap();
-    other.create_snapshot("vol", "s1").await.unwrap();
+    other.create_snapshot(&ds("vol"), "s1").await.unwrap();
     assert!(
         other
-            .recv_snapshot("vol", &mut incr.as_slice(), true)
+            .recv_snapshot(&ds("vol"), &mut incr.as_slice(), true)
             .await
             .is_err()
     );
@@ -198,7 +207,7 @@ async fn send_and_receive() {
 async fn fsck_finds_a_damaged_tree() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_kv_with("kv", fs.volblock_align(), 1 << 16)
+    fs.create_kv_with(&ds("kv"), fs.volblock_align(), 1 << 16)
         .await
         .unwrap();
     fill(&fs, "kv", 800, "a").await;
@@ -206,7 +215,7 @@ async fn fsck_finds_a_damaged_tree() {
     clean(&fs).await;
     // Overwrite a leaf with a well-formed node holding keys out of order:
     // its checksum is fine (a commit wrote it), its contents aren't.
-    let ds = fs.open_kv("kv").await.unwrap();
+    let ds = fs.open_kv(&ds("kv")).await.unwrap();
     let leaf = {
         let t = crate::btree::Txn::begin(&fs, &ds.obj).await.unwrap();
         let mut id = t.header.root.unwrap().get();
@@ -242,20 +251,20 @@ async fn fsck_finds_a_damaged_tree() {
 async fn names_and_shapes_are_checked() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    assert!(fs.create_kv("a@b").await.is_err());
-    assert!(fs.create_kv(crate::dataset::DEFAULT_FS).await.is_err());
-    assert!(fs.create_kv_with("x", 1000, 1 << 10).await.is_err());
+    assert!(crate::types::DatasetName::try_from("a@b").is_err());
+    assert!(fs.create_kv(&ds(crate::dataset::DEFAULT_FS)).await.is_err());
+    assert!(fs.create_kv_with(&ds("x"), 1000, 1 << 10).await.is_err());
     assert!(
-        fs.create_kv_with("x", fs.volblock_align(), 1)
+        fs.create_kv_with(&ds("x"), fs.volblock_align(), 1)
             .await
             .is_err()
     );
-    fs.create_kv("x").await.unwrap();
+    fs.create_kv(&ds("x")).await.unwrap();
     assert!(matches!(
-        fs.create_kv("x").await,
+        fs.create_kv(&ds("x")).await,
         Err(FileSystemError::AlreadyExists)
     ));
     // Not a volume.
-    assert!(fs.delete_volume("x").await.is_err());
+    assert!(fs.delete_volume(&ds("x")).await.is_err());
     assert_eq!(fs.list_volumes().await.unwrap().len(), 0);
 }

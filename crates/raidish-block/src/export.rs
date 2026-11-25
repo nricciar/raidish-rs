@@ -7,6 +7,7 @@
 
 use crate::fs::FileSystemError;
 use crate::peer_io::PeerExport;
+use crate::types::DatasetName;
 use crate::volume_io::{SwitchableIo, VolumeIo};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,23 +21,23 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 #[async_trait::async_trait]
 pub trait BlockExporter: Send + Sync {
     /// Export volume `volume`, written by this node.
-    async fn add_export(&self, volume: &str) -> Result<(), FileSystemError>;
+    async fn add_export(&self, volume: &DatasetName) -> Result<(), FileSystemError>;
     /// Export `volume`, `size` bytes, with its I/O going to `io`.
     fn add_export_io(
         &self,
-        volume: &str,
+        volume: &DatasetName,
         size: u64,
         io: Arc<dyn VolumeIo>,
     ) -> Result<(), FileSystemError>;
     /// The backend of `volume`'s export, to pause or switch it.
-    fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>>;
+    fn export_io(&self, volume: &DatasetName) -> Option<Arc<SwitchableIo>>;
     /// `volume`'s export for another node's proxy (see `crate::peer_io`):
     /// its connections count as the export's, so removing it drains them.
-    fn peer_export(&self, volume: &str) -> Option<PeerExport>;
+    fn peer_export(&self, volume: &DatasetName) -> Option<PeerExport>;
     /// Stop exporting `volume`: new connections are refused, current ones
     /// closed once their in-flight requests finish, then everything is
     /// committed. False: it wasn't exported.
-    async fn remove_export(&self, volume: &str) -> Result<bool, FileSystemError>;
+    async fn remove_export(&self, volume: &DatasetName) -> Result<bool, FileSystemError>;
     /// The exported volumes (what tests check).
     #[cfg(test)]
     fn exports(&self) -> Vec<String>;
@@ -111,11 +112,11 @@ impl<E: Exported> ExportTable<E> {
         self.all().iter().map(|e| e.volume().to_string()).collect()
     }
 
-    pub fn export_io(&self, volume: &str) -> Option<Arc<SwitchableIo>> {
+    pub fn export_io(&self, volume: &DatasetName) -> Option<Arc<SwitchableIo>> {
         Some(self.get(volume)?.io().clone())
     }
 
-    pub fn peer_export(&self, volume: &str) -> Option<PeerExport> {
+    pub fn peer_export(&self, volume: &DatasetName) -> Option<PeerExport> {
         let e = self.get(volume)?;
         Some(PeerExport {
             size: e.size(),

@@ -20,6 +20,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
+use crate::types::DatasetName;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::volume::DIRTY_LIMIT_BYTES;
 #[cfg(any(test, feature = "testutil"))]
@@ -39,7 +40,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Create an empty `kv` dataset.
-    pub async fn create_kv(&self, name: &str) -> Result<FileId, FileSystemError> {
+    pub async fn create_kv(&self, name: &DatasetName) -> Result<FileId, FileSystemError> {
         self.create_kv_with(name, self.default_kv_blksz(), NODE_CAPACITY)
             .await
     }
@@ -48,7 +49,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// (whole stripes, as a volume's records).
     pub async fn create_kv_with(
         &self,
-        name: &str,
+        name: &DatasetName,
         blksz: u32,
         capacity: u64,
     ) -> Result<FileId, FileSystemError> {
@@ -60,7 +61,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// nodes of `blksz` bytes, with properties `props`.
     pub async fn create_btree(
         &self,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
         blksz: u32,
         capacity: u64,
@@ -114,7 +115,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// queue), with properties `props`.
     pub async fn create_service(
         &self,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
         props: crate::inode::DatasetProps,
     ) -> Result<FileId, FileSystemError> {
@@ -142,7 +143,7 @@ impl<D: BlockDevice> FileSystem<D> {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_btree(
         &self,
-        name: &str,
+        name: &DatasetName,
         format: DatasetFormat,
     ) -> Result<Arc<Dataset>, FileSystemError> {
         let ds = self.open_dataset(name).await?;
@@ -159,13 +160,20 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// `kv` dataset `name`, opened.
     #[cfg(any(test, feature = "testutil"))]
-    pub(crate) async fn open_kv(&self, name: &str) -> Result<Arc<Dataset>, FileSystemError> {
+    pub(crate) async fn open_kv(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
         self.open_btree(name, DatasetFormat::Kv).await
     }
 
     /// The value of `key` (uncommitted changes included).
     #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_get(&self, name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, FileSystemError> {
+    pub async fn kv_get(
+        &self,
+        name: &DatasetName,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
         Txn::begin(self, &ds.obj).await?.get(key).await
@@ -175,7 +183,7 @@ impl<D: BlockDevice> FileSystem<D> {
     #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_put(
         &self,
-        name: &str,
+        name: &DatasetName,
         key: &[u8],
         value: &[u8],
     ) -> Result<bool, FileSystemError> {
@@ -193,7 +201,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Remove `key`. Returns whether it was there.
     #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_delete(&self, name: &str, key: &[u8]) -> Result<bool, FileSystemError> {
+    pub async fn kv_delete(&self, name: &DatasetName, key: &[u8]) -> Result<bool, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let removed = {
             let _w = ds.ops.write().await;
@@ -210,7 +218,7 @@ impl<D: BlockDevice> FileSystem<D> {
     #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_range(
         &self,
-        name: &str,
+        name: &DatasetName,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
         limit: usize,
@@ -228,7 +236,7 @@ impl<D: BlockDevice> FileSystem<D> {
     #[cfg(any(test, feature = "testutil"))]
     pub async fn kv_scan_prefix(
         &self,
-        name: &str,
+        name: &DatasetName,
         prefix: &[u8],
         after: Option<&[u8]>,
         limit: usize,
@@ -247,7 +255,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// How many keys `name` holds.
     #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_len(&self, name: &str) -> Result<u64, FileSystemError> {
+    pub async fn kv_len(&self, name: &DatasetName) -> Result<u64, FileSystemError> {
         let ds = self.open_kv(name).await?;
         let _r = ds.ops.read().await;
         Ok(Txn::begin(self, &ds.obj).await?.header.entries)

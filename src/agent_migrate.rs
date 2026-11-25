@@ -29,6 +29,7 @@ use crate::cluster::LeaseOp;
 use crate::cluster::lease::LeaseClient;
 use crate::committer::PoolAdmin;
 use crate::node_facts::FactsHandle;
+use crate::types::DatasetName;
 use crate::vm::{DomMeta, Incoming, Virsh};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -39,7 +40,7 @@ const READY_WAIT: Duration = Duration::from_secs(60);
 /// A live migration from this node, under way.
 pub(super) struct Migration {
     pub to: String,
-    pub volumes: Vec<String>,
+    pub volumes: Vec<DatasetName>,
     pub started: Instant,
     pub task: JoinHandle<Result<(), Failure>>,
 }
@@ -68,7 +69,7 @@ impl From<crate::vm::VmError> for Failure {
 /// Migrated away: its volumes being handed to `to`.
 pub(super) struct Migrated {
     pub to: String,
-    pub volumes: Vec<String>,
+    pub volumes: Vec<DatasetName>,
     /// This node detached from them (so they're handed over).
     pub detached: bool,
 }
@@ -76,7 +77,7 @@ pub(super) struct Migrated {
 /// A live migration that failed, until where its guest runs is known.
 pub(super) struct Unsettled {
     pub to: String,
-    pub volumes: Vec<String>,
+    pub volumes: Vec<DatasetName>,
     pub why: String,
     /// It was said that B couldn't be asked (said once).
     pub told: bool,
@@ -121,7 +122,7 @@ pub(super) async fn runs_there(http: &reqwest::Client, url: &str, name: &str) ->
     if view.error.is_some() {
         return None;
     }
-    Some(view.vms.iter().any(|v| v.domain.name == name))
+    Some(view.vms.iter().any(|v| v.name.as_str() == name))
 }
 
 /// Attach `volume` to `node` too, or (`on: false`) no longer.
@@ -149,8 +150,8 @@ pub(super) struct Job {
     pub url: String,
     /// B's host in that URL: its libvirt and qemu's stream, by default.
     pub host: String,
-    pub name: String,
-    pub volumes: Vec<String>,
+    pub name: crate::types::VmName,
+    pub volumes: Vec<DatasetName>,
     pub me: String,
     pub to: String,
     pub virsh: Virsh,

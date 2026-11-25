@@ -284,7 +284,7 @@ impl Vms {
     fn row(&self, ctx: &Context<Self>, vm: &VmView) -> Html {
         let link = ctx.link();
         let can_write = ctx.props().can_write;
-        let name = vm.spec.name.clone();
+        let name = vm.spec.name.to_string();
         let href = Route::Vms(Some(name.clone())).href();
         let act = |a: &'static str| {
             let n = name.clone();

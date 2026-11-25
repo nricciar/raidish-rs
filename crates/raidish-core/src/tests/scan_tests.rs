@@ -1,5 +1,6 @@
 use super::*;
 use crate::fs::LabelState;
+use crate::test_util::ds;
 use crate::test_util::{TestPool, check_files, write_files};
 use crate::types::Txg;
 use crate::vdev::Pool;
@@ -173,7 +174,9 @@ async fn scrub_runs_safely_alongside_volume_writes() {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let vbs = crate::test_util::DEFAULT_VOLBLOCKSIZE as u64;
-    fs.create_block("vol", 64 * vbs, vbs as u32).await.unwrap();
+    fs.create_block(&ds("vol"), 64 * vbs, vbs as u32)
+        .await
+        .unwrap();
 
     let writer = {
         let fs = fs.clone();
@@ -182,7 +185,7 @@ async fn scrub_runs_safely_alongside_volume_writes() {
                 for slot in 0..16u64 {
                     let fill = (round * 16 + slot) as u8;
                     let at = ((slot * 7 + round) % 64) * vbs;
-                    fs.block_write("vol", at, &vec![fill; vbs as usize])
+                    fs.block_write(&ds("vol"), at, &vec![fill; vbs as usize])
                         .await
                         .unwrap();
                 }
@@ -206,7 +209,7 @@ async fn scrub_runs_safely_alongside_volume_writes() {
     // Every record holds a uniform fill: none was torn by a scan rewrite.
     let mut buf = vec![0u8; vbs as usize];
     for i in 0..64 {
-        fs.block_read("vol", i * vbs, &mut buf).await.unwrap();
+        fs.block_read(&ds("vol"), i * vbs, &mut buf).await.unwrap();
         assert!(buf.iter().all(|&b| b == buf[0]), "record {} torn", i);
     }
     let r = fs.scrub(true).await.unwrap();

@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use std::path::Path;
 
 #[tokio::test]
@@ -74,10 +75,10 @@ async fn a_volume_is_a_block_dataset_not_an_entry_in_root() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let id = fs
-        .create_block("vol", 1 << 20, fs.default_volblocksize())
+        .create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    let e = fs.dataset_entry("vol").await.unwrap();
+    let e = fs.dataset_entry(&ds("vol")).await.unwrap();
     assert_eq!((e.root, e.format), (id, DatasetFormat::Block));
     let d = fs.read_dnode(id).await.unwrap();
     assert_eq!(d.kind(), ObjType::Volume);
@@ -85,14 +86,14 @@ async fn a_volume_is_a_block_dataset_not_an_entry_in_root() {
     // Not in `/`; a file of the same name is something else.
     assert!(fs.ls(Path::new("")).await.unwrap().files.is_empty());
     fs.write_file(Path::new("/vol"), b"a file").await.unwrap();
-    fs.block_write("vol", 0, b"a block").await.unwrap();
+    fs.block_write(&ds("vol"), 0, b"a block").await.unwrap();
     let mut buf = [0u8; 7];
-    fs.block_read("vol", 0, &mut buf).await.unwrap();
+    fs.block_read(&ds("vol"), 0, &mut buf).await.unwrap();
     assert_eq!(&buf, b"a block");
     assert_eq!(fs.read_file(Path::new("/vol")).await.unwrap(), b"a file");
     // A posix dataset isn't a volume.
-    assert!(fs.block_read(DEFAULT_FS, 0, &mut buf).await.is_err());
-    assert!(fs.delete_volume(DEFAULT_FS).await.is_err());
+    assert!(fs.block_read(&ds(DEFAULT_FS), 0, &mut buf).await.is_err());
+    assert!(fs.delete_volume(&ds(DEFAULT_FS)).await.is_err());
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
@@ -102,20 +103,21 @@ async fn dataset_names_are_checked() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     let vbs = fs.default_volblocksize();
+    // Bad names don't get this far: they don't parse.
     for bad in ["", "a@b", "a:b", "a/b", ".", ".."] {
         assert!(
-            fs.create_block(bad, 1 << 20, vbs).await.is_err(),
+            crate::types::DatasetName::try_from(bad).is_err(),
             "{:?}",
             bad
         );
     }
     assert!(matches!(
-        fs.create_block(DEFAULT_FS, 1 << 20, vbs).await,
+        fs.create_block(&ds(DEFAULT_FS), 1 << 20, vbs).await,
         Err(FileSystemError::AlreadyExists)
     ));
-    fs.create_block("v", 1 << 20, vbs).await.unwrap();
+    fs.create_block(&ds("v"), 1 << 20, vbs).await.unwrap();
     assert!(matches!(
-        fs.create_block("v", 1 << 20, vbs).await,
+        fs.create_block(&ds("v"), 1 << 20, vbs).await,
         Err(FileSystemError::AlreadyExists)
     ));
 }
@@ -124,17 +126,19 @@ async fn dataset_names_are_checked() {
 async fn snapshots_and_clones_are_datasets_too() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("vol", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("vol"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    fs.block_write("vol", 0, b"before").await.unwrap();
+    fs.block_write(&ds("vol"), 0, b"before").await.unwrap();
     fs.sync().await.unwrap();
-    fs.create_snapshot("vol", "s1").await.unwrap();
-    fs.clone_snapshot("vol", "s1", "copy").await.unwrap();
-    let e = fs.dataset_entry("copy").await.unwrap();
+    fs.create_snapshot(&ds("vol"), "s1").await.unwrap();
+    fs.clone_snapshot(&ds("vol"), "s1", &ds("copy"))
+        .await
+        .unwrap();
+    let e = fs.dataset_entry(&ds("copy")).await.unwrap();
     assert_eq!(e.format, DatasetFormat::Block);
     let mut buf = [0u8; 6];
-    fs.block_read("copy", 0, &mut buf).await.unwrap();
+    fs.block_read(&ds("copy"), 0, &mut buf).await.unwrap();
     assert_eq!(&buf, b"before");
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
@@ -142,8 +146,8 @@ async fn snapshots_and_clones_are_datasets_too() {
     // Survives a reload; deleting the clone takes its entry away.
     drop(fs);
     let fs = pool.load().await;
-    fs.delete_volume("copy").await.unwrap();
-    assert!(fs.dataset_entry("copy").await.is_err());
+    fs.delete_volume(&ds("copy")).await.unwrap();
+    assert!(fs.dataset_entry(&ds("copy")).await.is_err());
     assert_eq!(fs.list_volumes().await.unwrap().len(), 1);
     let report = fs.fsck(false).await.unwrap();
     assert!(report.is_clean(), "{}", report);
@@ -167,10 +171,10 @@ async fn a_sync_without_folding_keeps_the_dnodes_log() {
     use crate::types::{Holding, LeaseRef, ep, res};
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("v", 1 << 20, fs.default_volblocksize())
+    fs.create_block(&ds("v"), 1 << 20, fs.default_volblocksize())
         .await
         .unwrap();
-    let vol = fs.open_dataset("v").await.unwrap();
+    let vol = fs.open_dataset(&ds("v")).await.unwrap();
     let log = DatasetLog {
         regions: vec![LogRegion {
             start: 1 << 30,

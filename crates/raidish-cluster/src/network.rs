@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-type NodeId = u64;
+use crate::types::NodeId;
 
 /// Peers are looked up in this node's own view of the pool (membership
 /// records no addresses).
@@ -69,7 +69,7 @@ impl Conn {
             .post(&url)
             .timeout(option.hard_ttl())
             .header(super::FINGERPRINT_HEADER, &self.fingerprint)
-            .header(super::TO_HEADER, self.target.to_string())
+            .header(super::TO_HEADER, super::to_header(self.target))
             .header(super::PROTOCOL_HEADER, super::RAFT_PROTOCOL.to_string())
             .json(req)
             .send()

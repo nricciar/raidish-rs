@@ -5,6 +5,7 @@ use crate::inode::{Dnode, FileIndex};
 use crate::metaslab::{MetaslabLayout, MetaslabState};
 use crate::object::{ObjTree, Sizing, TreeRoot};
 use crate::raidz::RaidZError;
+use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use crate::types::Txg;
 use crate::vdev::Topology;
@@ -601,7 +602,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// directory; fixed once formatted).
     pub(crate) root_dir: Arc<AtomicU64>,
     /// Open copy-on-write volumes and their dirty records.
-    pub open_datasets: Arc<std::sync::Mutex<HashMap<String, Arc<Dataset>>>>,
+    pub open_datasets: Arc<std::sync::Mutex<HashMap<DatasetName, Arc<Dataset>>>>,
     /// Files open for writing at any offset (see `crate::open_file`).
     pub(crate) files: Arc<std::sync::Mutex<HashMap<FileId, Arc<crate::open_file::OpenFile>>>>,
     commit_lock: Arc<Mutex<()>>,
@@ -621,7 +622,7 @@ pub struct FileSystem<D: BlockDevice> {
     /// left it with nothing dirty from before that commit began: its writes
     /// up to then are durable, whatever happened to other datasets in that
     /// commit (see `sync_for`).
-    clean_at: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    clean_at: Arc<std::sync::Mutex<HashMap<DatasetName, u64>>>,
     /// Opened for inspection: never writes (no commits, no self-heal repairs),
     /// so it is safe to point at a pool another process is serving.
     pub(crate) read_only: bool,
@@ -1476,12 +1477,15 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `sync` for dataset `name` alone: every write to it completed before
     /// this call is durable. Other datasets' failures in the same commit
     /// (one refused, out of space, its disk writes failing) don't fail it.
-    pub async fn sync_for(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn sync_for(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         self.sync_scoped(Some(name)).await
     }
 
     /// `sync` (None) or `sync_for` (Some).
-    pub(crate) async fn sync_scoped(&self, only: Option<&str>) -> Result<(), FileSystemError> {
+    pub(crate) async fn sync_scoped(
+        &self,
+        only: Option<&DatasetName>,
+    ) -> Result<(), FileSystemError> {
         let need = self.commits_started.load(Ordering::SeqCst) + 1;
         let covered = || {
             self.commits_done.load(Ordering::SeqCst) >= need
@@ -1508,7 +1512,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Note that commit `id` left each of `names` clean (durably).
-    pub(crate) fn note_clean(&self, id: u64, names: &[String]) {
+    pub(crate) fn note_clean(&self, id: u64, names: &[DatasetName]) {
         let mut c = self.clean_at.lock().unwrap();
         for n in names {
             let e = c.entry(n.clone()).or_insert(0);

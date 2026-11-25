@@ -3,14 +3,15 @@
 
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::vdev::Pool;
 
 async fn queue(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<Queue<Pool>>) {
     let fs = Arc::new(pool.format().await);
-    fs.create_service("q", DatasetFormat::Queue, Default::default())
+    fs.create_service(&ds("q"), DatasetFormat::Queue, Default::default())
         .await
         .unwrap();
-    let q = Queue::open(fs.clone(), "q").await.unwrap();
+    let q = Queue::open(fs.clone(), &ds("q")).await.unwrap();
     (fs, q)
 }
 
@@ -233,7 +234,7 @@ async fn survives_a_reload() {
     drop(q);
     drop(fs);
     let fs = Arc::new(pool.load().await);
-    let q = Queue::open(fs.clone(), "q").await.unwrap();
+    let q = Queue::open(fs.clone(), &ds("q")).await.unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 2);
     let (got2, _) = q.receive(10, None).await.unwrap();
     // "kept" is still in flight.

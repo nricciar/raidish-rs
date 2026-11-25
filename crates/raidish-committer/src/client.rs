@@ -5,6 +5,7 @@ use super::admin::PoolAdmin;
 use super::*;
 use crate::send::SendHeader;
 use crate::types::MetaslabIdx;
+use crate::types::{DatasetName, VmName};
 use std::sync::atomic::AtomicUsize;
 
 /// Talks to whichever `listen` node is the committer.
@@ -152,7 +153,7 @@ impl CommitClient {
     /// `name`. Not retried: a stream can't be sent twice.
     pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         &self,
-        name: &str,
+        name: &DatasetName,
         force: bool,
         mut r: R,
     ) -> Result<StreamReport, CommitError> {
@@ -277,7 +278,7 @@ impl PoolAdmin for CommitClient {
         .await
     }
 
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}", name);
         self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
             .await
@@ -286,7 +287,7 @@ impl PoolAdmin for CommitClient {
     /// Every VM definition.
     async fn vms(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, crate::api_types::VmDef>, CommitError> {
+    ) -> Result<std::collections::BTreeMap<VmName, crate::api_types::VmDef>, CommitError> {
         self.call(
             reqwest::Method::GET,
             "/api/v1/pool/vms",
@@ -332,7 +333,7 @@ impl PoolAdmin for CommitClient {
     }
 
     /// Delete VM `name`'s definition (`change`: only if it's that one).
-    async fn delete_vm(&self, name: &str, change: Option<u64>) -> Result<(), CommitError> {
+    async fn delete_vm(&self, name: &VmName, change: Option<u64>) -> Result<(), CommitError> {
         let mut path = format!("/api/v1/pool/vms/{}", name);
         if let Some(c) = change {
             path.push_str(&format!("?change={}", c));
@@ -361,45 +362,52 @@ impl PoolAdmin for CommitClient {
         .await
     }
 
-    async fn delete_dataset(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_dataset(&self, name: &DatasetName) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/datasets/{}", name);
         self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
             .await
     }
 
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/props", name);
         self.call(reqwest::Method::PUT, &path, Some(props), Some(10))
             .await
     }
 
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
         self.call(reqwest::Method::GET, &path, None::<&()>, Some(10))
             .await
     }
 
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/snapshots", name);
         let body = NewName { name: snap.into() };
         self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
             .await
     }
 
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/snapshots/{}", name, snap);
         self.call(reqwest::Method::DELETE, &path, None::<&()>, Some(10))
             .await
     }
 
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+    async fn clone_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        new: &DatasetName,
+    ) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/snapshots/{}/clone", name, snap);
-        let body = NewName { name: new.into() };
+        let body = NewName {
+            name: new.to_string(),
+        };
         self.call(reqwest::Method::POST, &path, Some(&body), Some(10))
             .await
     }
 
-    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError> {
         let path = format!("/api/v1/pool/volumes/{}/rollback", name);
         self.call(reqwest::Method::POST, &path, None::<&()>, Some(10))
             .await
@@ -407,7 +415,7 @@ impl PoolAdmin for CommitClient {
 
     async fn recv_check(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         force: bool,
     ) -> Result<(), CommitError> {
@@ -469,9 +477,9 @@ impl CommitSink for CommitClient {
         )
         .await
     }
-    async fn claim_dataset(&self, volume: &str, ds: &Holding) -> Result<(), CommitError> {
+    async fn claim_dataset(&self, volume: &DatasetName, ds: &Holding) -> Result<(), CommitError> {
         let body = ClaimRequest {
-            dataset: volume.into(),
+            dataset: volume.clone(),
             ds: ds.clone(),
         };
         self.call(

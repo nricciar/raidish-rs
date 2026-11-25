@@ -45,6 +45,7 @@ use crate::disk::{BlockDevice, FileId};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Body, Dnode, Head, Snap, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
+use crate::types::DatasetName;
 use crate::types::Txg;
 use std::sync::Arc;
 
@@ -88,7 +89,7 @@ fn short(r: &SnapRef) -> &str {
 
 impl<D: BlockDevice> FileSystem<D> {
     /// The volume `name` and its dnode (a volume, not a snapshot).
-    async fn head(&self, name: &str) -> Result<(FileId, Dnode), FileSystemError> {
+    async fn head(&self, name: &DatasetName) -> Result<(FileId, Dnode), FileSystemError> {
         let e = self.dataset_entry(name).await?;
         if !e.format.is_tree() {
             return Err(FileSystemError::NotAFile);
@@ -166,7 +167,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Snapshot volume `name` as `snap` (`name@snap`), as last committed
     /// (everything written here so far is committed first). Returns its
     /// TXG.
-    pub async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, FileSystemError> {
+    pub async fn create_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<Txg, FileSystemError> {
         self.create_snapshot_as(name, snap, None, None).await
     }
 
@@ -174,7 +179,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// `created_ns` (a received snapshot keeps the sender's; None: new).
     pub(crate) async fn create_snapshot_as(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
         guid: Option<u64>,
         created_ns: Option<u64>,
@@ -227,7 +232,10 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Volume `name`'s snapshots, oldest first.
-    pub async fn list_snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, FileSystemError> {
+    pub async fn list_snapshots(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Vec<SnapshotInfo>, FileSystemError> {
         let (_, head) = self.head(name).await?;
         let (origin, snapshots) = head_lineage(&head);
         let names = self.dataset_names().await?;
@@ -269,7 +277,11 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Destroy snapshot `name@snap`, freeing what only it referenced.
     /// Refused while clones of it exist.
-    pub async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), FileSystemError> {
+    pub async fn destroy_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<(), FileSystemError> {
         let mut tx = self.begin_tx().await;
         let tx = &mut tx;
         let r: Result<_, FileSystemError> = async {
@@ -331,9 +343,9 @@ impl<D: BlockDevice> FileSystem<D> {
     /// snapshot's contents and shares its blocks.
     pub async fn clone_snapshot(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
-        new: &str,
+        new: &DatasetName,
     ) -> Result<FileId, FileSystemError> {
         let mut tx = self.begin_tx().await;
         let tx = &mut tx;
@@ -381,7 +393,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Roll volume `name` back to its newest snapshot, discarding every
     /// write since (unsynced ones too). The volume must not be running.
-    pub async fn rollback_volume(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn rollback_volume(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         let mut tx = self.begin_tx().await;
         let tx = &mut tx;
         let r: Result<_, FileSystemError> = async {
@@ -424,7 +436,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Read snapshot `name@snap` at byte `offset`.
     pub async fn snapshot_read(
         &self,
-        name: &str,
+        name: &DatasetName,
         snap: &str,
         offset: u64,
         buf: &mut [u8],
@@ -434,11 +446,19 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Snapshot `name@snap`'s size in bytes.
-    pub async fn snapshot_size(&self, name: &str, snap: &str) -> Result<u64, FileSystemError> {
+    pub async fn snapshot_size(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<u64, FileSystemError> {
         Ok(self.open_snapshot(name, snap).await?.size())
     }
 
-    async fn open_snapshot(&self, name: &str, snap: &str) -> Result<Arc<ObjTree>, FileSystemError> {
+    async fn open_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<Arc<ObjTree>, FileSystemError> {
         let (_, head) = self.head(name).await?;
         let (_, snapshots) = head_lineage(&head);
         let r = snapshots

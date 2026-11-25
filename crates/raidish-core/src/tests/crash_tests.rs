@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -113,7 +114,7 @@ async fn volume_writes_and_commits_stay_consistent() {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     let size = 8 * 1024 * 1024u64;
-    fs.create_block("vol", size, crate::test_util::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), size, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
 
@@ -135,9 +136,9 @@ async fn volume_writes_and_commits_stay_consistent() {
                 let slot = (i * 7 + w * 131) % (size / 4096);
                 let fill = ((w * 400 + i) % 250 + 1) as u8;
                 if i % 13 == 0 {
-                    fs.block_zero("vol", slot * 4096, 4096).await.unwrap();
+                    fs.block_zero(&ds("vol"), slot * 4096, 4096).await.unwrap();
                 } else {
-                    fs.block_write("vol", slot * 4096, &[fill; 4096])
+                    fs.block_write(&ds("vol"), slot * 4096, &[fill; 4096])
                         .await
                         .unwrap();
                 }
@@ -159,7 +160,7 @@ async fn volume_writes_and_commits_stay_consistent() {
                     problems.push(format!("leaked: {:?}", o));
                 }
                 let mut buf = vec![0u8; size as usize];
-                match snap.block_read("vol", 0, &mut buf).await {
+                match snap.block_read(&ds("vol"), 0, &mut buf).await {
                     Err(e) => problems.push(format!("read: {e}")),
                     Ok(_) => {
                         for (n, s) in buf.chunks(4096).enumerate() {
@@ -198,7 +199,7 @@ async fn write_generation<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     .await
     .unwrap();
     fs.block_write(
-        "vol",
+        &ds("vol"),
         generation as u64 * 1_000_000,
         &vec![generation; 200_000],
     )
@@ -221,7 +222,7 @@ async fn check_generations<D: crate::disk::BlockDevice + Send + Sync + 'static>(
             "file gen{g}"
         );
         let mut buf = vec![0u8; 200_000];
-        fs.block_read("vol", g as u64 * 1_000_000, &mut buf)
+        fs.block_read(&ds("vol"), g as u64 * 1_000_000, &mut buf)
             .await
             .unwrap();
         assert!(buf.iter().all(|&b| b == g), "volume gen{g}");
@@ -240,7 +241,7 @@ async fn degraded_operation_and_stale_disk_return() {
     {
         let fs = pool.format().await;
         fs.mkdir(Path::new("/d")).await.unwrap();
-        fs.create_block("vol", 64 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
+        fs.create_block(&ds("vol"), 64 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
             .await
             .unwrap();
         write_generation(&fs, 1).await;
@@ -311,10 +312,10 @@ async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
         let (p, d) = file(n, 10 + n as u8);
         fs.write_file(&p, &d).await?;
     }
-    fs.create_block("vol", 4 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
+    fs.create_block(&ds("vol"), 4 << 20, crate::test_util::DEFAULT_VOLBLOCKSIZE)
         .await?;
     for slot in 0..40u64 {
-        fs.block_write("vol", slot * 9 * 4096, &[(slot % 200 + 1) as u8; 4096])
+        fs.block_write(&ds("vol"), slot * 9 * 4096, &[(slot % 200 + 1) as u8; 4096])
             .await?;
     }
     fs.sync().await?;
@@ -328,10 +329,14 @@ async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     assert!(r.is_clean(), "{}", r);
     for slot in 0..40u64 {
         if slot % 3 == 0 {
-            fs.block_zero("vol", slot * 9 * 4096, 4096).await?;
+            fs.block_zero(&ds("vol"), slot * 9 * 4096, 4096).await?;
         } else {
-            fs.block_write("vol", slot * 9 * 4096, &[(slot % 200 + 101) as u8; 4096])
-                .await?;
+            fs.block_write(
+                &ds("vol"),
+                slot * 9 * 4096,
+                &[(slot % 200 + 101) as u8; 4096],
+            )
+            .await?;
         }
     }
     fs.sync().await?;
@@ -384,9 +389,9 @@ async fn crash_at_every_point_of_a_workload() {
                 assert!(data.iter().all(|&b| b == data[0]), "k={k}: {name} torn");
             }
         }
-        if fs.open_dataset("vol").await.is_ok() {
+        if fs.open_dataset(&ds("vol")).await.is_ok() {
             let mut buf = vec![0u8; 4 << 20];
-            fs.block_read("vol", 0, &mut buf)
+            fs.block_read(&ds("vol"), 0, &mut buf)
                 .await
                 .unwrap_or_else(|e| panic!("k={k}: volume read: {e}"));
             for (n, s) in buf.chunks(4096).enumerate() {

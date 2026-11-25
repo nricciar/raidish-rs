@@ -480,6 +480,9 @@ pub async fn dispatch(
             if !exists(fe, &name) {
                 return Err(no_queue());
             }
+            let Ok(name) = crate::types::DatasetName::try_from(name.as_str()) else {
+                return Err(no_queue());
+            };
             match fe.delete_service(&name).await {
                 Ok(true) => Ok(json!({})),
                 Ok(false) => Err(no_queue()),
@@ -1088,7 +1091,7 @@ async fn queue_op(
             let me = arn(fe, &q.tree.name);
             let mut urls = Vec::new();
             for (name, r) in fe.routes() {
-                if r.format != DatasetFormat::Queue || name == q.tree.name {
+                if r.format != DatasetFormat::Queue || name == q.tree.name.as_str() {
                     continue;
                 }
                 let a = call(
@@ -1242,7 +1245,7 @@ async fn move_dead(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, dead: Vec<super::De
                 "SentMs": m.sent_ms,
                 "ReceiveCount": m.receive_count,
                 "FirstReceiveMs": m.first_receive_ms,
-                "From": m.dead_from.clone().unwrap_or_else(|| q.tree.name.clone()),
+                "From": m.dead_from.clone().unwrap_or_else(|| q.tree.name.to_string()),
                 "Sender": m.sender,
             },
         });

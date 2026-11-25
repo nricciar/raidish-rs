@@ -10,6 +10,7 @@
 
 use crate::disk::BlockDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::types::DatasetName;
 use async_trait::async_trait;
 use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -45,14 +46,14 @@ pub trait VolumeIo: Send + Sync {
 /// This node writes the volume: straight to the file system.
 pub struct LocalIo<D: BlockDevice> {
     fs: Arc<FileSystem<D>>,
-    name: String,
+    name: DatasetName,
 }
 
 impl<D: BlockDevice> LocalIo<D> {
-    pub fn new(fs: Arc<FileSystem<D>>, name: &str) -> Self {
+    pub fn new(fs: Arc<FileSystem<D>>, name: &DatasetName) -> Self {
         LocalIo {
             fs,
-            name: name.to_string(),
+            name: name.clone(),
         }
     }
 }

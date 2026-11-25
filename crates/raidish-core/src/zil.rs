@@ -63,6 +63,7 @@ use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, LogRegion};
 use crate::object::{Dirty, Unlogged};
+use crate::types::DatasetName;
 use crate::writer::WriterState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -250,11 +251,11 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// `flush` for dataset `name` alone: other datasets' failures (a commit
     /// of theirs refused, their lease unconfirmed) don't fail it.
-    pub async fn flush_for(&self, name: &str) -> Result<(), FileSystemError> {
+    pub async fn flush_for(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         self.flush_scoped(Some(name)).await
     }
 
-    async fn flush_scoped(&self, only: Option<&str>) -> Result<(), FileSystemError> {
+    async fn flush_scoped(&self, only: Option<&DatasetName>) -> Result<(), FileSystemError> {
         let Some(w) = self.writer.clone() else {
             return self.sync_scoped(only).await;
         };
@@ -396,7 +397,7 @@ impl<D: BlockDevice> FileSystem<D> {
             if !w.lease_fresh(&p.vol.name) {
                 let name = p.vol.name.clone();
                 p.restore(&io);
-                if only.is_none_or(|n| n == name) {
+                if only.is_none_or(|n| *n == name) {
                     stale.get_or_insert(name);
                 }
             }
@@ -505,15 +506,17 @@ impl<D: BlockDevice> FileSystem<D> {
     // ---- the committer's side ----
 
     /// The intent log of every tree dataset that has one.
-    pub async fn dataset_logs(&self) -> Result<Vec<(String, DatasetLog)>, FileSystemError> {
-        let names: Vec<String> = self
+    pub async fn dataset_logs(&self) -> Result<Vec<(DatasetName, DatasetLog)>, FileSystemError> {
+        // A name the directory holds but that doesn't parse is an error, not
+        // a dataset skipped: it may have a log.
+        let names: Vec<DatasetName> = self
             .datasets()
             .await?
             .datasets
             .into_iter()
             .filter(|(_, e)| e.format.is_tree())
-            .map(|(n, _)| n)
-            .collect();
+            .map(|(n, _)| DatasetName::try_from(n))
+            .collect::<Result<_, _>>()?;
         let mut out = Vec::new();
         for name in names {
             // Gone since listed: no log. Anything else unread may hide one,
@@ -611,7 +614,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// replayed. A no-op if the volume no longer has that log.
     pub async fn replay_dataset_log(
         &self,
-        name: &str,
+        name: &DatasetName,
         log: &DatasetLog,
     ) -> Result<usize, FileSystemError> {
         // A record that can't be read looks just like the end of the log: on

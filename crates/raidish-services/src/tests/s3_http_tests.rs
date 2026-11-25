@@ -6,6 +6,7 @@ use crate::frontend::testing::Fixture;
 use crate::frontend::{Owner, Route};
 use crate::pki::Role;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::types::ep;
 use std::collections::BTreeMap;
 
@@ -39,7 +40,7 @@ impl Resp {
 
 async fn server(pool: &TestPool) -> S3 {
     let fs = Arc::new(pool.format().await);
-    fs.create_service("b", DatasetFormat::S3, Default::default())
+    fs.create_service(&ds("b"), DatasetFormat::S3, Default::default())
         .await
         .unwrap();
     let fx = Fixture::new(vec![]);
@@ -58,7 +59,7 @@ async fn server(pool: &TestPool) -> S3 {
         },
     );
     fe.set_routes(routes, BTreeMap::new());
-    fe.serve_local("b", DatasetFormat::S3, fs.clone(), ep(1))
+    fe.serve_local(&ds("b"), DatasetFormat::S3, fs.clone(), ep(1))
         .await
         .unwrap();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -571,7 +572,7 @@ async fn a_cancelled_delete_service_enables_it_again() {
     use crate::committer::{Authority, PoolAdmin};
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
-    fs.create_service("b", DatasetFormat::S3, Default::default())
+    fs.create_service(&ds("b"), DatasetFormat::S3, Default::default())
         .await
         .unwrap();
     let auth = Arc::new(crate::committer::LocalAuthority::default());
@@ -622,7 +623,7 @@ async fn a_cancelled_delete_service_enables_it_again() {
     // Still served: the delete waits for that to stop, and is cancelled.
     let r = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        fe.delete_service("b"),
+        fe.delete_service(&ds("b")),
     )
     .await;
     assert!(r.is_err(), "the delete finished");

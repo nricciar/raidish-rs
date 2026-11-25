@@ -34,6 +34,7 @@ use crate::inode::Transport;
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
 use crate::peer_io::{PeerExport, PeerIo, PeerLines, PeerOut, PeerVolumes, read_line};
+use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::vdev::Pool;
 use crate::volume_io::{LocalIo, OwnedPaused, SwitchableIo};
@@ -78,14 +79,14 @@ impl WriterParts {
         }
     }
 
-    pub async fn add_export(&self, name: &str, t: Transport) -> Result<(), String> {
+    pub async fn add_export(&self, name: &DatasetName, t: Transport) -> Result<(), String> {
         self.exporter(t)
             .add_export(name)
             .await
             .map_err(|e| e.to_string())
     }
 
-    pub async fn remove_export(&self, name: &str, t: Transport) -> Result<bool, String> {
+    pub async fn remove_export(&self, name: &DatasetName, t: Transport) -> Result<bool, String> {
         self.exporter(t)
             .remove_export(name)
             .await
@@ -107,7 +108,7 @@ impl Proxy {
     /// whoever can): retired, so requests stuck retrying a writer that's
     /// gone let go, with no replacement to wait for, so they and the
     /// export's last sync fail at once instead of stalling the caller.
-    pub(super) async fn take_down(&self, volume: &str, w: Option<&WriterParts>) {
+    pub(super) async fn take_down(&self, volume: &DatasetName, w: Option<&WriterParts>) {
         self.io.no_replacement();
         self.peer.retire();
         if let Some(w) = w
@@ -138,14 +139,14 @@ pub(super) struct Shared {
     /// What this node's leases say of it.
     pub desc: Mutex<crate::types::Holder>,
     pub writer: Mutex<Option<WriterParts>>,
-    pub slots: Mutex<BTreeMap<String, Slot>>,
+    pub slots: Mutex<BTreeMap<DatasetName, Slot>>,
     /// The volumes this node writes, by `ds/` lease epoch: what peers may
     /// proxy to.
-    pub writing: Mutex<BTreeMap<String, Epoch>>,
+    pub writing: Mutex<BTreeMap<DatasetName, Epoch>>,
     /// Volumes taken over here in a clean handoff: name → (the epoch this
     /// node writes it at, the epoch of the writer it came from). What peer
     /// proxies are told (see `PeerExport::from`).
-    pub handed_from: Mutex<BTreeMap<String, (Epoch, Epoch)>>,
+    pub handed_from: Mutex<BTreeMap<DatasetName, (Epoch, Epoch)>>,
 }
 
 impl Shared {
@@ -166,7 +167,12 @@ impl Shared {
     /// (`drop_proxies`) took the claim with it, and its proxies are dead.
     /// Such a proxy isn't put back (it would serve again, to nobody) but
     /// taken down here, where it's still at hand (structural triage I-27).
-    pub(super) async fn restore(&self, volume: &str, proxy: Option<Proxy>, w: &WriterParts) {
+    pub(super) async fn restore(
+        &self,
+        volume: &DatasetName,
+        proxy: Option<Proxy>,
+        w: &WriterParts,
+    ) {
         let dead = {
             let cur = self.writer.lock().unwrap();
             let live = cur.as_ref().is_some_and(|c| Arc::ptr_eq(&c.fs, &w.fs));
@@ -177,7 +183,7 @@ impl Shared {
             }
             match proxy {
                 Some(p) if ours && live => {
-                    slots.insert(volume.to_string(), Slot::Proxy(p));
+                    slots.insert(volume.clone(), Slot::Proxy(p));
                     None
                 }
                 p => p,
@@ -198,7 +204,7 @@ impl Shared {
 pub(super) async fn take_over(
     leases: &LeaseClient,
     w: &WriterParts,
-    name: &str,
+    name: &DatasetName,
     transport: Transport,
     owner: &str,
     epoch: Epoch,
@@ -254,7 +260,7 @@ pub(super) async fn take_over(
 
 #[async_trait]
 impl PeerVolumes for Shared {
-    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String> {
+    fn export(&self, volume: &DatasetName, epoch: Epoch) -> Result<PeerExport, String> {
         match self.writing.lock().unwrap().get(volume) {
             Some(e) if *e == epoch => {}
             Some(e) => {
@@ -284,7 +290,7 @@ impl PeerVolumes for Shared {
 
     async fn handoff(
         &self,
-        volume: &str,
+        volume: &DatasetName,
         epoch: Epoch,
         transport: &str,
         mut rd: PeerLines,
@@ -311,15 +317,15 @@ impl PeerVolumes for Shared {
             let mut slots = self.slots.lock().unwrap();
             match slots.remove(volume) {
                 Some(Slot::Proxy(p)) => {
-                    slots.insert(volume.to_string(), Slot::TakingOver);
+                    slots.insert(volume.clone(), Slot::TakingOver);
                     Ok(Some(p))
                 }
                 None => {
-                    slots.insert(volume.to_string(), Slot::TakingOver);
+                    slots.insert(volume.clone(), Slot::TakingOver);
                     Ok(None)
                 }
                 Some(other) => {
-                    slots.insert(volume.to_string(), other);
+                    slots.insert(volume.clone(), other);
                     Err(())
                 }
             }
@@ -402,13 +408,13 @@ impl PeerVolumes for Shared {
                         self.writing
                             .lock()
                             .unwrap()
-                            .insert(volume.to_string(), new_epoch);
+                            .insert(volume.clone(), new_epoch);
                         self.handed_from
                             .lock()
                             .unwrap()
-                            .insert(volume.to_string(), (new_epoch, epoch));
+                            .insert(volume.clone(), (new_epoch, epoch));
                         self.slots.lock().unwrap().insert(
-                            volume.to_string(),
+                            volume.clone(),
                             Slot::Adopted {
                                 lease,
                                 lost,

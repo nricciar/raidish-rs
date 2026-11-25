@@ -10,7 +10,9 @@
 //! Everything here is deterministic: the leader stamps `now_ms` into each
 //! request before proposing it, so every replica computes the same result.
 
-use crate::types::{Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, MetaslabIdx};
+use crate::types::{
+    Epoch, Holder, HolderRole, Holding, LeaseRef, LeaseResource, MetaslabIdx, NodeId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -606,7 +608,7 @@ impl ClusterState {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MemberView {
-    pub id: u64,
+    pub id: NodeId,
     /// None for the node that answered.
     pub addr: Option<String>,
     pub disks: Vec<usize>,
@@ -617,8 +619,8 @@ pub struct MemberView {
 pub struct Status {
     /// The node that answered (name and id).
     pub node: String,
-    pub id: u64,
-    pub leader: Option<u64>,
+    pub id: NodeId,
+    pub leader: Option<NodeId>,
     pub term: u64,
     pub members: Vec<MemberView>,
     pub fingerprint: String,

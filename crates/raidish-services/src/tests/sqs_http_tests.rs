@@ -6,6 +6,7 @@ use crate::frontend::testing::Fixture;
 use crate::frontend::{Owner, Route};
 use crate::pki::Role;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::types::ep;
 use std::collections::BTreeMap;
 
@@ -24,7 +25,7 @@ async fn server(pool: &TestPool) -> Sqs {
     let fe = fx.frontend();
     let mut routes = BTreeMap::new();
     for q in ["q", "dlq"] {
-        fs.create_service(q, DatasetFormat::Queue, Default::default())
+        fs.create_service(&ds(q), DatasetFormat::Queue, Default::default())
             .await
             .unwrap();
         routes.insert(
@@ -42,7 +43,7 @@ async fn server(pool: &TestPool) -> Sqs {
     }
     fe.set_routes(routes, BTreeMap::new());
     for q in ["q", "dlq"] {
-        fe.serve_local(q, DatasetFormat::Queue, fs.clone(), ep(1))
+        fe.serve_local(&ds(q), DatasetFormat::Queue, fs.clone(), ep(1))
             .await
             .unwrap();
     }

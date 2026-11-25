@@ -3,14 +3,15 @@
 
 use super::*;
 use crate::test_util::TestPool;
+use crate::test_util::ds;
 use crate::vdev::Pool;
 
 async fn bucket(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<Bucket<Pool>>) {
     let fs = Arc::new(pool.format().await);
-    fs.create_service("b", DatasetFormat::S3, Default::default())
+    fs.create_service(&ds("b"), DatasetFormat::S3, Default::default())
         .await
         .unwrap();
-    let b = Bucket::open(fs.clone(), "b").await.unwrap();
+    let b = Bucket::open(fs.clone(), &ds("b")).await.unwrap();
     (fs, b)
 }
 
@@ -56,7 +57,7 @@ async fn get(b: &Arc<Bucket<Pool>>, key: &str) -> Option<Vec<u8>> {
 
 /// Body chunks in the tree.
 async fn chunks(fs: &FileSystem<Pool>) -> usize {
-    let ds = fs.open_btree("b", DatasetFormat::S3).await.unwrap();
+    let ds = fs.open_btree(&ds("b"), DatasetFormat::S3).await.unwrap();
     let t = Txn::begin(fs, &ds.obj).await.unwrap();
     t.range_raw(Bound::Included(b"B"), Bound::Excluded(b"C"), usize::MAX)
         .await
@@ -315,7 +316,7 @@ async fn half_written_bodies_are_dropped_on_reopen() {
     }
     let fs = Arc::new(pool.load().await);
     assert_eq!(chunks(&fs).await, 2 + 1);
-    let b = Bucket::open(fs.clone(), "b").await.unwrap();
+    let b = Bucket::open(fs.clone(), &ds("b")).await.unwrap();
     b.collect().await.unwrap();
     assert_eq!(chunks(&fs).await, 2);
     assert_eq!(get(&b, "kept").await.unwrap(), data(CHUNK + 1, 5));

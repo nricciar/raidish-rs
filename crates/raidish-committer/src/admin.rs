@@ -13,7 +13,7 @@ use crate::api_types::NodeFacts;
 use crate::api_types::VmDef;
 use crate::events::{EventPage, EventQuery};
 use crate::send::SendHeader;
-use crate::types::DatasetName;
+use crate::types::{DatasetName, VmName};
 use std::collections::BTreeMap;
 
 /// The trait, and its `Admin` implementation (each method to `via()`),
@@ -47,31 +47,31 @@ macro_rules! pool_admin {
 pool_admin! {
     async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError>;
     async fn create_volume(&self, name: &DatasetName, size_bytes: u64) -> Result<(), CommitError>;
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError>;
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError>;
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError>;
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError>;
 
     async fn datasets(&self) -> Result<Vec<DatasetInfo>, CommitError>;
     async fn create_dataset(&self, req: &CreateDataset) -> Result<(), CommitError>;
-    async fn delete_dataset(&self, name: &str) -> Result<(), CommitError>;
+    async fn delete_dataset(&self, name: &DatasetName) -> Result<(), CommitError>;
 
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError>;
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError>;
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError>;
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError>;
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError>;
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError>;
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError>;
+    async fn clone_snapshot(&self, name: &DatasetName, snap: &str, new: &DatasetName) -> Result<(), CommitError>;
     /// Back to its newest snapshot.
-    async fn rollback(&self, name: &str) -> Result<(), CommitError>;
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError>;
     /// Whether a stream with `header` would be received into `name`.
     async fn recv_check(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         force: bool,
     ) -> Result<(), CommitError>;
 
-    async fn vms(&self) -> Result<BTreeMap<String, VmDef>, CommitError>;
+    async fn vms(&self) -> Result<BTreeMap<VmName, VmDef>, CommitError>;
     async fn put_vm(&self, req: &PutVm) -> Result<VmDef, CommitError>;
     /// `change`: refuse unless the stored one is that change.
-    async fn delete_vm(&self, name: &str, change: Option<u64>) -> Result<(), CommitError>;
+    async fn delete_vm(&self, name: &VmName, change: Option<u64>) -> Result<(), CommitError>;
 
     async fn node_facts(&self) -> Result<BTreeMap<String, NodeFacts>, CommitError>;
     async fn put_node_facts(&self, facts: &NodeFacts) -> Result<(), CommitError>;
@@ -111,7 +111,7 @@ impl<D: BlockDevice + 'static> LocalAdmin<D> {
     }
 
     /// Dataset `name`, as an event subject.
-    async fn subject_of(&self, name: &str) -> Subject {
+    async fn subject_of(&self, name: &DatasetName) -> Subject {
         Subject::dataset(self.committer.props_of(name).await.map(|p| p.0), name)
     }
 
@@ -123,7 +123,7 @@ impl<D: BlockDevice + 'static> LocalAdmin<D> {
     /// a stream can't be sent twice, so there is no retrying it.
     pub async fn recv<R: tokio::io::AsyncRead + Unpin + Send>(
         &self,
-        name: &str,
+        name: &DatasetName,
         r: &mut R,
         force: bool,
     ) -> Result<StreamReport, CommitError> {
@@ -159,7 +159,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn delete_volume(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_volume(&self, name: &DatasetName) -> Result<(), CommitError> {
         let r = self.committer.delete_volume(name).await;
         self.noted(r, EventKind::VolumeDeleted, Subject::volume(name), |_| {
             format!("Volume '{}' deleted", name)
@@ -167,7 +167,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn set_props(&self, name: &str, props: &DatasetProps) -> Result<(), CommitError> {
+    async fn set_props(&self, name: &DatasetName, props: &DatasetProps) -> Result<(), CommitError> {
         let before = self.committer.props_of(name).await;
         let r = self.committer.set_props(name, props.clone()).await;
         // Only a change worth saying is recorded.
@@ -206,7 +206,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn delete_dataset(&self, name: &str) -> Result<(), CommitError> {
+    async fn delete_dataset(&self, name: &DatasetName) -> Result<(), CommitError> {
         let f = self.committer.props_of(name).await.map(|p| p.0);
         let label = crate::events::label_of(f);
         let r = self.committer.delete_dataset(name).await;
@@ -219,11 +219,11 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>, CommitError> {
+    async fn snapshots(&self, name: &DatasetName) -> Result<Vec<SnapshotInfo>, CommitError> {
         Ok(self.committer.snapshots(name).await?)
     }
 
-    async fn create_snapshot(&self, name: &str, snap: &str) -> Result<Txg, CommitError> {
+    async fn create_snapshot(&self, name: &DatasetName, snap: &str) -> Result<Txg, CommitError> {
         let r = self.committer.create_snapshot(name, snap).await;
         let subject = self.subject_of(name).await;
         self.noted(r, EventKind::SnapshotCreated, subject, |_| {
@@ -232,7 +232,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn destroy_snapshot(&self, name: &str, snap: &str) -> Result<(), CommitError> {
+    async fn destroy_snapshot(&self, name: &DatasetName, snap: &str) -> Result<(), CommitError> {
         let r = self.committer.destroy_snapshot(name, snap).await;
         let subject = self.subject_of(name).await;
         self.noted(r, EventKind::SnapshotDestroyed, subject, |_| {
@@ -241,7 +241,12 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn clone_snapshot(&self, name: &str, snap: &str, new: &str) -> Result<(), CommitError> {
+    async fn clone_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        new: &DatasetName,
+    ) -> Result<(), CommitError> {
         let r = self.committer.clone_snapshot(name, snap, new).await;
         let subject = self.subject_of(new).await;
         self.noted(r, EventKind::SnapshotCloned, subject, |_| {
@@ -250,7 +255,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn rollback(&self, name: &str) -> Result<(), CommitError> {
+    async fn rollback(&self, name: &DatasetName) -> Result<(), CommitError> {
         let r = self.committer.rollback(name).await;
         let subject = self.subject_of(name).await;
         self.noted(r, EventKind::SnapshotRollback, subject, |_| {
@@ -261,14 +266,14 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
 
     async fn recv_check(
         &self,
-        name: &str,
+        name: &DatasetName,
         header: &SendHeader,
         force: bool,
     ) -> Result<(), CommitError> {
         Ok(self.committer.recv_check(name, header, force).await?)
     }
 
-    async fn vms(&self) -> Result<BTreeMap<String, VmDef>, CommitError> {
+    async fn vms(&self) -> Result<BTreeMap<VmName, VmDef>, CommitError> {
         Ok(self.vm_store().await?.list().await?)
     }
 
@@ -289,7 +294,7 @@ impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
         .await
     }
 
-    async fn delete_vm(&self, name: &str, change: Option<u64>) -> Result<(), CommitError> {
+    async fn delete_vm(&self, name: &VmName, change: Option<u64>) -> Result<(), CommitError> {
         let r = self.vm_store().await?.delete(name, change).await;
         self.noted(r, EventKind::VmDeleted, Subject::vm(name), |_| {
             format!("VM '{}' deleted", name)

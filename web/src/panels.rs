@@ -7,7 +7,6 @@ use crate::session::{Shared, Snapshot};
 use raidish_core::fs::LabelState;
 use raidish_core::inspect::{DiskReport, Health};
 use raidish_core::vdev::Topology;
-use raidish_types::types::NodeId;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use yew::prelude::*;
@@ -231,11 +230,11 @@ fn disk_card(d: &DiskReport, p: &TopologyProps) -> Html {
         .map(|m| match &m.addr {
             Some(a) => format!(
                 "{} · {}",
-                NodeId::from_raw(m.id),
+                m.id,
                 a.trim_start_matches("https://")
                     .trim_start_matches("http://")
             ),
-            None => format!("{} · this node", NodeId::from_raw(m.id)),
+            None => format!("{} · this node", m.id),
         });
     let history = p.history.get(d.index);
     // Mean round trip over each refresh interval.
@@ -355,7 +354,7 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
             <div class="kv">
                 <span>{ "Leader" }</span>
                 <span>
-                    if let Some(l) = s.leader { { NodeId::from_raw(l).name() } }
+                    if let Some(l) = s.leader { { l.name() } }
                     else { <span class="tag bad">{ "no quorum" }</span> }
                 </span>
                 <span>{ "Raft term" }</span><span>{ s.term }</span>
@@ -369,7 +368,7 @@ pub fn ClusterPanel(p: &ClusterProps) -> Html {
                     html! {
                         <li>
                             <span class={classes!("dot", if quorum { "ok" } else { "warn" })}></span>
-                            <span class="mono">{ NodeId::from_raw(m.id).name() }</span>
+                            <span class="mono">{ m.id.name() }</span>
                             if leader { <span class="crown" title="leader">{ "♛" }</span> }
                             <span class="muted">{ m.addr.clone().unwrap_or_else(|| "this node".to_string()) }</span>
                             <span class="muted small">{ format!("disks {}", m.disks.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) }</span>

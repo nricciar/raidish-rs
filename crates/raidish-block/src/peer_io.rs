@@ -36,6 +36,7 @@ use crate::nbd::{
     EIO, ENOSPC, ExportSession, NBD_CMD_FLUSH, NBD_CMD_READ, NBD_CMD_WRITE, NBD_CMD_WRITE_ZEROES,
     NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC,
 };
+use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::volume_io::{SwitchableIo, VolumeIo};
 use async_trait::async_trait;
@@ -85,14 +86,14 @@ pub type PeerOut = tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStrea
 pub trait PeerVolumes: Send + Sync + 'static {
     /// `volume`'s export, if this node writes it under its `ds/` lease at
     /// `epoch`; otherwise why not.
-    fn export(&self, volume: &str, epoch: Epoch) -> Result<PeerExport, String>;
+    fn export(&self, volume: &DatasetName, epoch: Epoch) -> Result<PeerExport, String>;
 
     /// The writer of `volume` (at lease `epoch`) wants to hand it to this
     /// node, exported over `transport`: the rest of the conversation is
     /// the handler's (see `crate::agent`'s handoff). Unsupported by default.
     async fn handoff(
         &self,
-        _volume: &str,
+        _volume: &DatasetName,
         _epoch: Epoch,
         _transport: &str,
         _rd: PeerLines,
@@ -152,12 +153,17 @@ async fn serve_conn(
         words.next(),
         words.next(),
     ) {
+        let Ok(volume) = DatasetName::try_from(volume) else {
+            wr.write_all(b"ERR bad volume name\n").await?;
+            wr.flush().await?;
+            return Ok(());
+        };
         let Ok(epoch) = epoch.parse::<Epoch>() else {
             wr.write_all(b"ERR bad epoch\n").await?;
             wr.flush().await?;
             return Ok(());
         };
-        volumes.handoff(volume, epoch, transport, rd, wr).await;
+        volumes.handoff(&volume, epoch, transport, rd, wr).await;
         return Ok(());
     }
     let mut words = line.split(' ');
@@ -172,7 +178,12 @@ async fn serve_conn(
         wr.write_all(b"ERR bad epoch\n").await?;
         return Ok(());
     };
-    let export = match volumes.export(volume, epoch) {
+    let Ok(volume) = DatasetName::try_from(volume) else {
+        wr.write_all(b"ERR bad volume name\n").await?;
+        wr.flush().await?;
+        return Ok(());
+    };
+    let export = match volumes.export(&volume, epoch) {
         Ok(e) => e,
         Err(why) => {
             let why = why.replace('\n', " ");
@@ -184,7 +195,7 @@ async fn serve_conn(
     wr.write_all(format!("OK {} {}\n", export.size, export.from).as_bytes())
         .await?;
     wr.flush().await?;
-    crate::nbd::serve_requests(rd, wr, volume, export.io, export.session).await
+    crate::nbd::serve_requests(rd, wr, &volume, export.io, export.session).await
 }
 
 pub async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(rd: &mut R) -> std::io::Result<String> {
@@ -301,7 +312,7 @@ impl Durability {
 /// A volume's I/O, proxied to its writer on another node.
 pub struct PeerIo {
     durability: StdMutex<Durability>,
-    volume: String,
+    volume: DatasetName,
     connector: TlsConnector,
     locate: Arc<dyn Locate>,
     conn: Mutex<Option<Arc<Conn>>>,
@@ -317,10 +328,10 @@ pub struct PeerIo {
 const LOG_EVERY_MS: u64 = 5000;
 
 impl PeerIo {
-    pub fn new(volume: &str, connector: TlsConnector, locate: Arc<dyn Locate>) -> Self {
+    pub fn new(volume: &DatasetName, connector: TlsConnector, locate: Arc<dyn Locate>) -> Self {
         PeerIo {
             durability: Default::default(),
-            volume: volume.to_string(),
+            volume: volume.clone(),
             connector,
             locate,
             conn: Mutex::new(None),

@@ -7,6 +7,7 @@ use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset
 use crate::disk::{BLOCK_SIZE, BlockDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::test_util::TestPool;
+use crate::test_util::dsn;
 use crate::types::Txg;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx};
 use crate::vdev::Pool;
@@ -60,7 +61,7 @@ struct Setup {
 async fn setup() -> Setup {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_block("a", 8 * MB as u64, fs.default_volblocksize())
+    fs.create_block(&dsn("a"), 8 * MB as u64, fs.default_volblocksize())
         .await
         .unwrap();
     drop(fs);
@@ -118,9 +119,14 @@ async fn writer(s: &Setup, id: &str, fresh: Option<crate::writer::LeaseCheck>) -
         .unwrap();
     let ds_owner = format!("o{}", id);
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), &ds_owner).await;
-    fs.attach_dataset_leased("a", Holding::new(ds_owner.clone(), ds_epoch), None, fresh)
-        .await
-        .unwrap();
+    fs.attach_dataset_leased(
+        &dsn("a"),
+        Holding::new(ds_owner.clone(), ds_epoch),
+        None,
+        fresh,
+    )
+    .await
+    .unwrap();
     Writer {
         fs,
         id: id.into(),
@@ -136,13 +142,13 @@ async fn txg(s: &Setup) -> u64 {
 
 async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
-    let n = fs.block_read("a", offset, &mut buf).await.unwrap();
+    let n = fs.block_read(&dsn("a"), offset, &mut buf).await.unwrap();
     buf.truncate(n);
     buf
 }
 
 async fn cursor(fs: &FileSystem<Pool>) -> Option<LogCursor> {
-    fs.open_dataset("a")
+    fs.open_dataset(&dsn("a"))
         .await
         .unwrap()
         .cursor
@@ -163,7 +169,7 @@ async fn a_flush_is_acknowledged_from_the_log_and_replayed_after_a_crash() {
     let w = writer(&s, "1", None).await;
 
     // The first flush commits (no log yet) and registers a region.
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
@@ -174,12 +180,14 @@ async fn a_flush_is_acknowledged_from_the_log_and_replayed_after_a_crash() {
 
     // Later flushes only append to the log: no commit.
     let before = txg(&s).await;
-    w.fs.block_write("a", 100_000, &pattern(200_000, 2))
+    w.fs.block_write(&dsn("a"), 100_000, &pattern(200_000, 2))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
-    w.fs.block_zero("a", 1_000_000, 500_000).await.unwrap();
-    w.fs.block_write("a", 2_000_000, &pattern(70_001, 3))
+    w.fs.block_zero(&dsn("a"), 1_000_000, 500_000)
+        .await
+        .unwrap();
+    w.fs.block_write(&dsn("a"), 2_000_000, &pattern(70_001, 3))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
@@ -211,12 +219,12 @@ async fn the_next_holder_claims_the_volume_and_sees_the_log() {
     let s = setup().await;
     let w1 = writer(&s, "1", None).await;
     w1.fs
-        .block_write("a", 0, &pattern(100_000, 1))
+        .block_write(&dsn("a"), 0, &pattern(100_000, 1))
         .await
         .unwrap();
     w1.fs.flush().await.unwrap(); // commits, registers the log
     w1.fs
-        .block_write("a", 50_000, &pattern(400_000, 2))
+        .block_write(&dsn("a"), 50_000, &pattern(400_000, 2))
         .await
         .unwrap();
     w1.fs.flush().await.unwrap(); // logged only
@@ -231,14 +239,17 @@ async fn the_next_holder_claims_the_volume_and_sees_the_log() {
     assert_eq!(read(&w2.fs, 0, want.len()).await, want);
 
     // It carries on with a log of its own, and a clean detach drops it.
-    w2.fs.block_write("a", 0, &pattern(1000, 3)).await.unwrap();
-    w2.fs.flush().await.unwrap();
     w2.fs
-        .block_write("a", 4000, &pattern(1000, 4))
+        .block_write(&dsn("a"), 0, &pattern(1000, 3))
         .await
         .unwrap();
     w2.fs.flush().await.unwrap();
-    w2.fs.detach_dataset("a").await.unwrap();
+    w2.fs
+        .block_write(&dsn("a"), 4000, &pattern(1000, 4))
+        .await
+        .unwrap();
+    w2.fs.flush().await.unwrap();
+    w2.fs.detach_dataset(&dsn("a")).await.unwrap();
     assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     want[..1000].copy_from_slice(&pattern(1000, 3));
     want[4000..5000].copy_from_slice(&pattern(1000, 4));
@@ -254,10 +265,14 @@ async fn the_next_holder_claims_the_volume_and_sees_the_log() {
 async fn a_commit_rotates_the_log_and_the_space_adds_up() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    w.fs.block_write("a", 0, &pattern(50_000, 1)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 1))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     let first = cursor(&w.fs).await.unwrap().region;
-    w.fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
 
     // The regular commit folds the log into the tree and starts a new one.
@@ -270,10 +285,10 @@ async fn a_commit_rotates_the_log_and_the_space_adds_up() {
     // A live log is in use: no leak, nothing in it handed out twice.
     assert_clean(&s).await;
 
-    w.fs.detach_dataset("a").await.unwrap();
+    w.fs.detach_dataset(&dsn("a")).await.unwrap();
     // Gone from the writer, log cursor and all: it can't even be opened
     // there any more (structural triage I-23).
-    assert!(w.fs.open_dataset("a").await.is_err());
+    assert!(w.fs.open_dataset(&dsn("a")).await.is_err());
     assert!(!w.fs.open_datasets.lock().unwrap().contains_key("a"));
     assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     w.fs.return_metaslabs().await;
@@ -284,14 +299,16 @@ async fn a_commit_rotates_the_log_and_the_space_adds_up() {
 async fn a_full_log_falls_back_to_a_commit() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    w.fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     let region = cursor(&w.fs).await.unwrap().region;
 
     // More than the region holds, in one flush.
     let big = pattern(region.len as usize * crate::disk::BLOCK_SIZE + 1, 2);
     let before = txg(&s).await;
-    w.fs.block_write("a", 0, &big).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &big).await.unwrap();
     w.fs.flush().await.unwrap();
     assert!(txg(&s).await > before, "committed instead");
     assert_eq!(cursor(&w.fs).await.unwrap().seq, 0, "with a fresh log");
@@ -304,12 +321,16 @@ async fn no_acknowledgement_without_a_fresh_lease() {
     let ok = Arc::new(AtomicBool::new(true));
     let flag = ok.clone();
     let w = writer(&s, "1", Some(Arc::new(move || flag.load(Ordering::SeqCst)))).await;
-    w.fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
 
     // The lease can't be confirmed (renewals failing): flushes aren't acked.
     ok.store(false, Ordering::SeqCst);
-    w.fs.block_write("a", 0, &pattern(1000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 2))
+        .await
+        .unwrap();
     assert!(matches!(
         w.fs.flush().await,
         Err(FileSystemError::Unavailable(_))
@@ -342,11 +363,13 @@ fn expire_volume_lease(s: &Setup, ago_ms: u64) {
 async fn a_lapsed_lease_is_taken_over_before_its_log_is_replayed() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    w.fs.block_write("a", 0, &pattern(300_000, 1))
+    w.fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
-    w.fs.block_write("a", 0, &pattern(1000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     let mut want = pattern(300_000, 1);
     want[..1000].copy_from_slice(&pattern(1000, 2));
@@ -382,9 +405,13 @@ async fn a_lapsed_lease_is_taken_over_before_its_log_is_replayed() {
 async fn replay_stops_at_the_end_of_the_log() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    w.fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
-    w.fs.block_write("a", 0, &pattern(1000, 2)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 2))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     // Leftovers past the last record: a record from another log (wrong
     // guid), then garbage.
@@ -425,15 +452,17 @@ async fn a_flush_some_disk_missed_commits_and_reports_the_miss() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(10_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(10_000, 1))
+        .await
+        .unwrap();
     fs.flush().await.unwrap(); // commits: log registered
     let data = pattern(300_000, 2);
     for (i, chunk) in data.chunks(50_000).enumerate() {
         let before = txg(&s).await;
-        fs.block_write("a", (i * 50_000) as u64, chunk)
+        fs.block_write(&dsn("a"), (i * 50_000) as u64, chunk)
             .await
             .unwrap();
         fs.flush().await.unwrap();
@@ -458,10 +487,12 @@ async fn a_flush_some_disk_missed_commits_and_reports_the_miss() {
 
     // A writer that reaches every disk acknowledges from the log again.
     let w = writer(&s, "2", None).await;
-    w.fs.block_write("a", 0, &pattern(1000, 3)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 3))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap(); // commits: log registered
     let before = txg(&s).await;
-    w.fs.block_write("a", 4096, &pattern(1000, 4))
+    w.fs.block_write(&dsn("a"), 4096, &pattern(1000, 4))
         .await
         .unwrap();
     w.fs.flush().await.unwrap();
@@ -509,7 +540,7 @@ impl crate::writer::CommitSink for Gate {
     }
     async fn claim_dataset(
         &self,
-        volume: &str,
+        volume: &crate::types::DatasetName,
         ds: &Holding,
     ) -> Result<(), crate::writer::CommitError> {
         self.inner.claim_dataset(volume, ds).await
@@ -536,14 +567,18 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(100_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(100_000, 1))
+        .await
+        .unwrap();
     fs.flush().await.unwrap(); // commits: log registered
 
     // B is written and logged, then a commit starts and gets stuck.
-    fs.block_write("a", 0, &pattern(50_000, 2)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(50_000, 2))
+        .await
+        .unwrap();
     fs.flush().await.unwrap();
     open_tx.send_replace(false);
     let folding = {
@@ -556,7 +591,7 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
 
     // Meanwhile C is written, after the commit took its records. Flushes
     // don't wait for the commit.
-    fs.block_write("a", 200_000, &pattern(60_000, 3))
+    fs.block_write(&dsn("a"), 200_000, &pattern(60_000, 3))
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), fs.flush())
@@ -596,10 +631,12 @@ async fn flushes_carry_on_while_a_commit_waits_for_the_committer() {
 async fn a_faulted_pool_keeps_the_log_for_later() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    w.fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
     w.fs.flush().await.unwrap();
     let data = pattern(200_000, 2);
-    w.fs.block_write("a", 0, &data).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &data).await.unwrap();
     w.fs.flush().await.unwrap();
     w.die(&s).await;
 
@@ -637,10 +674,12 @@ async fn a_writer_heals_what_a_disk_missed_in_its_lent_space() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    a.attach_dataset("a", Holding::new("o1", ds_epoch))
+    a.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
-    a.block_write("a", 0, &pattern(400_000, 1)).await.unwrap();
+    a.block_write(&dsn("a"), 0, &pattern(400_000, 1))
+        .await
+        .unwrap();
     a.sync().await.unwrap();
     assert!(s.committer.fs().degraded_disks()[1].is_some());
     let lent = a.writer.as_ref().unwrap().lent.lock().unwrap().clone();
@@ -672,7 +711,7 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
     let (dev, switch) = FaultyDev::new(s.pool.dev().await);
     let fs = FileSystem::load_writer(dev, sink).await.unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset_leased("a", Holding::new("o1", ds_epoch), None, None)
+    fs.attach_dataset_leased(&dsn("a"), Holding::new("o1", ds_epoch), None, None)
         .await
         .unwrap();
     let cursor = |fs: &FileSystem<FaultyDev<Pool>>| {
@@ -680,11 +719,15 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
         vol.cursor.lock().unwrap().clone()
     };
 
-    fs.block_write("a", 0, &pattern(300_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(300_000, 1))
+        .await
+        .unwrap();
     fs.flush().await.unwrap();
 
     // The disk flush fails: the record just written may not have made it.
-    fs.block_write("a", 0, &pattern(1000, 2)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(1000, 2))
+        .await
+        .unwrap();
     let c = cursor(&fs).expect("a log region");
     switch.fail_flushes(true);
     assert!(fs.flush().await.is_err());
@@ -695,7 +738,9 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
         .unwrap();
 
     // A later flush is acknowledged...
-    fs.block_write("a", 1000, &pattern(1000, 3)).await.unwrap();
+    fs.block_write(&dsn("a"), 1000, &pattern(1000, 3))
+        .await
+        .unwrap();
     fs.flush().await.unwrap();
 
     // ...and survives the writer dying, gap or not.
@@ -724,13 +769,13 @@ fn lcg(seed: &mut u64) -> u64 {
 async fn small_writes_log_only_the_bytes_that_changed() {
     let s = setup().await;
     let w = writer(&s, "1", None).await;
-    let bs = w.fs.open_dataset("a").await.unwrap().blksz;
+    let bs = w.fs.open_dataset(&dsn("a")).await.unwrap().blksz;
     let size = 3 * MB;
     let mut want = vec![0u8; size];
 
     // A committed base, and a registered log.
     want[..MB].copy_from_slice(&pattern(MB, 1));
-    w.fs.block_write("a", 0, &want[..MB]).await.unwrap();
+    w.fs.block_write(&dsn("a"), 0, &want[..MB]).await.unwrap();
     w.fs.flush().await.unwrap();
     let before = txg(&s).await;
 
@@ -747,19 +792,23 @@ async fn small_writes_log_only_the_bytes_that_changed() {
             _ => (lcg(&mut seed) as usize % (MB / bs)) * bs + bs / 3,
         };
         let data = pattern(len, i as u8 + 10);
-        w.fs.block_write("a", off as u64, &data).await.unwrap();
+        w.fs.block_write(&dsn("a"), off as u64, &data)
+            .await
+            .unwrap();
         want[off..off + len].copy_from_slice(&data);
         w.fs.flush().await.unwrap();
     }
     // A record zeroed whole, then written into: a hole, then bytes over it.
-    w.fs.block_zero("a", (4 * bs) as u64, bs).await.unwrap();
+    w.fs.block_zero(&dsn("a"), (4 * bs) as u64, bs)
+        .await
+        .unwrap();
     want[4 * bs..5 * bs].fill(0);
-    w.fs.block_write("a", (4 * bs + 100) as u64, &pattern(300, 99))
+    w.fs.block_write(&dsn("a"), (4 * bs + 100) as u64, &pattern(300, 99))
         .await
         .unwrap();
     want[4 * bs + 100..4 * bs + 400].copy_from_slice(&pattern(300, 99));
     // Most of a record: logged whole.
-    w.fs.block_write("a", (8 * bs + 10) as u64, &pattern(bs - 20, 98))
+    w.fs.block_write(&dsn("a"), (8 * bs + 10) as u64, &pattern(bs - 20, 98))
         .await
         .unwrap();
     want[8 * bs + 10..9 * bs - 10].copy_from_slice(&pattern(bs - 20, 98));
@@ -806,16 +855,18 @@ async fn a_patch_written_during_a_stuck_commit_applies_over_what_it_synced() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
     let mut want = pattern(100_000, 1);
-    fs.block_write("a", 0, &want).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &want).await.unwrap();
     fs.flush().await.unwrap(); // commits: log registered
 
     // B: a few bytes, logged as a patch; then a commit takes the record
     // and gets stuck.
-    fs.block_write("a", 1000, &pattern(10, 2)).await.unwrap();
+    fs.block_write(&dsn("a"), 1000, &pattern(10, 2))
+        .await
+        .unwrap();
     want[1000..1010].copy_from_slice(&pattern(10, 2));
     fs.flush().await.unwrap();
     open_tx.send_replace(false);
@@ -828,7 +879,9 @@ async fn a_patch_written_during_a_stuck_commit_applies_over_what_it_synced() {
     }
 
     // C: more bytes of the same record, over the copy being synced.
-    fs.block_write("a", 3000, &pattern(20, 3)).await.unwrap();
+    fs.block_write(&dsn("a"), 3000, &pattern(20, 3))
+        .await
+        .unwrap();
     want[3000..3020].copy_from_slice(&pattern(20, 3));
     fs.flush().await.unwrap();
 
@@ -889,10 +942,12 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(1000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
     fs.flush().await.unwrap(); // commits: log registered
     // The loop's first tick runs at once; the next would be SYNC_INTERVAL
     // away, far longer than this test waits.
@@ -916,7 +971,7 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
         }
         let off = (i * chunk) % (8 * MB);
         let data = pattern(chunk, i as u8 + 2);
-        fs.block_write("a", off as u64, &data).await.unwrap();
+        fs.block_write(&dsn("a"), off as u64, &data).await.unwrap();
         want[off..off + chunk].copy_from_slice(&data);
         fs.flush().await.unwrap();
         assert_eq!(txg(&s).await, before, "a flush fell back to a commit");
@@ -931,7 +986,7 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(read(&fs, 0, want.len()).await, want);
-    fs.detach_dataset("a").await.unwrap();
+    fs.detach_dataset(&dsn("a")).await.unwrap();
     fs.return_metaslabs().await;
     drop(fs);
     release(&s.auth, &dataset_resource("a"), "o1", ds_epoch).await;
@@ -946,7 +1001,7 @@ async fn a_filling_log_is_folded_early_by_the_sync_loop() {
 async fn setup_kv() -> Setup {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_kv_with("k", fs.volblock_align(), 1 << 16)
+    fs.create_kv_with(&dsn("k"), fs.volblock_align(), 1 << 16)
         .await
         .unwrap();
     drop(fs);
@@ -964,7 +1019,7 @@ async fn setup_kv() -> Setup {
 
 async fn kv_all(fs: &FileSystem<Pool>) -> Vec<(Vec<u8>, Vec<u8>)> {
     fs.kv_range(
-        "k",
+        &dsn("k"),
         std::ops::Bound::Unbounded,
         std::ops::Bound::Unbounded,
         usize::MAX,
@@ -978,7 +1033,7 @@ fn model_vec(m: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn kv_cursor(fs: &FileSystem<Pool>) -> Option<LogCursor> {
-    fs.open_dataset("k")
+    fs.open_dataset(&dsn("k"))
         .await
         .unwrap()
         .cursor
@@ -1000,7 +1055,7 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-    fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("k"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
 
@@ -1009,7 +1064,7 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
     for i in 0..600u32 {
         let k = format!("base/{:05}", i).into_bytes();
         let v = pattern(40 + (i as usize % 90), i as u8);
-        fs.kv_put("k", &k, &v).await.unwrap();
+        fs.kv_put(&dsn("k"), &k, &v).await.unwrap();
         model.insert(k, v);
     }
     fs.flush().await.unwrap();
@@ -1028,17 +1083,17 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
         let i = lcg(&mut seed) % 700;
         let k = format!("base/{:05}", i).into_bytes();
         if n % 4 == 3 {
-            fs.kv_delete("k", &k).await.unwrap();
+            fs.kv_delete(&dsn("k"), &k).await.unwrap();
             model.remove(&k);
         } else {
             let v = pattern(10 + (lcg(&mut seed) as usize % 200), n as u8);
-            fs.kv_put("k", &k, &v).await.unwrap();
+            fs.kv_put(&dsn("k"), &k, &v).await.unwrap();
             model.insert(k, v);
         }
         fs.flush().await.unwrap();
     }
     let big = pattern(100_000, 77);
-    fs.kv_put("k", b"big", &big).await.unwrap();
+    fs.kv_put(&dsn("k"), b"big", &big).await.unwrap();
     model.insert(b"big".to_vec(), big);
     fs.flush().await.unwrap();
     assert_eq!(txg(&s).await, before, "every flush went to the log");
@@ -1069,7 +1124,7 @@ async fn kv_flushes_log_operations_and_replay_after_a_crash() {
     assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
     let fresh = s.pool.load().await;
     assert_eq!(kv_all(&fresh).await, model_vec(&model));
-    assert_eq!(fresh.kv_len("k").await.unwrap(), model.len() as u64);
+    assert_eq!(fresh.kv_len(&dsn("k")).await.unwrap(), model.len() as u64);
     drop(fresh);
     assert_clean(&s).await;
 }
@@ -1094,13 +1149,13 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
             .unwrap(),
     );
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-    fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("k"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
     let mut model = BTreeMap::new();
     for i in 0..400u32 {
         let k = format!("a/{:04}", i).into_bytes();
-        fs.kv_put("k", &k, &k).await.unwrap();
+        fs.kv_put(&dsn("k"), &k, &k).await.unwrap();
         model.insert(k.clone(), k);
     }
     fs.flush().await.unwrap(); // commits: log registered
@@ -1111,12 +1166,14 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
     // reshape it on the way.
     for i in 0..60u32 {
         let k = format!("a/{:04}", i * 5).into_bytes();
-        fs.kv_put("k", &k, &pattern(700, i as u8)).await.unwrap();
-        fs.kv_put("k", &k, b"short").await.unwrap();
+        fs.kv_put(&dsn("k"), &k, &pattern(700, i as u8))
+            .await
+            .unwrap();
+        fs.kv_put(&dsn("k"), &k, b"short").await.unwrap();
         model.insert(k, b"short".to_vec());
         let n = format!("b/{:04}", i).into_bytes();
-        fs.kv_put("k", &n, &n).await.unwrap();
-        fs.kv_delete("k", &n).await.unwrap();
+        fs.kv_put(&dsn("k"), &n, &n).await.unwrap();
+        fs.kv_delete(&dsn("k"), &n).await.unwrap();
     }
     open_tx.send_replace(false);
     let folding = {
@@ -1130,10 +1187,12 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
     // C, after the cut. This flush logs B (its commit hasn't landed) and C.
     for i in 0..80u32 {
         let k = format!("c/{:04}", i).into_bytes();
-        fs.kv_put("k", &k, &pattern(30, i as u8)).await.unwrap();
+        fs.kv_put(&dsn("k"), &k, &pattern(30, i as u8))
+            .await
+            .unwrap();
         model.insert(k, pattern(30, i as u8));
     }
-    fs.kv_delete("k", b"a/0001").await.unwrap();
+    fs.kv_delete(&dsn("k"), b"a/0001").await.unwrap();
     model.remove(&b"a/0001"[..]);
     tokio::time::timeout(std::time::Duration::from_secs(2), fs.flush())
         .await
@@ -1151,7 +1210,7 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
     s.committer.reclaim().await;
     let fresh = s.pool.load().await;
     assert_eq!(kv_all(&fresh).await, model_vec(&model));
-    assert_eq!(fresh.kv_len("k").await.unwrap(), model.len() as u64);
+    assert_eq!(fresh.kv_len(&dsn("k")).await.unwrap(), model.len() as u64);
     drop(fresh);
     assert_clean(&s).await;
 }
@@ -1160,17 +1219,17 @@ async fn kv_operations_a_stuck_fold_took_replay_again_harmlessly() {
 async fn committed_kv_operations_leave_the_queue() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    fs.create_kv("k").await.unwrap();
+    fs.create_kv(&dsn("k")).await.unwrap();
     for i in 0..50u32 {
-        fs.kv_put("k", &i.to_be_bytes(), b"v").await.unwrap();
+        fs.kv_put(&dsn("k"), &i.to_be_bytes(), b"v").await.unwrap();
     }
     // No writer: nothing logs them, a commit has them.
-    let ds = fs.open_dataset("k").await.unwrap();
+    let ds = fs.open_dataset(&dsn("k")).await.unwrap();
     assert_eq!(ds.obj.dirty.lock().unwrap().ops.len(), 50);
     fs.sync().await.unwrap();
     assert!(ds.obj.dirty.lock().unwrap().ops.is_empty());
     // A delete of nothing changes nothing, so it queues nothing.
-    fs.kv_delete("k", b"absent").await.unwrap();
+    fs.kv_delete(&dsn("k"), b"absent").await.unwrap();
     assert!(ds.obj.dirty.lock().unwrap().ops.is_empty());
 }
 
@@ -1187,13 +1246,15 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
         .await
         .unwrap();
     let ds_epoch = lease(&s.auth, &dataset_resource("a"), "o1").await;
-    fs.attach_dataset("a", Holding::new("o1", ds_epoch))
+    fs.attach_dataset(&dsn("a"), Holding::new("o1", ds_epoch))
         .await
         .unwrap();
-    fs.block_write("a", 0, &pattern(10_000, 1)).await.unwrap();
+    fs.block_write(&dsn("a"), 0, &pattern(10_000, 1))
+        .await
+        .unwrap();
     fs.flush().await.unwrap(); // commits (and reports disk 2)
     let w = fs.writer.clone().unwrap();
-    let vol = fs.open_dataset("a").await.unwrap();
+    let vol = fs.open_dataset(&dsn("a")).await.unwrap();
     // Nothing unreported: nothing to commit.
     let before = txg(&s).await;
     fs.writer_report_misses(&w, &vol).await.unwrap();
@@ -1233,13 +1294,13 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
             .await
             .unwrap();
         let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o1").await;
-        fs.attach_dataset("k", Holding::new("o1", ds_epoch))
+        fs.attach_dataset(&dsn("k"), Holding::new("o1", ds_epoch))
             .await
             .unwrap();
         for i in 0..400u32 {
             let k = format!("base/{:05}", i).into_bytes();
             let v = pattern(40 + (i as usize % 90), i as u8);
-            fs.kv_put("k", &k, &v).await.unwrap();
+            fs.kv_put(&dsn("k"), &k, &v).await.unwrap();
             model.insert(k, v);
         }
         fs.flush().await.unwrap();
@@ -1247,7 +1308,7 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
         for i in 0..60u32 {
             let k = format!("log/{:05}", i).into_bytes();
             let v = pattern(30, i as u8);
-            fs.kv_put("k", &k, &v).await.unwrap();
+            fs.kv_put(&dsn("k"), &k, &v).await.unwrap();
             model.insert(k, v);
             fs.flush().await.unwrap();
         }
@@ -1269,14 +1330,14 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
     assert!(s.committer.fs().dataset_logs().await.unwrap().is_empty());
 
     let ds_epoch = lease(&s.auth, &dataset_resource("k"), "o2").await;
-    fs.attach_dataset("k", Holding::new("o2", ds_epoch))
+    fs.attach_dataset(&dsn("k"), Holding::new("o2", ds_epoch))
         .await
         .unwrap();
     assert_eq!(kv_all(&fs).await, model_vec(&model));
     for i in 0..50u32 {
         let k = format!("next/{:05}", i).into_bytes();
         let v = pattern(20, i as u8);
-        fs.kv_put("k", &k, &v).await.unwrap();
+        fs.kv_put(&dsn("k"), &k, &v).await.unwrap();
         model.insert(k, v);
     }
     fs.sync().await.expect("the next writer's sync");
