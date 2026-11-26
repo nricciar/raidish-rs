@@ -404,6 +404,22 @@ impl Cluster {
             .map_err(|e| format!("forwarding to leader: {}", e))
     }
 
+    /// The cluster CA as this node has applied it (None: not set up, or
+    /// only staged on node 0 before the first quorum).
+    pub fn pki(&self) -> Option<Arc<raidish_types::pki::PkiState>> {
+        self.store.pki()
+    }
+
+    /// This node's Raft directory (`cluster.data_dir/<name>`).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// Whether a leader is known: proposals can be committed.
+    pub fn has_leader(&self) -> bool {
+        self.raft.metrics().borrow().current_leader.is_some()
+    }
+
     /// The NFSv4 client records (owner strings, hex) as this node has them.
     pub fn nfs_clients(&self) -> Vec<String> {
         self.store.nfs_clients()
@@ -555,10 +571,13 @@ impl Cluster {
                 .collect(),
             fingerprint: self.members.fingerprint.clone(),
             state: ClusterState {
-                // Never handed out (status is for any reader).
+                // Never handed out (status is for any reader): the service
+                // key, and the CA's sealed keys (`pki` below instead).
                 service_key: None,
+                pki: None,
                 ..self.store.state()
             },
+            pki: self.store.pki().map(|p| p.view()),
             now_ms: now_ms(),
             initialized: m.last_log_index.is_some() || m.vote != openraft::Vote::default(),
             last_log_index: m.last_log_index,

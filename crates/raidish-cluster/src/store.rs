@@ -5,6 +5,9 @@
 //! Everything here is tiny (a handful of leases, a log that's purged after
 //! every snapshot), so every change rewrites the affected file atomically
 //! (write a temp file, fsync, rename).
+//!
+//! The directory is the node's alone (`0700`, files `0600`): it holds the
+//! cluster CA's sealed keys, and the service key in the clear.
 
 use super::TypeConfig;
 use super::state::{ClusterState, Response};
@@ -68,6 +71,12 @@ pub struct Store {
 /// The file naming the Raft protocol a data directory was written in.
 const VERSION_FILE: &str = "version";
 
+/// What the cluster CA (`raidish-ca`) keeps in the data directory, which
+/// `ca init` makes before there's any Raft data: its staged CA and its
+/// one-shot unseal file's directory. Not Raft data.
+pub const CA_STAGED_FILE: &str = "pki_bootstrap.json";
+pub const CA_DIR: &str = "pki";
+
 /// Refuse Raft data of another protocol version (see
 /// `super::RAFT_PROTOCOL`); stamp a new directory with ours.
 fn check_version(dir: &Path) -> Result<(), String> {
@@ -84,8 +93,13 @@ fn check_version(dir: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let used = std::fs::read_dir(dir)
                 .map_err(|e| format!("{}: {}", dir.display(), e))?
-                .next()
-                .is_some();
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    let name = e.file_name();
+                    name != CA_STAGED_FILE
+                        && name != CA_DIR
+                        && !name.to_string_lossy().ends_with(".tmp")
+                });
             if used {
                 return Err(format!(
                     "{}: Raft data of an older raidish (no {} file): this one speaks \
@@ -100,6 +114,20 @@ fn check_version(dir: &Path) -> Result<(), String> {
         }
         Err(e) => Err(format!("{}: {}", path.display(), e)),
     }
+}
+
+/// Make `dir` and the files in it this user's only (directories made, or
+/// files written, before this was enforced included).
+pub fn restrict(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, SErr> {
@@ -121,9 +149,15 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
 /// fsynced, renamed over it, and the directory fsynced (else the rename
 /// itself may not survive a crash). Any failure is an error: Raft must not
 /// act on state it hasn't stored (audit R4a).
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
@@ -169,6 +203,7 @@ impl Store {
     /// Open (or create) the store in `dir`.
     pub fn open(dir: &Path, fence: Arc<dyn crate::types::FenceObserver>) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+        restrict(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
         check_version(dir)?;
         let err = |e: SErr| format!("{}: {}", dir.display(), e);
         let vote = read_json(&dir.join("vote.json")).map_err(err)?;
@@ -229,6 +264,11 @@ impl Store {
     /// One lease of the applied state (cheaper than `state()`).
     pub fn lease(&self, resource: &crate::types::LeaseResource) -> Option<super::state::Lease> {
         self.view.read().unwrap().leases.get(resource).cloned()
+    }
+
+    /// The cluster CA of the applied state.
+    pub fn pki(&self) -> Option<Arc<raidish_types::pki::PkiState>> {
+        self.view.read().unwrap().pki.clone()
     }
 
     /// The applied cluster state.
@@ -373,7 +413,9 @@ impl RaftStorage<TypeConfig> for Store {
             sm.last_applied = Some(e.log_id);
             out.push(match &e.payload {
                 EntryPayload::Blank => Response::None,
-                EntryPayload::Normal(req) => sm.state.apply(req),
+                EntryPayload::Normal(req) => {
+                    sm.state.apply_with(req, &raidish_auth::ca::X509Checker)
+                }
                 EntryPayload::Membership(m) => {
                     sm.membership = StoredMembership::new(Some(e.log_id), m.clone());
                     Response::None

@@ -57,6 +57,7 @@ pub async fn listen(
     vms: Option<Arc<crate::vm::VmRuntime>>,
     facts: crate::node_facts::FactsHandle,
     events: crate::events::EventSink,
+    ca: Arc<raidish_ca::CaService>,
 ) {
     // Serving blocks doesn't need a formatted pool (that's how a remote
     // client formats it in the first place).
@@ -132,6 +133,7 @@ pub async fn listen(
         .manage(volumes)
         .manage(crate::vms_api::VmsState::new(vms, facts))
         .manage(cluster)
+        .manage(ca)
         .manage(committer)
         .manage(agent)
         .manage(events)
@@ -156,6 +158,7 @@ pub async fn listen(
             ],
         )
         .mount("/", crate::cluster::routes::routes())
+        .mount("/", raidish_ca::routes::routes())
         .attach(crate::cluster::routes::stop_raft_on_shutdown())
         .mount("/", crate::frontend::routes::routes())
         .mount("/", crate::committer::routes::routes())

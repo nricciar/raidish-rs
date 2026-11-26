@@ -32,7 +32,8 @@ pub struct TlsConfig {
     pub key: Option<String>,
 }
 
-fn expand(p: &str) -> PathBuf {
+/// `p`, with a leading `~/` as `$HOME/`.
+pub fn expand(p: &str) -> PathBuf {
     match (p.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(p),

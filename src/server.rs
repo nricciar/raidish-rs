@@ -7,7 +7,6 @@ use crate::config::{Config, PoolSpec};
 use crate::disk::DiskOptions;
 use crate::disks::DiskSet;
 use crate::{api, cluster};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Serve this node until it is asked to stop. Err: the config can't be
@@ -35,10 +34,7 @@ pub async fn listen(
         .map_err(|e| format!("cluster: {}", e))?;
     // The node's name comes from its id: the pool position of its first disk.
     let name = members.me.name();
-    let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
-        Some(d) => expand_tilde(d).join(&name),
-        None => cluster::default_data_dir(&name),
-    };
+    let data_dir = config.data_dir(&name);
     println!(
         "cluster: node {} ({}), {} member{}",
         members.me,
@@ -91,6 +87,13 @@ pub async fn listen(
     let node = cluster::Cluster::start(&name, members, data_dir, floor.clone())
         .await
         .map_err(|e| format!("cluster: {}", e))?;
+    let ca = raidish_ca::CaService::start(
+        node.clone(),
+        raidish_ca::CaOptions {
+            unseal_once: config.ca.unseal_once,
+        },
+    )
+    .map_err(|e| format!("ca: {}", e))?;
     let slot: crate::committer::CommitterSlot = Default::default();
     let agent_state: crate::agent::AgentState = Default::default();
     let files: crate::files_api::WriterSlot = Default::default();
@@ -287,12 +290,14 @@ pub async fn listen(
         vms,
         facts,
         events,
+        ca,
     )
     .await;
     Ok(())
 }
 
-/// Warn if this node's certificate expires within 30 days (or has).
+/// Warn if this node's certificate has less than a third of its life, at
+/// most 30 days, left (or has run out).
 fn warn_expiry(tls: &crate::tls::TlsConfig) {
     let Ok(Some((chain, _))) = tls.identity() else {
         return;
@@ -301,15 +306,22 @@ fn warn_expiry(tls: &crate::tls::TlsConfig) {
         return;
     };
     let left = info.not_after - ::time::OffsetDateTime::now_utc();
+    let life = chain
+        .first()
+        .and_then(|c| raidish_auth::ca::facts(c).ok())
+        .map(|f| ::time::Duration::milliseconds((f.not_after_ms - f.not_before_ms) as i64))
+        .unwrap_or(::time::Duration::days(90));
     println!(
         "tls: serving as '{}' ({}), certificate expires {}",
         info.name,
         info.role.map(|r| r.to_string()).unwrap_or("?".into()),
         info.expiry()
     );
-    if left < ::time::Duration::days(30) {
+    let soon: ::time::Duration = std::cmp::min(life / 3, ::time::Duration::days(30));
+    if left < soon {
         eprintln!(
-            "WARNING: this node's certificate {} on {}: reissue it with `raidish cert issue {} --role node --force`",
+            "WARNING: this node's certificate {} on {}: renew it with `raidish ca renew` \
+             (then restart), or, from a `cert` CA, `raidish cert issue {} --role node --force`",
             if left.is_negative() {
                 "expired"
             } else {
@@ -318,12 +330,5 @@ fn warn_expiry(tls: &crate::tls::TlsConfig) {
             info.not_after.date(),
             info.name
         );
-    }
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(path),
     }
 }

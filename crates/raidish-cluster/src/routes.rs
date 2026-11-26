@@ -123,12 +123,25 @@ pub async fn snapshot(
 
 #[post("/api/v1/cluster/lease?<forwarded>", data = "<op>")]
 pub async fn lease(
-    _auth: crate::auth::CanWrite,
+    auth: crate::auth::CanWrite,
     op: Json<LeaseOp>,
     forwarded: Option<bool>,
     cluster: &State<Shared>,
 ) -> Json<Result<Response, String>> {
-    Json(cluster.lease(&op, forwarded.unwrap_or(false)).await)
+    let forwarded = forwarded.unwrap_or(false);
+    // CA changes are proposed by a node's CA service in-process, and reach
+    // here only as a node forwarding one to the leader. Anyone else must
+    // go through the CA's own endpoints (which check what they propose).
+    // A node that does is trusted no further for it: what grants
+    // authority is checked when applied or when used (see `crate::pki`).
+    if matches!(*op, LeaseOp::Pki(_))
+        && !(forwarded && auth.0.role == raidish_auth::pki::Role::Node)
+    {
+        return Json(Err(
+            "CA changes go through /api/v1/pki, not the lease API".into()
+        ));
+    }
+    Json(cluster.lease(&op, forwarded).await)
 }
 
 #[get("/api/v1/cluster/status")]

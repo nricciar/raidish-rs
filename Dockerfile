@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends ca-certificates curl libvirt-clients \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/raidish /usr/local/bin/raidish
 COPY docker/entrypoint.sh /usr/local/bin/raidish-entrypoint

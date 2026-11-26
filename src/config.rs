@@ -52,6 +52,30 @@ pub struct Config {
     /// Run VMs whose disks are volumes, through libvirt (see `crate::vm`).
     /// Absent: this node runs none.
     pub vm: Option<crate::vm::VmConfig>,
+    /// The cluster CA (see `raidish_ca`).
+    #[serde(default)]
+    pub ca: CaConfig,
+}
+
+/// ```yaml
+/// ca:
+///   unseal_once: false   # ignore `ca init`'s one-shot unseal file
+/// ```
+#[derive(Deserialize, Debug, Clone)]
+pub struct CaConfig {
+    /// Unseal at start from the one-shot file `ca init` leaves (default on).
+    #[serde(default = "yes")]
+    pub unseal_once: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for CaConfig {
+    fn default() -> Self {
+        CaConfig { unseal_once: true }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -217,6 +241,14 @@ impl Config {
 
     /// Where to ask for leases: every `listen` node that serves one of the
     /// pool's remote disks. Empty for a pool of local disks only.
+    /// Node `name`'s Raft data dir (`cluster.data_dir/<name>`).
+    pub fn data_dir(&self, name: &str) -> std::path::PathBuf {
+        match self.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
+            Some(d) => crate::tls::expand(d).join(name),
+            None => crate::cluster::default_data_dir(name),
+        }
+    }
+
     pub fn lease_endpoints(&self) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
         for path in self.pool_spec()?.map(|s| s.paths).unwrap_or_default() {

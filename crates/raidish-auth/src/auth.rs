@@ -147,6 +147,11 @@ pub fn parse_token(token: &str) -> Result<Parsed, String> {
 /// Checks client certificates and tokens against the trust bundle.
 pub struct Verifier {
     roots: Arc<rustls::RootCertStore>,
+    /// Issuers a token's signer certificate may chain through to a root:
+    /// a managed CA's admin certs are signed by an issuer, and an `rdt1`
+    /// token carries only the leaf. This process's own chain has the active
+    /// issuer (see `from_config`).
+    intermediates: Vec<CertificateDer<'static>>,
     revoked: Vec<String>,
 }
 
@@ -159,12 +164,23 @@ impl Verifier {
         }
         Ok(Verifier {
             roots: Arc::new(store),
+            intermediates: Vec::new(),
             revoked,
         })
     }
 
+    /// Let token signers chain through `issuers` too.
+    pub fn with_intermediates(mut self, issuers: Vec<CertificateDer<'static>>) -> Self {
+        self.intermediates = issuers;
+        self
+    }
+
     pub fn from_config(tls: &crate::tls::TlsConfig, auth: &AuthConfig) -> Result<Self, String> {
-        Self::new(tls.roots()?, auth.revoked.clone())
+        let issuers = match tls.identity()? {
+            Some((chain, _)) => chain.into_iter().skip(1).collect(),
+            None => Vec::new(),
+        };
+        Ok(Self::new(tls.roots()?, auth.revoked.clone())?.with_intermediates(issuers))
     }
 
     /// Does `der` chain to a trusted CA as a client certificate?
@@ -173,7 +189,11 @@ impl Verifier {
             .build()
             .map_err(|e| e.to_string())?;
         verifier
-            .verify_client_cert(&CertificateDer::from(der.to_vec()), &[], UnixTime::now())
+            .verify_client_cert(
+                &CertificateDer::from(der.to_vec()),
+                &self.intermediates,
+                UnixTime::now(),
+            )
             .map(|_| ())
             .map_err(|e| format!("signer certificate: {}", e))
     }
@@ -346,6 +366,45 @@ role_guard!(CanRead, "Any authenticated caller.", |_p| true);
 role_guard!(CanWrite, "Admins and nodes.", |p| p.role >= Role::Admin);
 role_guard!(IsNode, "Nodes only (Raft between peers).", |p| p.role
     == Role::Node);
+role_guard!(
+    IsAdmin,
+    "Admins only, by certificate or token (not nodes): for what only takes \
+     authority away (revoking, sealing).",
+    |p| p.role == Role::Admin
+);
+
+/// An admin, by its own certificate on this very connection: no token, no
+/// node passing a request on. For everything that grants authority or
+/// changes how the CA is unlocked (signing, enrollments, key slots), so a
+/// leaked dashboard token can't, and a compromised node can't claim to
+/// speak for an admin (see `docs/ca-service-plan.md` D8).
+pub struct IsAdminCert(pub Principal);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for IsAdminCert {
+    type Error = String;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
+        match req.guard::<Authed>().await.map(|a| a.0) {
+            Outcome::Success(p)
+                if p.role == Role::Admin
+                    && p.via == Via::Cert
+                    && req.headers().get_one(ON_BEHALF).is_none() =>
+            {
+                Outcome::Success(IsAdminCert(p))
+            }
+            Outcome::Success(p) => Outcome::Error((
+                Status::Forbidden,
+                format!(
+                    "{} '{}' may not do this: it takes an admin certificate, presented directly",
+                    p.role, p.name
+                ),
+            )),
+            Outcome::Error(e) => Outcome::Error(e),
+            Outcome::Forward(f) => Outcome::Forward(f),
+        }
+    }
+}
 
 /// GET /api/v1/auth/whoami: who the server thinks you are (401 if nobody).
 #[rocket::get("/api/v1/auth/whoami")]

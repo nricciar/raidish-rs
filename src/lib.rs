@@ -46,6 +46,8 @@ pub(crate) use raidish_auth::auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]
+mod cli_ca;
+#[cfg(not(target_arch = "wasm32"))]
 mod cli_pki;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli_vm;

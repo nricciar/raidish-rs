@@ -185,6 +185,29 @@ enum Commands {
         #[command(subcommand)]
         command: crate::cli_pki::TokenCommands,
     },
+    /// The cluster's own CA: set it up, join nodes, issue and renew.
+    Ca {
+        #[command(subcommand)]
+        command: crate::cli_ca::CaCommands,
+    },
+    /// Get this node's certificate from the cluster CA with a join token
+    /// (from `ca init` or `ca token create`), before its first `listen`.
+    Join {
+        /// A running node (`https://node0:8881`).
+        url: String,
+        /// Read the token from stdin.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Read the token from a file.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// The port this node's `listen` serves on (to find it in the pool).
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Replace this node's certificate files.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -493,11 +516,43 @@ pub async fn main() -> std::io::Result<()> {
         return Ok(());
     }
     let config = load_config(&cli.config)?;
+    // Made before this node has certificates to init TLS with.
+    match &cli.command {
+        Commands::Ca {
+            command: command @ crate::cli_ca::CaCommands::Init { .. },
+        } => {
+            crate::cli_ca::init(command, &config);
+            return Ok(());
+        }
+        Commands::Join {
+            url,
+            token_stdin,
+            token_file,
+            port,
+            force,
+        } => {
+            crate::cli_ca::join(
+                url,
+                *token_stdin,
+                token_file.as_deref(),
+                *port,
+                *force,
+                &config,
+            )
+            .await;
+            return Ok(());
+        }
+        _ => {}
+    }
     crate::tls::init(config.tls.as_ref()).unwrap_or_else(|e| fail(e));
     // The storage core's remote disks speak the same TLS.
     let _ = crate::disk::ws::set_tls_client(crate::tls::client());
     if let Ok(Some(spec)) = config.pool_spec() {
         crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
+    }
+    if let Commands::Ca { command } = &cli.command {
+        crate::cli_ca::run(command, &config).await;
+        return Ok(());
     }
     if let Commands::Token { command } = &cli.command {
         if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
@@ -854,6 +909,8 @@ pub async fn main() -> std::io::Result<()> {
         | Commands::Csi { .. }
         | Commands::Cert { .. }
         | Commands::Token { .. }
+        | Commands::Ca { .. }
+        | Commands::Join { .. }
         | Commands::Dataset { .. } => unreachable!(),
     }
     if let Some(lease) = lease {

@@ -197,6 +197,10 @@ pub enum LeaseOp {
         from: String,
         to: String,
     },
+    /// A change to the cluster CA (see `crate::pki`). Proposed only by the
+    /// CA service in-process; `/api/v1/cluster/lease` refuses it from
+    /// outside.
+    Pki(crate::pki::PkiOp),
 }
 
 impl LeaseOp {
@@ -314,6 +318,12 @@ pub struct ClusterState {
     /// leave them attached to both for ever).
     #[serde(default)]
     pub migrations: BTreeMap<VmName, MigrationRecord>,
+    /// The cluster CA, once `raidish ca init`'s state is committed (see
+    /// `crate::pki`). Sealed keys only, but still not for every reader:
+    /// `Status` carries a `PkiView` instead. In an `Arc`, so cloning the
+    /// state (every agent tick) stays cheap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pki: Option<std::sync::Arc<crate::pki::PkiState>>,
 }
 
 impl ClusterState {
@@ -393,7 +403,15 @@ impl ClusterState {
             .is_some_and(|l| l.epoch == lease.epoch)
     }
 
+    /// Apply `req` where no CA certificates can be checked: CA ops that
+    /// need one are refused (see [`Self::apply_with`]).
     pub fn apply(&mut self, req: &Request) -> Response {
+        self.apply_with(req, &crate::pki::NoCertChecker)
+    }
+
+    /// Apply `req`, checking CA certificates with `checker` (every Raft
+    /// replica uses the same one, so they all agree).
+    pub fn apply_with(&mut self, req: &Request, checker: &dyn crate::pki::CertChecker) -> Response {
         self.clock_ms = self.clock_ms.max(req.now_ms);
         let now_ms = self.clock_ms;
         match &req.op {
@@ -679,6 +697,10 @@ impl ClusterState {
                 }
                 Response::Recorded
             }
+            LeaseOp::Pki(op) => match crate::pki::apply(&mut self.pki, op, now_ms, checker) {
+                Ok(()) => Response::Recorded,
+                Err(e) => Response::Refused(e),
+            },
         }
     }
 }
@@ -713,6 +735,9 @@ pub struct Status {
     /// It votes: false while it catches up after losing its state.
     #[serde(default)]
     pub voting: bool,
+    /// The cluster CA as any reader may see it (`state.pki` is left out).
+    #[serde(default)]
+    pub pki: Option<crate::pki::PkiView>,
 }
 
 impl Status {
