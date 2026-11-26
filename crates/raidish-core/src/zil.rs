@@ -59,7 +59,7 @@
 //! lets go of it once the log is replayed.
 
 use crate::dataset::Dataset;
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, LogRegion};
 use crate::object::{Dirty, Unlogged};
@@ -181,7 +181,7 @@ pub(crate) struct LogIoGuard<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a,
 /// A log append planned under the cursor lock, to be written.
 struct Planned {
     vol: Arc<Dataset>,
-    lba: u64,
+    lba: crate::coords::PoolLba,
     bytes: Vec<u8>,
     idxs: BTreeMap<u64, Unlogged>,
     ops: Vec<(u64, KeyedOp)>,
@@ -227,7 +227,7 @@ impl Drop for Unaccounted<'_, '_> {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Take the intent log append lock (one flush appends at a time).
     pub(crate) async fn lock_log_io(&self) -> LogIoGuard<'_> {
         LogIoGuard(self.log_io.lock().await)
@@ -452,7 +452,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if c.used + blocks > c.region.len {
             return Err(());
         }
-        let lba = c.region.start + c.used;
+        let lba = crate::coords::PoolLba::new(c.region.start + c.used);
         c.used += blocks;
         c.seq += 1;
         let idxs = std::mem::take(&mut d.unlogged);
@@ -570,7 +570,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut out = Vec::new();
         let (mut used, mut seq) = (0u64, 0u64);
         while used + unit <= region.len {
-            let lba = region.start + used;
+            let lba = crate::coords::PoolLba::new(region.start + used);
             let check_header = move |d: &[u8]| parse_header(d, region.guid, seq).is_some();
             let head = match self
                 .read_verified(lba, unit, HEADER_BYTES, &check_header, false)
@@ -621,9 +621,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // a pool with more disks missing or stale (awaiting a resilver) than
         // parity can rebuild, replaying now would drop acknowledged writes.
         // Keep the log until it can be read.
-        if self.dev.pool().is_some()
-            && crate::inspect::margin_for_recent_writes(&self.pool_report().await) < 0
-        {
+        if crate::inspect::margin_for_recent_writes(&self.pool_report().await) < 0 {
             return Err(FileSystemError::Unavailable(format!(
                 "too many disks missing or awaiting a resilver; keeping volume '{}''s \
                  intent log until it can be read",
@@ -764,7 +762,7 @@ impl<D: BlockDevice> FileSystem<D> {
 /// One intent log record as written: at `lba`, `bytes` (header and
 /// payload) zero-padded to whole stripes on disk.
 pub struct LogRecord {
-    pub lba: u64,
+    pub lba: crate::coords::PoolLba,
     pub bytes: Vec<u8>,
 }
 

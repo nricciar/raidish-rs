@@ -13,7 +13,7 @@
 //! `FileSystem`, shared with the NVMe/TCP target) also commits every few
 //! seconds while there is dirty data.
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::export::{BlockExporter, ExportLife, ExportTable, Exported};
 pub(crate) use crate::export::{ExportSession, export_closed};
 use crate::fs::{FileSystem, FileSystemError};
@@ -115,7 +115,7 @@ impl Exported for Export {
 }
 
 /// An NBD server exporting any number of volumes of one file system.
-pub struct NbdServer<D: BlockDevice> {
+pub struct NbdServer<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     bind: String,
     port: u16,
@@ -129,7 +129,7 @@ pub async fn serve_nbd<D>(
     port: u16,
 ) -> std::io::Result<()>
 where
-    D: BlockDevice + Send + Sync + 'static,
+    D: PoolDevice + Send + Sync + 'static,
 {
     let server = NbdServer::with_bind(fs, DEFAULT_BIND, port);
     // Served until the process ends.
@@ -144,7 +144,7 @@ where
 // single-export CLI wrapper and the tests use all of it.
 impl<D> NbdServer<D>
 where
-    D: BlockDevice + Send + Sync + 'static,
+    D: PoolDevice + Send + Sync + 'static,
 {
     /// A server with no exports that `run` binds to `bind:port`.
     pub fn with_bind(fs: Arc<FileSystem<D>>, bind: impl Into<String>, port: u16) -> Self {
@@ -187,7 +187,7 @@ where
 #[async_trait::async_trait]
 impl<D> BlockExporter for NbdServer<D>
 where
-    D: BlockDevice + Send + Sync + 'static,
+    D: PoolDevice + Send + Sync + 'static,
 {
     async fn add_export(
         &self,

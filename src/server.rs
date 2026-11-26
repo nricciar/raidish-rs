@@ -57,7 +57,10 @@ pub async fn listen(
                 .iter()
                 .enumerate()
                 .filter_map(|(pool_idx, d)| match d {
-                    crate::inspect::DiskAddr::This(i) => Some((*i as usize, pool_idx)),
+                    crate::inspect::DiskAddr::This(i) => Some((
+                        crate::coords::ServedDiskIdx::new(*i),
+                        crate::coords::PoolDiskIdx::new(pool_idx)?,
+                    )),
                     _ => None,
                 })
                 .collect(),

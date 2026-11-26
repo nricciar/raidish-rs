@@ -26,7 +26,7 @@
 
 use crate::api_error::ApiError;
 use crate::committer::object_resource;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
@@ -86,7 +86,7 @@ impl FilesState {
 // ---- reads ----
 
 /// A file's dnode, as of the newest committed root.
-async fn file_dnode<D: BlockDevice>(
+async fn file_dnode<D: PoolDevice>(
     fs: &FileSystem<D>,
     path: &Path,
 ) -> Result<Dnode, FileSystemError> {
@@ -99,7 +99,7 @@ pub(crate) const STREAM_RECORDS: usize = 8;
 
 /// Bytes `range` of the file, read a few records at a time. A piece that
 /// can't be read is an error, which ends the stream.
-fn record_stream<D: BlockDevice + 'static>(
+fn record_stream<D: PoolDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     dnode: Dnode,
     range: std::ops::Range<u64>,
@@ -226,7 +226,7 @@ impl<'r> Responder<'r, 'r> for FileBody {
     }
 }
 
-async fn file_body<D: BlockDevice + 'static>(
+async fn file_body<D: PoolDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     path: &Path,
     range: Option<&str>,
@@ -289,7 +289,7 @@ fn stat_of(id: FileId, d: &Dnode) -> Stat {
     }
 }
 
-async fn list<D: BlockDevice>(
+async fn list<D: PoolDevice>(
     fs: &FileSystem<D>,
     path: &Path,
 ) -> Result<Vec<DirEntry>, FileSystemError> {
@@ -543,7 +543,7 @@ async fn patch_file(
     Ok(Json(Written { id, size }))
 }
 
-async fn stat<D: BlockDevice>(fs: &FileSystem<D>, path: &Path) -> Result<Stat, FileSystemError> {
+async fn stat<D: PoolDevice>(fs: &FileSystem<D>, path: &Path) -> Result<Stat, FileSystemError> {
     fs.refresh_root().await?;
     let (id, d) = fs.stat(path).await?;
     Ok(stat_of(id, &d))

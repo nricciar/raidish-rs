@@ -35,7 +35,7 @@ mod ops;
 pub mod state;
 
 use crate::backend::{Backend, NfsStat, status as s3};
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::inode::{ObjType, SetAttrs};
 use crate::rpc::{Call, Cred, Reply};
 use crate::xdr::{Reader, Writer, XdrError, XdrResult};
@@ -393,7 +393,7 @@ fn skip_cb_sec(r: &mut Reader<'_>) -> XdrResult<()> {
     Ok(())
 }
 
-pub struct Server<D: BlockDevice> {
+pub struct Server<D: PoolDevice> {
     backend: Arc<Backend<D>>,
     node: String,
     state: std::sync::RwLock<Arc<StateTable>>,
@@ -402,7 +402,7 @@ pub struct Server<D: BlockDevice> {
     owning: AtomicBool,
 }
 
-impl<D: BlockDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static> Server<D> {
     /// A server that owns its state (a pool only this node serves).
     pub fn new(backend: Arc<Backend<D>>, node: &str) -> Self {
         Self::make(backend, node, None, true)

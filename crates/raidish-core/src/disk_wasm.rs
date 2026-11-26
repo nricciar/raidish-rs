@@ -1,7 +1,7 @@
 //! Remote disks from the browser: the same websocket block protocol as the
 //! native client (`disk_ws.rs`), over `web_sys::WebSocket`.
 //!
-//! Browser objects aren't `Send`, but `BlockDevice` futures must be. So one
+//! Browser objects aren't `Send`, but `PoolDevice` futures must be. So one
 //! `spawn_local` task owns the socket (and every JS callback and timer), and
 //! callers only ever touch `Send` channels: a request goes in over an mpsc,
 //! its reply comes back on a oneshot. Timeouts are enforced by that task.

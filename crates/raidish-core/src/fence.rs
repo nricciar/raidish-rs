@@ -19,7 +19,9 @@
 //! a server that lags the cluster can safely learn newer epochs from the
 //! requests themselves (as with the single pool epoch before).
 
-use crate::disks::DISK_LABEL_BLOCKS;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::coords::ServedDiskIdx;
+use crate::coords::{PoolDiskIdx, RawDiskBlock};
 use crate::metaslab::MetaslabLayout;
 use crate::types::Epoch;
 use crate::types::MetaslabIdx;
@@ -43,11 +45,13 @@ impl FenceMap {
     }
 
     /// The domain of raw block `block` (label area included) of leaf `disk`.
-    pub fn domain_of(&self, disk: usize, block: u64) -> Domain {
-        if block < DISK_LABEL_BLOCKS || self.layout.metaslab_size_blocks == 0 {
+    pub fn domain_of(&self, disk: PoolDiskIdx, block: RawDiskBlock) -> Domain {
+        let Some(shard) = block.to_shard() else {
+            return Domain::Pool;
+        };
+        if self.layout.metaslab_size_blocks == 0 {
             return Domain::Pool;
         }
-        let shard = block - DISK_LABEL_BLOCKS;
         // A shard holds pool blocks at or after its own number: one past the
         // last metaslab is no metaslab's (nor mapped, which could overflow).
         let end = self.layout.data_start.saturating_add(
@@ -55,13 +59,13 @@ impl FenceMap {
                 .metaslab_count
                 .saturating_mul(self.layout.metaslab_size_blocks),
         );
-        if shard >= end {
+        if shard.get() >= end {
             return Domain::Pool;
         }
         match self
             .topology
             .pool_range_of(disk, shard)
-            .and_then(|r| self.layout.metaslab_for_block(r.start))
+            .and_then(|r| self.layout.metaslab_for_block(r.start.get()))
         {
             Some(i) => Domain::Metaslab(i),
             None => Domain::Pool,
@@ -69,13 +73,13 @@ impl FenceMap {
     }
 
     /// The distinct domains `count` raw blocks from `block` fall in.
-    pub fn domains(&self, disk: usize, block: u64, count: u32) -> Vec<Domain> {
+    pub fn domains(&self, disk: PoolDiskIdx, block: RawDiskBlock, count: u32) -> Vec<Domain> {
         let mut out: Vec<Domain> = Vec::new();
         // Never empty and never wrapping: a range that ends past the last
         // block (its caller refuses it) still names the domain it starts in.
-        let blocks = (0..count.max(1) as u64).map_while(|i| block.checked_add(i));
+        let blocks = (0..count.max(1) as u64).map_while(|i| block.get().checked_add(i));
         for b in blocks {
-            let d = self.domain_of(disk, b);
+            let d = self.domain_of(disk, RawDiskBlock::new(b));
             if !out.contains(&d) {
                 out.push(d);
             }
@@ -118,8 +122,8 @@ struct FenceInner {
     /// Domain map; None until the pool's layout is known (then everything
     /// is the pool domain).
     map: Option<FenceMap>,
-    /// Served disk index → pool leaf index (None: identity).
-    served: Option<HashMap<usize, usize>>,
+    /// Served disk → pool leaf (None: the same index).
+    served: Option<HashMap<ServedDiskIdx, PoolDiskIdx>>,
     /// The pool was found unformatted (or there's no pool to map): with no
     /// map, every block is the pool's. See [`Ready`].
     unmapped: bool,
@@ -166,18 +170,18 @@ impl FenceInner {
         }
     }
 
-    fn domains(&self, served_disk: usize, block: u64, count: u32) -> Vec<Domain> {
+    fn domains(&self, served_disk: ServedDiskIdx, block: RawDiskBlock, count: u32) -> Vec<Domain> {
         let Some(map) = self.map.as_ref() else {
             return vec![Domain::Pool];
         };
         let disk = match self.served.as_ref() {
-            None => served_disk,
-            Some(m) => match m.get(&served_disk) {
-                Some(&d) => d,
-                None => return vec![Domain::Pool],
-            },
+            None => PoolDiskIdx::new(served_disk.as_usize()),
+            Some(m) => m.get(&served_disk).copied(),
         };
-        map.domains(disk, block, count)
+        match disk {
+            Some(disk) => map.domains(disk, block, count),
+            None => vec![Domain::Pool],
+        }
     }
 }
 
@@ -276,7 +280,7 @@ impl ServerFence {
         self.lock().map.is_some()
     }
 
-    pub fn set_served(&self, served: HashMap<usize, usize>) {
+    pub fn set_served(&self, served: HashMap<ServedDiskIdx, PoolDiskIdx>) {
         self.lock().served = Some(served);
     }
 
@@ -289,8 +293,8 @@ impl ServerFence {
     /// not.
     pub fn admit(
         &self,
-        served_disk: usize,
-        block: u64,
+        served_disk: ServedDiskIdx,
+        block: RawDiskBlock,
         count: u32,
         epoch: Epoch,
         write: bool,
@@ -315,8 +319,8 @@ impl ServerFence {
     /// checked is what is raised (I-11).
     pub fn admit_stamp(
         &self,
-        served_disk: usize,
-        block: u64,
+        served_disk: ServedDiskIdx,
+        block: RawDiskBlock,
         count: u32,
         stamp: Stamp,
         write: bool,
@@ -496,8 +500,8 @@ impl ClientFence {
         &self,
         map: Option<&FenceMap>,
         ms: &HashMap<MetaslabIdx, Stamp>,
-        disk: usize,
-        block: u64,
+        disk: PoolDiskIdx,
+        block: RawDiskBlock,
     ) -> Stamp {
         let pool = Stamp::Pool(self.pool_epoch());
         let Some(map) = map else {
@@ -521,16 +525,21 @@ impl ClientFence {
     /// Usually one run; more where the range crosses a domain boundary
     /// whose stamps differ (one stamp for both would be wrong for one:
     /// audit R2b).
-    pub fn stamps(&self, disk: Option<usize>, block: u64, count: u32) -> Vec<(u64, u32, Stamp)> {
+    pub fn stamps(
+        &self,
+        disk: Option<PoolDiskIdx>,
+        block: RawDiskBlock,
+        count: u32,
+    ) -> Vec<(RawDiskBlock, u32, Stamp)> {
         let pool = Stamp::Pool(self.pool_epoch());
         let ms = self.metaslabs.read().unwrap();
         let map = self.map.read().unwrap();
         let (false, Some(map), Some(disk)) = (ms.is_empty(), map.as_ref(), disk) else {
             return vec![(block, count, pool)];
         };
-        let mut out: Vec<(u64, u32, Stamp)> = Vec::new();
+        let mut out: Vec<(RawDiskBlock, u32, Stamp)> = Vec::new();
         for i in 0..count.max(1) {
-            let Some(b) = block.checked_add(i as u64) else {
+            let Some(b) = block.get().checked_add(i as u64).map(RawDiskBlock::new) else {
                 // Past the last block (the server refuses it): keep the
                 // rest in the last run rather than drop it.
                 if let Some((_, n, _)) = out.last_mut() {
@@ -549,7 +558,7 @@ impl ClientFence {
 
     /// The one stamp for a request that can't be split (a range in one
     /// domain, as `stamps` gives).
-    pub fn epoch_for(&self, disk: Option<usize>, block: u64, count: u32) -> Stamp {
+    pub fn epoch_for(&self, disk: Option<PoolDiskIdx>, block: RawDiskBlock, count: u32) -> Stamp {
         self.stamps(disk, block, count)[0].2
     }
 }

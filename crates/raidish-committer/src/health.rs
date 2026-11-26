@@ -2,10 +2,11 @@
 //! storage core's scrub and resilver (`crate::scan`), driven by disk
 //! reconnects and reported to the activity log (`crate::events`).
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::events::{EventKind, Subject};
 use crate::fs::{FileSystem, LabelState};
 use crate::types::Txg;
+use raidish_core::coords::PoolDiskIdx;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,14 +14,15 @@ use std::time::Duration;
 /// (a replaced disk is fenced and fully resilvered), and whenever an online
 /// disk is degraded, resilver it. Also re-checks periodically, since misses
 /// are only noticed at commit time.
-pub fn spawn_health_monitor<D: BlockDevice + 'static>(
+pub fn spawn_health_monitor<D: PoolDevice + 'static>(
     fs: Arc<FileSystem<D>>,
     interval: Duration,
     events: Option<crate::events::EventSink>,
 ) -> tokio::task::JoinHandle<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-    if let Some(pool) = fs.dev.pool() {
-        for d in 0..pool.disks().len() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PoolDiskIdx>();
+    {
+        let pool = fs.dev.pool();
+        for d in pool.disks().indexes() {
             if let Some(mut events) = pool.disks().disk(d).reconnects() {
                 let tx = tx.clone();
                 tokio::spawn(async move {

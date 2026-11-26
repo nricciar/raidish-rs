@@ -83,12 +83,12 @@ pool_admin! {
 // ---- in process ----
 
 /// This process's committer, acting for `by` (None: the system itself).
-pub struct LocalAdmin<D: BlockDevice> {
+pub struct LocalAdmin<D: PoolDevice> {
     pub committer: Arc<Committer<D>>,
     pub by: Option<String>,
 }
 
-impl<D: BlockDevice + 'static> LocalAdmin<D> {
+impl<D: PoolDevice + 'static> LocalAdmin<D> {
     pub fn new(committer: Arc<Committer<D>>, by: Option<String>) -> Self {
         LocalAdmin { committer, by }
     }
@@ -142,7 +142,7 @@ impl<D: BlockDevice + 'static> LocalAdmin<D> {
 }
 
 #[async_trait]
-impl<D: BlockDevice + 'static> PoolAdmin for LocalAdmin<D> {
+impl<D: PoolDevice + 'static> PoolAdmin for LocalAdmin<D> {
     async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError> {
         Ok(self.committer.volumes().await?)
     }

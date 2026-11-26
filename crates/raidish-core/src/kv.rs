@@ -16,7 +16,7 @@ use crate::btree::Txn;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::dataset::Dataset;
 use crate::dataset::DatasetFormat;
-use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
+use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
@@ -33,7 +33,7 @@ pub const TARGET_NODE_BYTES: usize = 16 * 1024;
 /// Node ids a `kv` dataset can hold. Unused ones are holes (no space).
 pub const NODE_CAPACITY: u64 = 1 << 27;
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// The node size of new `kv` datasets on this pool.
     pub fn default_kv_blksz(&self) -> u32 {
         self.btree_blksz(TARGET_NODE_BYTES)

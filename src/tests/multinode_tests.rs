@@ -4,6 +4,7 @@ use crate::cluster::LeaseOp;
 use crate::cluster::state::Response;
 use crate::cluster::state::{ClusterState, POOL};
 use crate::committer::*;
+use crate::coords::*;
 use crate::fence::FenceMap;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::test_util::dsn;
@@ -385,7 +386,10 @@ async fn a_write_across_a_returned_metaslab_doesnt_fence_the_committer() {
     // The last raw block of metaslab 0 on disk 0, and metaslab 1's first.
     let shard = (0..u64::MAX)
         .map(|sh| sh + crate::disks::DISK_LABEL_BLOCKS)
-        .find(|&b| map.domain_of(0, b + 1) == crate::fence::Domain::Metaslab(crate::types::ms(1)))
+        .find(|&b| {
+            map.domain_of(PoolDiskIdx::new(0).unwrap(), RawDiskBlock::new(b + 1))
+                == crate::fence::Domain::Metaslab(crate::types::ms(1))
+        })
         .unwrap()
         - crate::disks::DISK_LABEL_BLOCKS;
     let returned = Epoch::from_raw(pool.get() + 5);
@@ -397,10 +401,27 @@ async fn a_write_across_a_returned_metaslab_doesnt_fence_the_committer() {
 
     // Rewrite what's there (the pool's own blocks), across the boundary...
     let mut two = crate::disk::zeroed_blocks(2);
-    disks.read_shards(0, shard, &mut two).await.unwrap();
-    disks.write_shards(0, shard, &two).await.unwrap();
+    disks
+        .read_shards(
+            PoolDiskIdx::new(0).unwrap(),
+            DiskShard::new(shard),
+            &mut two,
+        )
+        .await
+        .unwrap();
+    disks
+        .write_shards(PoolDiskIdx::new(0).unwrap(), DiskShard::new(shard), &two)
+        .await
+        .unwrap();
     // ...then metaslab 1 alone, with the pool epoch.
-    disks.write_shards(0, shard + 1, &two[1..]).await.unwrap();
+    disks
+        .write_shards(
+            PoolDiskIdx::new(0).unwrap(),
+            DiskShard::new(shard + 1),
+            &two[1..],
+        )
+        .await
+        .unwrap();
     assert!(!fence.is_stale());
     assert_eq!(
         server
@@ -437,10 +458,16 @@ async fn a_writers_repairs_pin_its_lent_space() {
         .map(crate::types::MetaslabIdx::from_raw)
         .find(|i| !lent.contains(i))
         .unwrap();
-    assert!(a.fs.repair_hold(start(other), 1).is_none(), "not lent");
-    assert!(a.fs.repair_hold(0, 1).is_none(), "not a metaslab");
+    assert!(
+        a.fs.repair_hold(PoolLba::new(start(other)), 1).is_none(),
+        "not lent"
+    );
+    assert!(
+        a.fs.repair_hold(PoolLba::new(0), 1).is_none(),
+        "not a metaslab"
+    );
 
-    let hold = a.fs.repair_hold(start(idx) + 3, 2).unwrap();
+    let hold = a.fs.repair_hold(PoolLba::new(start(idx) + 3), 2).unwrap();
     assert_eq!(hold.pinned(), &[idx]);
     a.fs.return_metaslabs().await;
     assert!(w.lent.lock().unwrap().contains(&idx), "pinned: kept");
@@ -448,7 +475,7 @@ async fn a_writers_repairs_pin_its_lent_space() {
     a.fs.return_metaslabs().await;
     assert!(!w.lent.lock().unwrap().contains(&idx));
     // Given back: no longer this writer's to repair.
-    assert!(a.fs.repair_hold(start(idx), 1).is_none());
+    assert!(a.fs.repair_hold(PoolLba::new(start(idx)), 1).is_none());
 }
 
 /// An authority whose view of the cluster lags (a committer on a Raft

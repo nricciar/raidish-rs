@@ -27,7 +27,7 @@ async fn test_read_write_single_block() {
     }
 
     // Write block
-    disk.write_block(0, &write_buf)
+    disk.write_block(crate::coords::RawDiskBlock::new(0), &write_buf)
         .await
         .expect("Failed to write block");
 
@@ -36,7 +36,7 @@ async fn test_read_write_single_block() {
 
     // Read block back
     let mut read_buf = [0u8; BLOCK_SIZE];
-    disk.read_block(0, &mut read_buf)
+    disk.read_block(crate::coords::RawDiskBlock::new(0), &mut read_buf)
         .await
         .expect("Failed to read block");
 
@@ -59,9 +59,12 @@ async fn test_write_read_multiple_blocks() {
             *b = ((block_id + i) % 256) as u8;
         }
 
-        disk.write_block(block_id as u64, &write_buf)
-            .await
-            .expect("Failed to write block");
+        disk.write_block(
+            crate::coords::RawDiskBlock::new(block_id as u64),
+            &write_buf,
+        )
+        .await
+        .expect("Failed to write block");
     }
 
     disk.flush().await.expect("Failed to flush");
@@ -69,7 +72,7 @@ async fn test_write_read_multiple_blocks() {
     // Read back and verify each block
     for block_id in 0..10 {
         let mut read_buf = [0u8; BLOCK_SIZE];
-        disk.read_block(block_id, &mut read_buf)
+        disk.read_block(crate::coords::RawDiskBlock::new(block_id), &mut read_buf)
             .await
             .expect("Failed to read block");
 
@@ -91,13 +94,13 @@ async fn test_overwrite_block() {
 
     // Write initial data
     let write_buf1 = [0xAAu8; BLOCK_SIZE];
-    disk.write_block(5, &write_buf1)
+    disk.write_block(crate::coords::RawDiskBlock::new(5), &write_buf1)
         .await
         .expect("Failed to write first time");
 
     // Overwrite with different data
     let write_buf2 = [0x55u8; BLOCK_SIZE];
-    disk.write_block(5, &write_buf2)
+    disk.write_block(crate::coords::RawDiskBlock::new(5), &write_buf2)
         .await
         .expect("Failed to write second time");
 
@@ -105,7 +108,7 @@ async fn test_overwrite_block() {
 
     // Read back
     let mut read_buf = [0u8; BLOCK_SIZE];
-    disk.read_block(5, &mut read_buf)
+    disk.read_block(crate::coords::RawDiskBlock::new(5), &mut read_buf)
         .await
         .expect("Failed to read block");
 
@@ -129,7 +132,7 @@ async fn test_non_sequential_block_access() {
 
     for &block_id in &block_ids {
         let write_buf = [block_id as u8; BLOCK_SIZE];
-        disk.write_block(block_id, &write_buf)
+        disk.write_block(crate::coords::RawDiskBlock::new(block_id), &write_buf)
             .await
             .expect("Failed to write block");
     }
@@ -139,7 +142,7 @@ async fn test_non_sequential_block_access() {
     // Read back in different order
     for &block_id in &[25, 50, 75, 90, 100] {
         let mut read_buf = [0u8; BLOCK_SIZE];
-        disk.read_block(block_id, &mut read_buf)
+        disk.read_block(crate::coords::RawDiskBlock::new(block_id), &mut read_buf)
             .await
             .expect("Failed to read block");
 
@@ -161,7 +164,7 @@ async fn test_flush_persistence() {
         let disk = Disk::open(&path_str).await.expect("Failed to open disk");
 
         let write_buf = [0x42u8; BLOCK_SIZE];
-        disk.write_block(10, &write_buf)
+        disk.write_block(crate::coords::RawDiskBlock::new(10), &write_buf)
             .await
             .expect("Failed to write block");
 
@@ -173,7 +176,7 @@ async fn test_flush_persistence() {
         let disk = Disk::open(&path_str).await.expect("Failed to re-open disk");
 
         let mut read_buf = [0u8; BLOCK_SIZE];
-        disk.read_block(10, &mut read_buf)
+        disk.read_block(crate::coords::RawDiskBlock::new(10), &mut read_buf)
             .await
             .expect("Failed to read block");
 

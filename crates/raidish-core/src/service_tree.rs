@@ -5,7 +5,7 @@
 
 use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::DatasetName;
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,7 @@ pub trait ServiceError: From<FileSystemError> {
 /// A dataset served from this node as one btree: stoppable, with writes
 /// made durable before they're answered and reads that only ever see
 /// durable writes.
-pub struct ServiceTree<D: BlockDevice> {
+pub struct ServiceTree<D: PoolDevice> {
     pub fs: Arc<FileSystem<D>>,
     pub name: DatasetName,
     format: DatasetFormat,
@@ -52,7 +52,7 @@ pub struct ServiceTree<D: BlockDevice> {
     pub settler: Settler,
 }
 
-impl<D: BlockDevice + 'static> ServiceTree<D> {
+impl<D: PoolDevice + 'static> ServiceTree<D> {
     /// Serve `name` (a `format` dataset) of `fs`.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
@@ -152,7 +152,7 @@ impl Settler {
     }
 
     /// Make every applied write to dataset `name` durable.
-    pub async fn settle<D: BlockDevice>(
+    pub async fn settle<D: PoolDevice>(
         &self,
         fs: &FileSystem<D>,
         name: &DatasetName,
@@ -170,7 +170,7 @@ impl Settler {
 
 /// Btree dataset `name` of `fs`, made empty if the pool has none yet (the
 /// committer's own stores: `.vms`, `.events`).
-pub async fn ensure_btree<D: BlockDevice>(
+pub async fn ensure_btree<D: PoolDevice>(
     fs: &FileSystem<D>,
     name: &DatasetName,
     format: DatasetFormat,

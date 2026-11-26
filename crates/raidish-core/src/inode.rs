@@ -17,7 +17,7 @@
 //!
 //! Object numbers are pool-wide and never reused.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
+use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, TreeRoot};
 use crate::types::Txg;
@@ -402,7 +402,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), FileSystemError> {
 /// Longest name in a directory, in bytes.
 pub const MAX_NAME_BYTES: usize = 255;
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Bytes per object table record.
     pub(crate) fn table_blksz(&self) -> usize {
         (self

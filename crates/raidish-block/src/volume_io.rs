@@ -8,7 +8,7 @@
 //! writer to being written here, without a client noticing more than a
 //! pause.
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::DatasetName;
 use async_trait::async_trait;
@@ -44,12 +44,12 @@ pub trait VolumeIo: Send + Sync {
 }
 
 /// This node writes the volume: straight to the file system.
-pub struct LocalIo<D: BlockDevice> {
+pub struct LocalIo<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     name: DatasetName,
 }
 
-impl<D: BlockDevice> LocalIo<D> {
+impl<D: PoolDevice> LocalIo<D> {
     pub fn new(fs: Arc<FileSystem<D>>, name: &DatasetName) -> Self {
         LocalIo {
             fs,
@@ -59,7 +59,7 @@ impl<D: BlockDevice> LocalIo<D> {
 }
 
 #[async_trait]
-impl<D: BlockDevice + Send + Sync + 'static> VolumeIo for LocalIo<D> {
+impl<D: PoolDevice + Send + Sync + 'static> VolumeIo for LocalIo<D> {
     async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
         self.fs.block_read(&self.name, offset, buf).await
     }
@@ -286,7 +286,7 @@ static SYNC_LOOPS: StdMutex<Vec<Weak<dyn Any + Send + Sync>>> = StdMutex::new(Ve
 /// the loop ends once the file system is dropped.
 pub fn ensure_sync_loop<D>(fs: &Arc<FileSystem<D>>, who: &'static str)
 where
-    D: BlockDevice + Send + Sync + 'static,
+    D: PoolDevice + Send + Sync + 'static,
 {
     {
         let mut loops = SYNC_LOOPS.lock().unwrap();

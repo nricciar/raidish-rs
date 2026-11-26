@@ -1,4 +1,4 @@
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::inspect::BlockKind;
 
@@ -31,7 +31,7 @@ fn symbol(k: BlockKind) -> &'static str {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Get terminal dimensions, defaulting to 80x24 if detection fails
     fn get_terminal_dimensions() -> (usize, usize) {
         if let Some((w, h)) = term_size::dimensions() {

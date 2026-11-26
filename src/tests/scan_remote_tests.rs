@@ -4,7 +4,8 @@
 //! storage core (`raidish_core::scan`).
 
 use crate::committer::health::spawn_health_monitor;
-use crate::disk::BlockDevice;
+use crate::coords::*;
+use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::test_util::{
     TOTAL_BLOCKS, TestDiskServer, TestPool, check_files, content, wait_until, write_files,
@@ -34,8 +35,8 @@ async fn resilver_restores_redundancy_after_an_outage() {
 
         // Data disk 1 drops out while the pool keeps changing.
         server.stop();
-        let disk1 = &fs.dev.pool().unwrap().disks();
-        assert!(wait_until(3, || !disk1.is_online(1)).await);
+        let disk1 = &fs.dev.pool().disks();
+        assert!(wait_until(3, || !disk1.is_online(PoolDiskIdx::new(1).unwrap())).await);
         write_files(&fs, "a", 2, 2).await; // overwrite some
         write_files(&fs, "b", 2, 3).await; // and add more
         fs.sync().await.unwrap();
@@ -49,7 +50,7 @@ async fn resilver_restores_redundancy_after_an_outage() {
         assert!(!fs.needs_resilver());
 
         server.restart().await;
-        assert!(wait_until(5, || disk1.is_online(1)).await);
+        assert!(wait_until(5, || disk1.is_online(PoolDiskIdx::new(1).unwrap())).await);
         assert!(fs.needs_resilver());
         let report = fs.resilver().await.unwrap();
         println!("{}", report);
@@ -93,11 +94,11 @@ async fn resilver_skips_what_did_not_change() {
     let full = fs.scrub(true).await.unwrap();
 
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks();
-    assert!(wait_until(3, || !stripe.is_online(4)).await);
+    let stripe = &fs.dev.pool().disks();
+    assert!(wait_until(3, || !stripe.is_online(PoolDiskIdx::new(4).unwrap())).await);
     write_files(&fs, "new", 1, 1).await;
     server.restart().await;
-    assert!(wait_until(5, || stripe.is_online(4)).await);
+    assert!(wait_until(5, || stripe.is_online(PoolDiskIdx::new(4).unwrap())).await);
 
     let report = fs.resilver().await.unwrap();
     assert!(report.is_clean(), "{}", report);
@@ -120,8 +121,8 @@ async fn health_monitor_resilvers_a_returning_disk() {
     let monitor = spawn_health_monitor(fs.clone(), Duration::from_millis(100), None);
 
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks();
-    assert!(wait_until(3, || !stripe.is_online(3)).await);
+    let stripe = &fs.dev.pool().disks();
+    assert!(wait_until(3, || !stripe.is_online(PoolDiskIdx::new(3).unwrap())).await);
     write_files(&fs, "m", 1, 2).await;
     assert!(fs.degraded_disks()[3].is_some());
 
@@ -148,8 +149,8 @@ async fn resilver_only_touches_the_disk_that_was_away() {
     write_files(&fs, "x", 1, 1).await;
     fs.sync().await.unwrap();
     server.stop();
-    let stripe = &fs.dev.pool().unwrap().disks();
-    assert!(wait_until(3, || !stripe.is_online(4)).await);
+    let stripe = &fs.dev.pool().disks();
+    assert!(wait_until(3, || !stripe.is_online(PoolDiskIdx::new(4).unwrap())).await);
     write_files(&fs, "y", 1, 1).await;
     fs.sync().await.unwrap();
     drop(fs);

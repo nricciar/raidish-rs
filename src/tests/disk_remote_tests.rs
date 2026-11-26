@@ -2,6 +2,7 @@
 //! disk server (`crate::test_util::TestDiskServer`): timeouts,
 //! reconnects, fencing. Local disks are tested with the storage core.
 
+use crate::coords::*;
 use crate::disk::*;
 use crate::test_util::create_test_disk_file;
 
@@ -22,13 +23,19 @@ async fn remote_read_write_roundtrip() {
     assert!(disk.is_online());
 
     let data: Vec<u8> = (0..BLOCK_SIZE * 3).map(|i| (i % 251) as u8).collect();
-    disk.write_blocks(10, crate::disk::as_blocks(&data).unwrap())
-        .await
-        .unwrap();
+    disk.write_blocks(
+        RawDiskBlock::new(10),
+        crate::disk::as_blocks(&data).unwrap(),
+    )
+    .await
+    .unwrap();
     let mut back = vec![0u8; data.len()];
-    disk.read_blocks(10, crate::disk::as_blocks_mut(&mut back).unwrap())
-        .await
-        .unwrap();
+    disk.read_blocks(
+        RawDiskBlock::new(10),
+        crate::disk::as_blocks_mut(&mut back).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(back, data);
     assert_eq!(
         disk.capacity_blocks().await.unwrap(),
@@ -53,7 +60,7 @@ async fn remote_disk_fails_fast_and_reconnects() {
     let t = Instant::now();
     assert!(
         disk.read_block(
-            0,
+            RawDiskBlock::new(0),
             <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap()
         )
         .await
@@ -70,9 +77,11 @@ async fn remote_disk_fails_fast_and_reconnects() {
         "never reconnected"
     );
     assert!(*reconnects.borrow_and_update() > gen0);
-    disk.write_block(3, &[7u8; BLOCK_SIZE]).await.unwrap();
+    disk.write_block(RawDiskBlock::new(3), &[7u8; BLOCK_SIZE])
+        .await
+        .unwrap();
     disk.read_block(
-        3,
+        RawDiskBlock::new(3),
         <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
     )
     .await
@@ -125,7 +134,7 @@ async fn remote_disk_times_out_on_a_silent_server() {
     let mut buf = vec![0u8; BLOCK_SIZE];
     let err = disk
         .read_block(
-            0,
+            RawDiskBlock::new(0),
             <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
         )
         .await
@@ -136,7 +145,7 @@ async fn remote_disk_times_out_on_a_silent_server() {
     server.set_mode(ServerMode::Normal);
     assert!(wait_until(5, || disk.is_online()).await);
     disk.read_block(
-        0,
+        RawDiskBlock::new(0),
         <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
     )
     .await
@@ -172,7 +181,7 @@ async fn remote_disk_opens_while_server_is_down() {
     assert!(wait_until(5, || disk.is_online()).await);
     let mut buf = vec![0u8; BLOCK_SIZE];
     disk.read_block(
-        0,
+        RawDiskBlock::new(0),
         <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
     )
     .await
@@ -188,7 +197,7 @@ async fn raidz_survives_a_hung_disk_within_the_timeout() {
     server.set_mode(ServerMode::Silent);
     let data: Vec<u8> = (0..BLOCK_SIZE * 30).map(|i| (i % 249) as u8).collect();
     let t = Instant::now();
-    raid.write_blocks(300, crate::disk::as_blocks(&data).unwrap())
+    raid.write_blocks(PoolLba::new(300), crate::disk::as_blocks(&data).unwrap())
         .await
         .unwrap();
     raid.flush().await.unwrap();
@@ -198,9 +207,12 @@ async fn raidz_survives_a_hung_disk_within_the_timeout() {
     );
 
     let mut back = vec![0u8; data.len()];
-    raid.read_blocks(300, crate::disk::as_blocks_mut(&mut back).unwrap())
-        .await
-        .unwrap();
+    raid.read_blocks(
+        PoolLba::new(300),
+        crate::disk::as_blocks_mut(&mut back).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(back, data);
 }
 
@@ -219,12 +231,23 @@ fn block_pointers_refuse_what_they_cant_describe() {
     use crate::blkptr::BlockPtr;
     use crate::types::Txg;
     let data = vec![1u8; BLOCK_SIZE + 1];
-    let p = BlockPtr::new(10, 2, &data, Txg::from_raw(5)).unwrap();
-    assert_eq!((p.lba, p.asize, p.lsize), (10, 2, BLOCK_SIZE as u32 + 1));
+    let p = BlockPtr::new(PoolLba::new(10), 2, &data, Txg::from_raw(5)).unwrap();
+    assert_eq!(
+        (p.lba, p.asize, p.lsize),
+        (PoolLba::new(10), 2, BLOCK_SIZE as u32 + 1)
+    );
     assert_eq!(p.checksum, *blake3::hash(&data).as_bytes());
     // More data than its blocks hold, or sizes past u32.
-    assert!(BlockPtr::new(10, 1, &data, Txg::from_raw(5)).is_err());
-    assert!(BlockPtr::new(10, u32::MAX as u64 + 1, &data, Txg::from_raw(5)).is_err());
+    assert!(BlockPtr::new(PoolLba::new(10), 1, &data, Txg::from_raw(5)).is_err());
+    assert!(
+        BlockPtr::new(
+            PoolLba::new(10),
+            u32::MAX as u64 + 1,
+            &data,
+            Txg::from_raw(5)
+        )
+        .is_err()
+    );
 }
 
 /// D6d: a missing local disk is an error, not a new empty disk.
@@ -274,10 +297,13 @@ async fn a_pool_shares_the_served_disks_opens() {
     let (_b, b) = create_test_disk_file().await;
     let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
     let served = crate::disks::DiskSet::new_with(&[a], locked()).await;
-    assert!(served.disk(0).is_local());
+    assert!(served.disk(PoolDiskIdx::new(0).unwrap()).is_local());
     let pool = crate::disks::DiskSet::new_sharing(&[a, b], locked(), &served).await;
-    assert!(pool.disk(0).is_local(), "the served disk wasn't shared");
-    assert!(pool.disk(1).is_local());
+    assert!(
+        pool.disk(PoolDiskIdx::new(0).unwrap()).is_local(),
+        "the served disk wasn't shared"
+    );
+    assert!(pool.disk(PoolDiskIdx::new(1).unwrap()).is_local());
     // The other one is locked by the pool's own open.
     assert!(Disk::open_with(b, locked()).await.is_err());
 }

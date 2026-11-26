@@ -8,7 +8,8 @@
 //! Requests that cross a boundary are split. A stripe tolerates no more
 //! failures than its weakest child.
 
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError};
+use crate::coords::VdevLba;
+use crate::disk::{BLOCK_SIZE, Block, Candidates, DiskError};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev, lcm, max_record_blocks};
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ pub struct Stripe {
 /// `offset` blocks into the request.
 struct Segment {
     child: usize,
-    local: u64,
+    local: VdevLba,
     offset: u64,
     len: u64,
 }
@@ -40,24 +41,28 @@ impl Stripe {
         }
     }
 
-    fn locate(&self, lba: BlockId) -> (usize, u64) {
-        let n = self.children.len() as u64;
+    /// The child holding the stripe's block `lba`, and its address there.
+    fn locate(&self, lba: VdevLba) -> (usize, VdevLba) {
+        let (n, lba) = (self.children.len() as u64, lba.get());
         let c = lba / self.chunk;
-        ((c % n) as usize, (c / n) * self.chunk + lba % self.chunk)
+        (
+            (c % n) as usize,
+            VdevLba::new((c / n) * self.chunk + lba % self.chunk),
+        )
     }
 
     /// Inverse of `locate`.
-    fn global(&self, child: usize, local: u64) -> u64 {
-        let n = self.children.len() as u64;
-        ((local / self.chunk) * n + child as u64) * self.chunk + local % self.chunk
+    fn global(&self, child: usize, local: VdevLba) -> VdevLba {
+        let (n, local) = (self.children.len() as u64, local.get());
+        VdevLba::new(((local / self.chunk) * n + child as u64) * self.chunk + local % self.chunk)
     }
 
-    fn segments(&self, lba: BlockId, blocks: u64) -> Vec<Segment> {
+    fn segments(&self, lba: VdevLba, blocks: u64) -> Vec<Segment> {
         let mut out = Vec::new();
         let mut offset = 0;
         while offset < blocks {
             let at = lba + offset;
-            let len = (self.chunk - at % self.chunk).min(blocks - offset);
+            let len = (self.chunk - at.get() % self.chunk).min(blocks - offset);
             let (child, local) = self.locate(at);
             out.push(Segment {
                 child,
@@ -82,18 +87,22 @@ fn first_err(results: Vec<Result<(), DiskError>>) -> Result<(), DiskError> {
 }
 
 #[async_trait]
-impl BlockDevice for Stripe {
+impl Vdev for Stripe {
+    fn width(&self) -> u64 {
+        self.width
+    }
+
     async fn flush(&self) -> Result<(), DiskError> {
         let results = futures::future::join_all(self.children.iter().map(|c| c.flush())).await;
         first_err(results)
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: VdevLba, buf: &mut Block) -> Result<(), DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].read_block(local, buf).await
     }
 
-    async fn write_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+    async fn write_block(&self, lba: VdevLba, buf: &Block) -> Result<(), DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].write_block(local, buf).await
     }
@@ -107,7 +116,7 @@ impl BlockDevice for Stripe {
         Ok(min / self.chunk * self.chunk * self.children.len() as u64)
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: VdevLba, buf: &mut [Block]) -> Result<(), DiskError> {
         let segs = self.segments(start, buf.len() as u64);
         let mut rest = buf;
         let mut reads = Vec::new();
@@ -119,7 +128,7 @@ impl BlockDevice for Stripe {
         first_err(futures::future::join_all(reads).await)
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: VdevLba, buf: &[Block]) -> Result<(), DiskError> {
         let segs = self.segments(start, buf.len() as u64);
         let writes = segs.iter().map(|s| {
             let at = s.offset as usize;
@@ -128,26 +137,19 @@ impl BlockDevice for Stripe {
         first_err(futures::future::join_all(writes).await)
     }
 
-    async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {
+    async fn reconstruct_candidates(&self, lba: VdevLba) -> Result<Candidates, DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].reconstruct_candidates(local).await
     }
 
-    async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+    async fn repair_block(&self, lba: VdevLba, buf: &Block) -> Result<(), DiskError> {
         let (child, local) = self.locate(lba);
         self.children[child].repair_block(local, buf).await
-    }
-}
-
-#[async_trait]
-impl Vdev for Stripe {
-    fn width(&self) -> u64 {
-        self.width
     }
 
     async fn verify_blocks(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         data: &[u8],
         repair: bool,
     ) -> Result<StripeCheck, RaidZError> {
@@ -166,7 +168,7 @@ impl Vdev for Stripe {
 
     async fn verify_labels(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,

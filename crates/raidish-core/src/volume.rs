@@ -8,7 +8,7 @@
 
 use crate::blkptr::BlockPtr;
 use crate::dataset::{Dataset, DatasetFormat};
-use crate::disk::{BLOCK_SIZE, BlockDevice, FileId};
+use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{Dirty, levels_for};
@@ -58,7 +58,7 @@ fn frag_of(leaves: &[(u64, BlockPtr)]) -> FragReport {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Records must be whole stripes so a record never shares a stripe:
     /// volume block sizes are multiples of this.
     pub fn volblock_align(&self) -> u32 {

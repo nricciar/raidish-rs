@@ -9,7 +9,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn file_ptrs<D: BlockDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
+async fn file_ptrs<D: PoolDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
     let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
     leaves.into_iter().map(|(_, p)| p).collect()
@@ -38,7 +38,7 @@ async fn objects_round_trip_with_aligned_records() {
         assert_eq!(object_size(&ptrs), len as u64);
         for p in &ptrs {
             assert_eq!(
-                p.lba % DATA_SHARDS as u64,
+                p.lba.get() % DATA_SHARDS as u64,
                 0,
                 "record start must be stripe aligned"
             );

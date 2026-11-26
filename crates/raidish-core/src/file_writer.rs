@@ -15,7 +15,7 @@
 //! instead of at the end; `finish` is refused if that lease was lost.
 
 use crate::blkptr::BlockPtr;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Dnode, Lookup};
 use crate::object::TreeRoot;
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 /// A file being written. Call `finish` to commit it or `abort` to give its
 /// space back; dropped without either, its records are left unreferenced
 /// until the pool is reopened (a writer's never reach the committer).
-pub struct FileWriter<'a, D: BlockDevice> {
+pub struct FileWriter<'a, D: PoolDevice> {
     fs: &'a FileSystem<D>,
     path: PathBuf,
     /// The file and its contents when opened (None: it didn't exist).
@@ -48,7 +48,7 @@ pub struct FileWriter<'a, D: BlockDevice> {
 /// (other writes on this node may take what was borrowed first).
 const ALLOC_ATTEMPTS: usize = 4;
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Start writing `path` (created on `finish` if it doesn't exist,
     /// replaced if it does), optionally under the file's `obj/<id>` lease.
     pub async fn file_writer(
@@ -162,7 +162,7 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 }
 
-impl<'a, D: BlockDevice> FileWriter<'a, D> {
+impl<'a, D: PoolDevice> FileWriter<'a, D> {
     /// Bytes written so far.
     pub fn len(&self) -> u64 {
         self.size + self.pending.len() as u64
@@ -468,7 +468,7 @@ impl<'a, D: BlockDevice> FileWriter<'a, D> {
     }
 }
 
-impl<D: BlockDevice> Drop for FileWriter<'_, D> {
+impl<D: PoolDevice> Drop for FileWriter<'_, D> {
     fn drop(&mut self) {
         self.unpin();
     }

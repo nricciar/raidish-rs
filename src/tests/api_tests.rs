@@ -1,5 +1,6 @@
 use super::*;
-use crate::disk::{BLOCK_SIZE, BlockDevice, Disk, DiskError};
+use crate::coords::*;
+use crate::disk::{BLOCK_SIZE, Disk, DiskError, RawDisk};
 use crate::test_util::{TestDiskServer, TestPool, fast_disk_options};
 use crate::types::{Epoch, ep};
 use crate::websocket::{WsOp, WsStatus, decode_response, encode_request};
@@ -110,11 +111,14 @@ async fn remote_client_sees_stale_epoch() {
     let disk = Disk::open_with(&server.url(0), fast_disk_options())
         .await
         .unwrap();
-    let err = disk.write_block(5, &[0u8; BLOCK_SIZE]).await.unwrap_err();
+    let err = disk
+        .write_block(RawDiskBlock::new(5), &[0u8; BLOCK_SIZE])
+        .await
+        .unwrap_err();
     assert!(matches!(err, DiskError::StaleEpoch), "got {}", err);
     let mut buf = vec![0u8; BLOCK_SIZE];
     disk.read_block(
-        5,
+        RawDiskBlock::new(5),
         <&mut crate::disk::Block>::try_from(&mut (buf)[..]).unwrap(),
     )
     .await
@@ -145,9 +149,14 @@ async fn a_stale_pool_epoch_stops_only_its_own_pool() {
     let old = open(1, || OLD.store(true, SeqCst)).await;
     let new = open(2, || NEW.store(true, SeqCst)).await;
     let block = [[0u8; BLOCK_SIZE]];
-    let err = old.write_shards(0, 5, &block).await.unwrap_err();
+    let err = old
+        .write_shards(PoolDiskIdx::new(0).unwrap(), DiskShard::new(5), &block)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DiskError::StaleEpoch), "got {}", err);
-    new.write_shards(0, 5, &block).await.unwrap();
+    new.write_shards(PoolDiskIdx::new(0).unwrap(), DiskShard::new(5), &block)
+        .await
+        .unwrap();
     assert!(OLD.load(SeqCst), "the refused pool's hook ran");
     assert!(!NEW.load(SeqCst), "the other pool's didn't");
 }

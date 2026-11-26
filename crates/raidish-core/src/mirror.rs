@@ -7,7 +7,8 @@
 //! knows which members need a resilver. A flush succeeds only if every
 //! write since the last one is then durable on a member that took it.
 
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, zeroed_blocks};
+use crate::coords::{PoolDiskIdx, VdevLba};
+use crate::disk::{BLOCK_SIZE, Block, Candidates, DiskError, zeroed_blocks};
 use crate::disks::{DiskSet, WriteAcks, fenced_any, ok_mask, read_or_fenced};
 use crate::raidz::RaidZError;
 use crate::vdev::{LabelScan, LabelScore, StripeCheck, Vdev};
@@ -20,12 +21,12 @@ const READ_REGION: u64 = 64;
 #[derive(Debug)]
 pub struct Mirror {
     disks: Arc<DiskSet>,
-    members: Vec<usize>,
+    members: Vec<PoolDiskIdx>,
     acks: WriteAcks,
 }
 
 impl Mirror {
-    pub fn new(disks: Arc<DiskSet>, members: Vec<usize>) -> Self {
+    pub fn new(disks: Arc<DiskSet>, members: Vec<PoolDiskIdx>) -> Self {
         assert!(!members.is_empty());
         Mirror {
             disks,
@@ -35,29 +36,29 @@ impl Mirror {
     }
 
     /// Members in the order reads of `lba` try them.
-    fn read_order(&self, lba: BlockId) -> impl Iterator<Item = usize> + '_ {
+    fn read_order(&self, lba: VdevLba) -> impl Iterator<Item = PoolDiskIdx> + '_ {
         let n = self.members.len();
-        let start = (lba / READ_REGION) as usize % n;
+        let start = (lba.get() / READ_REGION) as usize % n;
         (0..n).map(move |i| self.members[(start + i) % n])
     }
 
     /// The member normal reads of `lba` are served from.
-    fn primary(&self, lba: BlockId) -> usize {
+    fn primary(&self, lba: VdevLba) -> PoolDiskIdx {
         self.read_order(lba)
             .find(|&d| self.disks.is_readable(d))
             .unwrap_or_else(|| self.read_order(lba).next().unwrap())
     }
 
-    async fn read_run(&self, lba: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
-        let order: Vec<usize> = {
-            let mut v: Vec<usize> = self.read_order(lba).collect();
+    async fn read_run(&self, lba: VdevLba, buf: &mut [Block]) -> Result<(), DiskError> {
+        let order: Vec<PoolDiskIdx> = {
+            let mut v: Vec<PoolDiskIdx> = self.read_order(lba).collect();
             // Known-good members first; the rest only as a last resort.
             v.sort_by_key(|&d| !self.disks.is_readable(d));
             v
         };
         let mut last = DiskError::UnhealthyDisk;
         for d in order {
-            match self.disks.read_shards(d, lba, buf).await {
+            match self.disks.read_shards(d, lba.mirror_shard(), buf).await {
                 Ok(()) => return Ok(()),
                 Err(e) => last = e,
             }
@@ -70,13 +71,13 @@ impl Mirror {
     /// fails it all, see `read_or_fenced`).
     async fn read_all_raw(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         n: usize,
     ) -> Result<Vec<Option<Vec<Block>>>, DiskError> {
         let reads = self.members.iter().map(|&d| async move {
             let mut run = zeroed_blocks(n);
             self.disks
-                .read_shards_raw(d, lba, &mut run)
+                .read_shards_raw(d, lba.mirror_shard(), &mut run)
                 .await
                 .map(|_| run)
         });
@@ -85,7 +86,11 @@ impl Mirror {
 }
 
 #[async_trait]
-impl BlockDevice for Mirror {
+impl Vdev for Mirror {
+    fn width(&self) -> u64 {
+        1
+    }
+
     async fn flush(&self) -> Result<(), DiskError> {
         self.acks
             .flush(|| async {
@@ -97,18 +102,18 @@ impl BlockDevice for Mirror {
                 if results.iter().any(|r| r.is_ok()) {
                     Ok(ok_mask(&self.members, &results))
                 } else {
-                    results.into_iter().find(Result::is_err).unwrap().map(|_| 0)
+                    results
+                        .into_iter()
+                        .find(Result::is_err)
+                        .unwrap()
+                        .map(|_| Default::default())
                 }
             })
             .await
     }
 
-    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: VdevLba, buf: &mut Block) -> Result<(), DiskError> {
         self.read_run(lba, std::slice::from_mut(buf)).await
-    }
-
-    async fn write_block(&self, lba: BlockId, buf: &Block) -> Result<(), DiskError> {
-        self.write_blocks(lba, std::slice::from_ref(buf)).await
     }
 
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
@@ -117,11 +122,11 @@ impl BlockDevice for Mirror {
 
     /// Split at read-region boundaries so every block is read from the
     /// member `primary` names (the self-heal logic relies on that).
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: VdevLba, buf: &mut [Block]) -> Result<(), DiskError> {
         let mut lba = start;
         let mut rest = buf;
         while !rest.is_empty() {
-            let n = (READ_REGION - lba % READ_REGION).min(rest.len() as u64);
+            let n = (READ_REGION - lba.get() % READ_REGION).min(rest.len() as u64);
             let (run, tail) = rest.split_at_mut(n as usize);
             self.read_run(lba, run).await?;
             rest = tail;
@@ -130,11 +135,11 @@ impl BlockDevice for Mirror {
         Ok(())
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: VdevLba, buf: &[Block]) -> Result<(), DiskError> {
         let writes = self
             .members
             .iter()
-            .map(|&d| self.disks.write_shards(d, start, buf));
+            .map(|&d| self.disks.write_shards(d, start.mirror_shard(), buf));
         let results = futures::future::join_all(writes).await;
         if let Some(e) = fenced_any(&results) {
             return Err(e);
@@ -157,7 +162,7 @@ impl BlockDevice for Mirror {
 
     /// `rebuilt[d]`: a copy from a member other than the primary and `d`
     /// (`rebuilt[primary]`: any other copy).
-    async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {
+    async fn reconstruct_candidates(&self, lba: VdevLba) -> Result<Candidates, DiskError> {
         let target = self.primary(lba);
         let reads = self
             .members
@@ -166,17 +171,19 @@ impl BlockDevice for Mirror {
             .map(|&d| async move {
                 let mut b = [0u8; BLOCK_SIZE];
                 self.disks
-                    .read_shards(d, lba, std::slice::from_mut(&mut b))
+                    .read_shards(d, lba.mirror_shard(), std::slice::from_mut(&mut b))
                     .await
                     .ok()
-                    .map(|_| (d, b.to_vec()))
+                    .map(|_| (d, Box::new(b)))
             });
-        let copies: Vec<(usize, Vec<u8>)> = futures::future::join_all(reads)
+        let copies: Vec<(PoolDiskIdx, Box<Block>)> = futures::future::join_all(reads)
             .await
             .into_iter()
             .flatten()
             .collect();
-        let rebuilt = (0..self.disks.len())
+        let rebuilt = self
+            .disks
+            .indexes()
             .map(|exclude| {
                 copies
                     .iter()
@@ -190,29 +197,27 @@ impl BlockDevice for Mirror {
         })
     }
 
-    async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
+    async fn repair_block(&self, lba: VdevLba, buf: &Block) -> Result<(), DiskError> {
         self.disks
-            .repair_shards(self.primary(lba), lba, std::slice::from_ref(buf))
+            .repair_shards(
+                self.primary(lba),
+                lba.mirror_shard(),
+                std::slice::from_ref(buf),
+            )
             .await
-    }
-}
-
-#[async_trait]
-impl Vdev for Mirror {
-    fn width(&self) -> u64 {
-        1
     }
 
     async fn verify_blocks(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         data: &[u8],
         repair: bool,
     ) -> Result<StripeCheck, RaidZError> {
         let n = data.len() / BLOCK_SIZE;
         let copies = self.read_all_raw(lba, n).await?;
         let mut check = StripeCheck::new(self.disks.len(), n as u64);
-        for (i, &d) in self.members.iter().enumerate() {
+        for (i, &disk) in self.members.iter().enumerate() {
+            let d = disk.as_usize();
             let Some(run) = &copies[i] else {
                 check.unreadable[d] = true;
                 continue;
@@ -226,7 +231,11 @@ impl Vdev for Mirror {
                 if repair {
                     match self
                         .disks
-                        .repair_shards(d, lba + j as u64, std::slice::from_ref(want))
+                        .repair_shards(
+                            disk,
+                            (lba + j as u64).mirror_shard(),
+                            std::slice::from_ref(want),
+                        )
                         .await
                     {
                         Ok(()) => check.repaired[d] += 1,
@@ -246,18 +255,23 @@ impl Vdev for Mirror {
     /// (audit D3); `score` rejects labels newer than the last commit.
     async fn verify_labels(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
         stale: &[bool],
     ) -> Result<LabelScan, RaidZError> {
-        let is_stale = |i: usize| stale.get(self.members[i]).copied().unwrap_or(false);
+        let is_stale = |i: usize| {
+            stale
+                .get(self.members[i].as_usize())
+                .copied()
+                .unwrap_or(false)
+        };
         let mut scan = LabelScan {
             check: StripeCheck::new(self.disks.len(), 0),
             ..Default::default()
         };
-        for b in lba..lba + blocks {
+        for b in (0..blocks).map(|i| lba + i) {
             scan.units += 1;
             let mut copies = self.read_all_raw(b, 1).await?;
             // A stale member's copy doesn't vote while a current one is here.

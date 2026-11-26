@@ -28,7 +28,7 @@ pub mod http;
 
 use crate::btree::Txn;
 use crate::dataset::DatasetFormat;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
 use crate::types::DatasetName;
@@ -78,7 +78,7 @@ impl ServiceError for SqsError {
     }
 }
 
-impl<D: BlockDevice + 'static> Served for Queue<D> {
+impl<D: PoolDevice + 'static> Served for Queue<D> {
     fn is_stopped(&self) -> bool {
         self.tree.is_stopped()
     }
@@ -562,13 +562,13 @@ fn nonce(seq: u64) -> u64 {
 use crate::types::now_ms;
 
 /// A queue, served from this node.
-pub struct Queue<D: BlockDevice> {
+pub struct Queue<D: PoolDevice> {
     pub tree: ServiceTree<D>,
     /// Signalled when messages may have become receivable.
     arrived: tokio::sync::Notify,
 }
 
-impl<D: BlockDevice + 'static> Queue<D> {
+impl<D: PoolDevice + 'static> Queue<D> {
     /// Serve queue `name` of `fs`.
     pub async fn open(
         fs: Arc<FileSystem<D>>,
@@ -1117,7 +1117,7 @@ impl<D: BlockDevice + 'static> Queue<D> {
     }
 }
 
-async fn meta_of<D: BlockDevice>(t: &Txn<'_, D>) -> Result<Meta> {
+async fn meta_of<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
     match t.get(b"M").await? {
         Some(raw) => Ok(bincode::deserialize(&raw)?),
         None => Ok(Meta {
@@ -1127,7 +1127,7 @@ async fn meta_of<D: BlockDevice>(t: &Txn<'_, D>) -> Result<Meta> {
     }
 }
 
-async fn put_meta<D: BlockDevice>(t: &mut Txn<'_, D>, m: &Meta) -> Result<()> {
+async fn put_meta<D: PoolDevice>(t: &mut Txn<'_, D>, m: &Meta) -> Result<()> {
     t.put(b"M", &bincode::serialize(m)?).await?;
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 use crate::committer::PoolAdmin;
 use crate::config::Config;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::inode::DatasetProps;
 use crate::send::StreamReport;
@@ -377,7 +377,7 @@ fn load_config(path: &str) -> std::io::Result<Config> {
 /// reconnects immediately).
 const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
+async fn print_status<D: PoolDevice>(fs: &FileSystem<D>) {
     let degraded = fs.degraded_disks();
     if let Some(u) = fs.uberblock().await {
         println!("pool at TXG {}", u.txg);
@@ -395,9 +395,7 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
         })
         .collect();
     println!("rewind targets: {}", ring.join(", "));
-    let Some(pool) = fs.dev.pool() else {
-        return;
-    };
+    let pool = fs.dev.pool();
     let tolerance = pool.topology().fault_tolerance();
     println!(
         "layout: {} (survives any {} failed disk{})",
@@ -406,8 +404,9 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
         if tolerance == 1 { "" } else { "s" }
     );
     let mut lines = Vec::new();
-    for d in 0..pool.disks().len() {
-        let label = match fs.check_disk_label(d).await {
+    for idx in pool.disks().indexes() {
+        let d = idx.as_usize();
+        let label = match fs.check_disk_label(idx).await {
             fs::LabelState::Ok => "label ok",
             fs::LabelState::Offline => "OFFLINE",
             fs::LabelState::Foreign => "NOT A MEMBER (replaced?)",
@@ -419,7 +418,7 @@ async fn print_status<D: BlockDevice>(fs: &FileSystem<D>) {
         lines.push(format!(
             "disk {} {:<40} {:<24} {}",
             d,
-            pool.disks().disk(d).path(),
+            pool.disks().disk(idx).path(),
             label,
             state
         ));
@@ -451,7 +450,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-async fn open_fs<D: BlockDevice>(dev: D, read_only: bool, rewind: fs::Rewind) -> FileSystem<D> {
+async fn open_fs<D: PoolDevice>(dev: D, read_only: bool, rewind: fs::Rewind) -> FileSystem<D> {
     let opened = match (rewind, read_only) {
         (fs::Rewind::None, false) => FileSystem::load(dev).await,
         (fs::Rewind::None, true) => FileSystem::load_readonly(dev).await,
@@ -894,7 +893,7 @@ trait VolumeAdmin: Sync {
 }
 
 #[async_trait::async_trait]
-impl<D: BlockDevice + 'static> VolumeAdmin for FileSystem<D> {
+impl<D: PoolDevice + 'static> VolumeAdmin for FileSystem<D> {
     async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError> {
         Ok(self.list_volumes().await?)
     }

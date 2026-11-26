@@ -434,7 +434,12 @@ impl FaultDisk {
         Ok(self.file.metadata()?.len() / BLOCK_SIZE as u64)
     }
 
-    pub(super) async fn read(&self, start: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+    pub(super) async fn read(
+        &self,
+        range: crate::coords::RawBlockRange,
+        buf: &mut [u8],
+    ) -> Result<(), DiskError> {
+        let start = range.start().get();
         let n = (buf.len() / BLOCK_SIZE) as u64;
         let mut gate = self.hold_reads.subscribe();
         let holds = |r: &Option<Range<u64>>| {
@@ -451,7 +456,7 @@ impl FaultDisk {
             return Err(OFFLINE.to_error());
         }
         st.stats.reads += 1;
-        read_at_zero_fill(&self.file, buf, start * BLOCK_SIZE as u64)?;
+        read_at_zero_fill(&self.file, buf, range.byte_offset())?;
         if let Some(c) = st.cache.as_ref() {
             let n = (buf.len() / BLOCK_SIZE) as u64;
             for (b, data) in c.range(start..start + n) {
@@ -462,7 +467,12 @@ impl FaultDisk {
         Ok(())
     }
 
-    pub(super) async fn write(&self, start: u64, data: &[u8]) -> Result<(), DiskError> {
+    pub(super) async fn write(
+        &self,
+        range: crate::coords::RawBlockRange,
+        data: &[u8],
+    ) -> Result<(), DiskError> {
+        let start = range.start().get();
         let n = (data.len() / BLOCK_SIZE) as u64;
         let held = {
             let mut st = self.st();

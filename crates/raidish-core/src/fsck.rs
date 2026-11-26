@@ -19,7 +19,7 @@
 
 use crate::blkptr::BlockPtr;
 use crate::dataset::{DEFAULT_FS, DatasetFormat};
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Head, ObjType, Snap, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
@@ -275,7 +275,7 @@ pub struct LiveSet {
 
 impl Visitor for LiveSet {
     fn record(&mut self, ptr: &BlockPtr, _kind: ObjKind) {
-        let overlap = insert_range(&mut self.live, ptr.lba, ptr.asize as u64);
+        let overlap = insert_range(&mut self.live, ptr.lba.get(), ptr.asize as u64);
         self.cross_links.extend(overlap);
     }
     fn log_region(&mut self, start: u64, len: u64) {
@@ -542,7 +542,7 @@ impl Visitor for Collect {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Walk every record reachable from the object table at `table`,
     /// reporting each to `v`, then the namespace from the root directory.
     /// File and volume data records are only read when `verify_data`.
@@ -557,7 +557,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut stack: Vec<Node> = table_node(table).into_iter().collect();
         // Snapshots, clones and their volumes share subtrees: each record
         // once (a reused lba always has a newer birth).
-        let mut seen: HashSet<(u64, Txg)> = HashSet::new();
+        let mut seen: HashSet<(crate::coords::PoolLba, Txg)> = HashSet::new();
         while let Some(node) = stack.pop() {
             if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
                 continue;

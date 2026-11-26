@@ -11,8 +11,9 @@
 //! data shards for raidz, 1 for a mirror, the LCM of its children for a
 //! stripe). The pool's alignment is the root's width.
 
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Candidates, DiskError, DiskOptions};
-use crate::disks::{DiskSet, MAX_DISKS};
+use crate::coords::{DiskShard, PoolDiskIdx, PoolLba, VdevLba};
+use crate::disk::{Block, Candidates, DiskError, DiskOptions, PoolDevice};
+use crate::disks::{Caddy, DiskSet, MAX_DISKS};
 use crate::mirror::Mirror;
 use crate::raidz::{RaidZ, RaidZError};
 use crate::stripe::Stripe;
@@ -84,26 +85,45 @@ impl Topology {
     /// blocks: raidz stripe `s` holds blocks `s*data..(s+1)*data`, a
     /// mirror (or plain disk) block `s`, a stripe interleaves its
     /// children in chunks.
-    pub fn pool_range_of(&self, disk: usize, shard: u64) -> Option<std::ops::Range<u64>> {
+    /// `None` too where the range would overflow (a shard no disk has).
+    pub fn pool_range_of(
+        &self,
+        disk: PoolDiskIdx,
+        shard: DiskShard,
+    ) -> Option<std::ops::Range<PoolLba>> {
+        let range = |first: u64, len: u64| {
+            let end = first.checked_add(len)?;
+            Some(PoolLba::new(first)..PoolLba::new(end))
+        };
+        let (disk, shard) = (disk.as_usize(), shard.get());
         match self {
-            Topology::Disk(d) => (*d == disk).then_some(shard..shard + 1),
-            Topology::Mirror { disks } => disks.contains(&disk).then_some(shard..shard + 1),
+            Topology::Disk(d) => (*d == disk).then(|| range(shard, 1)).flatten(),
+            Topology::Mirror { disks } => disks.contains(&disk).then(|| range(shard, 1)).flatten(),
             Topology::RaidZ { parity, disks } => {
                 let data = (disks.len() - parity) as u64;
                 disks
                     .contains(&disk)
-                    .then_some(shard * data..(shard + 1) * data)
+                    .then(|| range(shard.checked_mul(data)?, data))
+                    .flatten()
             }
             Topology::Stripe { children } => {
                 let n = children.len() as u64;
                 let chunk = max_record_blocks(self.width());
+                let (disk, shard) = (PoolDiskIdx::new(disk)?, DiskShard::new(shard));
                 children.iter().enumerate().find_map(|(i, c)| {
                     let r = c.pool_range_of(disk, shard)?;
                     // A child's range never crosses a chunk (the chunk is
                     // a multiple of every child's width).
-                    let global =
-                        |local: u64| ((local / chunk) * n + i as u64) * chunk + local % chunk;
-                    Some(global(r.start)..global(r.end - 1) + 1)
+                    let global = |local: PoolLba| {
+                        let l = local.get();
+                        (l / chunk)
+                            .checked_mul(n)?
+                            .checked_add(i as u64)?
+                            .checked_mul(chunk)?
+                            .checked_add(l % chunk)
+                            .map(PoolLba::new)
+                    };
+                    Some(global(r.start)?..global(PoolLba::new(r.end.get() - 1))? + 1)
                 })
             }
         }
@@ -281,7 +301,7 @@ pub struct LabelScan {
     pub units: u64,
     /// First block (in the caller's address space) of every unit for which
     /// no valid contents could be found.
-    pub unrecoverable: Vec<u64>,
+    pub unrecoverable: Vec<VdevLba>,
     /// First block of every unit decided with stale members' copies voting
     /// (too few current ones were readable to decide alone) while some
     /// member's copy couldn't be read at all. That member may hold the
@@ -290,7 +310,7 @@ pub struct LabelScan {
     /// a stale member can't vouch for itself (structural triage I-19).
     /// With every copy read, the stale ones deciding is the best the pool
     /// can ever do (every member was away at some point), so it counts.
-    pub stale_votes: Vec<u64>,
+    pub stale_votes: Vec<VdevLba>,
 }
 
 impl LabelScan {
@@ -302,14 +322,41 @@ impl LabelScan {
     }
 }
 
+/// A [`LabelScan`] of the whole pool, in its addresses.
+#[derive(Debug, Default, Clone)]
+pub struct PoolLabelScan {
+    pub check: StripeCheck,
+    pub units: u64,
+    pub unrecoverable: Vec<PoolLba>,
+    pub stale_votes: Vec<PoolLba>,
+}
+
 /// Scores a label block: `Some(txg)` if it is a valid label.
 pub type LabelScore<'a> = &'a (dyn Fn(&[u8]) -> Option<u64> + Send + Sync);
 
-/// A node of the pool tree. Addresses are vdev-local.
+/// A node of the pool tree, over its members' [`RawDisk`]s (through the
+/// pool's `DiskSet`). Addresses are its own ([`VdevLba`]): the pool's for
+/// the root, the stripe's chunk of it for a stripe's child.
 #[async_trait]
-pub trait Vdev: BlockDevice + std::fmt::Debug {
+pub trait Vdev: Send + Sync + std::fmt::Debug {
     /// Alignment in blocks.
     fn width(&self) -> u64;
+
+    async fn flush(&self) -> Result<(), DiskError>;
+    /// Usable capacity in blocks.
+    async fn capacity_blocks(&self) -> Result<u64, DiskError>;
+    async fn read_blocks(&self, start: VdevLba, buf: &mut [Block]) -> Result<(), DiskError>;
+    async fn write_blocks(&self, start: VdevLba, buf: &[Block]) -> Result<(), DiskError>;
+    async fn read_block(&self, lba: VdevLba, buf: &mut Block) -> Result<(), DiskError> {
+        self.read_blocks(lba, std::slice::from_mut(buf)).await
+    }
+    async fn write_block(&self, lba: VdevLba, buf: &Block) -> Result<(), DiskError> {
+        self.write_blocks(lba, std::slice::from_ref(buf)).await
+    }
+    /// See [`PoolDevice::reconstruct_candidates`].
+    async fn reconstruct_candidates(&self, lba: VdevLba) -> Result<Candidates, DiskError>;
+    /// See [`PoolDevice::repair_block`].
+    async fn repair_block(&self, lba: VdevLba, buf: &Block) -> Result<(), DiskError>;
 
     /// Check `data` (whole multiples of `width`, known-good contents, e.g. a
     /// record that passed its checksum, starting at aligned `lba`) against
@@ -317,7 +364,7 @@ pub trait Vdev: BlockDevice + std::fmt::Debug {
     /// ones that differ.
     async fn verify_blocks(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         data: &[u8],
         repair: bool,
     ) -> Result<StripeCheck, RaidZError>;
@@ -330,7 +377,7 @@ pub trait Vdev: BlockDevice + std::fmt::Debug {
     /// copies are only repaired (audit D3).
     async fn verify_labels(
         &self,
-        lba: BlockId,
+        lba: VdevLba,
         blocks: u64,
         repair: bool,
         score: LabelScore<'_>,
@@ -338,17 +385,22 @@ pub trait Vdev: BlockDevice + std::fmt::Debug {
     ) -> Result<LabelScan, RaidZError>;
 }
 
-/// Build the vdev tree for `t` over `disks`.
+/// Build the vdev tree for `t` (validated: every leaf below `MAX_DISKS`)
+/// over `disks`.
 fn build(disks: &Arc<DiskSet>, t: &Topology) -> Box<dyn Vdev> {
+    let idx = |members: &[usize]| -> Vec<PoolDiskIdx> {
+        members
+            .iter()
+            .map(|&d| PoolDiskIdx::new(d).expect("validated topology"))
+            .collect()
+    };
     match t {
-        Topology::Disk(d) => Box::new(Mirror::new(disks.clone(), vec![*d])),
-        Topology::Mirror { disks: members } => {
-            Box::new(Mirror::new(disks.clone(), members.clone()))
-        }
+        Topology::Disk(d) => Box::new(Mirror::new(disks.clone(), idx(&[*d]))),
+        Topology::Mirror { disks: members } => Box::new(Mirror::new(disks.clone(), idx(members))),
         Topology::RaidZ {
             parity,
             disks: members,
-        } => Box::new(RaidZ::new(disks.clone(), members.clone(), *parity)),
+        } => Box::new(RaidZ::new(disks.clone(), idx(members), *parity)),
         Topology::Stripe { children } => Box::new(Stripe::new(
             children.iter().map(|c| build(disks, c)).collect(),
         )),
@@ -398,6 +450,61 @@ impl Pool {
         })
     }
 
+    /// Check the shards of `data` at `lba` (see [`Vdev::verify_blocks`]).
+    pub async fn verify_blocks(
+        &self,
+        lba: PoolLba,
+        data: &[u8],
+        repair: bool,
+    ) -> Result<StripeCheck, RaidZError> {
+        self.root.verify_blocks(lba.at_root(), data, repair).await
+    }
+
+    /// Verify `blocks` label blocks at `lba` (see [`Vdev::verify_labels`]).
+    pub async fn verify_labels(
+        &self,
+        lba: PoolLba,
+        blocks: u64,
+        repair: bool,
+        score: LabelScore<'_>,
+        stale: &[bool],
+    ) -> Result<PoolLabelScan, RaidZError> {
+        let scan = self
+            .root
+            .verify_labels(lba.at_root(), blocks, repair, score, stale)
+            .await?;
+        Ok(PoolLabelScan {
+            check: scan.check,
+            units: scan.units,
+            unrecoverable: scan
+                .unrecoverable
+                .into_iter()
+                .map(VdevLba::root_to_pool)
+                .collect(),
+            stale_votes: scan
+                .stale_votes
+                .into_iter()
+                .map(VdevLba::root_to_pool)
+                .collect(),
+        })
+    }
+
+    /// A pool of one disk: a stripe of it, no redundancy. A supported
+    /// pool, for whoever has one disk (an application with a filesystem
+    /// of its own, a single machine): checksums still catch corruption,
+    /// which then reads as an error, with no copy to repair it from. Its
+    /// label and superblock are a pool's like any other's, so it can be
+    /// opened (and checked) as one.
+    pub fn single(disk: Caddy) -> Self {
+        Self::new(
+            Arc::new(DiskSet::from_caddies(vec![disk])),
+            Topology::Stripe {
+                children: vec![Topology::Disk(0)],
+            },
+        )
+        .expect("a stripe of one disk")
+    }
+
     /// The 5-disk raidz2 every pool used to be.
     pub fn raidz(disks: Arc<DiskSet>, parity: usize) -> Self {
         let n = disks.len();
@@ -413,33 +520,33 @@ impl Pool {
 }
 
 #[async_trait]
-impl BlockDevice for Pool {
+impl PoolDevice for Pool {
     async fn flush(&self) -> Result<(), DiskError> {
         self.root.flush().await
     }
-    async fn read_block(&self, lba: BlockId, buf: &mut Block) -> Result<(), DiskError> {
-        self.root.read_block(lba, buf).await
+    async fn read_block(&self, lba: PoolLba, buf: &mut Block) -> Result<(), DiskError> {
+        self.root.read_block(lba.at_root(), buf).await
     }
-    async fn write_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        self.root.write_block(lba, buf).await
+    async fn write_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError> {
+        self.root.write_block(lba.at_root(), buf).await
     }
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         self.root.capacity_blocks().await
     }
-    async fn read_blocks(&self, lba: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
-        self.root.read_blocks(lba, buf).await
+    async fn read_blocks(&self, lba: PoolLba, buf: &mut [Block]) -> Result<(), DiskError> {
+        self.root.read_blocks(lba.at_root(), buf).await
     }
-    async fn write_blocks(&self, lba: BlockId, buf: &[Block]) -> Result<(), DiskError> {
-        self.root.write_blocks(lba, buf).await
+    async fn write_blocks(&self, lba: PoolLba, buf: &[Block]) -> Result<(), DiskError> {
+        self.root.write_blocks(lba.at_root(), buf).await
     }
-    async fn reconstruct_candidates(&self, lba: BlockId) -> Result<Candidates, DiskError> {
-        self.root.reconstruct_candidates(lba).await
+    async fn reconstruct_candidates(&self, lba: PoolLba) -> Result<Candidates, DiskError> {
+        self.root.reconstruct_candidates(lba.at_root()).await
     }
-    async fn repair_block(&self, lba: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        self.root.repair_block(lba, buf).await
+    async fn repair_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError> {
+        self.root.repair_block(lba.at_root(), buf).await
     }
-    fn pool(&self) -> Option<&Pool> {
-        Some(self)
+    fn pool(&self) -> &Pool {
+        self
     }
 }
 

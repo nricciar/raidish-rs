@@ -1,8 +1,11 @@
 //! The filesystem on every supported pool layout.
 
 use super::*;
+use crate::coords::RawDiskBlock;
+use crate::disk::BLOCK_SIZE;
 use crate::fs::FileSystem;
 use crate::test_util::TestPool;
+use crate::test_util::disk;
 use crate::test_util::ds;
 use crate::types::MetaslabIdx;
 use std::path::Path;
@@ -107,8 +110,14 @@ async fn default_pool_matches_the_old_fixed_layout() {
         crate::test_util::DEFAULT_VOLBLOCKSIZE
     );
     assert_eq!(fs.max_volblocksize(), crate::test_util::MAX_VOLBLOCKSIZE);
-    assert_eq!(fs.header.uberblock_start, crate::test_util::UBERBLOCK_START);
-    assert_eq!(fs.header.spacemap_start, crate::test_util::SPACEMAP_START);
+    assert_eq!(
+        fs.header.uberblock_start,
+        PoolLba::new(crate::test_util::UBERBLOCK_START)
+    );
+    assert_eq!(
+        fs.header.spacemap_start,
+        PoolLba::new(crate::test_util::SPACEMAP_START)
+    );
 }
 
 #[tokio::test]
@@ -306,16 +315,22 @@ async fn stripe_requests_crossing_chunks_are_split() {
     let dev = pool.dev().await;
     // Chunks are 30 blocks: 20..80 touches chunks 0, 1 and 2.
     let data = pattern(60 * BLOCK_SIZE, 7);
-    dev.write_blocks(20, crate::disk::as_blocks(&data).unwrap())
+    dev.write_blocks(PoolLba::new(20), crate::disk::as_blocks(&data).unwrap())
         .await
         .unwrap();
     dev.flush().await.unwrap();
     let mut back = vec![0u8; data.len()];
-    dev.read_blocks(20, crate::disk::as_blocks_mut(&mut back).unwrap())
+    dev.read_blocks(
+        PoolLba::new(20),
+        crate::disk::as_blocks_mut(&mut back).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(back == data);
+    let check = dev
+        .verify_blocks(PoolLba::new(20), &data, false)
         .await
         .unwrap();
-    assert!(back == data);
-    let check = dev.root.verify_blocks(20, &data, false).await.unwrap();
     assert_eq!(check.mismatched.iter().sum::<u64>(), 0);
     assert_eq!(check.stripes, 60);
     // Chunk 1 (blocks 30..60) went to the second mirror only.
@@ -335,7 +350,7 @@ async fn stripe_requests_crossing_chunks_are_split() {
 /// servers' fencing domains agree with where the vdevs put the data.
 #[tokio::test]
 async fn fence_domains_match_placement_on_every_layout() {
-    use crate::disk::BlockDevice;
+    use crate::disk::PoolDevice;
     use crate::fence::{Domain, FenceMap};
     for t in layouts() {
         let what = t.summary();
@@ -362,7 +377,10 @@ async fn fence_domains_match_placement_on_every_layout() {
                 rec as usize * BLOCK_SIZE
             };
             fs.dev
-                .write_blocks(at, crate::disk::as_blocks(&buf[..len]).unwrap())
+                .write_blocks(
+                    PoolLba::new(at),
+                    crate::disk::as_blocks(&buf[..len]).unwrap(),
+                )
                 .await
                 .unwrap();
         }
@@ -378,7 +396,7 @@ async fn fence_domains_match_placement_on_every_layout() {
                 if before[r.clone()] != after[r] {
                     changed += 1;
                     assert_eq!(
-                        map.domain_of(d, b),
+                        map.domain_of(disk(d), RawDiskBlock::new(b)),
                         Domain::Metaslab(MetaslabIdx::of_index(k)),
                         "{}: disk {} raw block {}",
                         what,
@@ -390,9 +408,14 @@ async fn fence_domains_match_placement_on_every_layout() {
         }
         assert!(changed > 0, "{}", what);
         // Labels and headers are the pool's.
-        assert_eq!(map.domain_of(0, 0), Domain::Pool, "{}", what);
         assert_eq!(
-            map.domain_of(0, crate::disks::DISK_LABEL_BLOCKS),
+            map.domain_of(disk(0), RawDiskBlock::new(0)),
+            Domain::Pool,
+            "{}",
+            what
+        );
+        assert_eq!(
+            map.domain_of(disk(0), RawDiskBlock::new(crate::disks::DISK_LABEL_BLOCKS)),
             Domain::Pool,
             "{}",
             what
@@ -406,4 +429,57 @@ fn raidz_parity_is_at_most_three() {
     assert!(raidz(3, 0..6).validate(6).is_ok());
     let e = raidz(4, 0..8).validate(8).unwrap_err();
     assert!(e.contains("at most 3"), "{}", e);
+}
+
+/// A pool of one disk is a whole filesystem: files and volumes survive a
+/// reload, scrub finds nothing, and a corrupted block reads as an error
+/// (there is no copy to rebuild it from), never as wrong data.
+#[tokio::test]
+async fn a_single_disk_pool_is_a_whole_filesystem() {
+    let t = stripe(vec![Topology::Disk(0)]);
+    assert_eq!(t.fault_tolerance(), 0);
+    let pool = TestPool::with_topology(t).await;
+    let big = pattern(700_000, 42);
+    {
+        let fs = pool.format().await;
+        write_set(&fs, "f", 1).await;
+        fs.write_file(Path::new("/big"), &big).await.unwrap();
+        let vbs = fs.default_volblocksize();
+        fs.create_block(&ds("vol"), 8 << 20, vbs).await.unwrap();
+        fs.block_write(&ds("vol"), 5000, &pattern(vbs as usize + 7, 9))
+            .await
+            .unwrap();
+        fs.sync().await.unwrap();
+    }
+
+    // Reopened the way an embedder would: `Pool::single` over one disk.
+    let path = pool.paths[0].to_str().unwrap().to_string();
+    let disk = crate::disk::Disk::open(&path).await.unwrap();
+    let fs = FileSystem::load(Pool::single(crate::disks::Caddy::Healthy(path, disk)))
+        .await
+        .unwrap();
+    check_set(&fs, "f", 1, "single").await;
+    let mut buf = vec![0u8; fs.default_volblocksize() as usize + 7];
+    fs.block_read(&ds("vol"), 5000, &mut buf).await.unwrap();
+    assert!(buf == pattern(buf.len(), 9), "volume differs");
+    let report = fs.scrub(true).await.unwrap();
+    assert!(report.is_clean(), "{}", report);
+    assert_eq!(report.mismatched(), 0, "{}", report);
+
+    // Corrupt one block of /big's data, found by its contents.
+    let first = &big[..BLOCK_SIZE];
+    let off = (0..20_000u64)
+        .map(|b| b * BLOCK_SIZE as u64)
+        .find(|&off| pool.read_raw(0, off) == first)
+        .expect("/big's first block on disk");
+    pool.corrupt(0, off);
+
+    assert!(
+        fs.read_file(Path::new("/big")).await.is_err(),
+        "a corrupted block with no copy must not read"
+    );
+    check_set(&fs, "f", 1, "single, after /big was corrupted").await;
+    let report = fs.scrub(true).await.unwrap();
+    assert!(!report.is_clean(), "{}", report);
+    assert_eq!(report.repaired(), 0, "{}", report);
 }

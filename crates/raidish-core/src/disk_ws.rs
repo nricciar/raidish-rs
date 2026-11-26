@@ -215,7 +215,7 @@ impl WsConn {
         &self,
         op: WsOp,
         disk_id: u16,
-        fence: Option<&(usize, Arc<crate::fence::ClientFence>)>,
+        fence: Option<&(crate::coords::PoolDiskIdx, Arc<crate::fence::ClientFence>)>,
         block: u64,
         count: u32,
         data: Option<&[u8]>,
@@ -225,7 +225,11 @@ impl WsConn {
             (WsOp::Flush | WsOp::Info, Some((_, f))) => {
                 vec![(block, count, Stamp::Pool(f.pool_epoch()))]
             }
-            (_, Some((i, f))) => f.stamps(Some(*i), block, count),
+            (_, Some((i, f))) => f
+                .stamps(Some(*i), crate::coords::RawDiskBlock::new(block), count)
+                .into_iter()
+                .map(|(b, n, s)| (b.get(), n, s))
+                .collect(),
         };
         if let [(block, count, stamp)] = runs[..] {
             return self
@@ -251,7 +255,7 @@ impl WsConn {
         &self,
         op: WsOp,
         disk_id: u16,
-        fence: Option<&(usize, Arc<crate::fence::ClientFence>)>,
+        fence: Option<&(crate::coords::PoolDiskIdx, Arc<crate::fence::ClientFence>)>,
         block: u64,
         count: u32,
         stamp: Stamp,
@@ -325,7 +329,7 @@ pub struct RemoteDisk {
     url: String,
     disk_id: u16,
     /// This disk's index in its pool and that pool client's fence.
-    fence: std::sync::OnceLock<(usize, Arc<crate::fence::ClientFence>)>,
+    fence: std::sync::OnceLock<(crate::coords::PoolDiskIdx, Arc<crate::fence::ClientFence>)>,
     opts: DiskOptions,
     conn: std::sync::RwLock<Option<Arc<WsConn>>>,
     reconnecting: AtomicBool,
@@ -454,7 +458,11 @@ impl RemoteDisk {
         self.current().is_some()
     }
 
-    pub(super) fn set_fence(&self, index: usize, fence: Arc<crate::fence::ClientFence>) {
+    pub(super) fn set_fence(
+        &self,
+        index: crate::coords::PoolDiskIdx,
+        fence: Arc<crate::fence::ClientFence>,
+    ) {
         let _ = self.fence.set((index, fence));
     }
 

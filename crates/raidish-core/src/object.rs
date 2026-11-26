@@ -26,7 +26,7 @@
 
 use crate::blkptr::BlockPtr;
 use crate::disk::BLOCK_SIZE;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::types::Txg;
@@ -84,17 +84,17 @@ pub(crate) struct Unsettled<'a> {
 impl<'a> Unsettled<'a> {
     /// Guard what's pushed to `ptrs` from now on (not what's already in
     /// it): `build_tree`'s allocations.
-    pub(crate) fn added<D: BlockDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    pub(crate) fn added<D: PoolDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
         Self::from(fs, ptrs.len(), ptrs)
     }
 
     /// Guard everything in `ptrs`, as it is when dropped: a list the
     /// caller works through, popping each one it's done with.
-    pub(crate) fn all<D: BlockDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    pub(crate) fn all<D: PoolDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
         Self::from(fs, 0, ptrs)
     }
 
-    fn from<D: BlockDevice>(fs: &FileSystem<D>, from: usize, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    fn from<D: PoolDevice>(fs: &FileSystem<D>, from: usize, ptrs: &'a mut Vec<BlockPtr>) -> Self {
         Unsettled {
             from,
             ptrs,
@@ -294,17 +294,17 @@ impl DirtyState {
 /// so entries never go stale. Evicts oldest-inserted first, bounded by bytes.
 #[derive(Default)]
 struct RecordCache {
-    map: HashMap<(u64, Txg), Arc<Vec<u8>>>,
-    order: std::collections::VecDeque<(u64, Txg)>,
+    map: HashMap<(crate::coords::PoolLba, Txg), Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(crate::coords::PoolLba, Txg)>,
     bytes: usize,
 }
 
 impl RecordCache {
-    fn get(&self, key: (u64, Txg)) -> Option<Arc<Vec<u8>>> {
+    fn get(&self, key: (crate::coords::PoolLba, Txg)) -> Option<Arc<Vec<u8>>> {
         self.map.get(&key).cloned()
     }
 
-    fn insert(&mut self, key: (u64, Txg), data: Arc<Vec<u8>>) {
+    fn insert(&mut self, key: (crate::coords::PoolLba, Txg), data: Arc<Vec<u8>>) {
         if self.map.contains_key(&key) {
             return;
         }
@@ -371,7 +371,7 @@ pub struct ObjTree {
     pub dirty: Mutex<DirtyState>,
     /// Indirect blocks keyed by (lba, birth_txg): immutable once written, and
     /// a reused lba always has a newer birth TXG.
-    cache: Mutex<HashMap<(u64, Txg), Arc<Indirect>>>,
+    cache: Mutex<HashMap<(crate::coords::PoolLba, Txg), Arc<Indirect>>>,
     records: Mutex<RecordCache>,
 }
 
@@ -568,7 +568,7 @@ impl ObjTree {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     pub(crate) async fn load_indirect(
         &self,
         obj: &ObjTree,
@@ -971,12 +971,12 @@ impl<D: BlockDevice> FileSystem<D> {
             _ => self.tree_lookup(obj, old_root, 0, first - 1).await?,
         };
         Ok(match (before, prev_end) {
-            (Some(p), _) => Some(p.lba + p.asize as u64),
+            (Some(p), _) => Some(p.lba.get() + p.asize as u64),
             (None, Some((_, end))) => Some(end),
             (None, None) => self
                 .tree_lookup(obj, old_root, 0, first)
                 .await?
-                .map(|p| p.lba),
+                .map(|p| p.lba.get()),
         })
     }
 
@@ -1170,7 +1170,8 @@ impl<D: BlockDevice> FileSystem<D> {
                         records,
                     }) => Box::pin(async move {
                         let datas: Vec<&[u8]> = records.iter().map(|(_, b)| *b).collect();
-                        let r = self.write_records_at(start, record_blocks, &datas).await;
+                        let at = crate::coords::PoolLba::new(start);
+                        let r = self.write_records_at(at, record_blocks, &datas).await;
                         let written =
                             r.map(|ptrs| records.iter().map(|(i, _)| *i).zip(ptrs).collect());
                         (Some((start, len)), written)

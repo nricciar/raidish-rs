@@ -1,11 +1,18 @@
 //! Shared helpers for filesystem tests.
 
+use crate::coords::PoolLba;
+use crate::disk::{Block, Candidates, DiskError, PoolDevice};
 use crate::disks::DiskSet;
 use crate::fs::FileSystem;
 use crate::vdev::{Pool, Topology};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
+
+/// Pool disk `i` (tests name disks by number).
+pub fn disk(i: usize) -> crate::coords::PoolDiskIdx {
+    crate::coords::PoolDiskIdx::new(i).expect("a pool disk index")
+}
 
 pub const DISK_BYTES: u64 = 100 * 1024 * 1024;
 /// Format size for the default pool (raidz2 over 5 disks).
@@ -81,7 +88,6 @@ impl TestPool {
     }
 
     pub async fn format_blocks(&self, dev: &Pool) -> u64 {
-        use crate::disk::BlockDevice;
         TOTAL_BLOCKS.min(dev.capacity_blocks().await.unwrap())
     }
 
@@ -91,7 +97,8 @@ impl TestPool {
 
     /// Disk index and byte offset holding data block `lba` (data shard),
     /// for the default raidz2 pool.
-    pub fn locate(lba: u64) -> (usize, u64) {
+    pub fn locate(lba: PoolLba) -> (usize, u64) {
+        let lba = lba.get();
         let stripe = lba / DATA_SHARDS as u64;
         let disk = (lba % DATA_SHARDS as u64) as usize;
         (
@@ -101,8 +108,8 @@ impl TestPool {
     }
 
     /// Byte offset of a stripe's shard on any disk (default raidz2 pool).
-    pub fn stripe_offset(lba: u64) -> u64 {
-        (lba / DATA_SHARDS as u64 + crate::disks::DISK_LABEL_BLOCKS)
+    pub fn stripe_offset(lba: PoolLba) -> u64 {
+        (lba.get() / DATA_SHARDS as u64 + crate::disks::DISK_LABEL_BLOCKS)
             * crate::disk::BLOCK_SIZE as u64
     }
 
@@ -175,8 +182,10 @@ impl FaultSwitch {
     }
     /// Writes touching `range` (pool LBAs) wait until it's cleared
     /// (`None` lets every waiting one through).
-    pub fn stall_writes(&self, range: Option<std::ops::Range<u64>>) {
-        self.2.0.send_replace(range);
+    pub fn stall_writes(&self, range: Option<std::ops::Range<PoolLba>>) {
+        self.2
+            .0
+            .send_replace(range.map(|r| r.start.get()..r.end.get()));
     }
     /// Wait until `n` writes in all have stalled.
     pub async fn wait_stalled(&self, n: usize) {
@@ -205,7 +214,8 @@ impl<D> FaultyDev<D> {
         )
     }
 
-    async fn stalled(&self, b: u64, n: u64) {
+    async fn stalled(&self, b: PoolLba, n: u64) {
+        let b = b.get();
         let hit = |r: &Option<std::ops::Range<u64>>| {
             r.as_ref().is_some_and(|r| b < r.end && b + n > r.start)
         };
@@ -235,61 +245,41 @@ impl<D> FaultyDev<D> {
 }
 
 #[async_trait::async_trait]
-impl<D: crate::disk::BlockDevice> crate::disk::BlockDevice for FaultyDev<D> {
-    async fn flush(&self) -> Result<(), crate::disk::DiskError> {
+impl<D: PoolDevice> PoolDevice for FaultyDev<D> {
+    async fn flush(&self) -> Result<(), DiskError> {
         if self.flush_fails.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(crate::disk::DiskError::IoError(std::io::Error::other(
+            return Err(DiskError::IoError(std::io::Error::other(
                 "injected flush failure",
             )));
         }
         self.inner.flush().await
     }
-    async fn read_block(
-        &self,
-        b: u64,
-        buf: &mut crate::disk::Block,
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        self.inner.capacity_blocks().await
+    }
+    async fn read_block(&self, b: PoolLba, buf: &mut Block) -> Result<(), DiskError> {
         self.inner.read_block(b, buf).await
     }
-    async fn read_blocks(
-        &self,
-        b: u64,
-        buf: &mut [crate::disk::Block],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn read_blocks(&self, b: PoolLba, buf: &mut [Block]) -> Result<(), DiskError> {
         self.inner.read_blocks(b, buf).await
     }
-    async fn write_block(
-        &self,
-        b: u64,
-        buf: &[u8; crate::disk::BLOCK_SIZE],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn write_block(&self, b: PoolLba, buf: &Block) -> Result<(), DiskError> {
         self.stalled(b, 1).await;
         self.check()?;
         self.inner.write_block(b, buf).await
     }
-    async fn write_blocks(
-        &self,
-        b: u64,
-        buf: &[crate::disk::Block],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn write_blocks(&self, b: PoolLba, buf: &[Block]) -> Result<(), DiskError> {
         self.stalled(b, buf.len() as u64).await;
         self.check()?;
         self.inner.write_blocks(b, buf).await
     }
-    async fn reconstruct_candidates(
-        &self,
-        b: u64,
-    ) -> Result<crate::disk::Candidates, crate::disk::DiskError> {
+    async fn reconstruct_candidates(&self, b: PoolLba) -> Result<Candidates, DiskError> {
         self.inner.reconstruct_candidates(b).await
     }
-    async fn repair_block(
-        &self,
-        b: u64,
-        buf: &[u8; crate::disk::BLOCK_SIZE],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn repair_block(&self, b: PoolLba, buf: &Block) -> Result<(), DiskError> {
         self.inner.repair_block(b, buf).await
     }
-    fn pool(&self) -> Option<&Pool> {
+    fn pool(&self) -> &Pool {
         self.inner.pool()
     }
 }

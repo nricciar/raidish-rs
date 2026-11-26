@@ -18,7 +18,7 @@
 //!   lease let go, so another node can take over.
 
 use crate::committer::object_resource;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Dnode, ObjType, SetAttrs};
 use crate::object::{ObjTree, Sizing};
@@ -234,7 +234,7 @@ struct Held {
 /// Where the pool is (on a `listen` node: its writer, once it has one).
 pub type FsSource<D> = Arc<dyn Fn() -> Option<Arc<FileSystem<D>>> + Send + Sync>;
 
-pub struct Backend<D: BlockDevice> {
+pub struct Backend<D: PoolDevice> {
     source: FsSource<D>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: String,
@@ -252,7 +252,7 @@ pub struct Backend<D: BlockDevice> {
     peers: Option<Arc<dyn Peers>>,
 }
 
-impl<D: BlockDevice + 'static> Backend<D> {
+impl<D: PoolDevice + 'static> Backend<D> {
     /// `leases`: where per-file write leases come from (None: a pool only
     /// this process writes).
     pub fn new(source: FsSource<D>, leases: Option<Arc<dyn ObjectLeases>>, node: String) -> Self {

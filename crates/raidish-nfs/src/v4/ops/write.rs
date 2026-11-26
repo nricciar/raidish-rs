@@ -2,7 +2,7 @@
 
 use super::super::*;
 
-impl<D: BlockDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static> Server<D> {
     pub(in crate::v4) async fn write(
         &self,
         ctx: &mut Ctx,
