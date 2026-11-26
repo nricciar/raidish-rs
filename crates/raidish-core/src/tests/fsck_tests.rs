@@ -1,5 +1,7 @@
 use super::*;
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::coords::PoolLba;
+use crate::disk::PoolDevice;
+use crate::disk::{Block, Candidates, DiskError};
 use crate::fs::{LoadOptions, Rewind};
 use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
@@ -21,7 +23,7 @@ fn content(name: &str, generation: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn file_blocks<D: BlockDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
+async fn file_blocks<D: PoolDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
     let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
     leaves.into_iter().map(|(_, p)| p).collect()
@@ -29,14 +31,14 @@ async fn file_blocks<D: BlockDevice>(fs: &FileSystem<D>, path: &str) -> Vec<Bloc
 
 /// Make the stripe holding `lba` unrecoverable: three of the five raidz2
 /// shards corrupted.
-fn destroy_stripe(pool: &TestPool, lba: u64) {
+fn destroy_stripe(pool: &TestPool, lba: PoolLba) {
     for d in 0..3 {
         pool.corrupt(d, TestPool::stripe_offset(lba));
     }
 }
 
 /// Commit until every deferred free is released.
-async fn settle<D: BlockDevice>(fs: &FileSystem<D>) {
+async fn settle<D: PoolDevice>(fs: &FileSystem<D>) {
     for _ in 0..=TXG_DEFER_SIZE {
         fs.commit_txg().await.unwrap();
     }
@@ -126,7 +128,7 @@ async fn referenced_free_blocks_are_reallocated() {
 
     // Damage the space map: claim the file's second record is free.
     let victim = file_blocks(&fs, "/a").await[1].clone();
-    fs.unallocate(victim.lba, victim.asize as u64).await;
+    fs.unallocate(victim.lba.get(), victim.asize as u64).await;
     fs.commit_txg().await.unwrap();
 
     let report = fs.fsck(false).await.unwrap();
@@ -311,13 +313,13 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     drop(fs);
     let fs = pool.load().await;
     for p in &a_blocks {
-        let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
+        let ms = fs.layout.metaslab_for_block(p.lba.get()).unwrap();
         assert!(
             !fs.metaslabs[ms.index()]
                 .read()
                 .await
                 .released_map()
-                .contains_key(&p.lba),
+                .contains_key(&p.lba.get()),
             "/d/a's blocks were freed"
         );
     }
@@ -347,13 +349,13 @@ async fn damaged_directory_hides_no_space() {
     assert!(report.leaks.is_empty() && report.referenced_free.is_empty());
     assert!(!report.errors.is_empty(), "the directory is reported");
     for p in &a_blocks {
-        let ms = fs.layout.metaslab_for_block(p.lba).unwrap();
+        let ms = fs.layout.metaslab_for_block(p.lba.get()).unwrap();
         assert!(
             !fs.metaslabs[ms.index()]
                 .read()
                 .await
                 .released_map()
-                .contains_key(&p.lba),
+                .contains_key(&p.lba.get()),
             "/d/a's blocks were freed"
         );
     }
@@ -441,54 +443,34 @@ struct CountingDev<D> {
 }
 
 #[async_trait::async_trait]
-impl<D: BlockDevice> BlockDevice for CountingDev<D> {
-    async fn flush(&self) -> Result<(), crate::disk::DiskError> {
+impl<D: PoolDevice> PoolDevice for CountingDev<D> {
+    async fn flush(&self) -> Result<(), DiskError> {
         self.inner.flush().await
     }
-    async fn read_block(
-        &self,
-        b: u64,
-        buf: &mut crate::disk::Block,
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
+        self.inner.capacity_blocks().await
+    }
+    async fn read_block(&self, b: PoolLba, buf: &mut Block) -> Result<(), DiskError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_block(b, buf).await
     }
-    async fn read_blocks(
-        &self,
-        b: u64,
-        buf: &mut [crate::disk::Block],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn read_blocks(&self, b: PoolLba, buf: &mut [Block]) -> Result<(), DiskError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_blocks(b, buf).await
     }
-    async fn write_block(
-        &self,
-        b: u64,
-        buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn write_block(&self, b: PoolLba, buf: &Block) -> Result<(), DiskError> {
         self.inner.write_block(b, buf).await
     }
-    async fn write_blocks(
-        &self,
-        b: u64,
-        buf: &[crate::disk::Block],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn write_blocks(&self, b: PoolLba, buf: &[Block]) -> Result<(), DiskError> {
         self.inner.write_blocks(b, buf).await
     }
-    async fn reconstruct_candidates(
-        &self,
-        b: u64,
-    ) -> Result<crate::disk::Candidates, crate::disk::DiskError> {
+    async fn reconstruct_candidates(&self, b: PoolLba) -> Result<Candidates, DiskError> {
         self.inner.reconstruct_candidates(b).await
     }
-    async fn repair_block(
-        &self,
-        b: u64,
-        buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), crate::disk::DiskError> {
+    async fn repair_block(&self, b: PoolLba, buf: &Block) -> Result<(), DiskError> {
         self.inner.repair_block(b, buf).await
     }
-    fn pool(&self) -> Option<&Pool> {
+    fn pool(&self) -> &Pool {
         self.inner.pool()
     }
 }

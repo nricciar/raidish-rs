@@ -17,7 +17,7 @@
 //! controller advertises a volatile write cache), and FLUSH commits a TXG.
 //! Set `RAIDISH_NVME_TRACE=1` to log every command.
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::export::{
     BlockExporter, ExportLife, ExportSession, ExportTable, Exported, export_closed,
 };
@@ -310,7 +310,7 @@ struct QueueInfo {
     ctrl: Arc<Controller>,
 }
 
-struct Target<D: BlockDevice> {
+struct Target<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     /// By subsystem NQN.
     exports: ExportTable<Export>,
@@ -318,7 +318,7 @@ struct Target<D: BlockDevice> {
     next_cntlid: AtomicU16,
 }
 
-struct Conn<D: BlockDevice> {
+struct Conn<D: PoolDevice> {
     target: Arc<Target<D>>,
     writer: AsyncMutex<OwnedWriteHalf>,
     queue: Mutex<Option<QueueInfo>>,
@@ -333,7 +333,7 @@ struct Conn<D: BlockDevice> {
 }
 
 /// An NVMe/TCP target exporting any number of volumes of one file system.
-pub struct NvmeTcpServer<D: BlockDevice> {
+pub struct NvmeTcpServer<D: PoolDevice> {
     target: Arc<Target<D>>,
     bind: String,
     port: u16,
@@ -346,7 +346,7 @@ pub const NVME_PORT: u16 = 4420;
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
+impl<D: PoolDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
         fs: Arc<FileSystem<D>>,
@@ -405,7 +405,7 @@ impl<D: BlockDevice + Send + Sync + 'static> NvmeTcpServer<D> {
 }
 
 #[async_trait::async_trait]
-impl<D: BlockDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
+impl<D: PoolDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
     /// Exported as subsystem `subsystem_nqn(volume)`.
     async fn add_export(
         &self,
@@ -480,7 +480,7 @@ struct PendingWrite {
     received: usize,
 }
 
-async fn handle_connection<D: BlockDevice + Send + Sync + 'static>(
+async fn handle_connection<D: PoolDevice + Send + Sync + 'static>(
     target: Arc<Target<D>>,
     stream: TcpStream,
     peer: String,
@@ -563,7 +563,7 @@ fn command_bytes(sqe: &Sqe, data: &[u8]) -> usize {
     }
 }
 
-async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
+async fn connection_loop<D: PoolDevice + Send + Sync + 'static>(
     conn: &Arc<Conn<D>>,
     rd: &mut OwnedReadHalf,
 ) -> std::io::Result<()> {
@@ -725,7 +725,7 @@ async fn connection_loop<D: BlockDevice + Send + Sync + 'static>(
 
 /// Send R2Ts for the writes in `wait`, oldest first, while their data fits
 /// in `R2T_BUDGET` (one always may, when none is outstanding).
-async fn send_r2ts<D: BlockDevice>(
+async fn send_r2ts<D: PoolDevice>(
     conn: &Conn<D>,
     wait: &mut std::collections::VecDeque<Sqe>,
     pending: &mut HashMap<u16, PendingWrite>,
@@ -752,7 +752,7 @@ async fn send_r2ts<D: BlockDevice>(
     Ok(())
 }
 
-async fn send_r2t<D: BlockDevice>(
+async fn send_r2t<D: PoolDevice>(
     conn: &Conn<D>,
     cid: u16,
     ttag: u16,
@@ -771,7 +771,7 @@ async fn send_r2t<D: BlockDevice>(
 }
 
 /// Write any C2H data followed by the response capsule, in one piece.
-async fn send_completion<D: BlockDevice>(
+async fn send_completion<D: PoolDevice>(
     conn: &Conn<D>,
     cid: u16,
     c: Completion,
@@ -818,7 +818,7 @@ async fn send_completion<D: BlockDevice>(
     conn.writer.lock().await.write_all(&out).await
 }
 
-async fn execute<D: BlockDevice + Send + Sync + 'static>(
+async fn execute<D: PoolDevice + Send + Sync + 'static>(
     conn: &Conn<D>,
     sqe: Sqe,
     data: Vec<u8>,
@@ -883,7 +883,7 @@ fn shutdown_requested(sqe: &Sqe) -> bool {
         && (le32(&sqe.0, 48) >> 14) & 0x3 != 0
 }
 
-fn fabrics<D: BlockDevice>(
+fn fabrics<D: PoolDevice>(
     conn: &Conn<D>,
     queue: &Option<QueueInfo>,
     sqe: &Sqe,
@@ -1030,7 +1030,7 @@ fn fabrics<D: BlockDevice>(
     })
 }
 
-fn admin<D: BlockDevice>(
+fn admin<D: PoolDevice>(
     _conn: &Conn<D>,
     q: &QueueInfo,
     sqe: &Sqe,

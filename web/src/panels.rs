@@ -159,10 +159,7 @@ pub struct TopologyProps {
 #[function_component]
 pub fn TopologyPanel(p: &TopologyProps) -> Html {
     let r = &p.snap.report;
-    let body = match &r.topology {
-        Some(t) => vdev(t, p, true),
-        None => html! { <p class="muted">{ "A single device (no pool layout)." }</p> },
-    };
+    let body = vdev(&r.topology, p, true);
     html! {
         <section class="card">
             <h2>{ "Topology" }</h2>

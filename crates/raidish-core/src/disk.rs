@@ -1,3 +1,4 @@
+use crate::coords::{PoolDiskIdx, PoolLba, RawBlockRange, RawDiskBlock};
 use crate::websocket::{WS_MAX_BLOCKS, WsOp, WsStatus};
 use async_trait::async_trait;
 use futures::future::try_join_all;
@@ -10,18 +11,17 @@ use tokio::sync::watch;
 use url::ParseError;
 
 pub const BLOCK_SIZE: usize = 4096;
-pub type BlockId = u64;
 
-/// The byte offset of block `start`, if `blocks` blocks from it end at a
-/// byte offset a file can address (`i64`). `None` for a range whose bytes
-/// would wrap: `start * BLOCK_SIZE` must never be computed unchecked, since
-/// a wrapped offset lands on some other block (structural triage I-9).
-pub fn byte_offset(start: BlockId, blocks: u64) -> Option<u64> {
-    let end = start.checked_add(blocks)?.checked_mul(BLOCK_SIZE as u64)?;
-    (end <= i64::MAX as u64).then(|| start * BLOCK_SIZE as u64)
+/// The range of `blocks` raw blocks from `start`, refused if its bytes
+/// can't be addressed (see [`RawDiskBlock::range`]).
+pub fn raw_range(start: RawDiskBlock, blocks: usize) -> Result<RawBlockRange, DiskError> {
+    u32::try_from(blocks)
+        .ok()
+        .and_then(|n| start.range(n))
+        .ok_or_else(bad_offset)
 }
 
-fn bad_offset() -> DiskError {
+pub(crate) fn bad_offset() -> DiskError {
     DiskError::IoError(std::io::ErrorKind::InvalidInput.into())
 }
 pub use crate::types::FileId;
@@ -149,97 +149,104 @@ pub fn as_blocks_mut(bytes: &mut [u8]) -> Result<&mut [Block], DiskError> {
     }
 }
 
+/// One disk, by raw block (label area included): a pool's member, and
+/// what a disk server serves. Implemented by [`Disk`] and
+/// [`crate::disks::Caddy`]; vdevs build a pool out of them, and a
+/// filesystem never sits on one directly (see [`PoolDevice`]).
 #[async_trait]
-pub trait BlockDevice: Send + Sync {
+pub trait RawDisk: Send + Sync {
     async fn flush(&self) -> Result<(), DiskError>;
-    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError>;
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError>;
-
-    /// Usable capacity in blocks.
-    async fn capacity_blocks(&self) -> Result<u64, DiskError> {
-        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
-    }
-
+    /// Its size in blocks.
+    async fn capacity_blocks(&self) -> Result<u64, DiskError>;
     /// Read `buf.len()` consecutive blocks starting at `start`.
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
-        for (i, b) in buf.iter_mut().enumerate() {
-            self.read_block(start + i as u64, b).await?;
-        }
-        Ok(())
-    }
-
+    async fn read_blocks(&self, start: RawDiskBlock, buf: &mut [Block]) -> Result<(), DiskError>;
     /// Write `buf.len()` consecutive blocks starting at `start`.
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
-        for (i, b) in buf.iter().enumerate() {
-            self.write_block(start + i as u64, b).await?;
-        }
-        Ok(())
+    async fn write_blocks(&self, start: RawDiskBlock, buf: &[Block]) -> Result<(), DiskError>;
+
+    async fn read_block(&self, block: RawDiskBlock, buf: &mut Block) -> Result<(), DiskError> {
+        self.read_blocks(block, std::slice::from_mut(buf)).await
+    }
+    async fn write_block(&self, block: RawDiskBlock, buf: &Block) -> Result<(), DiskError> {
+        self.write_blocks(block, std::slice::from_ref(buf)).await
+    }
+}
+
+/// The device a `FileSystem` sits on: a pool's address space, by
+/// [`PoolLba`]. Implemented by [`crate::vdev::Pool`], and by what wraps
+/// one (an `Arc`, a test's fault injector), which forward [`Self::pool`].
+/// A single disk is a pool too ([`crate::vdev::Pool::single`]): there is
+/// no filesystem on a bare [`RawDisk`].
+#[async_trait]
+pub trait PoolDevice: Send + Sync {
+    async fn flush(&self) -> Result<(), DiskError>;
+    /// Usable capacity in blocks.
+    async fn capacity_blocks(&self) -> Result<u64, DiskError>;
+    /// Read `buf.len()` consecutive blocks starting at `start`.
+    async fn read_blocks(&self, start: PoolLba, buf: &mut [Block]) -> Result<(), DiskError>;
+    /// Write `buf.len()` consecutive blocks starting at `start`.
+    async fn write_blocks(&self, start: PoolLba, buf: &[Block]) -> Result<(), DiskError>;
+
+    async fn read_block(&self, lba: PoolLba, buf: &mut Block) -> Result<(), DiskError> {
+        self.read_blocks(lba, std::slice::from_mut(buf)).await
+    }
+    async fn write_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError> {
+        self.write_blocks(lba, std::slice::from_ref(buf)).await
     }
 
     /// Alternative rebuilds of a block, for a caller with an end-to-end
     /// checksum that has to work out which disks are wrong (e.g. a disk that
     /// came back stale after an outage, plus a corrupt one).
-    async fn reconstruct_candidates(&self, _block: BlockId) -> Result<Candidates, DiskError> {
-        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
-    }
-
-    /// The RAID array underneath, for pool-level health operations (labels,
-    /// missed-write tracking, scrub). Wrappers forward it.
-    fn pool(&self) -> Option<&crate::vdev::Pool> {
-        None
-    }
+    async fn reconstruct_candidates(&self, lba: PoolLba) -> Result<Candidates, DiskError>;
 
     /// Overwrite the primary copy of a block with known-good data.
-    async fn repair_block(
-        &self,
-        _block: BlockId,
-        _buf: &[u8; BLOCK_SIZE],
-    ) -> Result<(), DiskError> {
-        Err(DiskError::IoError(std::io::ErrorKind::Unsupported.into()))
-    }
+    async fn repair_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError>;
+
+    /// The pool underneath, for pool-level health operations (labels,
+    /// missed-write tracking, scrub).
+    fn pool(&self) -> &crate::vdev::Pool;
 }
 
 /// A shared device (e.g. a pool both a disk server's fencing and its
 /// read-only file endpoint look at).
 #[async_trait]
-impl<T: BlockDevice + ?Sized> BlockDevice for std::sync::Arc<T> {
+impl<T: PoolDevice + ?Sized> PoolDevice for std::sync::Arc<T> {
     async fn flush(&self) -> Result<(), DiskError> {
         (**self).flush().await
-    }
-    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
-        (**self).read_block(block, buf).await
-    }
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        (**self).write_block(block, buf).await
     }
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         (**self).capacity_blocks().await
     }
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+    async fn read_block(&self, lba: PoolLba, buf: &mut Block) -> Result<(), DiskError> {
+        (**self).read_block(lba, buf).await
+    }
+    async fn write_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError> {
+        (**self).write_block(lba, buf).await
+    }
+    async fn read_blocks(&self, start: PoolLba, buf: &mut [Block]) -> Result<(), DiskError> {
         (**self).read_blocks(start, buf).await
     }
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: PoolLba, buf: &[Block]) -> Result<(), DiskError> {
         (**self).write_blocks(start, buf).await
     }
-    async fn reconstruct_candidates(&self, block: BlockId) -> Result<Candidates, DiskError> {
-        (**self).reconstruct_candidates(block).await
+    async fn reconstruct_candidates(&self, lba: PoolLba) -> Result<Candidates, DiskError> {
+        (**self).reconstruct_candidates(lba).await
     }
-    async fn repair_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        (**self).repair_block(block, buf).await
+    async fn repair_block(&self, lba: PoolLba, buf: &Block) -> Result<(), DiskError> {
+        (**self).repair_block(lba, buf).await
     }
-    fn pool(&self) -> Option<&crate::vdev::Pool> {
+    fn pool(&self) -> &crate::vdev::Pool {
         (**self).pool()
     }
 }
 
-/// Rebuilds of one block. `rebuilt[d]` is the block reconstructed without
-/// its own disk (`disk`) and without disk `d`; None if not possible.
-/// `rebuilt[disk]` is a rebuild without just its own disk (with single
-/// parity or a 2-way mirror, the only kind there is).
-#[derive(Debug, Clone, Default)]
+/// Rebuilds of one block. `rebuilt[d]` (by pool disk) is the block
+/// reconstructed without its own disk (`disk`) and without disk `d`; None
+/// if not possible. `rebuilt[disk]` is a rebuild without just its own disk
+/// (with single parity or a 2-way mirror, the only kind there is).
+#[derive(Debug, Clone)]
 pub struct Candidates {
-    pub disk: usize,
-    pub rebuilt: Vec<Option<Vec<u8>>>,
+    pub disk: PoolDiskIdx,
+    pub rebuilt: Vec<Option<Box<Block>>>,
 }
 
 /// Map a websocket reply status to a result.
@@ -403,7 +410,7 @@ impl Disk {
     /// Tell a remote disk its index in the pool and its pool client's
     /// fence, so requests carry the right epoch (see `crate::fence`).
     /// No-op for local disks.
-    pub fn set_fence(&self, index: usize, fence: std::sync::Arc<crate::fence::ClientFence>) {
+    pub fn set_fence(&self, index: PoolDiskIdx, fence: std::sync::Arc<crate::fence::ClientFence>) {
         // The browser only reads.
         #[cfg(target_arch = "wasm32")]
         let _ = (index, fence);
@@ -543,7 +550,7 @@ fn read_at_zero_fill(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::
 }
 
 #[async_trait]
-impl BlockDevice for Disk {
+impl RawDisk for Disk {
     async fn flush(&self) -> Result<(), DiskError> {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
@@ -560,14 +567,6 @@ impl BlockDevice for Disk {
             }
         }
         Ok(())
-    }
-
-    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
-        self.read_blocks(block, std::slice::from_mut(buf)).await
-    }
-
-    async fn write_block(&self, block: BlockId, buf: &Block) -> Result<(), DiskError> {
-        self.write_blocks(block, std::slice::from_ref(buf)).await
     }
 
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
@@ -596,15 +595,17 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: RawDiskBlock, buf: &mut [Block]) -> Result<(), DiskError> {
+        // Checked on every backend; only the local ones use it.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+        let range = raw_range(start, buf.len())?;
         let buf = buf.as_flattened_mut();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
                 let len = buf.len();
-                let offset =
-                    byte_offset(start, (len / BLOCK_SIZE) as u64).ok_or_else(bad_offset)?;
+                let offset = range.byte_offset();
                 let data = tokio::task::spawn_blocking(move || {
                     let mut data = vec![0u8; len];
                     read_at_zero_fill(&file, &mut data, offset).map(|_| data)
@@ -614,11 +615,11 @@ impl BlockDevice for Disk {
                 Ok(())
             }
             #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
-            DiskBackend::Fault(f) => f.read(start, buf).await,
+            DiskBackend::Fault(f) => f.read(range, buf).await,
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
                 let reads = buf.chunks_mut(chunk).enumerate().map(|(i, out)| {
-                    let block = start + (i * WS_MAX_BLOCKS as usize) as u64;
+                    let block = start.get() + (i * WS_MAX_BLOCKS as usize) as u64;
                     let count = (out.len() / BLOCK_SIZE) as u32;
                     async move {
                         let data = r.request(WsOp::Read, block, count, None).await?;
@@ -635,24 +636,26 @@ impl BlockDevice for Disk {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: RawDiskBlock, buf: &[Block]) -> Result<(), DiskError> {
+        // Checked on every backend; only the local ones use it.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+        let range = raw_range(start, buf.len())?;
         let buf = buf.as_flattened();
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             DiskBackend::Local(file) => {
                 let file = file.clone();
-                let offset =
-                    byte_offset(start, (buf.len() / BLOCK_SIZE) as u64).ok_or_else(bad_offset)?;
+                let offset = range.byte_offset();
                 let data = buf.to_vec();
                 tokio::task::spawn_blocking(move || file.write_all_at(&data, offset)).await??;
                 Ok(())
             }
             #[cfg(all(any(test, feature = "testutil"), not(target_arch = "wasm32")))]
-            DiskBackend::Fault(f) => f.write(start, buf).await,
+            DiskBackend::Fault(f) => f.write(range, buf).await,
             DiskBackend::WebSocket(r) => {
                 let chunk = WS_MAX_BLOCKS as usize * BLOCK_SIZE;
                 let writes = buf.chunks(chunk).enumerate().map(|(i, data)| {
-                    let block = start + (i * WS_MAX_BLOCKS as usize) as u64;
+                    let block = start.get() + (i * WS_MAX_BLOCKS as usize) as u64;
                     let count = (data.len() / BLOCK_SIZE) as u32;
                     r.request(WsOp::Write, block, count, Some(data))
                 });

@@ -1,7 +1,7 @@
 //! The B+tree against a `BTreeMap` model, through `kv` datasets with the
 //! smallest nodes the test pool allows (so trees get deep quickly).
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
@@ -45,11 +45,7 @@ async fn small_kv(pool: &TestPool, name: &str) -> FileSystem<Pool> {
 }
 
 /// The committed tree is sound and holds exactly `model`.
-async fn verify<D: BlockDevice>(
-    fs: &FileSystem<D>,
-    name: &str,
-    model: &BTreeMap<Vec<u8>, Vec<u8>>,
-) {
+async fn verify<D: PoolDevice>(fs: &FileSystem<D>, name: &str, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
     let name = &ds(name);
     fs.sync().await.unwrap();
     let id = fs.dataset_id(name).await.unwrap();

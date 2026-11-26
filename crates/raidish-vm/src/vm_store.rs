@@ -21,7 +21,7 @@
 
 use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::{DatasetName, VmName};
 use crate::vm_def::VmSpec;
@@ -75,14 +75,14 @@ fn bad(m: String) -> FileSystemError {
 }
 
 /// The store, opened on the committer's pool.
-pub struct VmStore<D: BlockDevice> {
+pub struct VmStore<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     ds: Arc<Dataset>,
     /// Changes one at a time: each checks against all the others.
     write: tokio::sync::Mutex<()>,
 }
 
-impl<D: BlockDevice> VmStore<D> {
+impl<D: PoolDevice> VmStore<D> {
     /// Open the pool's store, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
         let ds = crate::service_tree::ensure_btree(

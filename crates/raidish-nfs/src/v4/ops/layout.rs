@@ -2,7 +2,7 @@
 
 use super::super::*;
 
-impl<D: BlockDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static> Server<D> {
     /// The nodes as pNFS data servers (none: no pNFS).
     pub(in crate::v4) fn devices(&self) -> Vec<Device> {
         self.cluster.as_ref().map_or(Vec::new(), |c| c.devices())

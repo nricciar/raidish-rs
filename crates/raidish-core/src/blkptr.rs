@@ -11,7 +11,8 @@
 //! run of at most `max_record_blocks()` blocks, so a record never shares a
 //! RaidZ stripe with anything else.
 
-use crate::disk::{BLOCK_SIZE, BlockDevice, zeroed_blocks};
+use crate::coords::PoolLba;
+use crate::disk::{BLOCK_SIZE, PoolDevice, zeroed_blocks};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::types::Txg;
@@ -26,7 +27,7 @@ const READ_CONCURRENCY: usize = 8;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlockPtr {
     /// First block of the record.
-    pub lba: u64,
+    pub lba: PoolLba,
     /// Blocks allocated to the record (stripe aligned; may exceed what `lsize` needs).
     pub asize: u32,
     /// Logical bytes stored in the record.
@@ -40,7 +41,7 @@ pub struct BlockPtr {
 impl BlockPtr {
     /// A record of `data` written at `lba` in `asize` blocks, in `txg`.
     /// Refused if its sizes don't fit a pointer.
-    pub fn new(lba: u64, asize: u64, data: &[u8], txg: Txg) -> Result<Self, FileSystemError> {
+    pub fn new(lba: PoolLba, asize: u64, data: &[u8], txg: Txg) -> Result<Self, FileSystemError> {
         let too_big = || {
             FileSystemError::InvalidArgument(format!(
                 "a record of {} blocks, {} bytes",
@@ -63,7 +64,7 @@ impl BlockPtr {
     /// The space this record occupies on disk.
     pub fn extent(&self) -> Extent {
         Extent {
-            start: self.lba,
+            start: self.lba.get(),
             len: self.asize as u64,
         }
     }
@@ -100,7 +101,7 @@ pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
     ptrs.iter().map(|p| p.lsize as u64).sum()
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Allocate space for `data` (scattered if need be), write it, and
     /// return the record pointers. The records belong to the open TXG.
     /// (Objects are trees of records now; only tests still use this.)
@@ -117,8 +118,8 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut ptrs = Vec::new();
         let mut rest = data;
         for extent in extents {
-            let mut lba = extent.start;
-            let end = extent.start + extent.len;
+            let mut lba = PoolLba::new(extent.start);
+            let end = lba + extent.len;
             while lba < end {
                 let asize = self.max_record_blocks().min(end - lba);
                 let take = rest.len().min(asize as usize * BLOCK_SIZE);
@@ -154,13 +155,15 @@ impl<D: BlockDevice> FileSystem<D> {
             self.layout,
             self.writer.is_some(),
         );
-        let r = self.write_record_blocks(extent.start, data).await;
+        let r = self
+            .write_record_blocks(PoolLba::new(extent.start), data)
+            .await;
         unwritten.disarm();
         if let Err(e) = r {
             self.release_unsettled(extent.start, extent.len).await;
             return Err(e);
         }
-        BlockPtr::new(extent.start, extent.len, data, txg)
+        BlockPtr::new(PoolLba::new(extent.start), extent.len, data, txg)
     }
 
     /// Write `records` back to back at `start`, each in `record_blocks`
@@ -168,7 +171,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// already be allocated; returns one pointer per record.
     pub(crate) async fn write_records_at(
         &self,
-        start: u64,
+        start: PoolLba,
         record_blocks: u64,
         records: &[&[u8]],
     ) -> Result<Vec<BlockPtr>, FileSystemError> {
@@ -192,7 +195,11 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(ptrs)
     }
 
-    pub async fn write_record_blocks(&self, lba: u64, data: &[u8]) -> Result<(), FileSystemError> {
+    pub async fn write_record_blocks(
+        &self,
+        lba: PoolLba,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
         let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
         let mut buf = zeroed_blocks(blocks as usize);
         buf.as_flattened_mut()[..data.len()].copy_from_slice(data);
@@ -287,7 +294,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// pointer, like intent log records (see `crate::zil`).
     pub(crate) async fn read_verified(
         &self,
-        lba: u64,
+        lba: PoolLba,
         n: u64,
         lsize: usize,
         check: &(dyn Fn(&[u8]) -> bool + Send + Sync),
@@ -320,21 +327,19 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Rebuild every block several ways (see `Candidates`), then test
         // hypotheses about which disks are bad; the record checksum decides.
-        let rebuilds = (0..n).map(|i| async move {
-            self.dev
-                .reconstruct_candidates(lba + i)
-                .await
-                .unwrap_or_default()
-        });
-        let cands: Vec<crate::disk::Candidates> = futures::future::join_all(rebuilds).await;
-        let disks = cands.iter().map(|c| c.rebuilt.len()).max().unwrap_or(0);
+        let rebuilds =
+            (0..n).map(|i| async move { self.dev.reconstruct_candidates(lba + i).await.ok() });
+        // A block nothing could rebuild stays as read under every hypothesis.
+        let cands: Vec<Option<crate::disk::Candidates>> = futures::future::join_all(rebuilds).await;
+        let disks: Vec<crate::coords::PoolDiskIdx> = self.disk_indexes().collect();
 
         // Hypotheses: every single disk and every pair of disks is bad (two
         // is all the parity can cover). Under a hypothesis, each block on a
         // bad disk is rebuilt without the bad disks; other blocks stay as read.
-        let mut hypotheses: Vec<Vec<usize>> = (0..disks).map(|d| vec![d]).collect();
-        for a in 0..disks {
-            for b in a + 1..disks {
+        let mut hypotheses: Vec<Vec<crate::coords::PoolDiskIdx>> =
+            disks.iter().map(|&d| vec![d]).collect();
+        for (i, &a) in disks.iter().enumerate() {
+            for &b in &disks[i + 1..] {
                 hypotheses.push(vec![a, b]);
             }
         }
@@ -342,6 +347,7 @@ impl<D: BlockDevice> FileSystem<D> {
         'hypothesis: for bad in &hypotheses {
             let mut fix = Vec::new();
             for (i, c) in cands.iter().enumerate() {
+                let Some(c) = c else { continue };
                 if c.rebuilt.is_empty() || !bad.contains(&c.disk) {
                     continue;
                 }
@@ -349,14 +355,14 @@ impl<D: BlockDevice> FileSystem<D> {
                 // one, any rebuild will do (they agree when the rest is good).
                 let other = bad.iter().find(|&&d| d != c.disk);
                 let rebuilt = match other {
-                    Some(&d) => c.rebuilt.get(d).cloned().flatten(),
+                    Some(&d) => c.rebuilt.get(d.as_usize()).cloned().flatten(),
                     None => c.rebuilt.iter().flatten().next().cloned(),
                 };
                 let Some(rebuilt) = rebuilt else {
                     continue 'hypothesis;
                 };
-                if rebuilt != blocks[i] {
-                    fix.push((i, rebuilt));
+                if rebuilt[..] != blocks[i][..] {
+                    fix.push((i, rebuilt.to_vec()));
                 }
             }
             if !fix.is_empty() && !trials.contains(&fix) {

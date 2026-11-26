@@ -4,7 +4,8 @@
 use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset_resource};
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::coords::*;
+use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::test_util::TestPool;
 use crate::test_util::dsn;
@@ -417,11 +418,11 @@ async fn replay_stops_at_the_end_of_the_log() {
     // guid), then garbage.
     let c = cursor(&w.fs).await.unwrap();
     let foreign = encode_data_record(c.region.guid ^ 1, c.seq, 0, pattern(48 * 1024, 9)).unwrap();
-    w.fs.write_record_blocks(c.region.start + c.used, &foreign)
+    w.fs.write_record_blocks(PoolLba::new(c.region.start + c.used), &foreign)
         .await
         .unwrap();
     let after = c.used + w.fs.align_blocks(foreign.len().div_ceil(BLOCK_SIZE) as u64);
-    w.fs.write_record_blocks(c.region.start + after, &pattern(8192, 7))
+    w.fs.write_record_blocks(PoolLba::new(c.region.start + after), &pattern(8192, 7))
         .await
         .unwrap();
     w.fs.dev.flush().await.unwrap();
@@ -644,7 +645,9 @@ async fn a_faulted_pool_keeps_the_log_for_later() {
     // would look like the end of the log, so nothing is replayed (or dropped).
     let disks = s.committer.fs().disk_count();
     for d in 0..3 {
-        s.committer.fs().mark_degraded(d, Txg::from_raw(1));
+        s.committer
+            .fs()
+            .mark_degraded(PoolDiskIdx::new(d).unwrap(), Txg::from_raw(1));
     }
     s.committer.reclaim().await;
     assert_eq!(s.committer.fs().dataset_logs().await.unwrap().len(), 1);
@@ -733,9 +736,12 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
     assert!(fs.flush().await.is_err());
     switch.fail_flushes(false);
     // Say it didn't.
-    fs.write_record_blocks(c.region.start + c.used, &vec![0u8; BLOCK_SIZE])
-        .await
-        .unwrap();
+    fs.write_record_blocks(
+        PoolLba::new(c.region.start + c.used),
+        &vec![0u8; BLOCK_SIZE],
+    )
+    .await
+    .unwrap();
 
     // A later flush is acknowledged...
     fs.block_write(&dsn("a"), 1000, &pattern(1000, 3))
@@ -1262,7 +1268,7 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
     // A write disk 2 misses, that no commit carries (the free slot after
     // the log's last record: the next append overwrites it).
     let c = cursor(&fs).await.unwrap();
-    fs.write_record_blocks(c.region.start + c.used, &vec![0u8; 4096])
+    fs.write_record_blocks(PoolLba::new(c.region.start + c.used), &vec![0u8; 4096])
         .await
         .unwrap();
     assert!(fs.unaccounted_misses()[2]);

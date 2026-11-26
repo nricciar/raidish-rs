@@ -33,7 +33,7 @@ pub mod v3;
 pub mod v4;
 pub mod xdr;
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use backend::Backend;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -80,13 +80,13 @@ impl NfsConfig {
 }
 
 /// Every program on the port: NFS 3 and 4, MOUNT, the portmapper.
-struct Programs<D: BlockDevice> {
+struct Programs<D: PoolDevice> {
     v3: v3::Server<D>,
     v4: Arc<v4::Server<D>>,
 }
 
 #[async_trait::async_trait]
-impl<D: BlockDevice + 'static> rpc::Dispatch for Programs<D> {
+impl<D: PoolDevice + 'static> rpc::Dispatch for Programs<D> {
     async fn call(&self, call: &rpc::Call, args: &mut xdr::Reader<'_>) -> rpc::Reply {
         use v3::{MOUNT_PROG, NFS_PROG, PMAP_PROG};
         match (call.prog, call.vers) {
@@ -106,7 +106,7 @@ impl<D: BlockDevice + 'static> rpc::Dispatch for Programs<D> {
 /// address; runs (with the housekeeping) until the runtime stops.
 /// `cluster`: where the NFSv4 state owner is (None: this node owns its
 /// state). Returns the bound address and the NFSv4 server.
-pub async fn start<D: BlockDevice + 'static>(
+pub async fn start<D: PoolDevice + 'static>(
     addr: &str,
     backend: Arc<Backend<D>>,
     cluster: Option<Arc<dyn v4::V4Cluster>>,

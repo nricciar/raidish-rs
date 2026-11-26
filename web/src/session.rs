@@ -189,7 +189,8 @@ impl Session {
     }
 
     pub fn online(&self) -> Vec<bool> {
-        (0..self.disks.len())
+        self.disks
+            .indexes()
             .map(|d| self.disks.is_online(d))
             .collect()
     }

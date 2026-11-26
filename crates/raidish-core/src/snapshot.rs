@@ -41,7 +41,7 @@
 //! is the volume as of a moment shortly before (crash-consistent).
 
 use crate::blkptr::BlockPtr;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Body, Dnode, Head, Snap, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
@@ -87,7 +87,7 @@ fn short(r: &SnapRef) -> &str {
     r.name.split_once('@').map_or(&r.name, |(_, s)| s)
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// The volume `name` and its dnode (a volume, not a snapshot).
     async fn head(&self, name: &DatasetName) -> Result<(FileId, Dnode), FileSystemError> {
         let e = self.dataset_entry(name).await?;
@@ -327,7 +327,7 @@ impl<D: BlockDevice> FileSystem<D> {
             self.write_dnode(tx, id, Some(head)).await?;
             self.write_dnode(tx, r.id, None).await?;
             for p in &unique {
-                self.free(tx, p.lba, p.asize as u64).await?;
+                self.free_record(tx, p).await?;
             }
             Ok(r.id)
         }
@@ -420,7 +420,7 @@ impl<D: BlockDevice> FileSystem<D> {
             head.attrs.touch();
             self.write_dnode(tx, id, Some(head)).await?;
             for p in &gone {
-                self.free(tx, p.lba, p.asize as u64).await?;
+                self.free_record(tx, p).await?;
             }
             Ok(())
         }

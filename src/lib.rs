@@ -10,6 +10,7 @@ pub use raidish_types::{api_types, types, vm_def};
 // The storage core.
 #[cfg(test)]
 pub(crate) use raidish_core::blkptr;
+pub use raidish_core::coords;
 pub(crate) use raidish_core::dataset;
 pub use raidish_core::disk;
 pub use raidish_core::disks;

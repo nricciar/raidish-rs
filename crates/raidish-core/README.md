@@ -27,7 +27,7 @@ Datasets (fs / volume / kv)  ──►  Object Trees & Inodes  ──►  Metasl
 
 | Area | Key modules | Purpose |
 |---|---|---|
-| **Disks & Fencing** | `disk`, `disks`, `websocket`, `fence` | `BlockDevice` abstraction (`4096`-byte blocks), local/WebSocket backends (`disk_ws`, `disk_wasm`), and per-domain epoch fencing |
+| **Disks & Fencing** | `disk`, `disks`, `coords`, `websocket`, `fence` | `RawDisk` (one disk) and `PoolDevice` (a pool) traits over `4096`-byte blocks, typed block coordinates and disk indexes (`coords`), local/WebSocket backends (`disk_ws`, `disk_wasm`), and per-domain epoch fencing |
 | **Vdevs & Topologies** | `vdev`, `raidz`, `mirror`, `stripe` | `Pool` and `Topology` combining RAID-Z (`reed-solomon-simd`), mirrors, and stripes with per-leaf health tracking |
 | **Allocator & COW Store** | `blkptr`, `object`, `metaslab`, `tx` | Checksummed `BlockPtr`s, sparse indirect trees, A/B metaslab space maps, and transactional metadata updates |
 | **Filesystem & Datasets** | `fs`, `inode`, `dataset`, `open_file`, `file_writer` | `FileSystem<D>`, dnode object table, directory namespace, random-access and streaming file writes |

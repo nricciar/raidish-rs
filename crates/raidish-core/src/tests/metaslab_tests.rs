@@ -41,7 +41,7 @@ fn layout_is_stripe_aligned_and_fits() {
         assert!(l.spacemap_slot_blocks * BLOCK_PAYLOAD_SIZE as u64 >= 2 * bitmap_bytes);
         // Slots of the last metaslab end where data begins.
         let last = l.slot_lba(l.metaslab_count as usize - 1, SPACEMAP_SLOTS - 1);
-        assert_eq!(last + l.spacemap_slot_blocks, l.data_start);
+        assert_eq!(last.get() + l.spacemap_slot_blocks, l.data_start);
     }
 }
 

@@ -9,7 +9,7 @@ use super::backend::{Attr, Backend, NfsResult, status};
 use super::rpc::{Call, Cred, Reply};
 use super::xdr::{Reader, Writer, XdrResult};
 use crate::backend::NfsStat;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::inode::{ObjType, SetAttrs};
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ const ACCESS_EXECUTE: u32 = 0x20;
 const UNSTABLE: u32 = 0;
 const FILE_SYNC: u32 = 2;
 
-pub struct Server<D: BlockDevice> {
+pub struct Server<D: PoolDevice> {
     pub backend: Arc<Backend<D>>,
     /// The port this serves on (what the portmapper answers).
     pub port: u16,
@@ -162,7 +162,7 @@ fn sattr(r: &mut Reader<'_>, now: u64) -> XdrResult<(SetAttrs, Option<u64>)> {
     ))
 }
 
-impl<D: BlockDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static> Server<D> {
     pub fn new(backend: Arc<Backend<D>>, port: u16) -> Self {
         Server { backend, port }
     }

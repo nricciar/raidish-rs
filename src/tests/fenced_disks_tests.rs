@@ -101,12 +101,9 @@ async fn i9_a_range_whose_bytes_wrap_is_refused() {
     assert!(d.validate_read(0, wraps, 1).is_err());
     // The last addressable byte range, and one block past it.
     let last = i64::MAX as u64 / BLOCK_SIZE as u64;
-    assert_eq!(
-        crate::disk::byte_offset(last - 1, 1),
-        Some((last - 1) * 4096)
-    );
-    assert_eq!(crate::disk::byte_offset(last, 1), None);
-    assert_eq!(crate::disk::byte_offset(u64::MAX / 4096, 1), None);
+    assert!(d.validate_read(0, last - 1, 1).is_ok());
+    assert!(d.validate_read(0, last, 1).is_err());
+    assert!(d.validate_read(0, u64::MAX / 4096, 1).is_err());
     // Nothing was written anywhere.
     assert_eq!(read_back(&d, 200).await, 0);
 }

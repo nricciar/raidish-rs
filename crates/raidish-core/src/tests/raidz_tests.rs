@@ -1,4 +1,11 @@
 use super::*;
+use crate::coords::{MemberIdx, PoolDiskIdx, VdevLba};
+use crate::vdev::Vdev;
+
+/// Pool disks `0..n`.
+fn first(n: usize) -> Vec<PoolDiskIdx> {
+    PoolDiskIdx::all(n).collect()
+}
 use crate::test_util::DISKS;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -33,7 +40,7 @@ async fn create_test_raidz() -> (RaidZ, Vec<NamedTempFile>) {
 
     let p: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
     let disks = std::sync::Arc::new(crate::disks::DiskSet::new(&p).await);
-    let raidz = RaidZ::new(disks, (0..5).collect(), 2);
+    let raidz = RaidZ::new(disks, first(5), 2);
     (raidz, temp_files)
 }
 
@@ -43,7 +50,11 @@ async fn test_raidz_creation() {
 
     // Verify that all disks are local
     for i in 0..5 {
-        assert!(raidz.is_local_disk(i), "Disk {} should be local", i);
+        assert!(
+            raidz.is_local_disk(MemberIdx(i)),
+            "Disk {} should be local",
+            i
+        );
     }
 }
 
@@ -54,7 +65,7 @@ async fn test_basic_read_write() {
     // Write a single block
     let write_buf = [0x42u8; BLOCK_SIZE];
     raidz
-        .write_block(0, &write_buf)
+        .write_block(VdevLba::new(0), &write_buf)
         .await
         .expect("Failed to write block");
 
@@ -64,7 +75,7 @@ async fn test_basic_read_write() {
     // Read the block back
     let mut read_buf = [0u8; BLOCK_SIZE];
     raidz
-        .read_block(0, &mut read_buf)
+        .read_block(VdevLba::new(0), &mut read_buf)
         .await
         .expect("Failed to read block");
 
@@ -84,7 +95,7 @@ async fn test_multiple_blocks_in_single_stripe() {
 
     for (i, block) in blocks.iter().enumerate() {
         raidz
-            .write_block(i as u64, block)
+            .write_block(VdevLba::new(i as u64), block)
             .await
             .expect("Failed to write block");
     }
@@ -95,7 +106,7 @@ async fn test_multiple_blocks_in_single_stripe() {
     for (i, expected) in blocks.iter().enumerate() {
         let mut read_buf = [0u8; BLOCK_SIZE];
         raidz
-            .read_block(i as u64, &mut read_buf)
+            .read_block(VdevLba::new(i as u64), &mut read_buf)
             .await
             .expect("Failed to read block");
 
@@ -110,14 +121,14 @@ async fn test_read_before_flush() {
     // Write data but don't flush
     let write_buf = [0x99u8; BLOCK_SIZE];
     raidz
-        .write_block(5, &write_buf)
+        .write_block(VdevLba::new(5), &write_buf)
         .await
         .expect("Failed to write block");
 
     // Should be able to read from the write buffer
     let mut read_buf = [0u8; BLOCK_SIZE];
     raidz
-        .read_block(5, &mut read_buf)
+        .read_block(VdevLba::new(5), &mut read_buf)
         .await
         .expect("Failed to read from write buffer");
 
@@ -186,7 +197,7 @@ async fn test_large_sequential_write() {
     for block_id in 0..30 {
         let write_buf = [(block_id % 256) as u8; BLOCK_SIZE];
         raidz
-            .write_block(block_id, &write_buf)
+            .write_block(VdevLba::new(block_id), &write_buf)
             .await
             .expect("Failed to write block");
     }
@@ -197,7 +208,7 @@ async fn test_large_sequential_write() {
     for block_id in 0..30 {
         let mut read_buf = [0u8; BLOCK_SIZE];
         raidz
-            .read_block(block_id, &mut read_buf)
+            .read_block(VdevLba::new(block_id), &mut read_buf)
             .await
             .expect("Failed to read block");
 
@@ -216,7 +227,7 @@ async fn test_random_access_pattern() {
     for &block_id in &block_ids {
         let write_buf = [block_id as u8; BLOCK_SIZE];
         raidz
-            .write_block(block_id, &write_buf)
+            .write_block(VdevLba::new(block_id), &write_buf)
             .await
             .expect("Failed to write block");
     }
@@ -227,7 +238,7 @@ async fn test_random_access_pattern() {
     for &block_id in &[0, 3, 6, 2, 8, 4, 12, 7, 15, 11] {
         let mut read_buf = [0u8; BLOCK_SIZE];
         raidz
-            .read_block(block_id, &mut read_buf)
+            .read_block(VdevLba::new(block_id), &mut read_buf)
             .await
             .expect("Failed to read block");
 
@@ -255,12 +266,15 @@ async fn range_io_round_trips_at_every_alignment() {
             let start = lba + start_off;
             let data = pattern(blocks, (start + blocks as u64) as u8);
             raidz
-                .write_blocks(start, crate::disk::as_blocks(&data).unwrap())
+                .write_blocks(VdevLba::new(start), crate::disk::as_blocks(&data).unwrap())
                 .await
                 .unwrap();
             let mut got = vec![0u8; data.len()];
             raidz
-                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .read_blocks(
+                    VdevLba::new(start),
+                    crate::disk::as_blocks_mut(&mut got).unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(got, data, "before flush: start {} blocks {}", start, blocks);
@@ -268,7 +282,10 @@ async fn range_io_round_trips_at_every_alignment() {
             raidz.flush().await.unwrap();
             let mut got = vec![0u8; data.len()];
             raidz
-                .read_blocks(start, crate::disk::as_blocks_mut(&mut got).unwrap())
+                .read_blocks(
+                    VdevLba::new(start),
+                    crate::disk::as_blocks_mut(&mut got).unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(got, data, "after flush: start {} blocks {}", start, blocks);
@@ -283,19 +300,22 @@ async fn full_stripe_write_supersedes_buffered_partial() {
     // Buffer a partial write to stripe 10, then overwrite the whole stripe.
     let stale = pattern(1, 1);
     raidz
-        .write_block(30, stale.as_slice().try_into().unwrap())
+        .write_block(VdevLba::new(30), stale.as_slice().try_into().unwrap())
         .await
         .unwrap();
     let fresh = pattern(3, 2);
     raidz
-        .write_blocks(30, crate::disk::as_blocks(&fresh).unwrap())
+        .write_blocks(VdevLba::new(30), crate::disk::as_blocks(&fresh).unwrap())
         .await
         .unwrap();
     raidz.flush().await.unwrap();
 
     let mut got = vec![0u8; fresh.len()];
     raidz
-        .read_blocks(30, crate::disk::as_blocks_mut(&mut got).unwrap())
+        .read_blocks(
+            VdevLba::new(30),
+            crate::disk::as_blocks_mut(&mut got).unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(got, fresh);
@@ -306,7 +326,7 @@ async fn full_stripe_writes_have_valid_parity() {
     let (raidz, _t) = create_test_raidz().await;
     let data = pattern(12, 5);
     raidz
-        .write_blocks(60, crate::disk::as_blocks(&data).unwrap())
+        .write_blocks(VdevLba::new(60), crate::disk::as_blocks(&data).unwrap())
         .await
         .unwrap();
     raidz.flush().await.unwrap();
@@ -314,7 +334,10 @@ async fn full_stripe_writes_have_valid_parity() {
     // Every way of rebuilding each data block from the other disks must
     // agree with what was written (i.e. parity is consistent).
     for i in 0..12u64 {
-        let c = raidz.reconstruct_candidates(60 + i).await.unwrap();
+        let c = raidz
+            .reconstruct_candidates(VdevLba::new(60 + i))
+            .await
+            .unwrap();
         let at = i as usize * BLOCK_SIZE;
         let rebuilt: Vec<_> = c.rebuilt.iter().flatten().collect();
         // Without each other disk, plus without just its own.
@@ -339,7 +362,9 @@ async fn concurrent_flushes_and_block_writes_lose_nothing() {
             let r = raidz.clone();
             tasks.push(tokio::spawn(async move {
                 let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
-                r.write_block(lba, &[fill; BLOCK_SIZE]).await.unwrap();
+                r.write_block(VdevLba::new(lba), &[fill; BLOCK_SIZE])
+                    .await
+                    .unwrap();
             }));
             if lba % 3 == 0 {
                 let r = raidz.clone();
@@ -352,7 +377,7 @@ async fn concurrent_flushes_and_block_writes_lose_nothing() {
         raidz.flush().await.unwrap();
         for lba in 0..BLOCKS {
             let mut buf = [0u8; BLOCK_SIZE];
-            raidz.read_block(lba, &mut buf).await.unwrap();
+            raidz.read_block(VdevLba::new(lba), &mut buf).await.unwrap();
             let fill = round.wrapping_mul(31).wrapping_add(lba as u8);
             assert!(buf.iter().all(|&b| b == fill), "round {round}, block {lba}");
         }
@@ -431,10 +456,13 @@ fn a_read_waiting_on_a_buffered_stripe_doesnt_block_the_map() {
                 })
                 .collect();
             let disks = Arc::new(crate::disks::DiskSet::from_caddies(caddies));
-            let raidz = Arc::new(RaidZ::new(disks, vec![0, 1, 2], 1));
+            let raidz = Arc::new(RaidZ::new(disks, first(3), 1));
             let data = raidz.data as u64;
             // Stripe 0, half written: buffered.
-            raidz.write_block(0, &[1u8; BLOCK_SIZE]).await.unwrap();
+            raidz
+                .write_block(VdevLba::new(0), &[1u8; BLOCK_SIZE])
+                .await
+                .unwrap();
 
             for h in &handles {
                 h.hold_writes(true);
@@ -451,7 +479,10 @@ fn a_read_waiting_on_a_buffered_stripe_doesnt_block_the_map() {
                 let raidz = raidz.clone();
                 async move {
                     let mut buf = [0u8; BLOCK_SIZE];
-                    raidz.read_block(0, &mut buf).await.map(|_| buf[0])
+                    raidz
+                        .read_block(VdevLba::new(0), &mut buf)
+                        .await
+                        .map(|_| buf[0])
                 }
             });
             for _ in 0..10 {
@@ -461,7 +492,7 @@ fn a_read_waiting_on_a_buffered_stripe_doesnt_block_the_map() {
             // (all but certainly: a few hundred shards at most).
             for other in 1..2000u64 {
                 raidz
-                    .write_block(other * data, &[2u8; BLOCK_SIZE])
+                    .write_block(VdevLba::new(other * data), &[2u8; BLOCK_SIZE])
                     .await
                     .unwrap();
             }
@@ -513,7 +544,7 @@ fn fault_raidz(
         .collect();
     let disks = Arc::new(crate::disks::DiskSet::from_caddies(caddies));
     (
-        Arc::new(RaidZ::new(disks, (0..n).collect(), parity)),
+        Arc::new(RaidZ::new(disks, first(n), parity)),
         handles,
         files,
     )
@@ -536,7 +567,7 @@ async fn a_partial_write_racing_a_full_stripe_write_keeps_its_neighbours() {
         let full = full.clone();
         async move {
             raidz
-                .write_blocks(0, crate::disk::as_blocks(&full).unwrap())
+                .write_blocks(VdevLba::new(0), crate::disk::as_blocks(&full).unwrap())
                 .await
         }
     });
@@ -547,7 +578,9 @@ async fn a_partial_write_racing_a_full_stripe_write_keeps_its_neighbours() {
     let partial = tokio::spawn({
         let raidz = raidz.clone();
         async move {
-            raidz.write_block(1, &[9u8; BLOCK_SIZE]).await?;
+            raidz
+                .write_block(VdevLba::new(1), &[9u8; BLOCK_SIZE])
+                .await?;
             raidz.flush().await
         }
     });
@@ -565,10 +598,10 @@ async fn a_partial_write_racing_a_full_stripe_write_keeps_its_neighbours() {
     raidz.flush().await.unwrap();
 
     let mut b0 = [0u8; BLOCK_SIZE];
-    raidz.read_block(0, &mut b0).await.unwrap();
+    raidz.read_block(VdevLba::new(0), &mut b0).await.unwrap();
     assert_eq!(&b0[..], &full[..BLOCK_SIZE], "block 0 lost the full write");
     let mut b1 = [0u8; BLOCK_SIZE];
-    raidz.read_block(1, &mut b1).await.unwrap();
+    raidz.read_block(VdevLba::new(1), &mut b1).await.unwrap();
     assert!(b1.iter().all(|&b| b == 9), "block 1: the later write");
 }
 
@@ -578,14 +611,17 @@ async fn a_partial_write_racing_a_full_stripe_write_keeps_its_neighbours() {
 #[tokio::test]
 async fn a_failed_full_stripe_write_keeps_the_buffered_partial() {
     let (raidz, handles, _f) = fault_raidz(3, 1);
-    raidz.write_block(0, &[5u8; BLOCK_SIZE]).await.unwrap();
+    raidz
+        .write_block(VdevLba::new(0), &[5u8; BLOCK_SIZE])
+        .await
+        .unwrap();
     for h in &handles[1..] {
         h.fail_writes(Some(crate::test_util::FaultError::Io));
     }
     let full = pattern(2, 3);
     assert!(
         raidz
-            .write_blocks(0, crate::disk::as_blocks(&full).unwrap())
+            .write_blocks(VdevLba::new(0), crate::disk::as_blocks(&full).unwrap())
             .await
             .is_err()
     );
@@ -596,12 +632,12 @@ async fn a_failed_full_stripe_write_keeps_the_buffered_partial() {
     // members to complete the stripe from: that flush must wait.
     assert!(raidz.flush().await.is_err());
     // Once they're found in sync again (what a resilver does), it goes.
-    for d in 1..3 {
+    for d in first(3).into_iter().skip(1) {
         raidz.disks.caught_up(d, raidz.disks.miss_count(d));
     }
     raidz.flush().await.unwrap();
     let mut b0 = [0u8; BLOCK_SIZE];
-    raidz.read_block(0, &mut b0).await.unwrap();
+    raidz.read_block(VdevLba::new(0), &mut b0).await.unwrap();
     assert!(
         b0.iter().all(|&b| b == 5),
         "the buffered write was dropped with the failed full write"
@@ -619,7 +655,7 @@ async fn read_modify_write_doesnt_read_a_member_that_missed_writes() {
     let (raidz, handles, _f) = fault_raidz(3, 1);
     let old = pattern(2, 1);
     raidz
-        .write_blocks(0, crate::disk::as_blocks(&old).unwrap())
+        .write_blocks(VdevLba::new(0), crate::disk::as_blocks(&old).unwrap())
         .await
         .unwrap();
     raidz.flush().await.unwrap();
@@ -628,24 +664,27 @@ async fn read_modify_write_doesnt_read_a_member_that_missed_writes() {
     handles[1].fail_writes(Some(crate::test_util::FaultError::Io));
     let new = pattern(2, 2);
     raidz
-        .write_blocks(0, crate::disk::as_blocks(&new).unwrap())
+        .write_blocks(VdevLba::new(0), crate::disk::as_blocks(&new).unwrap())
         .await
         .unwrap();
     raidz.flush().await.unwrap();
     handles[1].heal();
-    assert!(raidz.disks.may_lag(1));
+    assert!(raidz.disks.may_lag(first(2)[1]));
 
-    raidz.write_block(0, &[7u8; BLOCK_SIZE]).await.unwrap();
+    raidz
+        .write_block(VdevLba::new(0), &[7u8; BLOCK_SIZE])
+        .await
+        .unwrap();
     raidz.flush().await.unwrap();
     let mut b1 = [0u8; BLOCK_SIZE];
-    raidz.read_block(1, &mut b1).await.unwrap();
+    raidz.read_block(VdevLba::new(1), &mut b1).await.unwrap();
     assert_eq!(
         &b1[..],
         &new[BLOCK_SIZE..],
         "block 1 went back to what the stale member had"
     );
     // And the stripe's parity agrees (block 1 rebuilt without disk 1).
-    let c = raidz.reconstruct_candidates(1).await.unwrap();
+    let c = raidz.reconstruct_candidates(VdevLba::new(1)).await.unwrap();
     for r in c.rebuilt.iter().flatten() {
         assert_eq!(&r[..], &new[BLOCK_SIZE..]);
     }

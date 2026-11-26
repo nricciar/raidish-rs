@@ -20,7 +20,7 @@
 //! blocks that have since been overwritten (every one of them is a safe
 //! rewind target, see `fs::Rewind`).
 
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{
     BLOCK_HEADER_SIZE as BLOCK_HEADER, BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock,
 };
@@ -106,14 +106,18 @@ impl MetaslabLayout {
         align_up(bytes.div_ceil(BLOCK_PAYLOAD_SIZE as u64), align)
     }
 
-    pub fn slot_lba(&self, ms_idx: usize, slot: u64) -> u64 {
-        self.spacemap_start + (ms_idx as u64 * SPACEMAP_SLOTS + slot) * self.spacemap_slot_blocks
+    pub fn slot_lba(&self, ms_idx: usize, slot: u64) -> crate::coords::PoolLba {
+        crate::coords::PoolLba::new(
+            self.spacemap_start
+                + (ms_idx as u64 * SPACEMAP_SLOTS + slot) * self.spacemap_slot_blocks,
+        )
     }
 
     pub fn metaslab_start(&self, ms_idx: usize) -> u64 {
         self.data_start + ms_idx as u64 * self.metaslab_size_blocks
     }
 
+    /// The metaslab pool block `lba` (allocator space: see `Extent`) is in.
     pub fn metaslab_for_block(&self, lba: u64) -> Option<MetaslabIdx> {
         if lba < self.data_start {
             return None;
@@ -630,7 +634,16 @@ pub(crate) async fn settle_tail(
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
+    /// Free the space record `p` occupies (see `free`).
+    pub(crate) async fn free_record(
+        &self,
+        tx: &mut crate::tx::Tx,
+        p: &crate::blkptr::BlockPtr,
+    ) -> Result<(), FileSystemError> {
+        self.free(tx, p.lba.get(), p.asize as u64).await
+    }
+
     /// Free an extent. The space is not reusable until `TXG_DEFER_SIZE` TXGs
     /// after the TXG in which the free is committed.
     pub(crate) async fn free(
@@ -866,7 +879,12 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
-    async fn write_slot(&self, lba: u64, txg: Txg, bytes: &[u8]) -> Result<(), FileSystemError> {
+    async fn write_slot(
+        &self,
+        lba: crate::coords::PoolLba,
+        txg: Txg,
+        bytes: &[u8],
+    ) -> Result<(), FileSystemError> {
         let mut chunks = bytes.chunks(BLOCK_PAYLOAD_SIZE);
         for b in 0..self.layout.spacemap_slot_blocks {
             let chunk = chunks.next().unwrap_or(&[]);
@@ -954,7 +972,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// other copies / rebuilt from parity, and the slot is taken at the
     /// newest TXG (no newer than `max_txg`) that every block can reach.
     /// Blocks that came from elsewhere are repaired.
-    async fn read_slot(&self, lba: u64, max_txg: Txg) -> Option<(Txg, Vec<u8>)> {
+    async fn read_slot(&self, lba: crate::coords::PoolLba, max_txg: Txg) -> Option<(Txg, Vec<u8>)> {
         // versions[b]: every (txg, payload, came-from-parity) seen for block b.
         let mut versions: SlotVersions = Vec::new();
         for b in 0..self.layout.spacemap_slot_blocks {
@@ -976,7 +994,7 @@ impl<D: BlockDevice> FileSystem<D> {
         for (b, v) in versions.iter_mut().enumerate() {
             if let Ok(c) = self.dev.reconstruct_candidates(lba + b as u64).await {
                 for rebuilt in c.rebuilt.into_iter().flatten() {
-                    if let Ok((txg, len)) = crate::fs::parse_label(&rebuilt)
+                    if let Ok((txg, len)) = crate::fs::parse_label(&rebuilt[..])
                         && !v.iter().any(|(t, _, _)| *t == txg)
                     {
                         let block: [u8; BLOCK_SIZE] = rebuilt[..].try_into().ok()?;

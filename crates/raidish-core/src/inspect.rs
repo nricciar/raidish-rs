@@ -4,7 +4,7 @@
 //! Portable (the web dashboard runs it in the browser over the websocket
 //! block protocol). Everything here only reads.
 
-use crate::disk::{BlockDevice, IoStats};
+use crate::disk::{IoStats, PoolDevice, RawDisk};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
 use crate::inode::ObjType;
 use crate::metaslab::SPACEMAP_SLOTS;
@@ -50,7 +50,7 @@ impl DiskReport {
 pub struct PoolReport {
     pub health: Health,
     pub layout: String,
-    pub topology: Option<Topology>,
+    pub topology: Topology,
     /// Disk failures the layout survives when healthy, and right now.
     pub fault_tolerance: usize,
     pub failures_left: usize,
@@ -342,7 +342,7 @@ fn flatten(mut spans: Vec<Span>, total: u64) -> Vec<Span> {
     out
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Health, space and per-disk state of the pool.
     pub async fn pool_report(&self) -> PoolReport {
         let sb = self.superblock().await;
@@ -350,27 +350,28 @@ impl<D: BlockDevice> FileSystem<D> {
         let degraded = self.degraded_disks();
         let mut disks = Vec::new();
         let mut raw_blocks = 0;
-        if let Some(pool) = self.dev.pool() {
-            for (d, caddy) in pool.disks().caddies().iter().enumerate() {
-                let capacity = caddy.capacity_blocks().await.ok();
-                raw_blocks += capacity.unwrap_or(0);
-                disks.push(DiskReport {
-                    index: d,
-                    path: caddy.path().to_string(),
-                    local: caddy.is_local(),
-                    online: pool.disks().is_online(d),
-                    label: self.check_disk_label(d).await,
-                    degraded_since: degraded.get(d).copied().flatten(),
-                    missed_writes: pool.disks().miss_count(d),
-                    fenced: pool.disks().is_fenced(d),
-                    capacity_blocks: capacity,
-                    io: caddy.io_stats(),
-                });
-            }
+        let pool = self.dev.pool();
+        for (disk, caddy) in pool.disks().indexes().zip(pool.disks().caddies().iter()) {
+            let capacity = caddy.capacity_blocks().await.ok();
+            raw_blocks += capacity.unwrap_or(0);
+            let d = disk.as_usize();
+            disks.push(DiskReport {
+                index: d,
+                path: caddy.path().to_string(),
+                local: caddy.is_local(),
+                online: pool.disks().is_online(disk),
+                label: self.check_disk_label(disk).await,
+                degraded_since: degraded.get(d).copied().flatten(),
+                missed_writes: pool.disks().miss_count(disk),
+                fenced: pool.disks().is_fenced(disk),
+                capacity_blocks: capacity,
+                io: caddy.io_stats(),
+            });
         }
-        let topology = self.dev.pool().map(|p| p.topology().clone());
-        let (health, tolerance, left) = match &topology {
-            Some(t) => {
+        let topology = pool.topology().clone();
+        let (health, tolerance, left) = {
+            let t = &topology;
+            {
                 let margin = margin(t, &disks);
                 let any_bad = disks
                     .iter()
@@ -384,7 +385,6 @@ impl<D: BlockDevice> FileSystem<D> {
                 };
                 (health, t.fault_tolerance(), margin.max(0) as usize)
             }
-            None => (Health::Online, 0, 0),
         };
 
         let (mut used, mut free, mut deferred) = (0, 0, 0);
@@ -398,9 +398,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         PoolReport {
             health,
-            layout: topology
-                .as_ref()
-                .map_or("single device".into(), |t| t.summary()),
+            layout: topology.summary(),
             topology,
             fault_tolerance: tolerance,
             failures_left: left,
@@ -483,14 +481,14 @@ impl<D: BlockDevice> FileSystem<D> {
         );
         push(
             &mut spans,
-            SUPERBLOCK_LBA,
+            SUPERBLOCK_LBA.get(),
             self.header.superblock_blocks,
             BlockKind::Superblock,
             None,
         );
         push(
             &mut spans,
-            self.header.uberblock_start,
+            self.header.uberblock_start.get(),
             self.header.uberblock_blocks(),
             BlockKind::Uberblock,
             None,
@@ -632,10 +630,7 @@ fn margin(t: &Topology, disks: &[DiskReport]) -> isize {
 /// as bad too (it may hold stale data for anything written while it was
 /// away): how many more disk failures a read of recent writes survives.
 pub(crate) fn margin_for_recent_writes(report: &PoolReport) -> isize {
-    let Some(t) = &report.topology else {
-        return 0;
-    };
-    margin_by(t, &|d| {
+    margin_by(&report.topology, &|d| {
         report
             .disks
             .get(d)

@@ -1,8 +1,13 @@
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, BlockId, Disk, DiskError, DiskOptions};
+use crate::coords::{AtomicDiskMask, DiskMask, DiskShard, PoolDiskIdx, RawDiskBlock};
+use crate::disk::{Block, Disk, DiskError, DiskOptions, RawDisk};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+fn shard_raw(shard: DiskShard) -> Result<RawDiskBlock, DiskError> {
+    shard.to_raw().ok_or_else(crate::disk::bad_offset)
+}
 
 /// Blocks at the start of every member disk reserved for its identity label
 /// (two copies), outside the RAID address space. Shard `s` lives at block
@@ -23,7 +28,7 @@ pub const MAX_DISKS: usize = 64;
 #[derive(Debug)]
 pub struct DiskSet {
     disks: Arc<Vec<Caddy>>,
-    fenced: AtomicU64,
+    fenced: AtomicDiskMask,
     misses: Vec<AtomicU64>,
     /// Per disk: the miss count as of the last time it was found in sync
     /// (`caught_up`). Any miss since may have left it without some write.
@@ -46,8 +51,8 @@ pub struct DiskSet {
 
 impl DiskSet {
     /// Disk `index`.
-    pub fn disk(&self, index: usize) -> &Caddy {
-        &self.disks[index]
+    pub fn disk(&self, index: PoolDiskIdx) -> &Caddy {
+        &self.disks[index.as_usize()]
     }
 
     /// Every disk, in pool order (shared with the disk server).
@@ -64,12 +69,17 @@ impl DiskSet {
         self.disks.len()
     }
 
+    /// Every disk's index, in pool order.
+    pub fn indexes(&self) -> impl Iterator<Item = PoolDiskIdx> + Clone + use<> {
+        PoolDiskIdx::all(self.disks.len())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.disks.is_empty()
     }
 
-    pub fn is_local(&self, index: usize) -> bool {
-        self.disks[index].is_local()
+    pub fn is_local(&self, index: PoolDiskIdx) -> bool {
+        self.disks[index.as_usize()].is_local()
     }
 
     pub async fn new(paths: &[&str]) -> Self {
@@ -115,8 +125,8 @@ impl DiskSet {
         let disks: Vec<Caddy> = results
             .into_iter()
             .zip(paths.iter())
-            .enumerate()
-            .map(|(i, (result, &path))| match result {
+            .zip(PoolDiskIdx::all(MAX_DISKS))
+            .map(|((result, &path), i)| match result {
                 Ok(disk) => {
                     disk.set_fence(i, fence.clone());
                     Caddy::Healthy(path.to_string(), disk)
@@ -143,75 +153,71 @@ impl DiskSet {
             repairs_flushed: (0..disks.len()).map(|_| AtomicU64::new(0)).collect(),
             repairs_lost: Default::default(),
             disks: Arc::new(disks),
-            fenced: AtomicU64::new(0),
+            fenced: Default::default(),
         }
     }
 
     /// Stop (or resume) serving reads from `disk`; writes still go to it.
-    pub fn set_fenced(&self, disk: usize, fenced: bool) {
-        if fenced {
-            self.fenced.fetch_or(1 << disk, Ordering::SeqCst);
-        } else {
-            self.fenced.fetch_and(!(1 << disk), Ordering::SeqCst);
-        }
+    pub fn set_fenced(&self, disk: PoolDiskIdx, fenced: bool) {
+        self.fenced.set(disk, fenced);
     }
 
-    pub fn is_fenced(&self, disk: usize) -> bool {
-        self.fenced.load(Ordering::SeqCst) & (1 << disk) != 0
+    pub fn is_fenced(&self, disk: PoolDiskIdx) -> bool {
+        self.fenced.contains(disk)
     }
 
     /// Failed writes/flushes on `disk` so far (monotonic).
-    pub fn miss_count(&self, disk: usize) -> u64 {
-        self.misses[disk].load(Ordering::SeqCst)
+    pub fn miss_count(&self, disk: PoolDiskIdx) -> u64 {
+        self.misses[disk.as_usize()].load(Ordering::SeqCst)
     }
 
     /// `disk` may lack writes the pool made: it's degraded, or a write or
     /// flush failed on it since it was last found in sync. Its shards are
     /// fine to read when a checksum vouches for them, but not where nothing
     /// does (raidz read-modify-write: structural triage I-20).
-    pub fn may_lag(&self, disk: usize) -> bool {
-        self.miss_count(disk) != self.synced_misses[disk].load(Ordering::SeqCst)
+    pub fn may_lag(&self, disk: PoolDiskIdx) -> bool {
+        self.miss_count(disk) != self.synced_misses[disk.as_usize()].load(Ordering::SeqCst)
             || self
                 .degraded
                 .lock()
                 .unwrap()
-                .get(disk)
+                .get(disk.as_usize())
                 .is_some_and(|d| d.is_some())
     }
 
     /// A resilver found `disk` in sync as of `misses` (its miss count when
     /// the resilver began): misses since still count.
-    pub(crate) fn caught_up(&self, disk: usize, misses: u64) {
-        self.synced_misses[disk].fetch_max(misses, Ordering::SeqCst);
+    pub(crate) fn caught_up(&self, disk: PoolDiskIdx, misses: u64) {
+        self.synced_misses[disk.as_usize()].fetch_max(misses, Ordering::SeqCst);
     }
 
-    pub fn is_online(&self, disk: usize) -> bool {
-        self.disks[disk].is_online()
+    pub fn is_online(&self, disk: PoolDiskIdx) -> bool {
+        self.disks[disk.as_usize()].is_online()
     }
 
     /// Readable for normal I/O: online and not fenced.
-    pub fn is_readable(&self, disk: usize) -> bool {
+    pub fn is_readable(&self, disk: PoolDiskIdx) -> bool {
         self.is_online(disk) && !self.is_fenced(disk)
     }
 
     /// Count a failed write or flush as a miss: the disk lacks data the
     /// pool wrote. A fencing refusal isn't one (the disk is fine; we may not
     /// write there): it fails the whole op instead (see `fenced_any`).
-    fn miss<T>(&self, disk: usize, r: Result<T, DiskError>) -> Result<T, DiskError> {
+    fn miss<T>(&self, disk: PoolDiskIdx, r: Result<T, DiskError>) -> Result<T, DiskError> {
         if let Err(e) = &r
             && !e.is_fencing()
         {
-            self.misses[disk].fetch_add(1, Ordering::SeqCst);
+            self.misses[disk.as_usize()].fetch_add(1, Ordering::SeqCst);
         }
         r
     }
 
     /// Shards (blocks after the label area) available on every one of
     /// `members` (the smallest disk wins).
-    pub async fn shard_capacity(&self, members: &[usize]) -> Result<u64, DiskError> {
+    pub async fn shard_capacity(&self, members: &[PoolDiskIdx]) -> Result<u64, DiskError> {
         let mut min = u64::MAX;
         for &d in members {
-            min = min.min(self.disks[d].capacity_blocks().await?);
+            min = min.min(self.disks[d.as_usize()].capacity_blocks().await?);
         }
         Ok(min.saturating_sub(DISK_LABEL_BLOCKS))
     }
@@ -219,8 +225,8 @@ impl DiskSet {
     /// Read `buf.len()` consecutive shards of `disk` starting at `shard`.
     pub async fn read_shards(
         &self,
-        disk: usize,
-        shard: u64,
+        disk: PoolDiskIdx,
+        shard: DiskShard,
         buf: &mut [Block],
     ) -> Result<(), DiskError> {
         if self.is_fenced(disk) {
@@ -232,23 +238,23 @@ impl DiskSet {
     /// `read_shards`, even from a fenced disk (for verification).
     pub async fn read_shards_raw(
         &self,
-        disk: usize,
-        shard: u64,
+        disk: PoolDiskIdx,
+        shard: DiskShard,
         buf: &mut [Block],
     ) -> Result<(), DiskError> {
-        self.disks[disk]
-            .read_blocks(shard + DISK_LABEL_BLOCKS, buf)
+        self.disks[disk.as_usize()]
+            .read_blocks(shard_raw(shard)?, buf)
             .await
     }
 
     pub async fn write_shards(
         &self,
-        disk: usize,
-        shard: u64,
+        disk: PoolDiskIdx,
+        shard: DiskShard,
         buf: &[Block],
     ) -> Result<(), DiskError> {
-        let r = self.disks[disk]
-            .write_blocks(shard + DISK_LABEL_BLOCKS, buf)
+        let r = self.disks[disk.as_usize()]
+            .write_blocks(shard_raw(shard)?, buf)
             .await;
         self.miss(disk, r)
     }
@@ -261,25 +267,25 @@ impl DiskSet {
     /// the repair to ask (`take_repairs_lost`) before counting it done.
     pub async fn repair_shards(
         &self,
-        disk: usize,
-        shard: u64,
+        disk: PoolDiskIdx,
+        shard: DiskShard,
         buf: &[Block],
     ) -> Result<(), DiskError> {
         self.write_shards(disk, shard, buf).await?;
-        self.repairs[disk].fetch_add(1, Ordering::SeqCst);
+        self.repairs[disk.as_usize()].fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    pub async fn flush_disk(&self, disk: usize) -> Result<(), DiskError> {
+    pub async fn flush_disk(&self, disk: PoolDiskIdx) -> Result<(), DiskError> {
         // Only repairs written before this flush began are covered by it.
-        let repaired = self.repairs[disk].load(Ordering::SeqCst);
-        let r = self.disks[disk].flush().await;
-        if repaired > self.repairs_flushed[disk].load(Ordering::SeqCst) {
+        let repaired = self.repairs[disk.as_usize()].load(Ordering::SeqCst);
+        let r = self.disks[disk.as_usize()].flush().await;
+        if repaired > self.repairs_flushed[disk.as_usize()].load(Ordering::SeqCst) {
             if r.is_err() {
                 self.repairs_lost.store(true, Ordering::SeqCst);
             }
             // Accounted for either way: lost repairs are reported once.
-            self.repairs_flushed[disk].fetch_max(repaired, Ordering::SeqCst);
+            self.repairs_flushed[disk.as_usize()].fetch_max(repaired, Ordering::SeqCst);
         }
         self.miss(disk, r)
     }
@@ -298,22 +304,26 @@ impl DiskSet {
     /// Raw access to label copy `copy` (< DISK_LABEL_BLOCKS) of `disk`.
     pub async fn read_label(
         &self,
-        disk: usize,
+        disk: PoolDiskIdx,
         copy: u64,
         buf: &mut Block,
     ) -> Result<(), DiskError> {
         assert!(copy < DISK_LABEL_BLOCKS);
-        self.disks[disk].read_block(copy, buf).await
+        self.disks[disk.as_usize()]
+            .read_block(RawDiskBlock::new(copy), buf)
+            .await
     }
 
     pub async fn write_label(
         &self,
-        disk: usize,
+        disk: PoolDiskIdx,
         copy: u64,
-        buf: &[u8; BLOCK_SIZE],
+        buf: &Block,
     ) -> Result<(), DiskError> {
         assert!(copy < DISK_LABEL_BLOCKS);
-        self.disks[disk].write_block(copy, buf).await
+        self.disks[disk.as_usize()]
+            .write_block(RawDiskBlock::new(copy), buf)
+            .await
     }
 }
 
@@ -324,25 +334,7 @@ pub enum Caddy {
 }
 
 #[async_trait]
-impl BlockDevice for Caddy {
-    async fn read_block(&self, block: BlockId, buf: &mut Block) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.read_block(block, buf).await.inspect_err(|e| {
-                log_err("read from", dev, e);
-            }),
-        }
-    }
-
-    async fn write_block(&self, block: BlockId, buf: &[u8; BLOCK_SIZE]) -> Result<(), DiskError> {
-        match self {
-            Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
-            Caddy::Healthy(dev, disk) => disk.write_block(block, buf).await.inspect_err(|e| {
-                log_err("write to", dev, e);
-            }),
-        }
-    }
-
+impl RawDisk for Caddy {
     async fn capacity_blocks(&self) -> Result<u64, DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
@@ -350,7 +342,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn read_blocks(&self, start: BlockId, buf: &mut [Block]) -> Result<(), DiskError> {
+    async fn read_blocks(&self, start: RawDiskBlock, buf: &mut [Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.read_blocks(start, buf).await.inspect_err(|e| {
@@ -359,7 +351,7 @@ impl BlockDevice for Caddy {
         }
     }
 
-    async fn write_blocks(&self, start: BlockId, buf: &[Block]) -> Result<(), DiskError> {
+    async fn write_blocks(&self, start: RawDiskBlock, buf: &[Block]) -> Result<(), DiskError> {
         match self {
             Caddy::Unhealthy(_, _) => Err(DiskError::UnhealthyDisk),
             Caddy::Healthy(dev, disk) => disk.write_blocks(start, buf).await.inspect_err(|e| {
@@ -436,7 +428,7 @@ impl Caddy {
 pub struct WriteAcks {
     need: u32,
     /// Distinct "members that acked" masks (usually just one: all of them).
-    pending: std::sync::Mutex<std::collections::HashSet<u64>>,
+    pending: std::sync::Mutex<std::collections::HashSet<DiskMask>>,
     flushing: tokio::sync::Mutex<()>,
 }
 
@@ -449,8 +441,8 @@ impl WriteAcks {
         }
     }
 
-    /// Record a write `acked` (a mask of disk indices) took.
-    pub fn record(&self, acked: u64) {
+    /// Record a write the disks `acked` took.
+    pub fn record(&self, acked: DiskMask) {
         let mut p = self.pending.lock().unwrap();
         if !p.contains(&acked) {
             p.insert(acked);
@@ -463,7 +455,7 @@ impl WriteAcks {
     pub async fn flush<F, Fut>(&self, flush: F) -> Result<(), DiskError>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<u64, DiskError>>,
+        Fut: std::future::Future<Output = Result<DiskMask, DiskError>>,
     {
         let _serial = self.flushing.lock().await;
         // Given up on mid-flush (a dropped future), the writes taken go
@@ -477,13 +469,13 @@ impl WriteAcks {
                 .taken
                 .iter()
                 .flatten()
-                .find(|&&m| (m & flushed).count_ones() < self.need)
+                .find(|&&m| m.and(flushed).len() < self.need)
             {
                 None => Ok(()),
                 Some(&m) => Err(DiskError::IoError(std::io::Error::other(format!(
                     "flush: writes acked by disks {:#x} are durable on only {} of them",
                     m,
-                    (m & flushed).count_ones()
+                    m.and(flushed).len()
                 )))),
             }
         });
@@ -498,7 +490,7 @@ impl WriteAcks {
 /// covered them.
 struct Restore<'a> {
     acks: &'a WriteAcks,
-    taken: Option<std::collections::HashSet<u64>>,
+    taken: Option<std::collections::HashSet<DiskMask>>,
 }
 
 impl Drop for Restore<'_> {
@@ -531,11 +523,12 @@ pub fn read_or_fenced<T>(results: Vec<Result<T, DiskError>>) -> Result<Vec<Optio
     Ok(results.into_iter().map(Result::ok).collect())
 }
 
-/// The mask of `members` whose `results` are `Ok`.
-pub fn ok_mask<T, E>(members: &[usize], results: &[Result<T, E>]) -> u64 {
+/// The `members` whose `results` are `Ok`.
+pub fn ok_mask<T, E>(members: &[PoolDiskIdx], results: &[Result<T, E>]) -> DiskMask {
     members
         .iter()
         .zip(results)
         .filter(|(_, r)| r.is_ok())
-        .fold(0, |m, (&d, _)| m | 1 << d)
+        .map(|(&d, _)| d)
+        .collect()
 }

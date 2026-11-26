@@ -8,7 +8,7 @@ use super::pb::etcdserverpb::{
 };
 use super::store::{EtcdError, EtcdStore, KeyRange, MAX_REQUEST_BYTES};
 use crate::api_types::Role;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use futures::Stream;
 use pb::watch_request::RequestUnion;
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ pub(super) const WATCH_BYTES: usize = 1 << 20;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(600);
 
 /// The services of one etcd dataset, as this node serves them.
-pub struct EtcdServer<D: BlockDevice> {
+pub struct EtcdServer<D: PoolDevice> {
     pub store: Arc<EtcdStore<D>>,
     /// This node's name (the member's).
     pub node: String,
@@ -121,7 +121,7 @@ fn out<T: Send + 'static>(rx: mpsc::Receiver<std::result::Result<T, Status>>) ->
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-impl<D: BlockDevice + 'static> EtcdServer<D> {
+impl<D: PoolDevice + 'static> EtcdServer<D> {
     /// The gRPC router of every service, on `store`.
     pub fn router(self) -> tonic::transport::server::Router {
         let s = Arc::new(self);
@@ -144,7 +144,7 @@ impl<D: BlockDevice + 'static> EtcdServer<D> {
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> kv_server::Kv for EtcdServer<D> {
+impl<D: PoolDevice + 'static> kv_server::Kv for EtcdServer<D> {
     async fn range(&self, r: Request<pb::RangeRequest>) -> Res<pb::RangeResponse> {
         self.store
             .range(r.into_inner())
@@ -204,7 +204,7 @@ struct Watcher {
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> watch_server::Watch for EtcdServer<D> {
+impl<D: PoolDevice + 'static> watch_server::Watch for EtcdServer<D> {
     type WatchStream = Out<pb::WatchResponse>;
 
     async fn watch(&self, r: Request<Streaming<pb::WatchRequest>>) -> Res<Self::WatchStream> {
@@ -222,7 +222,7 @@ impl<D: BlockDevice + 'static> watch_server::Watch for EtcdServer<D> {
 /// One watch stream: its watchers, each sent the events of its keys in
 /// revision order, durable ones only (as `durable`, the store's
 /// `durable_rev`, moves).
-pub(super) async fn watch_session<D: BlockDevice + 'static>(
+pub(super) async fn watch_session<D: PoolDevice + 'static>(
     store: Arc<EtcdStore<D>>,
     mut inbound: impl futures::Stream<Item = std::result::Result<pb::WatchRequest, Status>>
     + Unpin
@@ -439,7 +439,7 @@ pub(super) fn chunks(events: Vec<super::pb::mvccpb::Event>) -> Vec<Vec<super::pb
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> lease_server::Lease for EtcdServer<D> {
+impl<D: PoolDevice + 'static> lease_server::Lease for EtcdServer<D> {
     type LeaseKeepAliveStream = Out<pb::LeaseKeepAliveResponse>;
 
     async fn lease_grant(&self, r: Request<pb::LeaseGrantRequest>) -> Res<pb::LeaseGrantResponse> {
@@ -521,7 +521,7 @@ fn unimplemented<T>(what: &str) -> Res<T> {
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> maintenance_server::Maintenance for EtcdServer<D> {
+impl<D: PoolDevice + 'static> maintenance_server::Maintenance for EtcdServer<D> {
     type SnapshotStream = Out<pb::SnapshotResponse>;
 
     async fn alarm(&self, _: Request<pb::AlarmRequest>) -> Res<pb::AlarmResponse> {
@@ -572,7 +572,7 @@ impl<D: BlockDevice + 'static> maintenance_server::Maintenance for EtcdServer<D>
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> cluster_server::Cluster for EtcdServer<D> {
+impl<D: PoolDevice + 'static> cluster_server::Cluster for EtcdServer<D> {
     async fn member_add(&self, _: Request<pb::MemberAddRequest>) -> Res<pb::MemberAddResponse> {
         unimplemented("MemberAdd")
     }
@@ -617,7 +617,7 @@ fn auth_off<T>() -> Res<T> {
 }
 
 #[tonic::async_trait]
-impl<D: BlockDevice + 'static> auth_server::Auth for EtcdServer<D> {
+impl<D: PoolDevice + 'static> auth_server::Auth for EtcdServer<D> {
     async fn auth_status(&self, _: Request<pb::AuthStatusRequest>) -> Res<pb::AuthStatusResponse> {
         let (rev, _) = self.store.revisions().await.map_err(status)?;
         Ok(Response::new(pb::AuthStatusResponse {

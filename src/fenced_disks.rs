@@ -6,7 +6,7 @@
 //! * Shape (R1a): a [`ValidatedWrite`] or [`ValidatedRead`] is the only way
 //!   to name blocks. Building one checks that the disk is local and served,
 //!   that `1 <= count <= WS_MAX_BLOCKS`, that the range doesn't wrap (in
-//!   blocks or in bytes), and
+//!   blocks or in bytes: it is a [`RawBlockRange`]), and
 //!   (for a write) that the data is exactly `count` blocks, before anything
 //!   is admitted (an admitted request raises floors).
 //! * Readiness (R1b): writes wait for the fence's startup barrier
@@ -25,7 +25,8 @@
 //!   client has given up on it (its connection closed, or its deadline
 //!   passed) is refused instead of landing later.
 
-use crate::disk::{Block, BlockDevice};
+use crate::coords::{RawBlockRange, RawDiskBlock, ServedDiskIdx};
+use crate::disk::{Block, RawDisk};
 use crate::disks::Caddy;
 use crate::fence::{Admit, Ready, ServerFence, Stamp};
 use crate::websocket::{WS_MAX_BLOCKS, WsStatus};
@@ -70,16 +71,15 @@ impl Expiry {
 
 /// A write of a valid shape to a served disk (see the module docs).
 pub struct ValidatedWrite<'a> {
-    disk: usize,
-    block: u64,
+    disk: ServedDiskIdx,
+    range: RawBlockRange,
     data: &'a [Block],
 }
 
 /// A read of a valid shape from a served disk.
 pub struct ValidatedRead {
-    disk: usize,
-    block: u64,
-    count: u32,
+    disk: ServedDiskIdx,
+    range: RawBlockRange,
 }
 
 pub struct FencedDisks {
@@ -122,6 +122,13 @@ impl FencedDisks {
         self.disks.get(disk).is_some_and(|d| d.is_local())
     }
 
+    /// Served disk `disk`, if it is local.
+    fn served(&self, disk: usize) -> Result<ServedDiskIdx, WsStatus> {
+        let d = u16::try_from(disk).map_err(|_| WsStatus::ErrorNotFound)?;
+        self.local(disk)?;
+        Ok(ServedDiskIdx::new(d))
+    }
+
     fn local(&self, disk: usize) -> Result<&Caddy, WsStatus> {
         self.disks
             .get(disk)
@@ -132,15 +139,20 @@ impl FencedDisks {
     /// The request's shape. The range must be addressable in bytes, not
     /// just in blocks (I-9): a block number whose byte offset wraps would
     /// be fenced, and stripe-locked, as one block and land on another.
-    fn check_range(&self, disk: usize, block: u64, count: u32) -> Result<(), WsStatus> {
-        self.local(disk)?;
-        if count == 0
-            || count > WS_MAX_BLOCKS
-            || crate::disk::byte_offset(block, count as u64).is_none()
-        {
+    fn check_range(
+        &self,
+        disk: usize,
+        block: u64,
+        count: u32,
+    ) -> Result<(ServedDiskIdx, RawBlockRange), WsStatus> {
+        let disk = self.served(disk)?;
+        if count == 0 || count > WS_MAX_BLOCKS {
             return Err(WsStatus::InvalidRequest);
         }
-        Ok(())
+        let range = RawDiskBlock::new(block)
+            .range(count)
+            .ok_or(WsStatus::InvalidRequest)?;
+        Ok((disk, range))
     }
 
     /// Whether `count` blocks from `block` are on the disk. The capacity is
@@ -148,13 +160,18 @@ impl FencedDisks {
     /// grew is seen and the common case costs nothing. Without this, a
     /// write past the end of a file disk grows the file, and a read past it
     /// returns zeros, both outside anything the fence maps.
-    async fn check_capacity(&self, disk: usize, block: u64, count: u32) -> Result<(), WsStatus> {
-        let end = block + count as u64; // checked by `check_range`
-        if end <= self.capacity[disk].load(Ordering::Relaxed) {
+    async fn check_capacity(
+        &self,
+        disk: ServedDiskIdx,
+        range: RawBlockRange,
+    ) -> Result<(), WsStatus> {
+        let end = range.end().get();
+        let seen = &self.capacity[disk.as_usize()];
+        if end <= seen.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let cap = self.capacity_blocks(disk).await?;
-        self.capacity[disk].fetch_max(cap, Ordering::Relaxed);
+        let cap = self.capacity_blocks(disk.as_usize()).await?;
+        seen.fetch_max(cap, Ordering::Relaxed);
         if end > cap {
             return Err(WsStatus::InvalidRequest);
         }
@@ -167,8 +184,8 @@ impl FencedDisks {
         block: u64,
         count: u32,
     ) -> Result<ValidatedRead, WsStatus> {
-        self.check_range(disk, block, count)?;
-        Ok(ValidatedRead { disk, block, count })
+        let (disk, range) = self.check_range(disk, block, count)?;
+        Ok(ValidatedRead { disk, range })
     }
 
     /// `data`: the raw payload, exactly `count` blocks.
@@ -179,12 +196,12 @@ impl FencedDisks {
         count: u32,
         data: &'a [u8],
     ) -> Result<ValidatedWrite<'a>, WsStatus> {
-        self.check_range(disk, block, count)?;
+        let (disk, range) = self.check_range(disk, block, count)?;
         let data = crate::disk::as_blocks(data).map_err(|_| WsStatus::InvalidRequest)?;
         if data.len() != count as usize {
             return Err(WsStatus::InvalidRequest);
         }
-        Ok(ValidatedWrite { disk, block, data })
+        Ok(ValidatedWrite { disk, range, data })
     }
 
     /// Read `r`. With a stamp, it's admitted first (a pool stamp raises
@@ -192,17 +209,19 @@ impl FencedDisks {
     /// under its blocks' stripe locks, shared: writes admitted before it
     /// have landed (see the module docs).
     pub async fn read(&self, r: ValidatedRead, stamp: Option<Stamp>) -> Result<Vec<u8>, WsStatus> {
-        self.check_capacity(r.disk, r.block, r.count).await?;
+        self.check_capacity(r.disk, r.range).await?;
         let _locked = match stamp {
             Some(stamp) => {
-                let locked = self.lock_shared(r.disk, r.block, r.count).await;
-                self.admit(r.disk, r.block, r.count, stamp, false)?;
+                let locked = self.lock_shared(r.disk, r.range).await;
+                self.admit(r.disk, r.range, stamp, false)?;
                 Some(locked)
             }
             None => None,
         };
-        let mut buffer = crate::disk::zeroed_blocks(r.count as usize);
-        self.disks[r.disk].read_blocks(r.block, &mut buffer).await?;
+        let mut buffer = crate::disk::zeroed_blocks(r.range.count() as usize);
+        self.disks[r.disk.as_usize()]
+            .read_blocks(r.range.start(), &mut buffer)
+            .await?;
         Ok(buffer.into_flattened())
     }
 
@@ -216,15 +235,16 @@ impl FencedDisks {
         if self.floor.readiness() != Ready::Ready {
             return Err(WsStatus::NotReady);
         }
-        let count = w.data.len() as u32;
-        self.check_capacity(w.disk, w.block, count).await?;
-        let _locked = self.lock(w.disk, w.block, count).await;
+        self.check_capacity(w.disk, w.range).await?;
+        let _locked = self.lock(w.disk, w.range).await;
         // From here to the write starting: no await.
         if expiry.is_expired() {
             return Err(WsStatus::Expired);
         }
-        self.admit(w.disk, w.block, count, stamp, true)?;
-        self.disks[w.disk].write_blocks(w.block, w.data).await?;
+        self.admit(w.disk, w.range, stamp, true)?;
+        self.disks[w.disk.as_usize()]
+            .write_blocks(w.range.start(), w.data)
+            .await?;
         Ok(())
     }
 
@@ -239,24 +259,26 @@ impl FencedDisks {
 
     fn admit(
         &self,
-        disk: usize,
-        block: u64,
-        count: u32,
+        disk: ServedDiskIdx,
+        range: RawBlockRange,
         stamp: Stamp,
         write: bool,
     ) -> Result<(), WsStatus> {
-        match self.floor.admit_stamp(disk, block, count, stamp, write) {
+        match self
+            .floor
+            .admit_stamp(disk, range.start(), range.count(), stamp, write)
+        {
             Admit::Yes => Ok(()),
             Admit::Stale => Err(WsStatus::StaleEpoch),
             Admit::Fenced => Err(WsStatus::Fenced),
         }
     }
 
-    /// The stripe locks over `count` blocks from `block`, in index order
-    /// (so two requests never wait on each other's).
-    fn stripe_indexes(block: u64, count: u32) -> Vec<usize> {
-        let first = block / STRIPE_BLOCKS;
-        let last = (block + count as u64 - 1) / STRIPE_BLOCKS;
+    /// The stripe locks over `range`, in index order (so two requests
+    /// never wait on each other's).
+    fn stripe_indexes(range: RawBlockRange) -> Vec<usize> {
+        let first = range.start().get() / STRIPE_BLOCKS;
+        let last = (range.end().get() - 1) / STRIPE_BLOCKS;
         let mut idx: Vec<usize> = (first..=last)
             .map(|s| (s % STRIPES as u64) as usize)
             .collect();
@@ -266,10 +288,14 @@ impl FencedDisks {
     }
 
     /// The stripe locks over a write, exclusive.
-    async fn lock(&self, disk: usize, block: u64, count: u32) -> Vec<RwLockWriteGuard<'_, ()>> {
+    async fn lock(
+        &self,
+        disk: ServedDiskIdx,
+        range: RawBlockRange,
+    ) -> Vec<RwLockWriteGuard<'_, ()>> {
         let mut out = Vec::new();
-        for i in Self::stripe_indexes(block, count) {
-            out.push(self.stripes[disk][i].write().await);
+        for i in Self::stripe_indexes(range) {
+            out.push(self.stripes[disk.as_usize()][i].write().await);
         }
         out
     }
@@ -277,13 +303,12 @@ impl FencedDisks {
     /// The stripe locks over a stamped read, shared.
     async fn lock_shared(
         &self,
-        disk: usize,
-        block: u64,
-        count: u32,
+        disk: ServedDiskIdx,
+        range: RawBlockRange,
     ) -> Vec<RwLockReadGuard<'_, ()>> {
         let mut out = Vec::new();
-        for i in Self::stripe_indexes(block, count) {
-            out.push(self.stripes[disk][i].read().await);
+        for i in Self::stripe_indexes(range) {
+            out.push(self.stripes[disk.as_usize()][i].read().await);
         }
         out
     }

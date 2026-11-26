@@ -530,7 +530,7 @@ async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
     assert!(read_any(&fs, rec * vbs as u64, vbs).await == second);
 }
 
-async fn read_any<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+async fn read_any<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     fs: &FileSystem<D>,
     offset: u64,
     len: usize,

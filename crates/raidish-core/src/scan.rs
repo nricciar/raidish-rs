@@ -21,7 +21,7 @@
 //! whether that included the disks being resilvered.
 
 use crate::blkptr::BlockPtr;
-use crate::disk::{BLOCK_SIZE, BlockDevice};
+use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError, parse_label};
 use crate::fsck::{Node, table_node};
 use crate::object::TreeRoot;
@@ -43,10 +43,10 @@ pub struct ScanReport {
     pub shards: StripeCheck,
     pub label_stripes: u64,
     /// Label units (first block of each) for which no valid contents could be found.
-    pub label_unrecoverable: Vec<u64>,
+    pub label_unrecoverable: Vec<crate::coords::PoolLba>,
     /// Label units decided with stale (degraded) members' copies voting:
     /// see `LabelScan::stale_votes`.
-    pub label_stale_votes: Vec<u64>,
+    pub label_stale_votes: Vec<crate::coords::PoolLba>,
     /// Records that could not be read or verified, with their location.
     pub errors: Vec<String>,
     /// Disks brought back in sync (no longer degraded).
@@ -177,7 +177,7 @@ impl std::fmt::Display for ScanReport {
 /// space from being reused while it runs.
 const MIN_FREE_FRACTION: u64 = 50; // 1/50 = 2%
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Check everything; with `repair`, fix what's wrong and bring degraded
     /// disks back in sync.
     pub async fn scrub(&self, repair: bool) -> Result<ScanReport, FileSystemError> {
@@ -192,13 +192,12 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Does any reachable disk need a resilver (or have unrecorded misses)?
     pub fn needs_resilver(&self) -> bool {
-        let Some(pool) = self.dev.pool() else {
-            return false;
-        };
+        let disks = self.dev.pool().disks();
         let degraded = self.degraded_disks();
         let missed = self.unaccounted_misses();
-        (0..pool.disks().len()).any(|d| {
-            pool.disks().is_online(d)
+        disks.indexes().any(|disk| {
+            let d = disk.as_usize();
+            disks.is_online(disk)
                 && (degraded.get(d).is_some_and(|t| t.is_some())
                     || missed.get(d).copied().unwrap_or(false))
         })
@@ -220,15 +219,16 @@ impl<D: BlockDevice> FileSystem<D> {
                 self.commit_locked(tx).await?;
             }
             let misses = self.miss_counts();
-            let marks: Vec<u64> = (0..misses.len()).map(|d| self.degraded_mark(d)).collect();
+            let marks: Vec<u64> = self.disk_indexes().map(|d| self.degraded_mark(d)).collect();
             let degraded = self.degraded_disks();
             let since = match since {
                 Some(s) => s,
                 None => {
-                    let online = |d: usize| pool.is_some_and(|p| p.disks().is_online(d));
-                    match (0..degraded.len())
-                        .filter(|&d| online(d))
-                        .filter_map(|d| degraded[d])
+                    match pool
+                        .disks()
+                        .indexes()
+                        .filter(|&d| pool.disks().is_online(d))
+                        .filter_map(|d| degraded[d.as_usize()])
                         .min()
                     {
                         Some(s) => s,
@@ -275,11 +275,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // A disk is cleared only once what was repaired on it is durable:
         // flushed, and no repair lost to a flush that failed (audit D1).
-        if repair
-            && report.is_clean()
-            && let Some(pool) = pool
-            && report.repaired() > 0
-        {
+        if repair && report.is_clean() && report.repaired() > 0 {
             let flushed = self.dev.flush().await;
             if pool.disks().take_repairs_lost() || flushed.is_err() {
                 report.errors.push(format!(
@@ -290,34 +286,32 @@ impl<D: BlockDevice> FileSystem<D> {
                 ));
             }
         }
-        if repair
-            && report.certifies()
-            && let Some(pool) = pool
-        {
+        if repair && report.certifies() {
             // Under the tx: no commit can write a label or fold a miss in
             // between the label write and the clear (audit D4).
             let mut tx = self.begin_tx().await;
             let degraded = self.degraded_disks();
-            for d in 0..pool.disks().len() {
+            for disk in pool.disks().indexes() {
+                let d = disk.as_usize();
                 let covered = degraded[d].is_some_and(|t| t >= since);
                 // Marked since the snapshot (a writer's report of a miss):
                 // something the walk didn't see is missing.
-                let in_sync = pool.disks().is_online(d)
-                    && pool.disks().miss_count(d) == misses_at_start[d]
-                    && self.degraded_mark(d) == marks_at_start[d]
+                let in_sync = pool.disks().is_online(disk)
+                    && pool.disks().miss_count(disk) == misses_at_start[d]
+                    && self.degraded_mark(disk) == marks_at_start[d]
                     && !report.shards.is_unreadable(d)
                     && !report.shards.has_write_failed(d);
                 if !(covered && in_sync) {
                     continue;
                 }
-                if pool.disks().is_fenced(d) {
-                    if let Err(e) = self.write_disk_label(d).await {
+                if pool.disks().is_fenced(disk) {
+                    if let Err(e) = self.write_disk_label(disk).await {
                         eprintln!("disk {}: label write failed: {}", d, e);
                         continue;
                     }
-                    pool.disks().set_fenced(d, false);
+                    pool.disks().set_fenced(disk, false);
                 }
-                if self.clear_degraded(&tx, d, marks_at_start[d], misses_at_start[d]) {
+                if self.clear_degraded(&tx, disk, marks_at_start[d], misses_at_start[d]) {
                     report.cleared.push(d);
                 }
             }
@@ -341,7 +335,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let total = self.layout.metaslab_count * self.layout.metaslab_size_blocks;
         let mut stack: Vec<Node> = table_node(&root).into_iter().collect();
         // Snapshots share subtrees with their volumes: each record once.
-        let mut seen: std::collections::HashSet<(u64, Txg)> = Default::default();
+        let mut seen: std::collections::HashSet<(crate::coords::PoolLba, Txg)> = Default::default();
 
         while let Some(node) = stack.pop() {
             if !seen.insert((node.ptr.lba, node.ptr.birth_txg)) {
@@ -387,12 +381,10 @@ impl<D: BlockDevice> FileSystem<D> {
     async fn scan_logs(
         &self,
         logs: &[(DatasetName, crate::inode::DatasetLog)],
-        repair: &(dyn Fn(u64) -> bool + Send + Sync),
+        repair: &(dyn Fn(crate::coords::PoolLba) -> bool + Send + Sync),
         report: &mut ScanReport,
     ) {
-        let Some(pool) = self.dev.pool() else {
-            return;
-        };
+        let pool = self.dev.pool();
         for (name, log) in logs {
             for (i, region) in log.regions.iter().enumerate() {
                 let from = if i == 0 { log.from_seq } else { 0 };
@@ -411,11 +403,7 @@ impl<D: BlockDevice> FileSystem<D> {
                     let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
                     padded[..rec.bytes.len()].copy_from_slice(&rec.bytes);
                     report.log_records += 1;
-                    match pool
-                        .root()
-                        .verify_blocks(rec.lba, &padded, repair(rec.lba))
-                        .await
-                    {
+                    match pool.verify_blocks(rec.lba, &padded, repair(rec.lba)).await {
                         Ok(check) => report.shards.add(&check),
                         Err(e) => report.errors.push(format!(
                             "volume '{}': intent log record at {}: {}",
@@ -438,17 +426,20 @@ impl<D: BlockDevice> FileSystem<D> {
         let data = self.read_record_healing(ptr, false).await.ok()?;
         report.records += 1;
         report.bytes += ptr.lsize as u64;
-        if let Some(pool) = self.dev.pool() {
-            // Exactly what `write_record_blocks` wrote: the data zero-padded
-            // to whole stripes (the rest of `asize`, if any, was never written).
-            let blocks = self.align_blocks(ptr.data_blocks());
-            let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
-            padded[..data.len()].copy_from_slice(&data);
-            match pool.root().verify_blocks(ptr.lba, &padded, repair).await {
-                Ok(check) => report.shards.add(&check),
-                Err(e) => {
-                    report.errors.push(format!("record at {}: {}", ptr.lba, e));
-                }
+        // Exactly what `write_record_blocks` wrote: the data zero-padded
+        // to whole stripes (the rest of `asize`, if any, was never written).
+        let blocks = self.align_blocks(ptr.data_blocks());
+        let mut padded = vec![0u8; blocks as usize * BLOCK_SIZE];
+        padded[..data.len()].copy_from_slice(&data);
+        match self
+            .dev
+            .pool()
+            .verify_blocks(ptr.lba, &padded, repair)
+            .await
+        {
+            Ok(check) => report.shards.add(&check),
+            Err(e) => {
+                report.errors.push(format!("record at {}: {}", ptr.lba, e));
             }
         }
         Some(data)
@@ -463,9 +454,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// lent as free). Once they're fixed, the committer's next resilver finds
     /// them good and clears the disk. None: nothing to do.
     pub async fn heal_lent(&self) -> Result<Option<ScanReport>, FileSystemError> {
-        let (Some(w), Some(pool)) = (self.writer.clone(), self.dev.pool()) else {
+        let Some(w) = self.writer.clone() else {
             return Ok(None);
         };
+        let pool = self.dev.pool();
         let lent: std::collections::HashSet<crate::types::MetaslabIdx> =
             w.lent.lock().unwrap().iter().copied().collect();
         if lent.is_empty() {
@@ -475,9 +467,11 @@ impl<D: BlockDevice> FileSystem<D> {
         let Some(newest) = ring.first() else {
             return Ok(None);
         };
-        let Some(since) = (0..newest.degraded.len())
+        let Some(since) = pool
+            .disks()
+            .indexes()
             .filter(|&d| pool.disks().is_online(d))
-            .filter_map(|d| newest.degraded[d])
+            .filter_map(|d| newest.degraded.get(d.as_usize()).copied().flatten())
             .min()
         else {
             return Ok(None);
@@ -500,9 +494,9 @@ impl<D: BlockDevice> FileSystem<D> {
                 .iter()
                 .copied()
                 .collect();
-            let in_lent = move |lba: u64| {
+            let in_lent = move |lba: crate::coords::PoolLba| {
                 layout
-                    .metaslab_for_block(lba)
+                    .metaslab_for_block(lba.get())
                     .is_some_and(|i| pinned.contains(&i))
             };
             self.scan_tree(
@@ -541,9 +535,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Verify the fixed label regions: superblock, uberblock ring and space
     /// map slots. Must run under the commit lock (commits rewrite them).
     async fn scan_labels(&self, _tx: &crate::tx::Tx, repair: bool, report: &mut ScanReport) {
-        let Some(pool) = self.dev.pool() else {
-            return;
-        };
+        let pool = self.dev.pool();
         // A label from past the last commit is a torn, uncommitted write:
         // never the truth, however many copies hold it.
         let committed = self.uberblock().await.map_or(0, |u| u.txg.get());
@@ -556,17 +548,18 @@ impl<D: BlockDevice> FileSystem<D> {
         // Degraded members missed label writes: their copies don't vote
         // (audit D3), they're what gets repaired. So may a disk with a
         // write failed since the snapshot, not yet folded into `degraded`.
-        let stale: Vec<bool> = (0..pool.disks().len())
+        let stale: Vec<bool> = pool
+            .disks()
+            .indexes()
             .map(|d| pool.disks().may_lag(d))
             .collect();
-        let header = (0, self.header.spacemap_start);
+        let header = (crate::fs::SUPERBLOCK_LBA, self.header.spacemap_start.get());
         let spacemaps = (
-            self.layout.spacemap_start,
+            crate::coords::PoolLba::new(self.layout.spacemap_start),
             self.layout.data_start - self.layout.spacemap_start,
         );
         for (lba, blocks) in [header, spacemaps] {
             match pool
-                .root()
                 .verify_labels(lba, blocks, repair, &score, &stale)
                 .await
             {

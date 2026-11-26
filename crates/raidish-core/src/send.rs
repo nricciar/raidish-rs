@@ -25,7 +25,7 @@
 //! (full).
 
 use crate::blkptr::BlockPtr;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
 use crate::types::DatasetName;
@@ -149,7 +149,7 @@ struct Pending {
     hole: Option<(u64, u64)>,
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Snapshot `name@snap` and its dnode's tree, size and record size.
     async fn snapshot_tree(
         &self,

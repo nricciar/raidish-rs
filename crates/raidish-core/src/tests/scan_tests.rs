@@ -1,4 +1,5 @@
 use super::*;
+use crate::coords::PoolLba;
 use crate::fs::LabelState;
 use crate::test_util::ds;
 use crate::test_util::{TestPool, check_files, write_files};
@@ -53,10 +54,10 @@ async fn scrub_repairs_corrupt_data_and_labels() {
         first_record(&fs, "/f0").await.lba
     };
     pool.corrupt(2, TestPool::locate(lba + 2).1); // a data shard
-    pool.corrupt(0, TestPool::stripe_offset(0)); // superblock mirror 0
+    pool.corrupt(0, TestPool::stripe_offset(PoolLba::new(0))); // superblock mirror 0
     pool.corrupt(
         4,
-        TestPool::stripe_offset(crate::test_util::UBERBLOCK_START),
+        TestPool::stripe_offset(PoolLba::new(crate::test_util::UBERBLOCK_START)),
     ); // uberblock parity
 
     let fs = pool.load().await;
@@ -90,16 +91,19 @@ async fn replaced_disk_is_fenced_then_rebuilt() {
 
     {
         let fs = pool.load().await;
-        let stripe = &fs.dev.pool().unwrap().disks();
+        let stripe = &fs.dev.pool().disks();
         assert_eq!(fs.degraded_disks()[2], Some(Txg::ZERO));
-        assert!(stripe.is_fenced(2));
+        assert!(stripe.is_fenced(crate::test_util::disk(2)));
         check_files(&fs, "f", 1, 3).await; // served around the blank disk
 
         let report = fs.resilver().await.unwrap();
         assert!(report.is_clean(), "{}", report);
         assert_eq!(report.cleared, vec![2]);
-        assert!(!stripe.is_fenced(2));
-        assert_eq!(fs.check_disk_label(2).await, LabelState::Ok);
+        assert!(!stripe.is_fenced(crate::test_util::disk(2)));
+        assert_eq!(
+            fs.check_disk_label(crate::test_util::disk(2)).await,
+            LabelState::Ok
+        );
     }
 
     let fs = FileSystem::load(pool.dev_without(&[0, 4]).await)
@@ -127,8 +131,8 @@ async fn a_resilver_that_skipped_a_stripe_clears_nothing() {
     let fs = Arc::new(fp.load().await);
     assert_eq!(fs.degraded_disks()[2], Some(Txg::ZERO));
     // The vdevs see it too (I-20: a read-modify-write won't read it).
-    let disks = fs.dev.pool().unwrap().disks().clone();
-    assert!(disks.may_lag(2) && !disks.may_lag(0));
+    let disks = fs.dev.pool().disks().clone();
+    assert!(disks.may_lag(crate::test_util::disk(2)) && !disks.may_lag(crate::test_util::disk(0)));
     let lba = first_record(&fs, "/f0").await.lba;
     let mut block = [0u8; BLOCK_SIZE];
     fs.dev.read_block(lba, &mut block).await.unwrap();
@@ -159,7 +163,7 @@ async fn a_resilver_that_skipped_a_stripe_clears_nothing() {
     fs.dev.flush().await.unwrap();
     let report = fs.resilver().await.unwrap();
     assert_eq!(report.cleared, vec![2], "{}", report);
-    assert!(!disks.may_lag(2));
+    assert!(!disks.may_lag(crate::test_util::disk(2)));
     drop(report);
     let fs = Arc::into_inner(fs).unwrap();
     drop(fs);

@@ -35,7 +35,7 @@
 //! serves them: NBD / NVMe for `block`) sits on top, in its own module.
 
 use crate::blkptr::BlockPtr;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, DatasetProps, Dnode, ObjType};
 use crate::object::{Dirty, ObjTree, Sizing};
@@ -157,7 +157,7 @@ pub(crate) fn decode_datasets(data: &[u8]) -> Result<DatasetIndex, FileSystemErr
     Ok(bincode::deserialize(data)?)
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// The dataset directory's contents (uncommitted changes included).
     pub async fn datasets(&self) -> Result<DatasetIndex, FileSystemError> {
         let dnode = self.read_dnode(self.datasets_object()).await?;
@@ -422,7 +422,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .unique_blocks(&dnode.tree, dnode.blksz as usize, held, None)
             .await?
         {
-            self.free(tx, p.lba, p.asize as u64).await?;
+            self.free_record(tx, &p).await?;
         }
         for r in dnode.log().iter().flat_map(|l| &l.regions) {
             self.free(tx, r.start, r.len).await?;
@@ -622,7 +622,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // As in `sync_table`: the rest freed all the same if given up on (I-1).
         let mut left = crate::object::Unsettled::all(self, &mut replaced);
         while let Some(p) = left.ptrs.last().cloned() {
-            self.free(tx, p.lba, p.asize as u64).await?;
+            self.free_record(tx, &p).await?;
             left.ptrs.pop();
         }
         left.disarm();

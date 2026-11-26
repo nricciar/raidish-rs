@@ -408,7 +408,7 @@ async fn the_committer_records_what_it_sees() {
     );
 }
 
-async fn log_of<D: crate::disk::BlockDevice>(c: &crate::Committer<D>) -> EventPage {
+async fn log_of<D: crate::disk::PoolDevice>(c: &crate::Committer<D>) -> EventPage {
     c.events()
         .await
         .unwrap()

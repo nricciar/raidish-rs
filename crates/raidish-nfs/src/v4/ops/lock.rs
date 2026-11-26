@@ -2,7 +2,7 @@
 
 use super::super::*;
 
-impl<D: BlockDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static> Server<D> {
     pub(in crate::v4) fn denied(w: &mut Writer, d: &state::Denied) {
         w.u64(d.range.start)
             .u64(d.range.length())

@@ -22,7 +22,7 @@
 
 use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::{Epoch, NodeId};
 use crate::types::{HolderRole, LeaseResource};
@@ -79,14 +79,14 @@ fn parse<T: for<'de> Deserialize<'de>>(b: &[u8]) -> Result<T, FileSystemError> {
 }
 
 /// The log, opened on the committer's pool.
-pub struct EventLog<D: BlockDevice> {
+pub struct EventLog<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     ds: Arc<Dataset>,
     /// Appends one at a time (they number events).
     append: tokio::sync::Mutex<()>,
 }
 
-impl<D: BlockDevice> EventLog<D> {
+impl<D: PoolDevice> EventLog<D> {
     /// Open the pool's log, made empty if it has none yet.
     pub async fn open(fs: Arc<FileSystem<D>>) -> Result<Arc<Self>, FileSystemError> {
         let ds = crate::service_tree::ensure_btree(
@@ -201,7 +201,7 @@ impl<D: BlockDevice> EventLog<D> {
 
 /// Drop the oldest events past the limits (a few at a time: each append
 /// does some).
-async fn prune<D: BlockDevice>(t: &mut Txn<'_, D>, now: u64) -> Result<(), FileSystemError> {
+async fn prune<D: PoolDevice>(t: &mut Txn<'_, D>, now: u64) -> Result<(), FileSystemError> {
     // Besides the events: `M` and `S`.
     let events = t.header.entries.saturating_sub(2);
     let over = events.saturating_sub(MAX_EVENTS);

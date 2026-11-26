@@ -7,7 +7,7 @@ use super::pb::etcdserverpb as pb;
 use super::pb::mvccpb;
 use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::service_tree::spawn_while_alive;
 use pb::compare::{CompareResult, CompareTarget, TargetUnion};
@@ -359,7 +359,7 @@ struct Mark {
 }
 
 /// One etcd keyspace, served from this node.
-pub struct EtcdStore<D: BlockDevice> {
+pub struct EtcdStore<D: PoolDevice> {
     fs: Arc<FileSystem<D>>,
     pub name: crate::types::DatasetName,
     pub cluster_id: u64,
@@ -377,14 +377,14 @@ pub struct EtcdStore<D: BlockDevice> {
     stopped: watch::Sender<bool>,
 }
 
-impl<D: BlockDevice + 'static> crate::service_tree::Served for EtcdStore<D> {
+impl<D: PoolDevice + 'static> crate::service_tree::Served for EtcdStore<D> {
     fn is_stopped(&self) -> bool {
         *self.stopped.borrow()
     }
 }
 
 /// A request's view of the header fields.
-fn header_of<D: BlockDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseHeader> {
+fn header_of<D: PoolDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseHeader> {
     Some(pb::ResponseHeader {
         cluster_id: s.cluster_id,
         member_id: s.member_id,
@@ -393,7 +393,7 @@ fn header_of<D: BlockDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseH
     })
 }
 
-impl<D: BlockDevice + 'static> EtcdStore<D> {
+impl<D: PoolDevice + 'static> EtcdStore<D> {
     /// Serve etcd dataset `name` of `fs` (opened as its writer, or as the
     /// committer in tests). Leases start afresh.
     pub async fn open(
@@ -1037,7 +1037,7 @@ fn set_rev(h: &mut Option<pb::ResponseHeader>, rev: i64) {
     }
 }
 
-async fn read_meta<D: BlockDevice>(t: &Txn<'_, D>) -> Result<Meta> {
+async fn read_meta<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
     match t.get(META).await? {
         None => Ok(Meta::default()),
         Some(b) => dec(&b, "meta"),
@@ -1045,7 +1045,7 @@ async fn read_meta<D: BlockDevice>(t: &Txn<'_, D>) -> Result<Meta> {
 }
 
 /// Every entry with a tree key in `[lo, hi)`.
-async fn scan<D: BlockDevice>(
+async fn scan<D: PoolDevice>(
     t: &Txn<'_, D>,
     lo: Vec<u8>,
     hi: Vec<u8>,
@@ -1070,7 +1070,7 @@ async fn scan<D: BlockDevice>(
     Ok(out)
 }
 
-async fn hist_at<D: BlockDevice>(
+async fn hist_at<D: PoolDevice>(
     t: &Txn<'_, D>,
     key: &[u8],
     main: i64,
@@ -1102,7 +1102,7 @@ fn kv_of(key: &[u8], main: i64, h: Hist) -> Option<mvccpb::KeyValue> {
 }
 
 /// The value of `cur` (a live key).
-async fn current_kv<D: BlockDevice>(
+async fn current_kv<D: PoolDevice>(
     t: &Txn<'_, D>,
     key: &[u8],
     cur: &Current,
@@ -1129,7 +1129,7 @@ async fn current_kv<D: BlockDevice>(
     })
 }
 
-async fn get_current<D: BlockDevice>(t: &Txn<'_, D>, key: &[u8]) -> Result<Option<Current>> {
+async fn get_current<D: PoolDevice>(t: &Txn<'_, D>, key: &[u8]) -> Result<Option<Current>> {
     match t.get(&k_key(key)).await? {
         None => Ok(None),
         Some(b) => Ok(Some(dec(&b, "key")?)),
@@ -1137,7 +1137,7 @@ async fn get_current<D: BlockDevice>(t: &Txn<'_, D>, key: &[u8]) -> Result<Optio
 }
 
 /// The event for change `c` at `main.sub`.
-async fn event_at<D: BlockDevice>(
+async fn event_at<D: PoolDevice>(
     t: &Txn<'_, D>,
     c: &Change,
     main: i64,
@@ -1183,7 +1183,7 @@ struct Found {
 }
 
 /// The keys of `kr` as of revision `at` (None: as the tree has them now).
-async fn found<D: BlockDevice>(
+async fn found<D: PoolDevice>(
     t: &Txn<'_, D>,
     kr: &KeyRange,
     at: Option<i64>,
@@ -1280,7 +1280,7 @@ fn found_of(key: Vec<u8>, c: Current) -> Found {
     }
 }
 
-async fn range<D: BlockDevice>(
+async fn range<D: PoolDevice>(
     t: &Txn<'_, D>,
     meta: &Meta,
     cur: i64,
@@ -1373,7 +1373,7 @@ async fn range<D: BlockDevice>(
     })
 }
 
-async fn value_of<D: BlockDevice>(t: &Txn<'_, D>, f: &Found) -> Result<Vec<u8>> {
+async fn value_of<D: PoolDevice>(t: &Txn<'_, D>, f: &Found) -> Result<Vec<u8>> {
     if let Some(v) = &f.value {
         return Ok(v.clone());
     }
@@ -1388,7 +1388,7 @@ async fn value_of<D: BlockDevice>(t: &Txn<'_, D>, f: &Found) -> Result<Vec<u8>> 
 }
 
 /// Whether every comparison holds (at the current state).
-async fn compares_hold<D: BlockDevice>(t: &Txn<'_, D>, cs: &[pb::Compare]) -> Result<bool> {
+async fn compares_hold<D: PoolDevice>(t: &Txn<'_, D>, cs: &[pb::Compare]) -> Result<bool> {
     for c in cs {
         let kr = KeyRange::new(&c.key, &c.range_end);
         let keys = found(t, &kr, None).await?;
@@ -1420,7 +1420,7 @@ async fn compares_hold<D: BlockDevice>(t: &Txn<'_, D>, cs: &[pb::Compare]) -> Re
     Ok(true)
 }
 
-async fn compare_one<D: BlockDevice>(
+async fn compare_one<D: PoolDevice>(
     t: &Txn<'_, D>,
     c: &pb::Compare,
     target: CompareTarget,
@@ -1568,7 +1568,7 @@ fn has_txn(ops: &[pb::RequestOp]) -> bool {
 
 /// One write transaction on the keyspace: every change in it is at
 /// revision `meta.rev + 1` (sub-revisions in order), all applied together.
-pub(crate) struct Writer<'a, D: BlockDevice> {
+pub(crate) struct Writer<'a, D: PoolDevice> {
     t: Txn<'a, D>,
     max_key: usize,
     meta: Meta,
@@ -1579,7 +1579,7 @@ pub(crate) struct Writer<'a, D: BlockDevice> {
     leases_removed: Vec<i64>,
 }
 
-impl<D: BlockDevice> Writer<'_, D> {
+impl<D: PoolDevice> Writer<'_, D> {
     /// The revision reads in this transaction see.
     fn cur_rev(&self) -> i64 {
         if self.sub > 0 {

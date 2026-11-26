@@ -2,6 +2,7 @@
 //! instant, even while operations and commits run concurrently.
 
 use super::*;
+use crate::coords::PoolLba;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 
 /// Load an independent view of whatever is committed on disk right now and
 /// check it as if the process had crashed at this moment.
-async fn check_snapshot<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+async fn check_snapshot<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     pool: &TestPool,
     writer: &FileSystem<D>,
 ) -> Result<(), String> {
@@ -188,7 +189,7 @@ async fn volume_writes_and_commits_stay_consistent() {
     );
 }
 
-async fn write_generation<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+async fn write_generation<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     fs: &FileSystem<D>,
     generation: u8,
 ) {
@@ -208,7 +209,7 @@ async fn write_generation<D: crate::disk::BlockDevice + Send + Sync + 'static>(
     fs.sync().await.unwrap();
 }
 
-async fn check_generations<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+async fn check_generations<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     fs: &FileSystem<D>,
     upto: u8,
 ) {
@@ -298,7 +299,7 @@ async fn degraded_operation_and_stale_disk_return() {
 }
 
 /// One fixed workload of metadata and volume operations.
-async fn workload<D: crate::disk::BlockDevice + Send + Sync + 'static>(
+async fn workload<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     fs: &FileSystem<D>,
 ) -> Result<(), crate::fs::FileSystemError> {
     let file = |n: u32, v: u8| {
@@ -429,7 +430,9 @@ async fn a_commit_dropped_in_its_space_map_writes_keeps_them_dirty() {
     let pool = TestPool::new().await;
     let (fs, faults) = pool.format_faulty().await;
     fs.mkdir(Path::new("/d")).await.unwrap();
-    faults.stall_writes(Some(fs.layout.spacemap_start..fs.layout.data_start));
+    faults.stall_writes(Some(
+        PoolLba::new(fs.layout.spacemap_start)..PoolLba::new(fs.layout.data_start),
+    ));
     {
         let write = fs.write_file(Path::new("/d/a"), &[7u8; 50_000]);
         tokio::pin!(write);
@@ -523,7 +526,9 @@ async fn a_commit_dropped_in_its_table_writes_keeps_the_records() {
     let r = fs.mkdir_locked(&mut tx, Path::new("/d/e")).await;
     tx.check(r).await.unwrap();
     drop(tx);
-    faults.stall_writes(Some(fs.layout.data_start..u64::MAX));
+    faults.stall_writes(Some(
+        PoolLba::new(fs.layout.data_start)..PoolLba::new(u64::MAX),
+    ));
     {
         let commit = fs.commit_txg();
         tokio::pin!(commit);

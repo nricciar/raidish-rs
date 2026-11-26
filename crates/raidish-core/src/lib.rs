@@ -11,6 +11,7 @@ pub use raidish_types::{api_types, types, vm_def};
 
 pub mod blkptr;
 pub mod btree;
+pub mod coords;
 pub mod dataset;
 pub mod disk;
 pub mod disks;

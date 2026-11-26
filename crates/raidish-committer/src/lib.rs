@@ -26,7 +26,7 @@ use crate::cluster::state::MetaslabGrant;
 use crate::cluster::state::{ClusterState, POOL, Response};
 use crate::cluster::{Cluster, LeaseOp, now_ms};
 use crate::dataset::{DatasetFormat, DatasetInfo};
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::events::{EventKind, EventLog, Held, Level, NewEvent, Observed, Subject};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::DatasetProps;
@@ -286,7 +286,7 @@ pub fn orphan_state(
     }
 }
 
-pub struct Committer<D: BlockDevice> {
+pub struct Committer<D: PoolDevice> {
     pub fs: Arc<FileSystem<D>>,
     auth: Arc<dyn Authority>,
     /// Its `pool` lease.
@@ -414,7 +414,7 @@ pub struct CommitterInfo {
     pub epoch: Epoch,
 }
 
-impl<D: BlockDevice> Committer<D> {
+impl<D: PoolDevice> Committer<D> {
     /// Become the committer of `fs`, which was opened writable under the
     /// `pool` lease (`owner`, `epoch`).
     pub async fn new(
@@ -424,9 +424,7 @@ impl<D: BlockDevice> Committer<D> {
         epoch: Epoch,
         node: String,
     ) -> Self {
-        if let Some(pool) = fs.dev.pool() {
-            pool.disks().fence().set_pool_epoch(epoch);
-        }
+        fs.dev.pool().disks().fence().set_pool_epoch(epoch);
         let state = auth.state();
         let lends: std::collections::HashMap<MetaslabIdx, Lend> = state
             .metaslabs
@@ -578,20 +576,21 @@ impl<D: BlockDevice> Committer<D> {
 
     /// Pool disks that went offline or came back since the last look.
     fn disk_changes(&self) -> Vec<crate::events::Noticed> {
-        let Some(pool) = self.fs.dev.pool() else {
-            return Vec::new();
-        };
-        let now: Vec<bool> = (0..pool.disks().len())
+        let pool = self.fs.dev.pool();
+        let now: Vec<bool> = pool
+            .disks()
+            .indexes()
             .map(|d| pool.disks().is_online(d))
             .collect();
         let nodes = self.auth.disk_nodes();
         let mut last = self.disks_online.lock().unwrap();
         let mut out = Vec::new();
-        for (d, &online) in now.iter().enumerate() {
+        for (idx, &online) in pool.disks().indexes().zip(&now) {
+            let d = idx.as_usize();
             let before = last.as_ref().and_then(|l| l.get(d).copied());
             let name = match nodes.get(&d) {
                 Some(n) => format!("Disk {} ({})", d, n),
-                None => disk_label(d, pool.disks().disk(d).path(), &self.node),
+                None => disk_label(d, pool.disks().disk(idx).path(), &self.node),
             };
             match (before, online) {
                 (Some(true), false) | (None, false) => out.push((
@@ -1408,14 +1407,14 @@ impl<D: BlockDevice> Committer<D> {
 
 /// A writer's sink for a committer in the same process (tests).
 #[cfg(any(test, feature = "testutil"))]
-pub struct DirectSink<D: BlockDevice> {
+pub struct DirectSink<D: PoolDevice> {
     pub committer: Arc<Committer<D>>,
     pub writer: LeaseRef,
 }
 
 #[cfg(any(test, feature = "testutil"))]
 #[async_trait]
-impl<D: BlockDevice + 'static> CommitSink for DirectSink<D> {
+impl<D: PoolDevice + 'static> CommitSink for DirectSink<D> {
     fn writer(&self) -> LeaseRef {
         self.writer.clone()
     }
@@ -1591,7 +1590,7 @@ pub async fn run(
             health::spawn_health_monitor(fs.clone(), Duration::from_secs(30), Some(events.clone()));
         *slot.write().await = Some(committer.clone());
         let mut observe_failing = false;
-        let fenced_out = || fs.dev.pool().is_some_and(|p| p.disks().fence().is_stale());
+        let fenced_out = || fs.dev.pool().disks().fence().is_stale();
         let mut ticked = false;
         while !lost.load(Ordering::SeqCst) {
             if fenced_out() {

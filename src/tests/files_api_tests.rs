@@ -519,7 +519,7 @@ async fn ruin_record(s: &Setup, name: &str, idx: u64) {
         .unwrap();
     drop(fs);
     let mut spots = std::collections::BTreeSet::new();
-    for lba in leaf.lba..leaf.lba + leaf.asize as u64 {
+    for lba in (0..leaf.asize as u64).map(|i| leaf.lba + i) {
         for disk in 0..s.pool.paths.len() {
             spots.insert((disk, TestPool::stripe_offset(lba)));
         }

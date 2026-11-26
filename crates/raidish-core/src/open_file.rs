@@ -14,7 +14,7 @@
 //! is a commit.)
 
 use crate::blkptr::BlockPtr;
-use crate::disk::{BlockDevice, FileId};
+use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, ObjTree, Sizing};
 use crate::writer::{CommitError, FsOp, ObjLease, WriterState};
@@ -95,7 +95,7 @@ impl Drop for FileSyncOnDrop<'_> {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Open the file at `path` for reading and writing at any offset,
     /// optionally under its `obj/<id>` lease. Opening an open file returns
     /// the same one.
@@ -405,7 +405,7 @@ impl<D: BlockDevice> FileSystem<D> {
         // As in `sync_table`: the rest freed all the same if given up on.
         let mut left = crate::object::Unsettled::all(self, &mut replaced);
         while let Some(p) = left.ptrs.last().cloned() {
-            self.free(tx, p.lba, p.asize as u64).await?;
+            self.free_record(tx, &p).await?;
             left.ptrs.pop();
         }
         left.disarm();

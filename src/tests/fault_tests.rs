@@ -7,7 +7,8 @@
 use crate::cluster::LeaseOp;
 use crate::cluster::state::{POOL, Response};
 use crate::committer::{Authority, Committer, DirectSink, LocalAuthority, dataset_resource};
-use crate::disk::{BLOCK_SIZE, Block, BlockDevice, Disk};
+use crate::coords::*;
+use crate::disk::{BLOCK_SIZE, Block, Disk, PoolDevice, RawDisk};
 use crate::disks::DISK_LABEL_BLOCKS;
 use crate::fs::FileSystem;
 use crate::test_util::dsn;
@@ -39,7 +40,7 @@ fn one_disk() -> (tempfile::NamedTempFile, crate::test_util::FaultHandle, Disk) 
 
 async fn read(d: &Disk, b: u64) -> u8 {
     let mut buf = blk(0xEE);
-    d.read_block(b, &mut buf).await.unwrap();
+    d.read_block(RawDiskBlock::new(b), &mut buf).await.unwrap();
     assert!(buf.iter().all(|&x| x == buf[0]), "torn block {}", b);
     buf[0]
 }
@@ -60,23 +61,23 @@ fn on_file(f: &tempfile::NamedTempFile, b: u64) -> u8 {
 async fn write_failures_count_down_and_carry_the_error() {
     let (_f, h, d) = one_disk();
     h.fail_writes_after(2, FaultError::StaleEpoch);
-    d.write_block(1, &blk(1)).await.unwrap();
-    d.write_block(2, &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(1)).await.unwrap();
+    d.write_block(RawDiskBlock::new(2), &blk(2)).await.unwrap();
     assert!(matches!(
-        d.write_block(3, &blk(3)).await,
+        d.write_block(RawDiskBlock::new(3), &blk(3)).await,
         Err(crate::disk::DiskError::StaleEpoch)
     ));
-    assert!(d.write_block(4, &blk(4)).await.is_err());
+    assert!(d.write_block(RawDiskBlock::new(4), &blk(4)).await.is_err());
     assert_eq!((read(&d, 2).await, read(&d, 3).await), (2, 0));
     h.fail_writes(None);
-    d.write_block(3, &blk(3)).await.unwrap();
+    d.write_block(RawDiskBlock::new(3), &blk(3)).await.unwrap();
     assert_eq!(read(&d, 3).await, 3);
     let s = h.stats();
     assert_eq!((s.writes, s.failed_writes), (5, 2));
 
     h.fail_writes(Some(FaultError::Timeout));
     assert!(matches!(
-        d.write_block(5, &blk(5)).await,
+        d.write_block(RawDiskBlock::new(5), &blk(5)).await,
         Err(crate::disk::DiskError::Timeout)
     ));
 }
@@ -86,11 +87,17 @@ async fn faults_can_target_a_block_range() {
     let (_f, h, d) = one_disk();
     h.target_blocks(Some(10..20));
     h.fail_writes(Some(FaultError::Io));
-    d.write_block(9, &blk(9)).await.unwrap();
-    d.write_block(20, &blk(20)).await.unwrap();
-    assert!(d.write_block(10, &blk(1)).await.is_err());
+    d.write_block(RawDiskBlock::new(9), &blk(9)).await.unwrap();
+    d.write_block(RawDiskBlock::new(20), &blk(20))
+        .await
+        .unwrap();
+    assert!(d.write_block(RawDiskBlock::new(10), &blk(1)).await.is_err());
     // A run overlapping the range is targeted as a whole.
-    assert!(d.write_blocks(5, &[blk(1); 6]).await.is_err());
+    assert!(
+        d.write_blocks(RawDiskBlock::new(5), &[blk(1); 6])
+            .await
+            .is_err()
+    );
     assert_eq!(read(&d, 9).await, 9);
 }
 
@@ -102,12 +109,12 @@ async fn flush_failures_and_offline() {
     h.fail_flushes(None);
     d.flush().await.unwrap();
 
-    d.write_block(1, &blk(1)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(1)).await.unwrap();
     h.set_offline(true);
     assert!(!d.is_online());
     let mut buf = blk(0);
-    assert!(d.read_block(1, &mut buf).await.is_err());
-    assert!(d.write_block(1, &blk(2)).await.is_err());
+    assert!(d.read_block(RawDiskBlock::new(1), &mut buf).await.is_err());
+    assert!(d.write_block(RawDiskBlock::new(1), &blk(2)).await.is_err());
     assert!(d.flush().await.is_err());
     assert!(d.capacity_blocks().await.is_err());
     h.heal();
@@ -130,9 +137,9 @@ async fn flush_failures_and_offline() {
 #[tokio::test]
 async fn dropped_writes_are_acked_and_lost() {
     let (_f, h, d) = one_disk();
-    d.write_block(1, &blk(1)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(1)).await.unwrap();
     h.drop_writes(true);
-    d.write_block(1, &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(2)).await.unwrap();
     d.flush().await.unwrap();
     assert_eq!(read(&d, 1).await, 1);
     assert_eq!(h.stats().dropped_writes, 1);
@@ -142,14 +149,14 @@ async fn dropped_writes_are_acked_and_lost() {
 async fn the_write_cache_is_lost_on_a_power_cut_unless_flushed() {
     let (f, h, d) = one_disk();
     h.cache_writes(true);
-    d.write_block(1, &blk(1)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(1)).await.unwrap();
     assert_eq!(read(&d, 1).await, 1, "reads see the cache");
     assert_eq!(on_file(&f, 1), 0);
     d.flush().await.unwrap();
     assert_eq!(on_file(&f, 1), 1);
 
-    d.write_block(1, &blk(2)).await.unwrap();
-    d.write_block(2, &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(2), &blk(2)).await.unwrap();
     // A failed flush persists nothing.
     h.fail_flushes(Some(FaultError::Io));
     assert!(d.flush().await.is_err());
@@ -158,7 +165,7 @@ async fn the_write_cache_is_lost_on_a_power_cut_unless_flushed() {
 
     // Turning the cache off writes it back.
     h.fail_flushes(None);
-    d.write_block(3, &blk(3)).await.unwrap();
+    d.write_block(RawDiskBlock::new(3), &blk(3)).await.unwrap();
     h.cache_writes(false);
     assert_eq!(on_file(&f, 3), 3);
 }
@@ -169,9 +176,9 @@ async fn held_writes_land_in_the_order_released() {
     let d = Arc::new(d);
     h.hold_writes(true);
     let (d1, d2) = (d.clone(), d.clone());
-    let first = tokio::spawn(async move { d1.write_block(1, &blk(1)).await });
+    let first = tokio::spawn(async move { d1.write_block(RawDiskBlock::new(1), &blk(1)).await });
     h.wait_held(1).await;
-    let second = tokio::spawn(async move { d2.write_block(1, &blk(2)).await });
+    let second = tokio::spawn(async move { d2.write_block(RawDiskBlock::new(1), &blk(2)).await });
     h.wait_held(2).await;
     assert_eq!(read(&d, 1).await, 0, "nothing landed yet");
     // The later write lands first; the earlier one overwrites it.
@@ -185,7 +192,7 @@ async fn held_writes_land_in_the_order_released() {
 
     // A write whose caller is gone still lands when released.
     let d3 = d.clone();
-    let gone = tokio::spawn(async move { d3.write_block(5, &blk(5)).await });
+    let gone = tokio::spawn(async move { d3.write_block(RawDiskBlock::new(5), &blk(5)).await });
     h.wait_held(1).await;
     gone.abort();
     let _ = gone.await;
@@ -198,16 +205,16 @@ async fn held_writes_land_in_the_order_released() {
 async fn deferred_writes_reply_now_and_land_later() {
     let (_f, h, d) = one_disk();
     h.defer_writes(Some(Some(FaultError::Timeout)));
-    assert!(d.write_block(1, &blk(1)).await.is_err());
+    assert!(d.write_block(RawDiskBlock::new(1), &blk(1)).await.is_err());
     h.defer_writes(None);
-    d.write_block(1, &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(2)).await.unwrap();
     assert_eq!((h.deferred(), read(&d, 1).await), (1, 2));
     // The timed-out write lands over the newer one.
     assert_eq!(h.land_deferred(), 1);
     assert_eq!(read(&d, 1).await, 1);
 
     h.defer_writes(Some(None));
-    d.write_block(2, &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(2), &blk(2)).await.unwrap();
     assert_eq!(h.discard_deferred(), 1);
     assert_eq!(read(&d, 2).await, 0);
 }
@@ -215,11 +222,13 @@ async fn deferred_writes_reply_now_and_land_later() {
 #[tokio::test]
 async fn snapshot_and_restore_roll_the_image_back() {
     let (_f, h, d) = one_disk();
-    d.write_block(1, &blk(1)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(1)).await.unwrap();
     h.snapshot();
-    d.write_block(1, &blk(2)).await.unwrap();
-    d.write_block(1, &blk(3)).await.unwrap();
-    d.write_blocks(7, &[blk(7); 3]).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(2)).await.unwrap();
+    d.write_block(RawDiskBlock::new(1), &blk(3)).await.unwrap();
+    d.write_blocks(RawDiskBlock::new(7), &[blk(7); 3])
+        .await
+        .unwrap();
     assert_eq!(h.restore(), 4);
     assert_eq!(read(&d, 1).await, 1);
     assert_eq!(read(&d, 8).await, 0);
@@ -242,7 +251,7 @@ async fn a_fault_pool_reopens_with_its_faults_in_place() {
         // reported down.
         fp.disk(0).set_offline(true);
         let fs = fp.load().await;
-        assert!(!fs.dev.disks().is_online(0));
+        assert!(!fs.dev.disks().is_online(PoolDiskIdx::new(0).unwrap()));
         let mut buf = vec![0u8; 100_000];
         fs.block_read(&dsn("a"), 0, &mut buf).await.unwrap();
         assert_eq!(buf, pattern(100_000, 1));
@@ -264,7 +273,7 @@ async fn d1_mirror_flush_with_no_durable_copy_fails() {
     let fp = FaultPool::mirror(2).await;
     let dev = fp.dev();
     fp.disk(0).fail_writes(Some(FaultError::Io));
-    dev.write_block(100, &blk(7)).await.unwrap();
+    dev.write_block(PoolLba::new(100), &blk(7)).await.unwrap();
     fp.disk(0).fail_writes(None);
     fp.disk(1).fail_flushes(Some(FaultError::Io));
     assert!(
@@ -279,19 +288,24 @@ async fn d1_mirror_flush_with_no_durable_copy_fails() {
 async fn d1_a_cancelled_flush_keeps_its_writes_pending() {
     use crate::disks::WriteAcks;
     let acks = WriteAcks::new(1);
-    acks.record(0b01);
-    let stuck = acks.flush(std::future::pending::<Result<u64, crate::disk::DiskError>>);
+    let (d0, d1) = (PoolDiskIdx::new(0).unwrap(), PoolDiskIdx::new(1).unwrap());
+    acks.record(DiskMask::EMPTY.with(d0));
+    let stuck = acks.flush(std::future::pending::<Result<DiskMask, crate::disk::DiskError>>);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(10), stuck)
             .await
             .is_err()
     );
     assert!(
-        acks.flush(|| async { Ok(0b10) }).await.is_err(),
+        acks.flush(|| async { Ok(DiskMask::EMPTY.with(d1)) })
+            .await
+            .is_err(),
         "the write disk 0 took is still owed a flush of disk 0"
     );
-    acks.flush(|| async { Ok(0b01) }).await.unwrap();
-    acks.flush(|| async { Ok(0) }).await.unwrap();
+    acks.flush(|| async { Ok(DiskMask::EMPTY.with(d0)) })
+        .await
+        .unwrap();
+    acks.flush(|| async { Ok(DiskMask::EMPTY) }).await.unwrap();
 }
 
 /// D1: a repair (one disk's copy rewritten) doesn't fail the vdev's flush
@@ -300,13 +314,19 @@ async fn d1_a_cancelled_flush_keeps_its_writes_pending() {
 async fn d1_a_repair_a_disk_cant_flush_is_reported_lost() {
     let fp = FaultPool::mirror(2).await;
     let dev = fp.dev();
-    let disks = dev.pool().unwrap().disks().clone();
-    disks.repair_shards(1, 100, &[blk(7)]).await.unwrap();
+    let disks = dev.pool().disks().clone();
+    disks
+        .repair_shards(PoolDiskIdx::new(1).unwrap(), DiskShard::new(100), &[blk(7)])
+        .await
+        .unwrap();
     assert!(disks.take_repairs_lost(), "not flushed yet");
     dev.flush().await.unwrap();
     assert!(!disks.take_repairs_lost(), "flushed");
 
-    disks.repair_shards(1, 100, &[blk(8)]).await.unwrap();
+    disks
+        .repair_shards(PoolDiskIdx::new(1).unwrap(), DiskShard::new(100), &[blk(8)])
+        .await
+        .unwrap();
     fp.disk(1).fail_flushes(Some(FaultError::Io));
     dev.flush().await.unwrap();
     assert!(disks.take_repairs_lost(), "its disk's flush failed");
@@ -319,19 +339,32 @@ async fn d1_a_repair_a_disk_cant_flush_is_reported_lost() {
 #[tokio::test]
 async fn d1_overlapping_flushes_count_a_repair_once() {
     let fp = FaultPool::mirror(2).await;
-    let disks = fp.dev().pool().unwrap().disks().clone();
-    disks.repair_shards(1, 100, &[blk(7)]).await.unwrap();
+    let disks = fp.dev().pool().disks().clone();
+    disks
+        .repair_shards(PoolDiskIdx::new(1).unwrap(), DiskShard::new(100), &[blk(7)])
+        .await
+        .unwrap();
     fp.disk(1).hold_flushes(true);
-    let (x, y, ()) = tokio::join!(disks.flush_disk(1), disks.flush_disk(1), async {
-        fp.disk(1).wait_flushes_held(2).await;
-        fp.disk(1).hold_flushes(false);
-    });
+    let (x, y, ()) = tokio::join!(
+        disks.flush_disk(PoolDiskIdx::new(1).unwrap()),
+        disks.flush_disk(PoolDiskIdx::new(1).unwrap()),
+        async {
+            fp.disk(1).wait_flushes_held(2).await;
+            fp.disk(1).hold_flushes(false);
+        }
+    );
     x.unwrap();
     y.unwrap();
     assert!(!disks.take_repairs_lost(), "flushed");
-    disks.repair_shards(1, 100, &[blk(8)]).await.unwrap();
+    disks
+        .repair_shards(PoolDiskIdx::new(1).unwrap(), DiskShard::new(100), &[blk(8)])
+        .await
+        .unwrap();
     assert!(disks.take_repairs_lost(), "a new repair, not flushed yet");
-    disks.flush_disk(1).await.unwrap();
+    disks
+        .flush_disk(PoolDiskIdx::new(1).unwrap())
+        .await
+        .unwrap();
     assert!(!disks.take_repairs_lost(), "and that one flushed");
 }
 
@@ -343,7 +376,9 @@ async fn d1_raidz_flush_needs_data_many_durable_shards() {
     let dev = fp.dev();
     dev.flush().await.unwrap();
     fp.disk(0).fail_writes(Some(FaultError::Io));
-    dev.write_blocks(0, &[blk(3), blk(4)]).await.unwrap();
+    dev.write_blocks(PoolLba::new(0), &[blk(3), blk(4)])
+        .await
+        .unwrap();
     fp.disk(0).fail_writes(None);
     fp.disk(1).fail_flushes(Some(FaultError::Io));
     assert!(dev.flush().await.is_err());
@@ -353,7 +388,9 @@ async fn d1_raidz_flush_needs_data_many_durable_shards() {
     // A flush with only the missing disk failing is fine: the stripe was
     // never on it.
     fp.disk(0).fail_flushes(Some(FaultError::Io));
-    dev.write_blocks(2, &[blk(5), blk(6)]).await.unwrap();
+    dev.write_blocks(PoolLba::new(2), &[blk(5), blk(6)])
+        .await
+        .unwrap();
     dev.flush().await.unwrap();
 }
 
@@ -399,20 +436,20 @@ async fn r2a_a_fencing_refusal_fails_the_op_and_isnt_a_miss() {
     for fp in [FaultPool::mirror(2).await, FaultPool::raidz(1, 3).await] {
         let dev = fp.dev();
         fp.disk(1).fail_writes(Some(FaultError::StaleEpoch));
-        let r = dev.write_blocks(0, &[blk(1), blk(2)]).await;
+        let r = dev.write_blocks(PoolLba::new(0), &[blk(1), blk(2)]).await;
         assert!(
             matches!(r, Err(crate::disk::DiskError::StaleEpoch)),
             "{:?}",
             r.err()
         );
-        assert_eq!(dev.disks().miss_count(1), 0);
+        assert_eq!(dev.disks().miss_count(PoolDiskIdx::new(1).unwrap()), 0);
         fp.disk(1).fail_writes(None);
         fp.disk(1).fail_flushes(Some(FaultError::StaleEpoch));
         assert!(matches!(
             dev.flush().await,
             Err(crate::disk::DiskError::StaleEpoch)
         ));
-        assert_eq!(dev.disks().miss_count(1), 0);
+        assert_eq!(dev.disks().miss_count(PoolDiskIdx::new(1).unwrap()), 0);
     }
 }
 
@@ -424,14 +461,14 @@ async fn raidz3_reads_with_three_members_offline() {
     let fp = FaultPool::raidz(3, 6).await;
     let dev = fp.dev();
     let blocks: Vec<Block> = (0..9).map(|i| blk(i + 1)).collect();
-    dev.write_blocks(0, &blocks).await.unwrap();
+    dev.write_blocks(PoolLba::new(0), &blocks).await.unwrap();
     dev.flush().await.unwrap();
     for offline in [[0, 1, 2], [0, 3, 5], [3, 4, 5]] {
         for &d in &offline {
             fp.disk(d).set_offline(true);
         }
         let mut back = vec![[0u8; BLOCK_SIZE]; blocks.len()];
-        dev.read_blocks(0, &mut back)
+        dev.read_blocks(PoolLba::new(0), &mut back)
             .await
             .unwrap_or_else(|e| panic!("disks {:?} offline: {:?}", offline, e));
         assert_eq!(back, blocks, "disks {:?} offline", offline);
@@ -448,12 +485,14 @@ async fn raidz3_reads_with_three_members_offline() {
 async fn r2a_a_fenced_repair_fails_the_scrub() {
     for fp in [FaultPool::mirror(2).await, FaultPool::raidz(1, 3).await] {
         let dev = fp.dev();
-        dev.write_blocks(0, &[blk(1), blk(2)]).await.unwrap();
+        dev.write_blocks(PoolLba::new(0), &[blk(1), blk(2)])
+            .await
+            .unwrap();
         dev.flush().await.unwrap();
         // Checked against other contents: every member needs a repair.
         let want: Vec<u8> = [blk(3), blk(4)].concat();
         fp.disk(1).fail_writes(Some(FaultError::Fenced));
-        let r = dev.root().verify_blocks(0, &want, true).await;
+        let r = dev.root().verify_blocks(VdevLba::new(0), &want, true).await;
         assert!(
             matches!(
                 r,
@@ -466,7 +505,11 @@ async fn r2a_a_fenced_repair_fails_the_scrub() {
         );
         // An ordinary failure is still a failed repair.
         fp.disk(1).fail_writes(Some(FaultError::Io));
-        let c = dev.root().verify_blocks(0, &want, true).await.unwrap();
+        let c = dev
+            .root()
+            .verify_blocks(VdevLba::new(0), &want, true)
+            .await
+            .unwrap();
         assert!(c.has_write_failed(1));
     }
 }
@@ -682,7 +725,7 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
         fp.disk(1).restore();
         let fs = fp.load().await;
         let now = fs.uberblock().await.unwrap().txg;
-        fs.mark_degraded(1, now.next());
+        fs.mark_degraded(PoolDiskIdx::new(1).unwrap(), now.next());
 
         for &d in &peers {
             fp.disk(d).set_offline(true);
@@ -699,7 +742,7 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
         // With the peer back, the resilver repairs the labels and clears it.
         fp.heal();
         for &d in &peers {
-            fs.adopt_disk(d).await;
+            fs.adopt_disk(PoolDiskIdx::new(d).unwrap()).await;
         }
         let report = fs.resilver().await.unwrap();
         assert!(
@@ -737,7 +780,7 @@ async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, FileSystem<Pool>) {
     }
     let fs = fp.load().await;
     for &d in stale {
-        fs.mark_degraded(d, since);
+        fs.mark_degraded(PoolDiskIdx::new(d).unwrap(), since);
     }
     (fp, fs)
 }
@@ -761,7 +804,7 @@ async fn i19_stale_members_dont_overwrite_the_current_one() {
     );
 
     fp.heal();
-    fs.adopt_disk(0).await;
+    fs.adopt_disk(PoolDiskIdx::new(0).unwrap()).await;
     for _ in 0..3 {
         if !fs.needs_resilver() {
             break;
@@ -1261,9 +1304,13 @@ async fn r4d_lost_answers_to_a_lend_or_return_dont_wedge_the_metaslab() {
     assert!(!c.fs().lent_metaslabs().await.contains(&idx.get()));
     let layout = c.fs().layout;
     let lba = layout.data_start + idx.index() as u64 * layout.metaslab_size_blocks;
-    let fence = c.fs().dev.pool().unwrap().disks().fence();
+    let fence = c.fs().dev.pool().disks().fence();
     assert_eq!(
-        fence.epoch_for(Some(0), lba + crate::disks::DISK_LABEL_BLOCKS, 1),
+        fence.epoch_for(
+            Some(PoolDiskIdx::new(0).unwrap()),
+            RawDiskBlock::new(lba + crate::disks::DISK_LABEL_BLOCKS),
+            1
+        ),
         crate::fence::Stamp::Returned(back),
         "taken back as returned"
     );
@@ -2255,7 +2302,7 @@ async fn d4_a_miss_reported_during_the_scan_keeps_the_disk_degraded() {
     // A writer's commit reports a miss on disk 1 meanwhile.
     {
         let _tx = fs.begin_tx().await;
-        fs.mark_degraded(1, since);
+        fs.mark_degraded(PoolDiskIdx::new(1).unwrap(), since);
     }
     fp.disk(1).hold_writes(false);
     fp.disk(1).release_all();
@@ -2550,7 +2597,9 @@ async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
     fs.sync().await.unwrap();
 
     // Writes to the uberblock ring fail, on both members.
-    let ring = fs.header.uberblock_start + DISK_LABEL_BLOCKS;
+    // A mirror's block is the same shard on every member.
+    let ring = fs.header.uberblock_start.at_root().mirror_shard();
+    let ring = ring.to_raw().unwrap().get();
     let ring = ring..ring + fs.header.uberblock_blocks();
     for d in 0..2 {
         fp.disk(d).target_blocks(Some(ring.clone()));

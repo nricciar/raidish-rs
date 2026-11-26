@@ -20,7 +20,7 @@
 //! or its dataset from writing (see `crate::fence`).
 
 use crate::blkptr::BlockPtr;
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::object::TreeRoot;
@@ -412,7 +412,7 @@ async fn lease_lost(mut lost: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-impl<D: BlockDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D> {
     /// Open the pool as a volume writer: read-only, except for the records
     /// and indirect blocks of volumes it runs, which go into metaslabs
     /// `sink`'s committer lends it.
@@ -728,9 +728,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.free_extents.clear();
         }
-        if let Some(pool) = self.dev.pool() {
-            pool.disks().fence().clear_metaslab(idx);
-        }
+        self.dev.pool().disks().fence().clear_metaslab(idx);
     }
 
     /// Borrow metaslabs until `need` blocks are allocatable.
@@ -765,9 +763,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 let mut ms = ms.write().await;
                 ms.free_extents = lent.free.iter().map(|e| (e.start, e.len)).collect();
             }
-            if let Some(pool) = self.dev.pool() {
-                pool.disks().fence().set_lent(lent.idx, lent.epoch);
-            }
+            self.dev
+                .pool()
+                .disks()
+                .fence()
+                .set_lent(lent.idx, lent.epoch);
             self.note_open_txg(lent.open_txg).await;
             w.lent.lock().unwrap().push(lent.idx);
         }
@@ -1370,9 +1370,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let refuse = |m: String| CommitError::refused(ErrorKind::Conflict, m);
         let retry = |e: FileSystemError| CommitError::Retry(e.to_string());
         // Recorded whatever happens to the op: the misses are real either way.
-        for &d in &c.missed {
-            self.mark_degraded(d, c.birth_txg.prev());
-        }
+        self.mark_missed(&c.missed, c.birth_txg.prev());
         let file_id = match &c.op {
             FsOp::WriteFile {
                 path,
@@ -1662,9 +1660,7 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Take a metaslab back (its return went through the cluster at
     /// `epoch`: the committer writes there with it from now on).
     pub async fn unlend(&self, idx: MetaslabIdx, epoch: Epoch) {
-        if let Some(pool) = self.dev.pool() {
-            pool.disks().fence().set_returned(idx, epoch);
-        }
+        self.dev.pool().disks().fence().set_returned(idx, epoch);
         if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.lent = false;
         }
@@ -1739,9 +1735,7 @@ impl<D: BlockDevice> FileSystem<D> {
         };
         let applied = current == c.new_root && (c.new_root != c.base_root || log_only_applied());
         if applied {
-            for &d in &c.missed {
-                self.mark_degraded(d, c.birth_txg.prev());
-            }
+            self.mark_missed(&c.missed, c.birth_txg.prev());
             return Ok(());
         }
         if current != c.base_root {
@@ -1819,9 +1813,7 @@ impl<D: BlockDevice> FileSystem<D> {
             .map(|(&extent, birth)| crate::types::Born { extent, birth })
             .collect();
         let _ = self.free_unheld(tx, frees, held).await;
-        for &d in &c.missed {
-            self.mark_degraded(d, c.birth_txg.prev());
-        }
+        self.mark_missed(&c.missed, c.birth_txg.prev());
         Ok(())
     }
 }

@@ -45,7 +45,7 @@
 //! capacity of node ids (its size); a hole costs nothing, so it is set
 //! large.
 
-use crate::disk::BlockDevice;
+use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, ObjTree};
 use crate::zil::KeyedOp;
@@ -307,7 +307,7 @@ fn split_point(sizes: &[usize]) -> usize {
 
 /// One operation on a tree: reads see its own writes, which are applied
 /// together by [`Txn::apply`].
-pub struct Txn<'a, D: BlockDevice> {
+pub struct Txn<'a, D: PoolDevice> {
     fs: &'a FileSystem<D>,
     obj: &'a ObjTree,
     lim: Limits,
@@ -320,7 +320,7 @@ pub struct Txn<'a, D: BlockDevice> {
     effects: Vec<KeyedOp>,
 }
 
-impl<'a, D: BlockDevice> Txn<'a, D> {
+impl<'a, D: PoolDevice> Txn<'a, D> {
     /// Start an operation on the tree in `obj` (an object with no records
     /// is an empty tree).
     pub async fn begin(fs: &'a FileSystem<D>, obj: &'a ObjTree) -> Result<Self, FileSystemError> {
@@ -992,7 +992,7 @@ pub struct CheckReport {
 /// and overflow page is used once, that every id below `next_id` is used
 /// or free (none lost), and that every record of the object is the header
 /// or reachable.
-pub(crate) async fn check<D: BlockDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> CheckReport {
+pub(crate) async fn check<D: PoolDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> CheckReport {
     let mut r = CheckReport::default();
     let t = match Txn::begin(fs, obj).await {
         Ok(t) => t,
