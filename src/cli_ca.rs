@@ -751,12 +751,24 @@ pub async fn run(command: &CaCommands, config: &Config) {
 }
 
 /// A libvirt certificate laid out as libvirt and qemu read theirs.
+///
+/// GnuTLS (libvirt, qemu) checks a certificate against the CA file alone,
+/// so that file has the issuer as well as the root: the certificate files
+/// hold the leaf and its issuer, and the issuer is what signed the leaf.
 fn write_libvirt(out: &Path, issued: &Issued, key_pem: &str) -> Result<(), String> {
+    // The chain's PEM after the leaf: its issuer.
+    const END: &str = "-----END CERTIFICATE-----";
+    let issuers = issued
+        .cert_pem
+        .find(END)
+        .map(|i| issued.cert_pem[i + END.len()..].trim_start())
+        .unwrap_or("");
+    let ca = format!("{}\n{}", issued.ca_pem.trim_end(), issuers);
     for (path, secret) in crate::pki::LIBVIRT_FILES {
         let is_ca = path.ends_with("/cacert.pem") || path.ends_with("/ca-cert.pem");
         let (body, mode) = match (*secret, is_ca) {
             (true, _) => (key_pem, 0o600),
-            (false, true) => (issued.ca_pem.as_str(), 0o644),
+            (false, true) => (ca.as_str(), 0o644),
             (false, false) => (issued.cert_pem.as_str(), 0o644),
         };
         raidish_ca::write_file(&out.join(path), body.as_bytes(), mode)?;
