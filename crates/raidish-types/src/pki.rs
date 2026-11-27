@@ -806,9 +806,17 @@ impl PkiState {
 
     /// Is `serial` a recorded, unexpired, unrevoked certificate at `now_ms`?
     pub fn is_live(&self, serial: &Serial, now_ms: u64) -> bool {
-        self.certs
-            .get(serial)
-            .is_some_and(|c| c.not_after_ms > now_ms && !self.is_revoked(serial))
+        self.certs.get(serial).is_some_and(|c| {
+            c.not_after_ms > now_ms && !self.is_revoked(serial) && !self.issuer_revoked(c.issuer)
+        })
+    }
+
+    /// Whether issuer `id` is revoked (an unknown one counts: nothing it
+    /// signed can be trusted).
+    pub fn issuer_revoked(&self, id: IssuerId) -> bool {
+        self.issuers
+            .get(&id)
+            .is_none_or(|i| matches!(i.status, IssuerStatus::Revoked { .. }))
     }
 
     /// `member`'s live certificates (its node cert, its libvirt certs).
@@ -935,6 +943,28 @@ impl PkiState {
                 }
                 if cert.not_after_ms <= cert.not_before_ms {
                     return Err("a certificate must end after it starts".into());
+                }
+                // A renewal: of a certificate that's still good, as it is.
+                // The signer checked that too, but on its own view, which
+                // can be behind a revocation committed through another
+                // node: this entry is ordered after it.
+                if let Some(prev) = &cert.renews {
+                    let old = self
+                        .certs
+                        .get(prev)
+                        .ok_or_else(|| format!("renews {}, which isn't on record", prev))?;
+                    if self.is_revoked(prev) {
+                        return Err(format!("renews {}, which is revoked", prev));
+                    }
+                    if self.issuer_revoked(old.issuer) {
+                        return Err(format!("renews {}, whose issuer is revoked", prev));
+                    }
+                    if old.not_after_ms <= now_ms {
+                        return Err(format!("renews {}, which has expired", prev));
+                    }
+                    if old.identity != cert.identity {
+                        return Err(format!("a renewal of {} must keep its identity", prev));
+                    }
                 }
                 if cert.not_after_ms > issuer.not_after_ms {
                     return Err(format!("a certificate can't outlive {}", cert.issuer));

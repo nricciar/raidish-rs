@@ -219,6 +219,17 @@ impl CaService {
         state.pki.ok_or_else(CaError::no_ca)
     }
 
+    /// The CA as the cluster has it now, for an action `caller` (the
+    /// certificate the request came with, over TLS) asks for: refused if
+    /// that certificate, or its issuer, is revoked. This node's own view,
+    /// and so its TLS check, can be behind a revocation committed through
+    /// another node; this reads after a read index.
+    pub(crate) async fn for_caller(&self, caller: &[u8]) -> Result<Arc<PkiState>, CaError> {
+        let pki = self.current_linearizable().await?;
+        caller_ok(&pki, caller)?;
+        Ok(pki)
+    }
+
     pub fn unsealed(&self) -> bool {
         self.dek.read().unwrap().is_some()
     }
@@ -458,7 +469,7 @@ impl CaService {
     /// `POST /api/v1/pki/renew`: the caller's own identity again, from its
     /// current certificate (`cert_der`, which TLS has verified).
     pub async fn renew(&self, cert_der: &[u8], csr_pem: &str) -> Result<Issued, CaError> {
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
+        let pki = self.for_caller(cert_der).await?;
         let facts = raidish_auth::ca::facts(cert_der).map_err(CaError::bad)?;
         let now = now_ms();
         let cert = pki
@@ -497,8 +508,13 @@ impl CaService {
     }
 
     /// `POST /api/v1/pki/sign`: an admin issuing a certificate.
-    pub async fn sign(&self, admin: &Principal, req: SignRequest) -> Result<Issued, CaError> {
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
+    pub async fn sign(
+        &self,
+        admin: &Principal,
+        caller: &[u8],
+        req: SignRequest,
+    ) -> Result<Issued, CaError> {
+        let pki = self.for_caller(caller).await?;
         if !req.profile.admin_issuable() {
             return Err(CaError::bad(format!(
                 "{} certificates aren't issued this way{}",
@@ -562,9 +578,10 @@ impl CaService {
     pub async fn create_enrollment(
         &self,
         admin: &Principal,
+        caller: &[u8],
         req: EnrollmentRequest,
     ) -> Result<EnrollmentCreated, CaError> {
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
+        let pki = self.for_caller(caller).await?;
         let dek = self.dek().ok_or_else(CaError::sealed)?;
         if req.member == self.cluster.members.me {
             // Its pool config has no address for itself: another node's has.
@@ -688,6 +705,35 @@ pub(crate) fn open_signer(pki: &PkiState, dek: &[u8; 32]) -> Result<Signer, Stri
 }
 
 /// Does `dek` open the CA's active issuer?
+/// Whether certificate `der` may still act, by `pki`: not revoked, and not
+/// from a revoked issuer (on record, or by its key id for one that isn't).
+fn caller_ok(pki: &PkiState, der: &[u8]) -> Result<(), CaError> {
+    let facts = raidish_auth::ca::facts(der).map_err(CaError::bad)?;
+    let refused = |why: &str| {
+        Err(CaError::new(
+            401,
+            format!("certificate {} {}", facts.serial, why),
+        ))
+    };
+    if pki.is_revoked(&facts.serial) {
+        return refused("is revoked");
+    }
+    if let Some(c) = pki.certs.get(&facts.serial)
+        && pki.issuer_revoked(c.issuer)
+    {
+        return refused("is from a revoked issuer");
+    }
+    if let Some(aki) = raidish_auth::ca::authority_key_id(der)
+        && pki
+            .issuers
+            .values()
+            .any(|i| i.ski == aki && matches!(i.status, pki::IssuerStatus::Revoked { .. }))
+    {
+        return refused("is from a revoked issuer");
+    }
+    Ok(())
+}
+
 fn check_dek(pki: &PkiState, dek: &[u8; 32]) -> Result<(), String> {
     open_signer(pki, dek)
         .map(|_| ())

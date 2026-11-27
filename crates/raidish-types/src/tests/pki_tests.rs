@@ -985,3 +985,63 @@ fn a_token_signer_is_the_active_issuers_and_codesigning_only() {
             .is_revoked(&Serial::from_be_bytes(&[42]))
     );
 }
+
+#[test]
+fn a_renewal_is_of_a_good_certificate_kept_as_it_is() {
+    let mut pki = installed();
+    record(&mut pki, 50, node_cert(1, T0 + 30 * DAY));
+    record(&mut pki, 51, node_cert(2, T0 + 30 * DAY));
+    let renewal = |of: u8, serial: u8, cert: IssuedCert| PkiOp::RecordIssued {
+        serial: Serial::from_be_bytes(&[serial]),
+        cert: IssuedCert {
+            renews: Some(Serial::from_be_bytes(&[of])),
+            not_before_ms: T0 + DAY,
+            not_after_ms: T0 + 40 * DAY,
+            ..cert
+        },
+    };
+    // Of an unknown cert, or with another identity: refused.
+    assert!(run(&mut pki, renewal(99, 60, node_cert(1, 0)), T0 + DAY).is_err());
+    assert!(run(&mut pki, renewal(50, 60, node_cert(3, 0)), T0 + DAY).is_err());
+    // Of a cert revoked before the renewal is ordered: refused, though
+    // the signer that signed it hadn't seen the revocation yet.
+    run(
+        &mut pki,
+        PkiOp::RevokeCert {
+            serial: Serial::from_be_bytes(&[50]),
+            reason: RevocationReason::KeyCompromise,
+        },
+        T0 + DAY,
+    )
+    .unwrap();
+    let e = run(&mut pki, renewal(50, 60, node_cert(1, 0)), T0 + DAY).unwrap_err();
+    assert!(e.contains("revoked"), "{}", e);
+    assert!(
+        !pki.as_deref()
+            .unwrap()
+            .certs
+            .contains_key(&Serial::from_be_bytes(&[60]))
+    );
+    // A good one.
+    run(&mut pki, renewal(51, 61, node_cert(2, 0)), T0 + DAY).unwrap();
+    // Expired: refused.
+    assert!(run(&mut pki, renewal(51, 62, node_cert(2, 0)), T0 + 31 * DAY).is_err());
+    // Its issuer revoked: neither live nor renewable.
+    run(
+        &mut pki,
+        PkiOp::AddIssuer {
+            id: IssuerId(2),
+            record: Box::new(issuer("ISSUER2", 3, T0 + 1460 * DAY)),
+            activate: true,
+        },
+        T0 + DAY,
+    )
+    .unwrap();
+    run(&mut pki, PkiOp::RevokeIssuer { id: IssuerId(1) }, T0 + DAY).unwrap();
+    let p = pki.as_deref().unwrap();
+    assert!(!p.is_live(&Serial::from_be_bytes(&[61]), T0 + 2 * DAY));
+    let mut again = node_cert(2, 0);
+    again.issuer = IssuerId(2);
+    let e = run(&mut pki, renewal(61, 63, again), T0 + 2 * DAY).unwrap_err();
+    assert!(e.contains("issuer is revoked"), "{}", e);
+}

@@ -28,13 +28,7 @@ impl raidish_types::types::FenceObserver for NoFence {
     fn observe_grants(&self, _: Epoch, _: &mut dyn Iterator<Item = (MetaslabIdx, Grant)>) {}
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use raidish_auth::testing::free_port;
 
 fn nid(i: u64) -> NodeId {
     NodeId::from_raw(i)
@@ -97,11 +91,9 @@ async fn launch(
     app: axum::Router,
     stop: Arc<tokio::sync::Notify>,
 ) {
-    raidish_auth::http::spawn(("127.0.0.1", port), tls, app, async move {
-        stop.notified().await
-    })
-    .await
-    .unwrap();
+    raidish_auth::testing::spawn_on(port, tls, app, async move { stop.notified().await })
+        .await
+        .unwrap();
 }
 
 /// Start a member: Raft (and the CA routes, as peers forward to them) on

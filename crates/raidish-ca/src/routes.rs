@@ -82,20 +82,32 @@ pub async fn renew(
     ca.renew(peer.cert(), &req.csr_pem).await.map(Json)
 }
 
+/// The certificate a request came with (`IsAdminCert` means there is one).
+fn presented(peer: Option<Extension<Peer>>) -> Result<Peer, CaError> {
+    peer.map(|Extension(p)| p)
+        .ok_or_else(|| CaError::new(401, "it takes a certificate, presented over TLS"))
+}
+
 pub async fn sign(
     admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
     State(ca): Ca,
     req: Json<SignRequest>,
 ) -> Result<Json<Issued>, CaError> {
-    ca.sign(&admin.0, req.into_inner()).await.map(Json)
+    let peer = presented(peer)?;
+    ca.sign(&admin.0, peer.cert(), req.into_inner())
+        .await
+        .map(Json)
 }
 
 pub async fn create_enrollment(
     admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
     State(ca): Ca,
     req: Json<EnrollmentRequest>,
 ) -> Result<Json<EnrollmentCreated>, CaError> {
-    ca.create_enrollment(&admin.0, req.into_inner())
+    let peer = presented(peer)?;
+    ca.create_enrollment(&admin.0, peer.cert(), req.into_inner())
         .await
         .map(Json)
 }
@@ -112,9 +124,12 @@ pub async fn cancel_enrollment(
 /// Unseal this node (the one asked).
 pub async fn unseal(
     _admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
     State(ca): Ca,
     req: Json<UnsealRequest>,
 ) -> Result<Json<PkiStatus>, CaError> {
+    let peer = presented(peer)?;
+    ca.for_caller(peer.cert()).await?;
     ca.unseal(&req.recovery_key).await?;
     Ok(Json(ca.status().await))
 }
@@ -171,10 +186,14 @@ pub async fn revoke_cert(
 /// certificate only (D8). A sealed node answers 503.
 pub async fn create_token(
     _admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
     State(ca): Ca,
     req: Json<TokenRequest>,
 ) -> Result<Json<TokenCreated>, CaError> {
-    ca.create_token(req.into_inner()).await.map(Json)
+    let peer = presented(peer)?;
+    ca.create_token(peer.cert(), req.into_inner())
+        .await
+        .map(Json)
 }
 
 /// Revoke a token (or the S3/SQS keys made from it).

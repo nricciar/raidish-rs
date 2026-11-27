@@ -260,3 +260,38 @@ async fn a_revocable_stream_fails_once_its_peer_is_closed() {
     s.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ok");
 }
+
+#[tokio::test]
+async fn a_split_stream_wakes_its_parked_reader_after_another_task_wrote() {
+    // As NBD over peer_io: the read half parked in one task, a reply
+    // written from another that then ends. The revocation must reach the
+    // reader.
+    let ca = ca();
+    let trust = Trust::new(vec![]);
+    let peer = trust
+        .connections()
+        .register(leaf(&ca.issuer, "a").into())
+        .unwrap();
+    let serial = peer.serial().clone();
+    let (mine, mut theirs) = tokio::io::duplex(64);
+    let (mut rd, mut wr) = tokio::io::split(Revocable::new(mine, Some(peer)));
+    let reading = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        rd.read(&mut buf).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::spawn(async move {
+        wr.write_all(b"reply").await.unwrap();
+        wr.flush().await.unwrap();
+    })
+    .await
+    .unwrap();
+    let mut got = [0u8; 5];
+    theirs.read_exact(&mut got).await.unwrap();
+    trust.connections().close(&serial);
+    let r = tokio::time::timeout(Duration::from_secs(1), reading)
+        .await
+        .expect("the parked reader is woken")
+        .unwrap();
+    assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionAborted);
+}

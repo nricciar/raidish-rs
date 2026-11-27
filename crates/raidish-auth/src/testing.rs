@@ -162,3 +162,42 @@ impl Resp {
         self.headers.get(k).and_then(|v| v.to_str().ok())
     }
 }
+
+/// Listeners [`free_port`] reserved, until a test server takes them.
+static RESERVED: std::sync::Mutex<Vec<std::net::TcpListener>> = std::sync::Mutex::new(Vec::new());
+
+/// A port for a test server, bound now and held until [`spawn_on`] takes
+/// it: binding and dropping one (to learn a free port) leaves it for any
+/// test running alongside to take first (`AddrInUse`).
+pub fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    RESERVED.lock().unwrap().push(l);
+    port
+}
+
+/// Serve `app` on 127.0.0.1:`port` (as [`crate::http::spawn`]): with the
+/// listener [`free_port`] holds for it, or bound again (a server
+/// restarted on its port).
+pub async fn spawn_on(
+    port: u16,
+    tls: Option<crate::http::Server>,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let held = {
+        let mut r = RESERVED.lock().unwrap();
+        r.iter()
+            .position(|l| l.local_addr().is_ok_and(|a| a.port() == port))
+            .map(|i| r.swap_remove(i))
+    };
+    let listener = match held {
+        Some(l) => {
+            l.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(l)?
+        }
+        None => tokio::net::TcpListener::bind(("127.0.0.1", port)).await?,
+    };
+    tokio::spawn(crate::http::serve(listener, tls, app, shutdown));
+    Ok(())
+}

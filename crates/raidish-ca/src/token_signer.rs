@@ -111,7 +111,11 @@ impl CaService {
     }
 
     /// Mint an `rdt2` token (`POST /api/v1/pki/tokens`).
-    pub async fn create_token(&self, req: TokenRequest) -> Result<TokenCreated, CaError> {
+    pub async fn create_token(
+        &self,
+        caller: &[u8],
+        req: TokenRequest,
+    ) -> Result<TokenCreated, CaError> {
         use rustls::pki_types::{PrivatePkcs8KeyDer, pem::PemObject};
         let role: raidish_auth::pki::Role =
             req.role.parse().map_err(|e: String| CaError::new(400, e))?;
@@ -127,7 +131,7 @@ impl CaService {
         if req.ttl_s.is_some_and(|t| t <= 0) {
             return Err(CaError::new(400, "ttl_s must be positive"));
         }
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
+        let pki = self.for_caller(caller).await?;
         let key = self.token_key(&pki)?;
         let chain =
             raidish_auth::ca::pem_certs(&key.chain_pem).map_err(|e| CaError::new(500, e))?;

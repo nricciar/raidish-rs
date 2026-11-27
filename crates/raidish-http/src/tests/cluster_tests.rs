@@ -309,13 +309,7 @@ struct TestNode {
     url: String,
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use raidish_auth::testing::free_port;
 
 /// Start a node whose pool config is `paths` (every node gets the same
 /// URLs; each finds itself by port).
@@ -327,8 +321,8 @@ async fn start_node(name: &str, paths: &[String], port: u16, dir: &std::path::Pa
         .unwrap();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let stop = shutdown.clone();
-    raidish_auth::http::spawn(
-        ("127.0.0.1", port),
+    raidish_auth::testing::spawn_on(
+        port,
         None,
         raidish_auth::http::finish(
             routes::router(cluster.clone()),
