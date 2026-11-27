@@ -293,17 +293,25 @@ impl CaService {
         Ok(pki)
     }
 
+    /// Whether this node holds the DEK at the CA's seal epoch (one from an
+    /// older epoch, not yet dropped, doesn't count).
     pub fn unsealed(&self) -> bool {
-        self.dek.read().unwrap().is_some()
+        self.held_by().is_some()
     }
 
     /// How this node was unsealed, if it is.
     pub fn unsealed_by(&self) -> Option<String> {
+        self.held_by().map(str::to_string)
+    }
+
+    fn held_by(&self) -> Option<&'static str> {
+        let applied = self.cluster.pki().map(|p| p.seal.epoch);
         self.dek
             .read()
             .unwrap()
             .as_ref()
-            .map(|(_, _, by)| by.to_string())
+            .filter(|(_, e, _)| applied.is_none_or(|a| *e >= a))
+            .map(|(_, _, by)| *by)
     }
 
     pub(crate) fn http(&self) -> reqwest::Client {
@@ -437,22 +445,37 @@ impl CaService {
     }
 
     /// Hold `dek` at `epoch`, quietly (a rekey: this node made it).
-    pub(crate) fn keep_dek(&self, dek: Key, epoch: u64, by: &'static str) {
-        *self.dek.write().unwrap() = Some((dek, epoch, by));
+    /// Refused if the CA has moved past `epoch` since (sealed while the
+    /// key was being opened): it would only look unsealed.
+    pub(crate) fn keep_dek(&self, dek: Key, epoch: u64, by: &'static str) -> Result<(), CaError> {
+        // Under the lock: the view is updated before observers are told,
+        // so a `Seal` applied after this check drops what's stored here.
+        let mut held = self.dek.write().unwrap();
+        if let Some(applied) = self.cluster.pki().map(|p| p.seal.epoch)
+            && applied > epoch
+        {
+            return Err(CaError::conflict(format!(
+                "the CA was sealed meanwhile (seal epoch {}): unseal again",
+                applied
+            )));
+        }
+        *held = Some((dek, epoch, by));
+        drop(held);
         self.crl_wake.notify_one();
+        Ok(())
     }
 
     /// This node now holds `dek`, opened at `epoch` (`by`: how, as
     /// `ca status` says it).
-    pub(crate) fn set_dek(&self, dek: Key, epoch: u64, by: &'static str) {
-        self.keep_dek(dek, epoch, by);
+    pub(crate) fn set_dek(&self, dek: Key, epoch: u64, by: &'static str) -> Result<(), CaError> {
+        self.keep_dek(dek, epoch, by)?;
         self.event(
             raidish_types::api_types::EventKind::CaUnsealed,
             self.me_subject(),
             format!("{} unsealed by {}", self.cluster.name, by),
             None,
         );
-        self.crl_wake.notify_one();
+        Ok(())
     }
 
     /// `POST /api/v1/pki/join`. A sealed node passes it on to one that
@@ -516,11 +539,18 @@ impl CaService {
         let days = pki.params(ProfileKind::Node).default_days;
         // Signed first: a bad CSR mustn't use the token up.
         let issued = sign(&signer, &req.csr_pem, &identity, days)?;
-        self.commit(PkiOp::ConsumeEnrollment {
-            id: req.id.clone(),
-            secret_sha256: hash,
-            member: Some(req.member),
-        })
+        // At the epoch the MAC was checked at: after a `ca seal` or `ca
+        // rekey` this node hasn't applied yet, the token isn't used up (nor
+        // a replaced member's certificates revoked) for a certificate that
+        // then can't be recorded.
+        self.commit_at(
+            &pki,
+            PkiOp::ConsumeEnrollment {
+                id: req.id.clone(),
+                secret_sha256: hash,
+                member: Some(req.member),
+            },
+        )
         .await?;
         self.record(&pki, &signer, &identity, &issued, None).await?;
         println!(

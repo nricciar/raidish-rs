@@ -98,16 +98,35 @@ pub struct SealRequest {
     pub keep_node_keys: bool,
 }
 
+/// `POST /api/v1/pki/rekey` (CA-3d).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RekeyRequest {
+    /// The new recovery key (`RDK1-…`), made by the caller: then it's had
+    /// before the rekey is sent, and an answer lost on the way back loses
+    /// nothing. None: the node makes one and returns it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<String>,
+}
+
 /// `POST /api/v1/pki/rekey`'s answer (CA-3d).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Rekeyed {
     /// The one slot left: a new recovery key's.
     pub slot_id: String,
-    /// That key, shown this once.
-    pub recovery_key: String,
+    /// That key, shown this once, if the node made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<String>,
     /// The slots it replaced (passphrases and node keys must be added
     /// again).
     pub removed_slots: Vec<String>,
+    /// Join tokens in Raft without the signer's MAC (forged through Raft):
+    /// removed, not MACed anew.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_enrollments: Vec<String>,
+    /// The node that rekeyed holds the new DEK (false: the CA was sealed
+    /// meanwhile, and the new recovery key unseals it).
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// What a slot opens with.

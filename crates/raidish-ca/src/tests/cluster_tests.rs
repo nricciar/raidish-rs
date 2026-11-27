@@ -1800,8 +1800,17 @@ async fn a_sealed_cluster_says_so_and_warns_once() {
 }
 
 async fn rekey_through(c: &reqwest::Client, url: &str) -> Result<crate::api::Rekeyed, u16> {
+    rekey_with(c, url, None).await
+}
+
+async fn rekey_with(
+    c: &reqwest::Client,
+    url: &str,
+    recovery_key: Option<String>,
+) -> Result<crate::api::Rekeyed, u16> {
     let r = c
         .post(format!("{}/api/v1/pki/rekey", url))
+        .json(&crate::api::RekeyRequest { recovery_key })
         .send()
         .await
         .unwrap();
@@ -1844,13 +1853,76 @@ async fn rekey_replaces_the_dek_and_every_slot() {
         .unwrap()
         .post(format!("{}/api/v1/pki/rekey", urls[0]))
         .bearer_auth(&bearer.token)
+        .json(&crate::api::RekeyRequest::default())
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
 
+    // An enrollment put in through Raft by a node without the DEK (as in
+    // `init_join_hand_over_and_refusals`): the rekey drops it, it doesn't
+    // MAC it anew.
+    let m1 = members(&up.paths, up.raft[1]);
+    let forged = JoinToken::generate(token.root).unwrap();
+    let e = Enrollment {
+        scope: EnrollScope::Node {
+            fingerprint: m1.fingerprint.clone(),
+            member: Some(m1.me),
+            extra_sans: vec![],
+            replace: true,
+            compromised: false,
+        },
+        secret_sha256: forged.secret_sha256(),
+        uses: 1,
+        uses_left: 1,
+        expires_ms: crate::now_ms() + 3_600_000,
+        created_by: "nobody".into(),
+        mac: [0; 32],
+    };
+    let epoch = n2.cluster.pki().unwrap().seal.epoch;
+    let forge = LeaseOp::Pki(
+        PkiOp::CreateEnrollment {
+            id: forged.id.clone(),
+            enrollment: Box::new(e),
+        }
+        .at_epoch(epoch),
+    );
+    assert_eq!(
+        n2.cluster.lease(&forge, false).await.unwrap(),
+        Response::Recorded
+    );
+    assert!(
+        wait_for(10, || n0
+            .cluster
+            .pki()
+            .unwrap()
+            .enrollments
+            .contains_key(&forged.id))
+        .await
+    );
+
     let r = rekey_through(&admin, &urls[0]).await.unwrap();
     assert_eq!(r.removed_slots.len(), 2, "{:?}", r.removed_slots);
+    assert!(r.held);
+    assert_eq!(r.dropped_enrollments, vec![forged.id.to_string()]);
+    assert!(
+        !n0.cluster
+            .pki()
+            .unwrap()
+            .enrollments
+            .contains_key(&forged.id)
+    );
+    assert!(
+        n0.cluster
+            .pki()
+            .unwrap()
+            .enrollments
+            .contains_key(&token.id)
+    );
+    let r = crate::api::Rekeyed {
+        recovery_key: Some(r.recovery_key.clone().expect("the node made it")),
+        ..r
+    };
     let after = n0.cluster.pki().unwrap();
     let ids: Vec<&str> = after.seal.slots.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, vec![r.slot_id.as_str()]);
@@ -1859,7 +1931,10 @@ async fn rekey_replaces_the_dek_and_every_slot() {
         after.issuers[&raidish_types::pki::IssuerId(1)].sealed_key,
         before.issuers[&raidish_types::pki::IssuerId(1)].sealed_key
     );
-    assert_eq!(n0.events.of(EventKind::CaRekeyed).len(), 1);
+    // The rekey, and a warning naming the enrollment it dropped.
+    let said = n0.events.of(EventKind::CaRekeyed);
+    assert_eq!(said.len(), 2, "{:?}", said);
+    assert!(said.iter().any(|(_, m)| m.contains(&forged.id.to_string())));
 
     // Node 0 keeps the new DEK; node 1 is sealed by it.
     assert!(n0.ca.unsealed());
@@ -1868,7 +1943,8 @@ async fn rekey_replaces_the_dek_and_every_slot() {
     // The old secrets open nothing; the new key unseals, and that node signs.
     assert_eq!(unseal_with(&admin, &urls[2], &up.recovery_key).await, 403);
     assert_eq!(unseal_with(&admin, &urls[2], phrase).await, 403);
-    assert_eq!(unseal_with(&admin, &urls[2], &r.recovery_key).await, 200);
+    let new_key = r.recovery_key.clone().unwrap();
+    assert_eq!(unseal_with(&admin, &urls[2], &new_key).await, 200);
     assert!(n2.ca.unsealed());
     issue(
         &admin,
@@ -1899,6 +1975,39 @@ async fn rekey_replaces_the_dek_and_every_slot() {
             .unwrap()
             .is_live(&j.serial, crate::now_ms())
     );
+    // The forged one, dropped, stays unredeemable.
+    match crate::join::join(&urls[0], &forged, m1.me, &m1.fingerprint).await {
+        Err(e) => assert!(e.contains("unknown"), "{}", e),
+        Ok(_) => panic!("joined with a forged enrollment"),
+    }
+
+    // A recovery key the caller made: not sent back; it unseals.
+    let mine = raidish_auth::envelope::new_recovery_key().unwrap();
+    assert_eq!(
+        rekey_with(&admin, &urls[2], Some("RDK1-not-a-key".into()))
+            .await
+            .unwrap_err(),
+        400
+    );
+    let r = rekey_with(&admin, &urls[2], Some(mine.to_string()))
+        .await
+        .unwrap();
+    assert!(r.recovery_key.is_none() && r.held);
+    assert!(wait_for(10, || !n0.ca.unsealed()).await);
+    assert_eq!(unseal_with(&admin, &urls[0], &new_key).await, 403);
+    assert_eq!(unseal_with(&admin, &urls[0], &mine).await, 200);
+
+    // A DEK opened at an epoch the CA has since moved past (a seal while
+    // Argon2id ran) isn't held, and wouldn't count as unsealed.
+    let epoch = n0.cluster.pki().unwrap().seal.epoch;
+    seal_all(&admin, &urls[1]).await;
+    assert!(wait_for(10, || n0.cluster.pki().unwrap().seal.epoch == epoch + 1).await);
+    let stale = raidish_auth::envelope::new_key().unwrap();
+    assert_eq!(
+        n0.ca.keep_dek(stale, epoch, "test").unwrap_err().status,
+        409
+    );
+    assert!(!n0.ca.unsealed());
     for n in up.nodes {
         n.stop().await;
     }

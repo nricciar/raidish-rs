@@ -138,7 +138,10 @@ impl CaService {
         });
         match opened {
             Ok(dek) => {
-                self.set_dek(dek, pki.seal.epoch, src.by());
+                if let Err(e) = self.set_dek(dek, pki.seal.epoch, src.by()) {
+                    eprintln!("ca: this node's key: {}", e.msg);
+                    return;
+                }
                 println!("ca: unsealed by {}", src.by());
                 if let NodeKeySource::File(p) = src {
                     eprintln!(
@@ -173,13 +176,13 @@ impl CaService {
         .await
         .map_err(|e| CaError::new(500, e.to_string()))?
         .map_err(|e| CaError::new(403, e))?;
-        // Sealed again meanwhile: the observer has run already, and
-        // `dek_at` drops it at first use.
+        // Sealed again meanwhile (while Argon2id ran): refused, not held
+        // as if it were good.
         let by = match by_recovery_key {
             true => "recovery-key",
             false => "passphrase",
         };
-        self.set_dek(dek, epoch, by);
+        self.set_dek(dek, epoch, by)?;
         println!("ca: unsealed");
         Ok(())
     }
@@ -345,26 +348,65 @@ impl CaService {
     pub async fn rekey(
         &self,
         caller: &[u8],
+        req: crate::api::RekeyRequest,
         by: Option<String>,
     ) -> Result<crate::api::Rekeyed, CaError> {
+        let given = req.recovery_key.is_some();
+        let recovery_key = match req.recovery_key {
+            Some(k) => {
+                // Checked whole: it becomes the only way in.
+                envelope::parse_recovery_key(&k).map_err(CaError::bad)?;
+                zeroize::Zeroizing::new(k.trim().to_string())
+            }
+            None => envelope::new_recovery_key().map_err(|e| CaError::new(500, e))?,
+        };
         let mut tries = 0;
         loop {
             tries += 1;
             let pki = self.for_caller(caller).await?;
             let old = self.dek_at(&pki)?;
             let new = envelope::new_key().map_err(|e| CaError::new(500, e))?;
-            let (op, slot_id, recovery_key) = self.rekey_of(&pki, &old, &new).await?;
+            let (op, slot_id) = self.rekey_of(&pki, &old, &new, &recovery_key).await?;
+            let dropped: Vec<String> = match &op {
+                PkiOp::Rekey(r) => r.drop_enrollments.iter().map(|t| t.to_string()).collect(),
+                _ => vec![],
+            };
             let removed_slots: Vec<String> = pki.seal.slots.iter().map(|s| s.id.clone()).collect();
             match self.commit_at(&pki, op).await {
                 Ok(()) => {
                     // Applied here already (`commit` waits for it): the old
-                    // DEK is dropped; hold the new one.
-                    self.keep_dek(new, pki.seal.epoch + 1, "rekey");
+                    // DEK is dropped; hold the new one, unless the CA was
+                    // sealed since (then the new recovery key unseals).
+                    let held = match self.keep_dek(new, pki.seal.epoch + 1, "rekey") {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("ca: rekeyed, but not holding the new DEK: {}", e.msg);
+                            false
+                        }
+                    };
                     println!(
                         "ca: rekeyed: a new DEK, one recovery-key slot ({}); {} slots removed",
                         slot_id,
                         removed_slots.len()
                     );
+                    if !dropped.is_empty() {
+                        let msg = format!(
+                            "rekey: join tokens {} were in Raft without the signer's MAC (put \
+                             there by a node without the DEK: a compromised member?) and are \
+                             removed",
+                            dropped.join(", ")
+                        );
+                        eprintln!("ca: WARNING: {}", msg);
+                        if let Some(e) = &self.events {
+                            e.emit(
+                                raidish_types::api_types::Level::Warn,
+                                EventKind::CaRekeyed,
+                                Subject::Cluster,
+                                msg,
+                                None,
+                            );
+                        }
+                    }
                     self.event(
                         EventKind::CaRekeyed,
                         Subject::Cluster,
@@ -378,8 +420,10 @@ impl CaService {
                     );
                     return Ok(crate::api::Rekeyed {
                         slot_id,
-                        recovery_key: recovery_key.to_string(),
+                        recovery_key: (!given).then(|| recovery_key.to_string()),
                         removed_slots,
+                        dropped_enrollments: dropped,
+                        held,
                     });
                 }
                 Err(e)
@@ -394,14 +438,15 @@ impl CaService {
         }
     }
 
-    /// The rekey of `pki` from `old` to `new`, its new slot's id and its
-    /// recovery key.
+    /// The rekey of `pki` from `old` to `new`, with one slot for
+    /// `recovery_key`, and that slot's id.
     async fn rekey_of(
         &self,
         pki: &PkiState,
         old: &[u8; 32],
         new: &Key,
-    ) -> Result<(PkiOp, String, zeroize::Zeroizing<String>), CaError> {
+        recovery_key: &str,
+    ) -> Result<(PkiOp, String), CaError> {
         let internal = |e: String| CaError::new(500, e);
         let anchor = &pki.anchor.fingerprint;
         let mut issuer_keys = std::collections::BTreeMap::new();
@@ -423,15 +468,21 @@ impl CaService {
                 ))
             }
         };
-        let enrollment_macs = pki
-            .enrollments
-            .iter()
-            .map(|(id, e)| (id.clone(), Mac(envelope::enrollment_mac(new, id, e))))
-            .collect();
+        // Only what the old DEK MACed is MACed anew: an enrollment put in
+        // through Raft without it (a compromised voter) is dropped, never
+        // made good.
+        let mut enrollment_macs = std::collections::BTreeMap::new();
+        let mut drop_enrollments = Vec::new();
+        for (id, e) in &pki.enrollments {
+            if envelope::enrollment_mac_ok(old, id, e) {
+                enrollment_macs.insert(id.clone(), Mac(envelope::enrollment_mac(new, id, e)));
+            } else {
+                drop_enrollments.push(id.clone());
+            }
+        }
         let (m, t, p) = self.kdf;
         let kdf = envelope::kdf_params(m, t, p).map_err(internal)?;
-        let recovery_key = envelope::new_recovery_key().map_err(internal)?;
-        let bytes = envelope::parse_recovery_key(&recovery_key).map_err(internal)?;
+        let bytes = envelope::parse_recovery_key(recovery_key).map_err(internal)?;
         let slot_id = slot_id("recovery-key")?;
         let (dek, cluster_id, id) = (new.clone(), pki.seal.cluster_id, slot_id.clone());
         let slot = tokio::task::spawn_blocking(move || {
@@ -456,7 +507,8 @@ impl CaService {
             issuer_keys,
             token_signer_key,
             enrollment_macs,
+            drop_enrollments,
         }));
-        Ok((op, slot_id, recovery_key))
+        Ok((op, slot_id))
     }
 }

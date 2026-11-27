@@ -768,6 +768,10 @@ pub struct Rekey {
     /// Every outstanding enrollment's MAC, under the new DEK.
     #[serde(default)]
     pub enrollment_macs: BTreeMap<TokenId, Mac>,
+    /// Enrollments whose MAC the old DEK didn't make (put in through Raft
+    /// by a node without it): removed, never MACed anew.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_enrollments: Vec<TokenId>,
 }
 
 /// An HMAC-SHA256, as hex.
@@ -784,6 +788,8 @@ impl PkiOp {
             PkiOp::AddIssuer { .. }
                 | PkiOp::RecordIssued { .. }
                 | PkiOp::CreateEnrollment { .. }
+                // Redeeming checks the MAC with the DEK.
+                | PkiOp::ConsumeEnrollment { .. }
                 | PkiOp::AddSlot(_)
                 | PkiOp::SetCrl(_)
                 | PkiOp::SetTokenSigner(_)
@@ -957,7 +963,15 @@ impl PkiState {
                 );
             }
         }
-        if !r.enrollment_macs.keys().eq(self.enrollments.keys()) {
+        // Each outstanding enrollment exactly once: MACed anew, or dropped.
+        let mut covered: Vec<&TokenId> = r
+            .enrollment_macs
+            .keys()
+            .chain(r.drop_enrollments.iter())
+            .collect();
+        covered.sort();
+        let distinct = covered.windows(2).all(|w| w[0] != w[1]);
+        if !distinct || !covered.into_iter().eq(self.enrollments.keys()) {
             return Err("the join tokens changed since the rekey was made: make it again".into());
         }
         for (id, blob) in &r.issuer_keys {
@@ -968,6 +982,9 @@ impl PkiState {
         }
         for (id, mac) in &r.enrollment_macs {
             self.enrollments.get_mut(id).unwrap().mac = mac.0;
+        }
+        for id in &r.drop_enrollments {
+            self.enrollments.remove(id);
         }
         self.seal = r.seal.clone();
         Ok(())
@@ -1313,11 +1330,9 @@ impl PkiState {
                 self.seal.slots.remove(i);
             }
             PkiOp::Seal { remove_slots } => {
-                for id in remove_slots {
-                    if !self.seal.slots.iter().any(|s| s.id == *id) {
-                        return Err(format!("no slot {}", id));
-                    }
-                }
+                // A slot named that's gone already (removed, or dropped
+                // with its node, since the seal was made) is no reason to
+                // refuse sealing.
                 if self.seal.slots.iter().all(|s| remove_slots.contains(&s.id)) {
                     return Err("that removes every key slot: nothing would unseal the CA".into());
                 }

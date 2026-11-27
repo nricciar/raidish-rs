@@ -4,9 +4,9 @@
 
 use crate::CaService;
 use crate::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, Rekeyed, RemoveSlotQuery,
-    RenewRequest, RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest, SlotCreated,
-    SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, RekeyRequest, Rekeyed,
+    RemoveSlotQuery, RenewRequest, RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest,
+    SlotCreated, SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
 };
 use crate::service::CaError;
 use axum::extract::{ConnectInfo, Extension, Path, State};
@@ -247,9 +247,12 @@ pub async fn rekey(
     admin: IsAdminCert,
     peer: Option<Extension<Peer>>,
     State(ca): Ca,
+    req: Json<RekeyRequest>,
 ) -> Result<Json<Rekeyed>, CaError> {
     let peer = presented(peer)?;
-    ca.rekey(peer.cert(), Some(admin.0.name)).await.map(Json)
+    ca.rekey(peer.cert(), req.into_inner(), Some(admin.0.name))
+        .await
+        .map(Json)
 }
 
 /// Add a key slot: it changes how the CA is unlocked, so an admin's own

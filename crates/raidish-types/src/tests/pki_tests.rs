@@ -711,7 +711,6 @@ fn sealing_moves_the_epoch_and_takes_the_slots_it_names() {
     let only = |ids: &[&str]| PkiOp::Seal {
         remove_slots: ids.iter().map(|s| s.to_string()).collect(),
     };
-    assert!(run(&mut pki, only(&["nope"]), T0).is_err());
     let all: Vec<String> = pki
         .as_deref()
         .unwrap()
@@ -731,6 +730,16 @@ fn sealing_moves_the_epoch_and_takes_the_slots_it_names() {
     let s = pki.as_deref().unwrap();
     assert_eq!(s.seal.epoch, 1);
     assert!(s.seal.slots.iter().all(|x| x.id != "node-key-1"));
+    // A slot named that's gone already (removed since): sealed all the same.
+    run(&mut pki, only(&["node-key-1", "nope"]), T0).unwrap();
+    assert_eq!(pki.as_deref().unwrap().seal.epoch, 2);
+    // Gone, and the rest named: still never every slot.
+    let rest: Vec<&str> = vec!["recovery", "gone"];
+    assert!(
+        run(&mut pki, only(&rest), T0)
+            .unwrap_err()
+            .contains("every")
+    );
 }
 
 #[test]
@@ -1280,6 +1289,7 @@ fn rekey_of(pki: &Option<Arc<PkiState>>) -> Rekey {
             .keys()
             .map(|id| (id.clone(), Mac([7; 32])))
             .collect(),
+        drop_enrollments: vec![],
     }
 }
 
@@ -1348,4 +1358,48 @@ fn a_rekey_covers_exactly_what_there_is() {
     r.seal.slots[0].kind = SlotKind::NodeKey { node: m(1) };
     assert!(refused(&mut pki, r).contains("exactly one slot"));
     run(&mut pki, PkiOp::Rekey(Box::new(base)), T0).unwrap();
+}
+
+#[test]
+fn a_rekey_drops_the_enrollments_it_names_once_each() {
+    let mut pki = installed();
+    enroll(&mut pki, 1, node_enrollment(Some(1), false, 1));
+    enroll(&mut pki, 2, node_enrollment(Some(2), false, 1));
+    let mut r = rekey_of(&pki);
+    r.enrollment_macs.remove(&tid(2));
+    // Neither MACed nor dropped: refused.
+    assert!(run(&mut pki, PkiOp::Rekey(Box::new(r.clone())), T0).is_err());
+    // Both MACed and dropped: refused.
+    let mut both = rekey_of(&pki);
+    both.drop_enrollments.push(tid(2));
+    assert!(run(&mut pki, PkiOp::Rekey(Box::new(both)), T0).is_err());
+    r.drop_enrollments.push(tid(2));
+    run(&mut pki, PkiOp::Rekey(Box::new(r)), T0).unwrap();
+    let p = pki.as_deref().unwrap();
+    assert!(p.enrollments.contains_key(&tid(1)));
+    assert!(!p.enrollments.contains_key(&tid(2)), "dropped");
+}
+
+#[test]
+fn a_consume_made_before_a_seal_leaves_the_token_and_the_member_alone() {
+    let mut pki = installed();
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    enroll(&mut pki, 1, node_enrollment(Some(1), true, 1));
+    // The right secret: only the epoch is wrong.
+    let consume = PkiOp::ConsumeEnrollment {
+        id: tid(1),
+        secret_sha256: [5; 32],
+        member: Some(m(1)),
+    };
+    // Bare: refused (it's checked with the DEK).
+    assert!(apply(&mut pki, &consume, T0, &checker()).is_err());
+    let at_old = consume.clone().at_epoch(0);
+    run(&mut pki, seal(), T0).unwrap();
+    let before = pki.clone();
+    assert!(
+        apply(&mut pki, &at_old, T0, &checker())
+            .unwrap_err()
+            .contains("seal epoch")
+    );
+    assert_eq!(pki, before, "the token's left, the old cert unrevoked");
 }
