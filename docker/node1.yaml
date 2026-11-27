@@ -25,3 +25,8 @@ nfs:
 # (`raidish token s3-key`); see "Services" in the README.
 services:
   advertise: node1
+# This node's own key (`raidish ca slot add --node-key node-1 --out ...`),
+# to unseal itself at start: a plain file, so a copy of this volume opens
+# the CA (a real host keeps it in a systemd credential: unseal_credential).
+ca:
+  unseal_key: /data/unseal.key

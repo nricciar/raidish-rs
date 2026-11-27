@@ -4,6 +4,7 @@ use crate::api::{
     DEFAULT_TOKEN_TTL_SECS, EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest,
     MAX_TOKEN_TTL_SECS, SignRequest,
 };
+use crate::seal::NodeKeySource;
 use crate::token::JoinToken;
 use crate::{bootstrap_path, node_sans, now_ms, unseal_once_path, url_host};
 use raidish_auth::ca::{LeafSpec, Signer, X509Checker};
@@ -16,7 +17,7 @@ use raidish_types::pki::{
     TokenId,
 };
 use raidish_types::types::NodeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -74,21 +75,50 @@ pub struct CaOptions {
     /// `crate::unseal_once_path`). Off: such a file is ignored (and left,
     /// with a warning).
     pub unseal_once: bool,
+    /// Argon2id cost for new passphrase and recovery-key slots (m KiB, t,
+    /// p). Tests make it cheap.
+    pub kdf: (u32, u32, u32),
+    /// Where this node's own key is (`ca.unseal_key` or
+    /// `ca.unseal_credential`): it unseals itself with it from a node-key
+    /// slot naming it (CA-3b).
+    pub node_key: Option<NodeKeySource>,
+    /// The activity log (CA-3c): unseals, seals, slots, and a cluster no
+    /// node can sign for.
+    pub events: Option<Arc<dyn crate::CaEvents>>,
 }
 
 impl Default for CaOptions {
     fn default() -> Self {
-        CaOptions { unseal_once: true }
+        CaOptions {
+            node_key: None,
+            events: None,
+            unseal_once: true,
+            kdf: (envelope::KDF_M_KIB, envelope::KDF_T, envelope::KDF_P),
+        }
     }
 }
 
 /// Joins a client IP may try per minute.
 const JOINS_PER_MINUTE: u32 = 20;
+/// Unseals a client IP may try per minute.
+const UNSEALS_PER_MINUTE: u32 = 10;
+
+fn per_minute(map: &Mutex<HashMap<IpAddr, (Instant, u32)>>, ip: Option<IpAddr>, max: u32) -> bool {
+    let Some(ip) = ip else { return true };
+    let mut m = map.lock().unwrap();
+    let now = Instant::now();
+    m.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(60));
+    let (_, n) = m.entry(ip).or_insert((now, 0));
+    *n += 1;
+    *n <= max
+}
 
 pub struct CaService {
     cluster: Arc<Cluster>,
-    /// The cluster DEK, if this node is unsealed. Never stored.
-    dek: RwLock<Option<Key>>,
+    /// The cluster DEK, the seal epoch it was opened at and how (for
+    /// `ca status`), if this node is unsealed. Never stored. Dropped when
+    /// a newer epoch is applied (`ca seal`).
+    dek: RwLock<Option<(Key, u64, &'static str)>>,
     /// The CA as staged by `ca init`, until it's in Raft. Held across a
     /// change to it and across proposing it, so nothing recorded into it is
     /// lost in the hand-over.
@@ -96,9 +126,21 @@ pub struct CaService {
     warnings: Mutex<Vec<String>>,
     http: reqwest::Client,
     joins: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    unseals: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    pub(crate) kdf: (u32, u32, u32),
     /// Wakes the CRL re-signer (`crate::crl`): the CA changed, or this
     /// node was unsealed.
     pub(crate) crl_wake: Arc<tokio::sync::Notify>,
+    /// This node's own key, if configured.
+    pub(crate) node_key: Option<NodeKeySource>,
+    /// The node-key slots naming this node it has tried: each once, until
+    /// a restart (`crate::seal`).
+    pub(crate) node_key_seen: Mutex<HashSet<String>>,
+    /// Wakes the node-key unsealer: the CA changed.
+    pub(crate) node_key_wake: Arc<tokio::sync::Notify>,
+    pub(crate) events: Option<Arc<dyn crate::CaEvents>>,
+    /// A `ca.unsealed_none` is on (cleared when a node is unsealed).
+    pub(crate) warned_unsealed_none: std::sync::atomic::AtomicBool,
 }
 
 impl CaService {
@@ -150,7 +192,7 @@ impl CaService {
                         match parse_dek(&text).and_then(|k| check_dek(&pki, &k).map(|_| k)) {
                             Ok(k) => {
                                 println!("ca: unsealed (one-shot key from `ca init`, now removed)");
-                                dek = Some(k);
+                                dek = Some((k, pki.seal.epoch, "unseal-once"));
                             }
                             Err(e) => warnings.push(format!("{}: {}", once.display(), e)),
                         }
@@ -174,8 +216,29 @@ impl CaService {
             warnings: Mutex::new(warnings),
             http: raidish_auth::tls::http_client(Some(Duration::from_secs(20)))?,
             joins: Mutex::new(HashMap::new()),
+            unseals: Mutex::new(HashMap::new()),
+            kdf: opts.kdf,
             crl_wake: Arc::new(tokio::sync::Notify::new()),
+            node_key: opts.node_key,
+            node_key_seen: Mutex::new(HashSet::new()),
+            node_key_wake: Arc::new(tokio::sync::Notify::new()),
+            events: opts.events,
+            warned_unsealed_none: Default::default(),
         });
+        if let Some((_, _, by)) = ca.dek.read().unwrap().as_ref() {
+            ca.event(
+                raidish_types::api_types::EventKind::CaUnsealed,
+                ca.me_subject(),
+                format!("{} unsealed by {}", ca.cluster.name, by),
+                None,
+            );
+        }
+        tokio::spawn(crate::loud::announce(Arc::downgrade(&ca)));
+        if ca.node_key.is_some() {
+            // Before the observer: its first call (the CA as it is) wakes it.
+            crate::seal::start_node_key(&ca);
+        }
+        ca.cluster.observe_pki(Arc::new(Watch(Arc::downgrade(&ca))));
         crate::crl::start(&ca);
         if is_staged {
             println!(
@@ -234,11 +297,65 @@ impl CaService {
         self.dek.read().unwrap().is_some()
     }
 
-    pub(crate) fn dek(&self) -> Option<Key> {
-        self.dek.read().unwrap().clone()
+    /// How this node was unsealed, if it is.
+    pub fn unsealed_by(&self) -> Option<String> {
+        self.dek
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|(_, _, by)| by.to_string())
+    }
+
+    pub(crate) fn http(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
+    /// The DEK, to make something for `pki` with: only if it was opened
+    /// at `pki`'s seal epoch. Opened at an older one (a `Seal` applied
+    /// since), it's dropped. `pki` behind it (a stale view): 503.
+    pub(crate) fn dek_at(&self, pki: &PkiState) -> Result<Key, CaError> {
+        let mut held = self.dek.write().unwrap();
+        match held.as_ref() {
+            None => Err(CaError::sealed()),
+            Some((k, e, _)) if *e == pki.seal.epoch => Ok(k.clone()),
+            Some((_, e, _)) if *e < pki.seal.epoch => {
+                *held = None;
+                println!(
+                    "ca: sealed (the CA was sealed: seal epoch {})",
+                    pki.seal.epoch
+                );
+                Err(CaError::sealed())
+            }
+            Some(_) => Err(CaError::unavailable(
+                "this node's view of the CA is behind: try again",
+            )),
+        }
+    }
+
+    /// Told of the CA as it's applied: drop the DEK on a newer seal epoch.
+    fn observed(&self, pki: Option<&PkiState>) {
+        if let Some(pki) = pki {
+            let stale = self
+                .dek
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(_, e, _)| *e < pki.seal.epoch);
+            if stale {
+                let _ = self.dek_at(pki);
+            }
+        }
+        self.crl_wake.notify_one();
+        self.node_key_wake.notify_one();
     }
 
     pub async fn status(&self) -> PkiStatus {
+        self.status_of(true).await
+    }
+
+    /// This node's status (`crl_warning`: with its own warning about a CRL
+    /// it can't re-sign; `?all=true` says it cluster-wide instead).
+    pub(crate) async fn status_of(&self, crl_warning: bool) -> PkiStatus {
         let staged = self.staged.lock().await.is_some();
         let mut warnings = self.warnings.lock().unwrap().clone();
         let once = unseal_once_path(self.cluster.data_dir());
@@ -248,6 +365,7 @@ impl CaService {
         let pki = self.current().await;
         if let Some(w) = pki
             .as_deref()
+            .filter(|_| crl_warning)
             .and_then(|p| crate::crl::warning(p, self.unsealed(), now_ms()))
         {
             warnings.push(w);
@@ -255,34 +373,23 @@ impl CaService {
         PkiStatus {
             node: self.cluster.name.clone(),
             unsealed: self.unsealed(),
+            unsealed_by: self.unsealed_by(),
             staged,
             pki: pki.map(|p| p.view()),
             warnings,
+            nodes: vec![],
         }
-    }
-
-    /// Unseal this node with a recovery key.
-    pub async fn unseal(&self, recovery_key: &str) -> Result<(), CaError> {
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
-        let secret = envelope::parse_recovery_key(recovery_key).map_err(CaError::bad)?;
-        // Argon2id at 64 MiB: off the async threads.
-        let dek = tokio::task::spawn_blocking(move || {
-            envelope::unwrap_dek(&pki.seal.slots, &pki.seal.cluster_id, &secret)
-                .and_then(|k| check_dek(&pki, &k).map(|_| k))
-        })
-        .await
-        .map_err(|e| CaError::internal(e.to_string()))?
-        .map_err(CaError::denied)?;
-        *self.dek.write().unwrap() = Some(dek);
-        println!("ca: unsealed");
-        self.crl_wake.notify_one();
-        Ok(())
     }
 
     /// The active issuer, unsealed.
     pub(crate) fn signer(&self, pki: &PkiState) -> Result<Signer, CaError> {
-        let dek = self.dek().ok_or_else(CaError::sealed)?;
+        let dek = self.dek_at(pki)?;
         open_signer(pki, &dek).map_err(CaError::internal)
+    }
+
+    /// Record `op`, made with the DEK for `pki` (so at its seal epoch).
+    pub(crate) async fn commit_at(&self, pki: &PkiState, op: PkiOp) -> Result<(), CaError> {
+        self.commit(op.at_epoch(pki.seal.epoch)).await
     }
 
     /// Record `op`: in the staged CA while there is one, else through Raft.
@@ -320,13 +427,26 @@ impl CaService {
     /// May `ip` try another join now? (Guessing secrets is pointless at
     /// 256 bits, but nobody should be able to make the signer busy.)
     pub fn join_allowed(&self, ip: Option<IpAddr>) -> bool {
-        let Some(ip) = ip else { return true };
-        let mut joins = self.joins.lock().unwrap();
-        let now = Instant::now();
-        joins.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(60));
-        let (_, n) = joins.entry(ip).or_insert((now, 0));
-        *n += 1;
-        *n <= JOINS_PER_MINUTE
+        per_minute(&self.joins, ip, JOINS_PER_MINUTE)
+    }
+
+    /// May `ip` try another unseal now? (Each try is an Argon2id per slot,
+    /// and a guess at a passphrase.)
+    pub fn unseal_allowed(&self, ip: Option<IpAddr>) -> bool {
+        per_minute(&self.unseals, ip, UNSEALS_PER_MINUTE)
+    }
+
+    /// This node now holds `dek`, opened at `epoch` (`by`: how, as
+    /// `ca status` says it).
+    pub(crate) fn set_dek(&self, dek: Key, epoch: u64, by: &'static str) {
+        *self.dek.write().unwrap() = Some((dek, epoch, by));
+        self.event(
+            raidish_types::api_types::EventKind::CaUnsealed,
+            self.me_subject(),
+            format!("{} unsealed by {}", self.cluster.name, by),
+            None,
+        );
+        self.crl_wake.notify_one();
     }
 
     /// `POST /api/v1/pki/join`. A sealed node passes it on to one that
@@ -348,7 +468,7 @@ impl CaService {
         if !envelope::ct_eq(&e.secret_sha256, &hash) {
             return Err(CaError::denied("unknown, expired or used-up join token"));
         }
-        let dek = self.dek().ok_or_else(CaError::sealed)?;
+        let dek = self.dek_at(&pki)?;
         if !envelope::enrollment_mac_ok(&dek, &req.id, e) {
             return Err(CaError::denied(
                 "this join token wasn't made by the cluster's signer (its MAC is wrong)",
@@ -396,7 +516,7 @@ impl CaService {
             member: Some(req.member),
         })
         .await?;
-        self.record(&signer, &identity, &issued, None).await?;
+        self.record(&pki, &signer, &identity, &issued, None).await?;
         println!(
             "ca: {} joined as '{}' (certificate {})",
             req.member, identity.cn, issued.serial
@@ -448,21 +568,25 @@ impl CaService {
 
     async fn record(
         &self,
+        pki: &PkiState,
         signer: &Signer,
         identity: &Identity,
         issued: &raidish_auth::ca::Issued,
         renews: Option<pki::Serial>,
     ) -> Result<(), CaError> {
-        self.commit(PkiOp::RecordIssued {
-            serial: issued.serial.clone(),
-            cert: IssuedCert {
-                identity: identity.clone(),
-                issuer: signer.id,
-                not_before_ms: issued.not_before_ms,
-                not_after_ms: issued.not_after_ms,
-                renews,
+        self.commit_at(
+            pki,
+            PkiOp::RecordIssued {
+                serial: issued.serial.clone(),
+                cert: IssuedCert {
+                    identity: identity.clone(),
+                    issuer: signer.id,
+                    not_before_ms: issued.not_before_ms,
+                    not_after_ms: issued.not_after_ms,
+                    renews,
+                },
             },
-        })
+        )
         .await
     }
 
@@ -498,8 +622,14 @@ impl CaService {
             &identity,
             pki.params(profile).default_days,
         )?;
-        self.record(&signer, &identity, &issued, Some(facts.serial.clone()))
-            .await?;
+        self.record(
+            &pki,
+            &signer,
+            &identity,
+            &issued,
+            Some(facts.serial.clone()),
+        )
+        .await?;
         println!(
             "ca: renewed '{}' ({}): {} → {}",
             identity.cn, profile, facts.serial, issued.serial
@@ -566,7 +696,7 @@ impl CaService {
         };
         let signer = self.signer(&pki)?;
         let issued = sign(&signer, &req.csr_pem, &identity, days)?;
-        self.record(&signer, &identity, &issued, None).await?;
+        self.record(&pki, &signer, &identity, &issued, None).await?;
         println!(
             "ca: {} issued a {} certificate for '{}' ({})",
             admin.name, req.profile, identity.cn, issued.serial
@@ -582,7 +712,7 @@ impl CaService {
         req: EnrollmentRequest,
     ) -> Result<EnrollmentCreated, CaError> {
         let pki = self.for_caller(caller).await?;
-        let dek = self.dek().ok_or_else(CaError::sealed)?;
+        let dek = self.dek_at(&pki)?;
         if req.member == self.cluster.members.me {
             // Its pool config has no address for itself: another node's has.
             return Err(CaError::unavailable(format!(
@@ -623,10 +753,13 @@ impl CaService {
             &admin.name,
         );
         let expires_ms = enrollment.expires_ms;
-        self.commit(PkiOp::CreateEnrollment {
-            id: token.id.clone(),
-            enrollment: Box::new(enrollment),
-        })
+        self.commit_at(
+            &pki,
+            PkiOp::CreateEnrollment {
+                id: token.id.clone(),
+                enrollment: Box::new(enrollment),
+            },
+        )
         .await?;
         println!(
             "ca: {} made join token {} for {}{}",
@@ -734,7 +867,18 @@ fn caller_ok(pki: &PkiState, der: &[u8]) -> Result<(), CaError> {
     Ok(())
 }
 
-fn check_dek(pki: &PkiState, dek: &[u8; 32]) -> Result<(), String> {
+/// The CA's view of the cluster, for this node's [`CaService`].
+struct Watch(std::sync::Weak<CaService>);
+
+impl pki::PkiObserver for Watch {
+    fn observe_pki(&self, pki: Option<&PkiState>) {
+        if let Some(ca) = self.0.upgrade() {
+            ca.observed(pki);
+        }
+    }
+}
+
+pub(crate) fn check_dek(pki: &PkiState, dek: &[u8; 32]) -> Result<(), String> {
     open_signer(pki, dek)
         .map(|_| ())
         .map_err(|_| "that key doesn't open this CA".to_string())

@@ -12,7 +12,7 @@
 use crate::now_ms;
 use crate::service::{CaError, CaService};
 use raidish_cluster::state::{LeaseOp, Response};
-use raidish_types::pki::{CrlRecord, PkiObserver, PkiOp, PkiState};
+use raidish_types::pki::{CrlRecord, PkiOp, PkiState};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -24,19 +24,9 @@ pub const RESIGN_BEFORE_MS: u64 = 10 * DAY_MS;
 /// How often an unsealed node checks, changes or not.
 const CHECK_EVERY: Duration = Duration::from_secs(3600);
 
-/// Wakes the re-signer when the CA changes.
-struct Wake(Arc<tokio::sync::Notify>);
-
-impl PkiObserver for Wake {
-    fn observe_pki(&self, _: Option<&PkiState>) {
-        self.0.notify_one();
-    }
-}
-
-/// Start `ca`'s re-signer.
+/// Start `ca`'s re-signer (woken by `CaService`'s observer when the CA
+/// changes).
 pub(crate) fn start(ca: &Arc<CaService>) {
-    ca.cluster()
-        .observe_pki(Arc::new(Wake(ca.crl_wake.clone())));
     tokio::spawn(run(Arc::downgrade(ca), ca.crl_wake.clone()));
 }
 
@@ -52,6 +42,7 @@ async fn run(ca: Weak<CaService>, wake: Arc<tokio::sync::Notify>) {
             if let Err(e) = ca.refresh_crl().await {
                 eprintln!("ca: re-signing the CRL: {}", e);
             }
+            ca.check_unsealed_none().await;
         }
         tokio::select! {
             _ = wake.notified() => {}
@@ -144,7 +135,10 @@ impl CaService {
         };
         match self
             .cluster()
-            .lease(&LeaseOp::Pki(PkiOp::SetCrl(Box::new(record))), false)
+            .lease(
+                &LeaseOp::Pki(PkiOp::SetCrl(Box::new(record)).at_epoch(pki.seal.epoch)),
+                false,
+            )
             .await
         {
             Ok(Response::Recorded) => {

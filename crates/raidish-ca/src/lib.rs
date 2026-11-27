@@ -18,12 +18,16 @@ pub mod api;
 pub mod crl;
 pub mod init;
 pub mod join;
+pub mod loud;
 mod revoke;
 pub mod routes;
+mod seal;
 mod service;
 pub mod token;
 pub mod token_signer;
 
+pub use loud::CaEvents;
+pub use seal::NodeKeySource;
 pub use service::{CaError, CaOptions, CaService};
 
 use std::path::{Path, PathBuf};

@@ -66,7 +66,7 @@ impl CaService {
         if !due(&pki, now_ms()) {
             return Ok(false);
         }
-        let dek = self.dek().ok_or_else(|| CaError::new(503, "sealed"))?;
+        let dek = self.dek_at(&pki)?;
         let signer = self.signer(&pki)?;
         let (key_pem, csr) =
             raidish_auth::ca::generate_csr(CN).map_err(|e| CaError::new(500, e))?;
@@ -95,7 +95,7 @@ impl CaService {
         match self
             .cluster()
             .lease(
-                &LeaseOp::Pki(PkiOp::SetTokenSigner(Box::new(record))),
+                &LeaseOp::Pki(PkiOp::SetTokenSigner(Box::new(record)).at_epoch(pki.seal.epoch)),
                 false,
             )
             .await
@@ -156,11 +156,12 @@ impl CaService {
 
     /// The token signer, its key opened (503 when sealed or none yet).
     pub(crate) fn token_key(&self, pki: &PkiState) -> Result<TokenKey, CaError> {
-        let dek = self.dek().ok_or_else(|| {
-            CaError::new(
+        let dek = self.dek_at(pki).map_err(|e| match e.status {
+            503 => CaError::new(
                 503,
                 "this node is sealed (it can't mint tokens): ask another node",
-            )
+            ),
+            _ => e,
         })?;
         let t = pki
             .token_signer

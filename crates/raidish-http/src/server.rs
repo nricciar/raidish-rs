@@ -99,10 +99,16 @@ pub async fn listen(
         .await
         .map_err(|e| format!("cluster: {}", e))?;
     node.observe_pki(trust.clone());
+    // What happens on this node goes to the activity log (through
+    // whichever node is the committer).
+    let events = crate::events::EventSink::new(&name);
     let ca = raidish_ca::CaService::start(
         node.clone(),
         raidish_ca::CaOptions {
             unseal_once: config.ca.unseal_once,
+            node_key: config.ca.node_key()?,
+            events: Some(Arc::new(CaEventSink(events.clone()))),
+            ..Default::default()
         },
     )
     .map_err(|e| format!("ca: {}", e))?;
@@ -119,9 +125,6 @@ pub async fn listen(
         ))
     });
     let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
-    // What happens on this node goes to the activity log (through
-    // whichever node is the committer).
-    let events = crate::events::EventSink::new(&name);
     // The committer is wherever the `pool` lease is: here in process,
     // else ask every node.
     let endpoints: Vec<String> = {
@@ -343,5 +346,36 @@ fn warn_expiry(tls: &crate::tls::TlsConfig) {
             info.not_after.date(),
             info.name
         );
+    }
+}
+
+/// The CA's events, into this node's `EventSink` (`raidish-ca` doesn't
+/// depend on the committer).
+struct CaEventSink(crate::events::EventSink);
+
+impl raidish_ca::CaEvents for CaEventSink {
+    fn emit(
+        &self,
+        level: crate::api_types::Level,
+        kind: crate::api_types::EventKind,
+        subject: crate::api_types::Subject,
+        message: String,
+        by: Option<String>,
+    ) {
+        self.0.emit(level, kind, subject, message, by);
+    }
+
+    fn once(
+        &self,
+        level: crate::api_types::Level,
+        kind: crate::api_types::EventKind,
+        subject: crate::api_types::Subject,
+        message: String,
+    ) -> bool {
+        self.0.once(level, kind, subject, message)
+    }
+
+    fn clear(&self, subject: &crate::api_types::Subject) -> bool {
+        self.0.clear(subject)
     }
 }

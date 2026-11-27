@@ -183,8 +183,17 @@ fn installed() -> Option<Arc<PkiState>> {
     pki
 }
 
+/// Apply `op`, made (if it takes the DEK) at the CA's current seal epoch,
+/// as an unsealed node makes it.
 fn run(pki: &mut Option<Arc<PkiState>>, op: PkiOp, now: u64) -> Result<(), String> {
-    apply(pki, &op, now, &checker())
+    let epoch = pki.as_deref().map_or(0, |p| p.seal.epoch);
+    apply(pki, &op.at_epoch(epoch), now, &checker())
+}
+
+fn seal() -> PkiOp {
+    PkiOp::Seal {
+        remove_slots: vec![],
+    }
 }
 
 fn m(n: u64) -> NodeId {
@@ -340,7 +349,7 @@ fn bootstrap_installs_once() {
 #[test]
 fn ops_before_bootstrap_are_refused() {
     let mut pki = None;
-    let e = run(&mut pki, PkiOp::Seal, T0).unwrap_err();
+    let e = run(&mut pki, seal(), T0).unwrap_err();
     assert!(e.contains("ca init"), "{}", e);
 }
 
@@ -653,22 +662,104 @@ fn two_joins_for_one_member_one_wins() {
 
 // ---- seal and profiles -----------------------------------------------------
 
+fn slot(id: &str) -> PkiOp {
+    PkiOp::AddSlot(Box::new(KeySlot {
+        id: id.into(),
+        label: "x".into(),
+        kind: SlotKind::Passphrase(KdfParams {
+            salt: [0; 16],
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        }),
+        wrapped_dek: blob(),
+    }))
+}
+
 #[test]
-fn seal_config_keeps_its_cluster_and_moves_forward() {
+fn slots_come_and_go_but_never_the_last() {
     let mut pki = installed();
-    let mut cfg = pki.as_deref().unwrap().seal.clone();
-    cfg.epoch = 3;
-    run(&mut pki, PkiOp::SetSeal(cfg.clone()), T0).unwrap();
-    run(&mut pki, PkiOp::Seal, T0).unwrap();
-    assert_eq!(pki.as_deref().unwrap().seal.epoch, 4);
-    cfg.epoch = 2;
-    assert!(run(&mut pki, PkiOp::SetSeal(cfg.clone()), T0).is_err());
-    cfg.epoch = 5;
-    cfg.cluster_id = [8; 16];
-    assert!(run(&mut pki, PkiOp::SetSeal(cfg.clone()), T0).is_err());
-    cfg.cluster_id = [7; 16];
-    cfg.slots.clear();
-    assert!(run(&mut pki, PkiOp::SetSeal(cfg), T0).is_err());
+    let first = pki.as_deref().unwrap().seal.slots[0].id.clone();
+    run(&mut pki, slot("pass-1"), T0).unwrap();
+    assert!(
+        run(&mut pki, slot("pass-1"), T0).is_err(),
+        "the id is taken"
+    );
+    assert!(run(&mut pki, slot(""), T0).is_err());
+    // Neither moves the epoch: whoever is unsealed stays so.
+    assert_eq!(pki.as_deref().unwrap().seal.epoch, 0);
+    run(&mut pki, PkiOp::RemoveSlot { id: first }, T0).unwrap();
+    let last = PkiOp::RemoveSlot {
+        id: "pass-1".into(),
+    };
+    assert!(run(&mut pki, last, T0).unwrap_err().contains("last"));
+    assert!(run(&mut pki, PkiOp::RemoveSlot { id: "nope".into() }, T0).is_err());
+    for i in 0..(MAX_SLOTS - 1) {
+        run(&mut pki, slot(&format!("s{}", i)), T0).unwrap();
+    }
+    assert!(
+        run(&mut pki, slot("one-more"), T0).is_err(),
+        "at most {}",
+        MAX_SLOTS
+    );
+}
+
+#[test]
+fn sealing_moves_the_epoch_and_takes_the_slots_it_names() {
+    let mut pki = installed();
+    run(&mut pki, slot("node-key-1"), T0).unwrap();
+    let only = |ids: &[&str]| PkiOp::Seal {
+        remove_slots: ids.iter().map(|s| s.to_string()).collect(),
+    };
+    assert!(run(&mut pki, only(&["nope"]), T0).is_err());
+    let all: Vec<String> = pki
+        .as_deref()
+        .unwrap()
+        .seal
+        .slots
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    let every = PkiOp::Seal { remove_slots: all };
+    assert!(run(&mut pki, every, T0).unwrap_err().contains("every"));
+    assert_eq!(
+        pki.as_deref().unwrap().seal.epoch,
+        0,
+        "refused: nothing changed"
+    );
+    run(&mut pki, only(&["node-key-1"]), T0).unwrap();
+    let s = pki.as_deref().unwrap();
+    assert_eq!(s.seal.epoch, 1);
+    assert!(s.seal.slots.iter().all(|x| x.id != "node-key-1"));
+}
+
+#[test]
+fn what_the_dek_made_carries_the_epoch_it_was_made_at() {
+    let mut pki = installed();
+    let cert = || PkiOp::RecordIssued {
+        serial: Serial::from_be_bytes(&[70]),
+        cert: node_cert(1, T0 + 30 * DAY),
+    };
+    // Bare: refused.
+    let e = apply(&mut pki, &cert(), T0, &checker()).unwrap_err();
+    assert!(e.contains("seal epoch"), "{}", e);
+    // Made before a `Seal` it hadn't applied: refused.
+    run(&mut pki, seal(), T0).unwrap();
+    let stale = cert().at_epoch(0);
+    let e = apply(&mut pki, &stale, T0, &checker()).unwrap_err();
+    assert!(e.contains("was sealed"), "{}", e);
+    // At the CA's epoch: recorded.
+    apply(&mut pki, &cert().at_epoch(1), T0, &checker()).unwrap();
+    // What doesn't take the DEK isn't wrapped, and can't be.
+    let wrapped = PkiOp::AtEpoch {
+        seal_epoch: 1,
+        op: Box::new(PkiOp::RevokeToken {
+            id: tid(1),
+            expires_ms: None,
+        }),
+    };
+    assert!(apply(&mut pki, &wrapped, T0, &checker()).is_err());
+    assert_eq!(seal().at_epoch(1), seal());
 }
 
 // ---- pruning -------------------------------------------------------------------
@@ -694,13 +785,13 @@ fn pruning_forgets_what_expired() {
     .unwrap();
     enroll(&mut pki, 1, node_enrollment(None, false, 1));
     // Two days in: the enrollment is gone, certs stay.
-    run(&mut pki, PkiOp::Seal, T0 + 2 * DAY).unwrap();
+    run(&mut pki, seal(), T0 + 2 * DAY).unwrap();
     let s = pki.as_deref().unwrap();
     assert!(s.enrollments.is_empty());
     assert_eq!(s.certs.len(), 2);
     // A day past their expiry: certs and their revocation go; a token
     // revocation that never expires stays.
-    run(&mut pki, PkiOp::Seal, T0 + 32 * DAY).unwrap();
+    run(&mut pki, seal(), T0 + 32 * DAY).unwrap();
     let s = pki.as_deref().unwrap();
     assert!(s.certs.is_empty() && s.revoked_certs.is_empty());
     assert_eq!(s.revoked_tokens.len(), 1);
@@ -720,9 +811,9 @@ fn revoked_issuers_stay_until_they_expire() {
     )
     .unwrap();
     run(&mut pki, PkiOp::RevokeIssuer { id: IssuerId(1) }, T0).unwrap();
-    run(&mut pki, PkiOp::Seal, T0 + 700 * DAY).unwrap();
+    run(&mut pki, seal(), T0 + 700 * DAY).unwrap();
     assert!(pki.as_deref().unwrap().issuers.contains_key(&IssuerId(1)));
-    run(&mut pki, PkiOp::Seal, T0 + 732 * DAY).unwrap();
+    run(&mut pki, seal(), T0 + 732 * DAY).unwrap();
     let s = pki.as_deref().unwrap();
     assert!(!s.issuers.contains_key(&IssuerId(1)));
     assert!(s.issuers.contains_key(&IssuerId(2)));
@@ -1044,4 +1135,109 @@ fn a_renewal_is_of_a_good_certificate_kept_as_it_is() {
     again.issuer = IssuerId(2);
     let e = run(&mut pki, renewal(61, 63, again), T0 + 2 * DAY).unwrap_err();
     assert!(e.contains("issuer is revoked"), "{}", e);
+}
+
+fn node_slot(id: &str, node: u64) -> PkiOp {
+    PkiOp::AddSlot(Box::new(KeySlot {
+        id: id.into(),
+        label: "x".into(),
+        kind: SlotKind::NodeKey { node: m(node) },
+        wrapped_dek: blob(),
+    }))
+}
+
+fn has_slot(pki: &Option<Arc<PkiState>>, id: &str) -> bool {
+    pki.as_deref()
+        .unwrap()
+        .seal
+        .slots
+        .iter()
+        .any(|s| s.id == id)
+}
+
+#[test]
+fn a_node_key_slot_is_for_a_node_with_a_live_cert() {
+    let mut pki = installed();
+    assert!(
+        run(&mut pki, node_slot("nk-1", 1), T0)
+            .unwrap_err()
+            .contains("no live node certificate")
+    );
+    // A libvirt cert isn't a node cert.
+    let mut libvirt = node_cert(1, T0 + 300 * DAY);
+    libvirt.identity.profile = ProfileKind::Libvirt;
+    record(&mut pki, 21, libvirt);
+    assert!(run(&mut pki, node_slot("nk-1", 1), T0).is_err());
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    run(&mut pki, node_slot("nk-1", 1), T0).unwrap();
+    // Expired: no more slots for it.
+    assert!(run(&mut pki, node_slot("nk-1b", 1), T0 + 31 * DAY).is_err());
+}
+
+#[test]
+fn revoking_a_members_last_node_cert_takes_its_node_key_slots() {
+    let mut pki = installed();
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    record(&mut pki, 21, node_cert(1, T0 + 30 * DAY)); // renewed, say
+    record(&mut pki, 22, node_cert(2, T0 + 30 * DAY));
+    run(&mut pki, node_slot("nk-1", 1), T0).unwrap();
+    run(&mut pki, node_slot("nk-2", 2), T0).unwrap();
+    let revoke = |n: u8| PkiOp::RevokeCert {
+        serial: Serial::from_be_bytes(&[n]),
+        reason: RevocationReason::KeyCompromise,
+    };
+    run(&mut pki, revoke(20), T0).unwrap();
+    assert!(has_slot(&pki, "nk-1"), "node 1 still has a live node cert");
+    run(&mut pki, revoke(21), T0).unwrap();
+    assert!(!has_slot(&pki, "nk-1"), "gone in the same entry");
+    assert!(has_slot(&pki, "nk-2"), "another node's stays");
+}
+
+#[test]
+fn a_replaced_member_loses_its_node_key_slots() {
+    let mut pki = installed();
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    run(&mut pki, node_slot("nk-1", 1), T0).unwrap();
+    enroll(&mut pki, 1, node_enrollment(Some(1), true, 1));
+    consume(&mut pki, 1, Some(1)).unwrap();
+    assert!(!has_slot(&pki, "nk-1"));
+}
+
+#[test]
+fn revoking_an_issuer_takes_the_node_key_slots_of_its_nodes() {
+    let mut pki = installed();
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    run(&mut pki, node_slot("nk-1", 1), T0).unwrap();
+    run(
+        &mut pki,
+        PkiOp::AddIssuer {
+            id: IssuerId(2),
+            record: Box::new(issuer("ISSUER2", 3, T0 + 1460 * DAY)),
+            activate: true,
+        },
+        T0,
+    )
+    .unwrap();
+    assert!(has_slot(&pki, "nk-1"), "a retired issuer's certs stay good");
+    run(&mut pki, PkiOp::RevokeIssuer { id: IssuerId(1) }, T0 + 5).unwrap();
+    assert!(!has_slot(&pki, "nk-1"));
+}
+
+#[test]
+fn the_last_slot_stays_even_for_a_revoked_node() {
+    let mut pki = installed();
+    record(&mut pki, 20, node_cert(1, T0 + 30 * DAY));
+    run(&mut pki, node_slot("nk-1", 1), T0).unwrap();
+    let first = pki.as_deref().unwrap().seal.slots[0].id.clone();
+    run(&mut pki, PkiOp::RemoveSlot { id: first }, T0).unwrap();
+    run(
+        &mut pki,
+        PkiOp::RevokeCert {
+            serial: Serial::from_be_bytes(&[20]),
+            reason: RevocationReason::Unspecified,
+        },
+        T0,
+    )
+    .unwrap();
+    assert!(has_slot(&pki, "nk-1"), "never the last slot");
 }

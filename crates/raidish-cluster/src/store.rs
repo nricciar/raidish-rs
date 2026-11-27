@@ -282,8 +282,12 @@ impl Store {
 
     fn publish(&self, state: &ClusterState) {
         observe(&*self.fence, state);
-        let generation =
-            |p: &Option<Arc<PkiState>>| p.as_ref().map(|p| (p.anchor.fingerprint, p.generation));
+        // What observers are told of: a change verifiers see (generation),
+        // or to how the CA is unlocked (a `Seal` drops unsealed nodes' DEK).
+        let generation = |p: &Option<Arc<PkiState>>| {
+            p.as_ref()
+                .map(|p| (p.anchor.fingerprint, p.generation, p.seal.clone()))
+        };
         let changed = {
             let mut view = self.view.write().unwrap();
             let changed = generation(&view.pki) != generation(&state.pki);

@@ -4,7 +4,7 @@
 //!   Raft (AES-256-GCM, with an AAD naming what the blob is, so blobs can't
 //!   be swapped for one another).
 //! * **Key slots** each wrap the DEK under a KEK: Argon2id of a recovery key
-//!   (or, later, a passphrase), or a node's own raw key. Adding a way to
+//!   or a passphrase, or a node's own raw key. Adding a way to
 //!   unseal never re-encrypts the CA.
 //! * Keys derived from the DEK with HKDF do other jobs, e.g. MACing
 //!   enrollments, so a node without the DEK can't forge one through Raft.
@@ -14,6 +14,7 @@
 use raidish_types::pki::{
     CertFingerprint, Enrollment, IssuerId, KdfParams, KeySlot, SealedBlob, SlotKind, TokenId,
 };
+use raidish_types::types::NodeId;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
@@ -184,28 +185,142 @@ pub fn new_recovery_key() -> Result<Zeroizing<String>, String> {
 /// The 32 bytes of a recovery key as typed (case, dashes and spaces don't
 /// matter).
 pub fn parse_recovery_key(s: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    parse_key(RECOVERY_PREFIX, "recovery key", s)
+}
+
+/// `prefix-` and 64 hex digits, as typed, into its 32 bytes.
+fn parse_key(prefix: &str, what: &str, s: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let t = s.trim();
     let rest = t
-        .strip_prefix(RECOVERY_PREFIX)
-        .or_else(|| t.strip_prefix(&RECOVERY_PREFIX.to_ascii_lowercase()))
-        .ok_or("not a recovery key (they start with RDK1-)")?;
+        .strip_prefix(prefix)
+        .or_else(|| t.strip_prefix(&prefix.to_ascii_lowercase()))
+        .ok_or_else(|| format!("not a {} (they start with {}-)", what, prefix))?;
     let hex: Zeroizing<String> = Zeroizing::new(
         rest.chars()
-            .filter(|c| !matches!(c, '-' | ' ' | '\n' | '\t'))
+            .filter(|c| !matches!(c, '-' | ' ' | '\n' | '\r' | '\t'))
             .map(|c| c.to_ascii_lowercase())
             .collect(),
     );
     if hex.len() != 64 {
-        return Err("a recovery key has 64 hex digits".into());
+        return Err(format!("a {} has 64 hex digits", what));
     }
     let mut out = Zeroizing::new(Vec::with_capacity(32));
     for i in (0..64).step_by(2) {
-        out.push(u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| "bad recovery key")?);
+        out.push(u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| format!("bad {}", what))?);
     }
     Ok(out)
 }
 
+// ---- node keys ---------------------------------------------------------------------
+
+const NODE_KEY_PREFIX: &str = "RNK1";
+
+/// A new node key (CA-3b): 256 random bits, as `RNK1-` and 64 hex digits.
+/// Its 32 bytes wrap the DEK directly: it is random, so no KDF.
+pub fn new_node_key() -> Result<(Key, Zeroizing<String>), String> {
+    let b: Key = Zeroizing::new(random()?);
+    let mut s = Zeroizing::new(format!("{}-", NODE_KEY_PREFIX));
+    for x in b.iter() {
+        s.push_str(&format!("{:02x}", x));
+    }
+    Ok((b, s))
+}
+
+/// A node key as written (a file or a credential: whitespace is ignored).
+pub fn parse_node_key(s: &str) -> Result<Key, String> {
+    let b = parse_key(NODE_KEY_PREFIX, "node key", s)?;
+    Ok(Zeroizing::new(b[..].try_into().unwrap()))
+}
+
+/// A node-key slot's AAD names the node too: a slot moved to another
+/// node's name in Raft opens for no one.
+fn node_slot_aad(cluster_id: &[u8; 16], slot_id: &str, node: &NodeId) -> Vec<u8> {
+    let mut aad = slot_aad(cluster_id, slot_id);
+    aad.extend_from_slice(b"/node/");
+    aad.extend_from_slice(node.to_string().as_bytes());
+    aad
+}
+
+/// A slot wrapping `dek` under `node`'s key.
+pub fn node_key_slot(
+    dek: &[u8; 32],
+    cluster_id: &[u8; 16],
+    id: &str,
+    label: &str,
+    node: NodeId,
+    key: &[u8; 32],
+) -> Result<KeySlot, String> {
+    Ok(KeySlot {
+        id: id.into(),
+        label: label.into(),
+        wrapped_dek: seal(key, &node_slot_aad(cluster_id, id, &node), dek)?,
+        kind: SlotKind::NodeKey { node },
+    })
+}
+
+/// The DEK, from one of `me`'s node-key slots (no other slot is tried).
+pub fn unwrap_dek_node(
+    slots: &[KeySlot],
+    cluster_id: &[u8; 16],
+    me: NodeId,
+    key: &[u8; 32],
+) -> Result<Key, String> {
+    for slot in slots {
+        if !matches!(slot.kind, SlotKind::NodeKey { node } if node == me) {
+            continue;
+        }
+        if let Ok(dek) = open(
+            key,
+            &node_slot_aad(cluster_id, &slot.id, &me),
+            &slot.wrapped_dek,
+        ) {
+            let dek: [u8; 32] = dek[..]
+                .try_into()
+                .map_err(|_| "a slot's DEK is not 32 bytes")?;
+            return Ok(Zeroizing::new(dek));
+        }
+    }
+    Err(format!("this node's key opens none of {}'s key slots", me))
+}
+
 // ---- key slots ---------------------------------------------------------------------
+
+/// The shortest passphrase a slot takes (a recovery key is better: §2).
+pub const MIN_PASSPHRASE_CHARS: usize = 12;
+
+/// What someone unseals with.
+pub enum Secret {
+    /// The 32 bytes of an `RDK1-` key.
+    RecoveryKey(Zeroizing<Vec<u8>>),
+    Passphrase(Zeroizing<String>),
+}
+
+impl Secret {
+    /// `RDK1-…` is a recovery key (and must be a whole one); anything else
+    /// a passphrase, as typed.
+    pub fn parse(s: &str) -> Result<Secret, String> {
+        if s.trim().to_ascii_uppercase().starts_with(RECOVERY_PREFIX) {
+            return parse_recovery_key(s).map(Secret::RecoveryKey);
+        }
+        Ok(Secret::Passphrase(Zeroizing::new(s.to_string())))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Secret::RecoveryKey(b) => b,
+            Secret::Passphrase(p) => p.as_bytes(),
+        }
+    }
+
+    /// Whether `kind` is opened by this kind of secret.
+    fn opens(&self, kind: &SlotKind) -> Option<KdfParams> {
+        match (self, kind) {
+            (Secret::RecoveryKey(_), SlotKind::RecoveryKey(p))
+            | (Secret::Passphrase(_), SlotKind::Passphrase(p)) => Some(p.clone()),
+            _ => None,
+        }
+    }
+}
 
 /// A slot wrapping `dek` under recovery key `recovery` (Argon2id at `kdf`).
 pub fn recovery_slot(
@@ -225,14 +340,49 @@ pub fn recovery_slot(
     })
 }
 
-/// The DEK, from whichever recovery or passphrase slot `secret` opens.
-pub fn unwrap_dek(slots: &[KeySlot], cluster_id: &[u8; 16], secret: &[u8]) -> Result<Key, String> {
+/// A slot wrapping `dek` under `passphrase` (Argon2id at `kdf`), at least
+/// [`MIN_PASSPHRASE_CHARS`] long.
+pub fn passphrase_slot(
+    dek: &[u8; 32],
+    cluster_id: &[u8; 16],
+    id: &str,
+    label: &str,
+    passphrase: &str,
+    kdf: KdfParams,
+) -> Result<KeySlot, String> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(format!(
+            "a passphrase has at least {} characters",
+            MIN_PASSPHRASE_CHARS
+        ));
+    }
+    if passphrase
+        .trim()
+        .to_ascii_uppercase()
+        .starts_with(RECOVERY_PREFIX)
+    {
+        return Err(format!("a passphrase can't start with {}", RECOVERY_PREFIX));
+    }
+    let kek = derive_kek(passphrase.as_bytes(), &kdf)?;
+    Ok(KeySlot {
+        id: id.into(),
+        label: label.into(),
+        wrapped_dek: seal(&kek, &slot_aad(cluster_id, id), dek)?,
+        kind: SlotKind::Passphrase(kdf),
+    })
+}
+
+/// The DEK, from whichever slot of its kind `secret` opens.
+pub fn unwrap_dek(
+    slots: &[KeySlot],
+    cluster_id: &[u8; 16],
+    secret: &Secret,
+) -> Result<Key, String> {
     for slot in slots {
-        let kdf = match &slot.kind {
-            SlotKind::RecoveryKey(p) | SlotKind::Passphrase(p) => p,
-            SlotKind::NodeKey { .. } => continue,
+        let Some(kdf) = secret.opens(&slot.kind) else {
+            continue;
         };
-        let kek = derive_kek(secret, kdf)?;
+        let kek = derive_kek(secret.bytes(), &kdf)?;
         if let Ok(dek) = open(&kek, &slot_aad(cluster_id, &slot.id), &slot.wrapped_dek) {
             let dek: [u8; 32] = dek[..]
                 .try_into()

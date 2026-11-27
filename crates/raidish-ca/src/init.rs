@@ -151,7 +151,8 @@ pub fn init(opts: &InitOptions) -> Result<InitOutput, String> {
     // Everything after the anchor goes in as the ops the daemon would
     // make, through the same checks.
     let mut state: Option<Arc<PkiState>> = None;
-    let mut apply = |op: PkiOp| pki::apply(&mut state, &op, now, &X509Checker);
+    // At seal epoch 0, as the staged CA's signer makes them.
+    let mut apply = |op: PkiOp| pki::apply(&mut state, &op.at_epoch(0), now, &X509Checker);
     apply(PkiOp::Bootstrap(Box::new(base)))?;
     if let Some(days) = opts.node_days {
         let spec = ProfileKind::Node.spec();

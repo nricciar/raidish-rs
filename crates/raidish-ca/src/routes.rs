@@ -4,8 +4,9 @@
 
 use crate::CaService;
 use crate::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, RenewRequest, RevokeCertRequest,
-    RevokeTokenRequest, SignRequest, TokenCreated, TokenRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, RemoveSlotQuery, RenewRequest,
+    RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest, SlotCreated, SlotRequest,
+    TokenCreated, TokenRequest, UnsealRequest,
 };
 use crate::service::CaError;
 use axum::extract::{ConnectInfo, Extension, Path, State};
@@ -41,8 +42,22 @@ pub async fn ca_pem(State(ca): Ca) -> Result<Response, CaError> {
         .into_response())
 }
 
-pub async fn status(_auth: CanRead, State(ca): Ca) -> Json<PkiStatus> {
-    Json(ca.status().await)
+#[derive(Deserialize, Default)]
+pub struct StatusQuery {
+    /// Every member's seal too, asked now (CA-3c).
+    #[serde(default)]
+    all: bool,
+}
+
+pub async fn status(
+    _auth: CanRead,
+    Query(q): Query<StatusQuery>,
+    State(ca): Ca,
+) -> Json<PkiStatus> {
+    Json(match q.all {
+        true => ca.status_all().await,
+        false => ca.status().await,
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -121,16 +136,23 @@ pub async fn cancel_enrollment(
     ca.cancel_enrollment(id).await
 }
 
-/// Unseal this node (the one asked).
+/// Unseal this node (the one asked), with a recovery key or a passphrase.
 pub async fn unseal(
     _admin: IsAdminCert,
     peer: Option<Extension<Peer>>,
+    addr: Option<Extension<ConnectInfo<SocketAddr>>>,
     State(ca): Ca,
     req: Json<UnsealRequest>,
 ) -> Result<Json<PkiStatus>, CaError> {
     let peer = presented(peer)?;
+    if !ca.unseal_allowed(addr.map(|Extension(ConnectInfo(a))| a.ip())) {
+        return Err(CaError::new(
+            429,
+            "too many unseal attempts from this address: wait a minute",
+        ));
+    }
     ca.for_caller(peer.cert()).await?;
-    ca.unseal(&req.recovery_key).await?;
+    ca.unseal(&req.secret).await?;
     Ok(Json(ca.status().await))
 }
 
@@ -207,6 +229,43 @@ pub async fn revoke_token(
     ca.revoke_token(id, req.into_inner()).await
 }
 
+/// Seal every node. It only takes authority away (D8): an admin's
+/// certificate or token.
+pub async fn seal(
+    admin: IsAdmin,
+    State(ca): Ca,
+    req: Json<SealRequest>,
+) -> Result<Json<PkiStatus>, CaError> {
+    ca.seal(req.into_inner(), Some(admin.0.name)).await?;
+    Ok(Json(ca.status().await))
+}
+
+/// Add a key slot: it changes how the CA is unlocked, so an admin's own
+/// certificate only (D8), on an unsealed node.
+pub async fn add_slot(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
+    req: Json<SlotRequest>,
+) -> Result<Json<SlotCreated>, CaError> {
+    let peer = presented(peer)?;
+    ca.add_slot(peer.cert(), req.into_inner(), Some(admin.0.name))
+        .await
+        .map(Json)
+}
+
+pub async fn remove_slot(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    Path(id): Path<String>,
+    Query(q): Query<RemoveSlotQuery>,
+    State(ca): Ca,
+) -> Result<(), CaError> {
+    let peer = presented(peer)?;
+    ca.for_caller(peer.cert()).await?;
+    ca.remove_slot(&id, q.force, Some(admin.0.name)).await
+}
+
 /// The routes, on this node's CA service.
 pub fn router(ca: Arc<CaService>) -> axum::Router {
     axum::Router::new()
@@ -218,6 +277,9 @@ pub fn router(ca: Arc<CaService>) -> axum::Router {
         .route("/api/v1/pki/enrollments", post(create_enrollment))
         .route("/api/v1/pki/enrollments/{id}", delete(cancel_enrollment))
         .route("/api/v1/pki/unseal", post(unseal))
+        .route("/api/v1/pki/seal", post(seal))
+        .route("/api/v1/pki/slots", post(add_slot))
+        .route("/api/v1/pki/slots/{id}", delete(remove_slot))
         .route("/api/v1/pki/certs", get(certs))
         .route("/api/v1/pki/crl", get(crl))
         .route("/api/v1/pki/certs/{serial}/revoke", post(revoke_cert))

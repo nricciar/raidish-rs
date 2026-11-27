@@ -84,7 +84,65 @@ pub struct EnrollmentCreated {
 /// `POST /api/v1/pki/unseal`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UnsealRequest {
-    pub recovery_key: String,
+    /// A recovery key (`RDK1-…`) or a passphrase.
+    #[serde(alias = "recovery_key")]
+    pub secret: String,
+}
+
+/// `POST /api/v1/pki/seal`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SealRequest {
+    /// Keep node-key slots (those nodes unseal again when they restart).
+    /// Default: they go, so a sealed cluster stays sealed through a reboot.
+    #[serde(default)]
+    pub keep_node_keys: bool,
+}
+
+/// What a slot opens with.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NewSlotKind {
+    /// A new `RDK1-` key, made by the node and returned once.
+    RecoveryKey,
+    Passphrase,
+    /// A new `RNK1-` key for one member, made by the node and returned
+    /// once: that member unseals itself with it at start (CA-3b).
+    NodeKey,
+}
+
+/// `POST /api/v1/pki/slots`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SlotRequest {
+    pub kind: NewSlotKind,
+    /// Who or what it's for ("Alice's", "the safe").
+    #[serde(default)]
+    pub label: String,
+    /// For `passphrase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// For `node-key`: the member it's for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<raidish_types::types::NodeId>,
+}
+
+/// A slot added.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SlotCreated {
+    pub id: String,
+    /// For `recovery-key`: the key, shown this once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<String>,
+    /// For `node-key`: the key, shown this once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+}
+
+/// `DELETE /api/v1/pki/slots/{id}`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveSlotQuery {
+    /// Even the last recovery-key slot.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// How long a join token is good for unless asked otherwise.

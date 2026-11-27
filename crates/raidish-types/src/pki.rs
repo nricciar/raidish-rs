@@ -379,6 +379,16 @@ pub enum SlotKind {
     NodeKey { node: NodeId },
 }
 
+impl std::fmt::Display for SlotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotKind::Passphrase(_) => f.write_str("passphrase"),
+            SlotKind::RecoveryKey(_) => f.write_str("recovery-key"),
+            SlotKind::NodeKey { node } => write!(f, "node-key ({})", node),
+        }
+    }
+}
+
 /// One way to unwrap the cluster DEK.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct KeySlot {
@@ -397,8 +407,9 @@ pub struct SealConfig {
     #[serde(with = "hex_array")]
     pub cluster_id: [u8; 16],
     pub slots: Vec<KeySlot>,
-    /// Bumped by `ca seal` and slot changes: an unsealed node whose epoch
-    /// is older drops its DEK (CA-3).
+    /// Bumped by `ca seal` (and `ca rekey`): an unsealed node whose epoch
+    /// is older drops its DEK. Adding or removing a slot doesn't move it: a
+    /// node unsealed through a slot since removed stays unsealed.
     pub epoch: u64,
 }
 
@@ -707,8 +718,26 @@ pub enum PkiOp {
     CancelEnrollment {
         id: TokenId,
     },
-    SetSeal(SealConfig),
-    Seal,
+    /// Another way to unwrap the DEK (made by an unsealed node).
+    AddSlot(Box<KeySlot>),
+    /// Never the last slot.
+    RemoveSlot {
+        id: String,
+    },
+    /// Every node drops its DEK (`seal.epoch += 1`), and the slots in
+    /// `remove_slots` go with it (node keys, so a reboot doesn't undo it).
+    Seal {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remove_slots: Vec<String>,
+    },
+    /// `op`, made by a node holding the DEK at `seal_epoch`: refused unless
+    /// that's still the CA's epoch, so what a node signs after a `Seal` it
+    /// hasn't applied yet never lands. Every op that needs the DEK comes
+    /// wrapped ([`PkiOp::needs_seal_epoch`]).
+    AtEpoch {
+        seal_epoch: u64,
+        op: Box<PkiOp>,
+    },
     SetProfile {
         kind: ProfileKind,
         params: ProfileParams,
@@ -719,6 +748,37 @@ pub enum PkiOp {
     /// (D6). Replaces the one there is.
     SetTokenSigner(Box<TokenSignerRecord>),
 }
+
+impl PkiOp {
+    /// Made with the DEK (signed, sealed or MACed under it): comes in
+    /// [`PkiOp::AtEpoch`].
+    pub fn needs_seal_epoch(&self) -> bool {
+        matches!(
+            self,
+            PkiOp::AddIssuer { .. }
+                | PkiOp::RecordIssued { .. }
+                | PkiOp::CreateEnrollment { .. }
+                | PkiOp::AddSlot(_)
+                | PkiOp::SetCrl(_)
+                | PkiOp::SetTokenSigner(_)
+        )
+    }
+
+    /// `self`, as made at `seal_epoch` if it needs one.
+    pub fn at_epoch(self, seal_epoch: u64) -> PkiOp {
+        if self.needs_seal_epoch() {
+            PkiOp::AtEpoch {
+                seal_epoch,
+                op: Box::new(self),
+            }
+        } else {
+            self
+        }
+    }
+}
+
+/// Most key slots a CA keeps.
+pub const MAX_SLOTS: usize = 16;
 
 /// What [`CertChecker`] reads off a CA certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -835,6 +895,26 @@ impl PkiState {
             .any(|(_, c)| c.identity.profile == ProfileKind::Node)
     }
 
+    /// Remove the node-key slots of members left without a live node
+    /// certificate (revoked, or replaced): a revoked node's disk must not
+    /// open the CA. Never the last slot.
+    fn drop_orphan_node_slots(&mut self, now_ms: u64) {
+        let orphans: Vec<String> = self
+            .seal
+            .slots
+            .iter()
+            .filter(|s| {
+                matches!(s.kind, SlotKind::NodeKey { node } if !self.has_live_node_cert(node, now_ms))
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in orphans {
+            if self.seal.slots.len() > 1 {
+                self.seal.slots.retain(|s| s.id != id);
+            }
+        }
+    }
+
     /// Install-time checks: the anchor is a root, issuers chain to it,
     /// exactly one is active.
     fn validate(&self, now_ms: u64, checker: &dyn CertChecker) -> Result<(), String> {
@@ -877,8 +957,27 @@ impl PkiState {
         now_ms: u64,
         checker: &dyn CertChecker,
     ) -> Result<(), String> {
+        let op = match op {
+            PkiOp::AtEpoch { seal_epoch, op } => {
+                if !op.needs_seal_epoch() {
+                    return Err("only an op made with the DEK carries a seal epoch".into());
+                }
+                if *seal_epoch != self.seal.epoch {
+                    return Err(format!(
+                        "made at seal epoch {}, but the CA is at {}: that node was sealed",
+                        seal_epoch, self.seal.epoch
+                    ));
+                }
+                &**op
+            }
+            op if op.needs_seal_epoch() => {
+                return Err("made with the DEK, so it must carry its seal epoch".into());
+            }
+            op => op,
+        };
         match op {
             PkiOp::Bootstrap(_) => return Err("the CA is already set up".into()),
+            PkiOp::AtEpoch { .. } => unreachable!("unwrapped above"),
             PkiOp::AddIssuer {
                 id,
                 record,
@@ -922,6 +1021,7 @@ impl PkiState {
                         self.generation += 1;
                     }
                 }
+                self.drop_orphan_node_slots(now_ms);
             }
             PkiOp::RecordIssued { serial, cert } => {
                 if let Some(existing) = self.certs.get(serial) {
@@ -997,6 +1097,7 @@ impl PkiState {
                         expires_ms,
                     });
                 self.generation += 1;
+                self.drop_orphan_node_slots(now_ms);
             }
             PkiOp::RevokeToken { id, expires_ms } => {
                 self.revoked_tokens.entry(id.clone()).or_insert(Revocation {
@@ -1083,6 +1184,7 @@ impl PkiState {
                                 );
                             }
                             self.generation += 1;
+                            self.drop_orphan_node_slots(now_ms);
                         }
                     }
                     (EnrollScope::Node { .. }, None) => {
@@ -1103,22 +1205,46 @@ impl PkiState {
             PkiOp::CancelEnrollment { id } => {
                 self.enrollments.remove(id);
             }
-            PkiOp::SetSeal(cfg) => {
-                if cfg.cluster_id != self.seal.cluster_id {
-                    return Err("the cluster id can't change".into());
+            PkiOp::AddSlot(slot) => {
+                if slot.id.is_empty() || slot.id.len() > 64 {
+                    return Err("a slot id is 1 to 64 characters".into());
                 }
-                if cfg.epoch < self.seal.epoch {
-                    return Err("the seal epoch can't go back".into());
+                if self.seal.slots.iter().any(|s| s.id == slot.id) {
+                    return Err(format!("slot {} exists", slot.id));
                 }
-                if cfg.slots.is_empty() {
-                    return Err("the CA needs at least one key slot".into());
+                if self.seal.slots.len() >= MAX_SLOTS {
+                    return Err(format!("the CA has {} slots, the most it keeps", MAX_SLOTS));
                 }
-                self.seal = cfg.clone();
-                self.generation += 1;
+                if let SlotKind::NodeKey { node } = slot.kind
+                    && !self.has_live_node_cert(node, now_ms)
+                {
+                    return Err(format!("{} has no live node certificate", node));
+                }
+                self.seal.slots.push((**slot).clone());
             }
-            PkiOp::Seal => {
+            PkiOp::RemoveSlot { id } => {
+                let i = self
+                    .seal
+                    .slots
+                    .iter()
+                    .position(|s| s.id == *id)
+                    .ok_or_else(|| format!("no slot {}", id))?;
+                if self.seal.slots.len() == 1 {
+                    return Err("that's the last key slot: nothing would unseal the CA".into());
+                }
+                self.seal.slots.remove(i);
+            }
+            PkiOp::Seal { remove_slots } => {
+                for id in remove_slots {
+                    if !self.seal.slots.iter().any(|s| s.id == *id) {
+                        return Err(format!("no slot {}", id));
+                    }
+                }
+                if self.seal.slots.iter().all(|s| remove_slots.contains(&s.id)) {
+                    return Err("that removes every key slot: nothing would unseal the CA".into());
+                }
+                self.seal.slots.retain(|s| !remove_slots.contains(&s.id));
                 self.seal.epoch += 1;
-                self.generation += 1;
             }
             PkiOp::SetProfile { kind, params } => {
                 let hard = kind.spec().hard_max_days;
@@ -1216,11 +1342,7 @@ impl PkiState {
                 .map(|s| SlotView {
                     id: s.id.clone(),
                     label: s.label.clone(),
-                    kind: match &s.kind {
-                        SlotKind::Passphrase(_) => "passphrase".into(),
-                        SlotKind::RecoveryKey(_) => "recovery-key".into(),
-                        SlotKind::NodeKey { node } => format!("node-key ({})", node),
-                    },
+                    kind: s.kind.to_string(),
                 })
                 .collect(),
             seal_epoch: self.seal.epoch,
@@ -1350,6 +1472,10 @@ pub struct PkiStatus {
     pub node: String,
     /// Whether it can sign (holds the DEK).
     pub unsealed: bool,
+    /// How it was unsealed: `recovery-key`, `passphrase`, `node-key
+    /// (file)`, `node-key (credential)` or `unseal-once`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsealed_by: Option<String>,
     /// The CA is only staged on this node (before the cluster's first
     /// quorum), not yet in Raft.
     pub staged: bool,
@@ -1358,11 +1484,29 @@ pub struct PkiStatus {
     /// Problems worth saying (e.g. a leftover one-shot unseal file).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// With `?all=true`: every member as it answered just now (this one
+    /// too), asked live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodeSeal>,
+}
+
+/// One member's seal, as `GET /api/v1/pki/status?all=true` found it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NodeSeal {
+    pub node: String,
+    /// It answered (in time).
+    pub reachable: bool,
+    pub unsealed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsealed_by: Option<String>,
+    /// Why it didn't answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// What learns the cluster CA's state as it's applied (the node's live
 /// trust, `raidish_auth::live::Trust`; `docs/ca-service-plan.md` §3.7).
-/// Told when `generation` changes, or the CA appears, and once when it's
+/// Told when `generation` or the seal config changes, or the CA appears, and once when it's
 /// added. Called while applying: it must only swap in what it builds.
 pub trait PkiObserver: Send + Sync {
     fn observe_pki(&self, pki: Option<&PkiState>);

@@ -17,6 +17,7 @@ use raidish_auth::tls::TlsConfig;
 use raidish_cluster::Cluster;
 use raidish_cluster::members::{Members, derive, is_local_base};
 use raidish_cluster::state::{LeaseOp, Response};
+use raidish_types::api_types::{EventKind, Level, Subject};
 use raidish_types::pki::{EnrollScope, Enrollment, PkiOp, ProfileKind, RevocationReason, TokenId};
 use raidish_types::types::{Epoch, Grant, MetaslabIdx, NodeId};
 use std::path::{Path, PathBuf};
@@ -45,7 +46,54 @@ async fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// The activity log, as a node's `EventSink` would keep it.
+#[derive(Default)]
+struct TestEvents {
+    log: std::sync::Mutex<Vec<(EventKind, Subject, String)>>,
+    last: std::sync::Mutex<std::collections::HashMap<Subject, String>>,
+}
+
+impl TestEvents {
+    fn of(&self, kind: EventKind) -> Vec<(Subject, String)> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _, _)| *k == kind)
+            .map(|(_, s, m)| (s.clone(), m.clone()))
+            .collect()
+    }
+}
+
+impl crate::CaEvents for TestEvents {
+    fn emit(
+        &self,
+        _: Level,
+        kind: EventKind,
+        subject: Subject,
+        message: String,
+        _: Option<String>,
+    ) {
+        self.log.lock().unwrap().push((kind, subject, message));
+    }
+    fn once(&self, level: Level, kind: EventKind, subject: Subject, message: String) -> bool {
+        if self.last.lock().unwrap().get(&subject) == Some(&message) {
+            return false;
+        }
+        self.last
+            .lock()
+            .unwrap()
+            .insert(subject.clone(), message.clone());
+        self.emit(level, kind, subject, message, None);
+        true
+    }
+    fn clear(&self, subject: &Subject) -> bool {
+        self.last.lock().unwrap().remove(subject).is_some()
+    }
+}
+
 struct Node {
+    events: Arc<TestEvents>,
     cluster: Arc<Cluster>,
     ca: Arc<CaService>,
     /// Its live revocations, as `listen` wires them.
@@ -106,12 +154,33 @@ async fn start(
     root: &Path,
     tls_dir: &Path,
 ) -> Node {
+    start_with(paths, raft_port, tls_port, root, tls_dir, None).await
+}
+
+async fn start_with(
+    paths: &[String],
+    raft_port: u16,
+    tls_port: u16,
+    root: &Path,
+    tls_dir: &Path,
+    node_key: Option<crate::NodeKeySource>,
+) -> Node {
     let m = members(paths, raft_port);
     let name = m.me.name();
     let cluster = Cluster::start(&name, m, root.join(&name), Arc::new(NoFence))
         .await
         .unwrap();
-    let ca = CaService::start(cluster.clone(), CaOptions::default()).unwrap();
+    let events = Arc::new(TestEvents::default());
+    let ca = CaService::start(
+        cluster.clone(),
+        CaOptions {
+            kdf: (8, 1, 1),
+            node_key,
+            events: Some(events.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     use raidish_auth::auth::AuthState;
     use raidish_auth::http::finish;
     let routes = || {
@@ -142,6 +211,7 @@ async fn start(
     )
     .await;
     Node {
+        events,
         cluster,
         ca,
         trust,
@@ -373,10 +443,15 @@ async fn init_join_hand_over_and_refusals() {
     let r = n2
         .cluster
         .lease(
-            &LeaseOp::Pki(PkiOp::CreateEnrollment {
-                id: forged.id.clone(),
-                enrollment: Box::new(e),
-            }),
+            // A compromised node reads the epoch and wraps it too: only
+            // the MAC stops it.
+            &LeaseOp::Pki(
+                PkiOp::CreateEnrollment {
+                    id: forged.id.clone(),
+                    enrollment: Box::new(e),
+                }
+                .at_epoch(n2.cluster.pki().unwrap().seal.epoch),
+            ),
             false,
         )
         .await
@@ -399,7 +474,9 @@ async fn init_join_hand_over_and_refusals() {
 
     // CA ops on the lease API, from outside: refused, even "forwarded" by
     // an admin.
-    let seal = LeaseOp::Pki(PkiOp::Seal);
+    let seal = LeaseOp::Pki(PkiOp::Seal {
+        remove_slots: vec![],
+    });
     let r: Result<Response, String> = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/api/v1/cluster/lease", raft[0]))
         .json(&seal)
@@ -484,7 +561,7 @@ async fn init_join_hand_over_and_refusals() {
     let r = admin
         .post(format!("{}/api/v1/pki/unseal", n1.url))
         .json(&crate::api::UnsealRequest {
-            recovery_key: out.recovery_key.to_string(),
+            secret: out.recovery_key.to_string(),
         })
         .send()
         .await
@@ -494,9 +571,8 @@ async fn init_join_hand_over_and_refusals() {
     let r = admin
         .post(format!("{}/api/v1/pki/unseal", n2.url))
         .json(&crate::api::UnsealRequest {
-            recovery_key:
-                "RDK1-00000000-00000000-00000000-00000000-00000000-00000000-00000000-00000000"
-                    .into(),
+            secret: "RDK1-00000000-00000000-00000000-00000000-00000000-00000000-00000000-00000000"
+                .into(),
         })
         .send()
         .await
@@ -543,9 +619,35 @@ struct Up {
     admin_dir: PathBuf,
     base: PathBuf,
     recovery_key: String,
+    paths: Vec<String>,
+    raft: [u16; 3],
+    tls: [u16; 3],
+}
+
+impl Up {
+    /// Stop node `i` and start it again (its Raft log kept), with `key`.
+    async fn restart(&mut self, i: usize, key: Option<crate::NodeKeySource>) {
+        self.nodes[i].stop().await;
+        // Its servers let go of their ports.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.nodes[i] = start_with(
+            &self.paths,
+            self.raft[i],
+            self.tls[i],
+            &self.base.join("raft"),
+            &self.tls_dirs[i],
+            key,
+        )
+        .await;
+    }
 }
 
 async fn bring_up() -> Up {
+    bring_up_with(None).await
+}
+
+/// As `bring_up`, with node certificates of `node_days`.
+async fn bring_up_with(node_days: Option<u32>) -> Up {
     raidish_auth::tls::install_provider();
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().to_path_buf();
@@ -565,7 +667,7 @@ async fn bring_up() -> Up {
         data_dir: &root.join("node-0"),
         sans: vec!["127.0.0.1".into()],
         peer_sans: Default::default(),
-        node_days: None,
+        node_days,
         admin_name: "admin".into(),
         token_ttl_ms: 3_600_000,
         unseal_once: true,
@@ -598,6 +700,9 @@ async fn bring_up() -> Up {
         admin_dir,
         base,
         recovery_key: out.recovery_key.to_string(),
+        paths,
+        raft,
+        tls,
     }
 }
 
@@ -862,6 +967,14 @@ async fn the_crl_follows_revocations_on_every_node() {
             .unwrap()
             .is_empty()
     );
+    // Each node serves it once it has applied it.
+    for n in &up.nodes {
+        assert!(
+            wait_for(10, || n.cluster.pki().unwrap().crl.as_ref() == Some(&first)).await,
+            "{} has the CRL",
+            n.url
+        );
+    }
     for u in &urls {
         assert_eq!(crl_of(u).await.as_deref(), Some(&first.der[..]), "{}", u);
     }
@@ -869,7 +982,7 @@ async fn the_crl_follows_revocations_on_every_node() {
     let r = admin
         .post(format!("{}/api/v1/pki/unseal", urls[1]))
         .json(&crate::api::UnsealRequest {
-            recovery_key: up.recovery_key.clone(),
+            secret: up.recovery_key.clone(),
         })
         .send()
         .await
@@ -1154,6 +1267,533 @@ async fn rdt2_tokens_work_everywhere_and_are_revoked_everywhere() {
         }
         assert!(ok, "{}: the new signer's token", u);
     }
+    for n in up.nodes {
+        n.stop().await;
+    }
+}
+
+async fn unseal_with(c: &reqwest::Client, url: &str, secret: &str) -> u16 {
+    c.post(format!("{}/api/v1/pki/unseal", url))
+        .json(&crate::api::UnsealRequest {
+            secret: secret.into(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn add_slot(
+    c: &reqwest::Client,
+    url: &str,
+    req: &crate::api::SlotRequest,
+) -> Result<crate::api::SlotCreated, u16> {
+    let r = c
+        .post(format!("{}/api/v1/pki/slots", url))
+        .json(req)
+        .send()
+        .await
+        .unwrap();
+    match r.status().is_success() {
+        true => Ok(r.json().await.unwrap()),
+        false => Err(r.status().as_u16()),
+    }
+}
+
+fn passphrase(p: &str) -> crate::api::SlotRequest {
+    crate::api::SlotRequest {
+        kind: crate::api::NewSlotKind::Passphrase,
+        label: "test".into(),
+        passphrase: Some(p.into()),
+        node: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slots_and_sealing_on_every_node() {
+    let up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    let (n0, n1) = (&up.nodes[0], &up.nodes[1]);
+    assert!(n0.ca.unsealed() && !n1.ca.unsealed());
+
+    // A slot wraps the DEK: a sealed node can't add one (503).
+    let phrase = "a long enough passphrase";
+    assert_eq!(
+        add_slot(&admin, &urls[1], &passphrase(phrase))
+            .await
+            .unwrap_err(),
+        503
+    );
+    assert_eq!(
+        add_slot(&admin, &urls[0], &passphrase("short"))
+            .await
+            .unwrap_err(),
+        400
+    );
+    let pass = add_slot(&admin, &urls[0], &passphrase(phrase))
+        .await
+        .unwrap();
+    assert!(pass.id.starts_with("passphrase-") && pass.recovery_key.is_none());
+    // Node 1 unseals with it; a wrong one is refused.
+    assert_eq!(
+        unseal_with(&admin, &urls[1], "not the passphrase at all").await,
+        403
+    );
+    assert_eq!(unseal_with(&admin, &urls[1], phrase).await, 200);
+    assert!(n1.ca.unsealed());
+    // Removing the slot doesn't seal the node it unsealed.
+    let r = admin
+        .delete(format!("{}/api/v1/pki/slots/{}", urls[2], pass.id))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+    assert!(n1.ca.unsealed());
+    assert_eq!(unseal_with(&admin, &urls[2], phrase).await, 403, "gone");
+
+    // Two at once, through two nodes: both land.
+    let (pa, pb) = (
+        passphrase("first long passphrase"),
+        passphrase("second long passphrase"),
+    );
+    let (a, b) = tokio::join!(
+        add_slot(&admin, &urls[0], &pa),
+        add_slot(&admin, &urls[1], &pb),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    // Node 0 applies node 1's in its own time.
+    let ids = || -> Vec<String> {
+        n0.cluster
+            .pki()
+            .unwrap()
+            .seal
+            .slots
+            .iter()
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    assert!(
+        wait_for(10, || ids().contains(&a.id) && ids().contains(&b.id)).await,
+        "{:?}",
+        ids()
+    );
+
+    // The last recovery-key slot stays unless forced; a new recovery key
+    // replaces it.
+    let last = admin
+        .delete(format!("{}/api/v1/pki/slots/recovery-1", urls[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(last.status(), 409);
+    let rk = add_slot(
+        &admin,
+        &urls[0],
+        &crate::api::SlotRequest {
+            kind: crate::api::NewSlotKind::RecoveryKey,
+            label: "new".into(),
+            passphrase: None,
+            node: None,
+        },
+    )
+    .await
+    .unwrap();
+    let new_key = rk.recovery_key.clone().unwrap();
+    let r = admin
+        .delete(format!("{}/api/v1/pki/slots/recovery-1", urls[0]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // Seal, through node 2: every node drops its DEK.
+    let token = mint(&admin, &urls[0], "readonly", Some(3600))
+        .await
+        .unwrap();
+    let r = admin
+        .post(format!("{}/api/v1/pki/seal", urls[2]))
+        .json(&crate::api::SealRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+    for n in &up.nodes {
+        assert!(wait_for(10, || !n.ca.unsealed()).await, "{} sealed", n.url);
+    }
+    assert_eq!(n0.cluster.pki().unwrap().seal.epoch, 1);
+    for u in &urls {
+        let (_, csr) = raidish_auth::ca::generate_csr("x").unwrap();
+        let r = admin
+            .post(format!("{}/api/v1/pki/sign", u))
+            .json(&crate::api::SignRequest {
+                csr_pem: csr,
+                profile: ProfileKind::Readonly,
+                cn: "x".into(),
+                sans: vec![],
+                days: None,
+                member: None,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503, "{}: signing", u);
+        assert_eq!(
+            mint(&admin, u, "readonly", None).await.unwrap_err().0,
+            503,
+            "{}: minting",
+            u
+        );
+        // mTLS, and a token already minted, still work.
+        assert!(let_in(&admin, u).await);
+        let r = admin
+            .get(format!("{}/api/v1/auth/whoami", u))
+            .bearer_auth(&token.token)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+    }
+    // The old recovery key's slot is gone; the new one unseals, and the CA
+    // signs again.
+    assert_eq!(unseal_with(&admin, &urls[1], &up.recovery_key).await, 403);
+    assert_eq!(unseal_with(&admin, &urls[1], &new_key).await, 200);
+    issue(
+        &admin,
+        &urls[1],
+        ProfileKind::Readonly,
+        "after",
+        &up.base.join("after"),
+    )
+    .await;
+    for n in up.nodes {
+        n.stop().await;
+    }
+}
+
+fn node_key_for(n: u64) -> crate::api::SlotRequest {
+    crate::api::SlotRequest {
+        kind: crate::api::NewSlotKind::NodeKey,
+        label: String::new(),
+        passphrase: None,
+        node: Some(nid(n)),
+    }
+}
+
+async fn status_of(c: &reqwest::Client, url: &str) -> raidish_types::pki::PkiStatus {
+    c.get(format!("{}/api/v1/pki/status", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_keys_unseal_their_own_node_only() {
+    let mut up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    assert!(up.nodes[0].ca.unsealed() && !up.nodes[1].ca.unsealed());
+    assert_eq!(
+        status_of(&admin, &urls[0]).await.unsealed_by.as_deref(),
+        Some("unseal-once")
+    );
+
+    // Not for a stranger; a sealed node can't make one.
+    let mut stranger = node_key_for(7);
+    assert_eq!(
+        add_slot(&admin, &urls[0], &stranger).await.unwrap_err(),
+        400
+    );
+    stranger.node = None;
+    assert_eq!(
+        add_slot(&admin, &urls[0], &stranger).await.unwrap_err(),
+        400
+    );
+    assert_eq!(
+        add_slot(&admin, &urls[1], &node_key_for(1))
+            .await
+            .unwrap_err(),
+        503
+    );
+
+    // Node 1's key, as a file; node 2 is configured with the same file but
+    // has no slot of its own: it never tries node 1's.
+    let key1 = add_slot(&admin, &urls[0], &node_key_for(1)).await.unwrap();
+    assert!(key1.id.starts_with("node-key-node-1-") && key1.recovery_key.is_none());
+    let file = up.base.join("node1.key");
+    std::fs::write(&file, format!("{}\n", key1.node_key.unwrap())).unwrap();
+    let src = || Some(crate::NodeKeySource::File(file.clone()));
+    up.restart(1, src()).await;
+    up.restart(2, src()).await;
+    assert!(
+        wait_for(20, || up.nodes[1].ca.unsealed()).await,
+        "node 1 unseals itself at start"
+    );
+    assert_eq!(
+        status_of(&admin, &urls[1]).await.unsealed_by.as_deref(),
+        Some("node-key (file)")
+    );
+    assert!(up.nodes[2].cluster.pki().is_some());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !up.nodes[2].ca.unsealed(),
+        "node 2 never tries node 1's slot"
+    );
+    assert!(up.nodes[2].ca.node_key_seen.lock().unwrap().is_empty());
+
+    // A slot for node 2 appears, made with another key: it tries it once,
+    // fails, and doesn't try again on later changes.
+    let key2 = add_slot(&admin, &urls[1], &node_key_for(2)).await.unwrap();
+    assert!(
+        wait_for(10, || up.nodes[2]
+            .ca
+            .node_key_seen
+            .lock()
+            .unwrap()
+            .contains(&key2.id))
+        .await
+    );
+    assert!(!up.nodes[2].ca.unsealed());
+    // Now with the right key in its file: still nothing until a new slot
+    // or a restart.
+    let file2 = up.base.join("node2.key");
+    std::fs::write(&file2, key2.node_key.unwrap()).unwrap();
+    up.restart(2, Some(crate::NodeKeySource::File(file2.clone())))
+        .await;
+    assert!(
+        wait_for(20, || up.nodes[2].ca.unsealed()).await,
+        "after a restart"
+    );
+
+    // Signing through node 1, which unsealed itself.
+    issue(
+        &admin,
+        &urls[1],
+        ProfileKind::Readonly,
+        "by-node-key",
+        &up.base.join("by-node-key"),
+    )
+    .await;
+
+    // Sealed keeping node keys: node 1 stays sealed until it restarts,
+    // then unseals itself.
+    let r = admin
+        .post(format!("{}/api/v1/pki/seal", urls[0]))
+        .json(&crate::api::SealRequest {
+            keep_node_keys: true,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    for n in &up.nodes {
+        assert!(wait_for(10, || !n.ca.unsealed()).await, "{} sealed", n.url);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!up.nodes[1].ca.unsealed(), "not until a restart");
+    up.restart(1, src()).await;
+    assert!(wait_for(20, || up.nodes[1].ca.unsealed()).await);
+
+    // Revoking node 2's node cert takes its slot in the same entry.
+    let pki = up.nodes[0].cluster.pki().unwrap();
+    let serial2 = pki
+        .certs
+        .iter()
+        .find(|(s, c)| c.identity.member == Some(nid(2)) && pki.is_live(s, crate::now_ms()))
+        .map(|(s, _)| s.clone())
+        .unwrap();
+    assert!(revoke(&admin, &urls[0], &serial2, true).await.is_success());
+    assert!(
+        wait_for(10, || !up.nodes[0]
+            .cluster
+            .pki()
+            .unwrap()
+            .seal
+            .slots
+            .iter()
+            .any(|s| s.id == key2.id))
+        .await
+    );
+
+    // A plain seal takes the node keys: node 1 restarts sealed.
+    let r = admin
+        .post(format!("{}/api/v1/pki/seal", urls[0]))
+        .json(&crate::api::SealRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(wait_for(10, || !up.nodes[1].ca.unsealed()).await);
+    assert!(
+        !up.nodes[0]
+            .cluster
+            .pki()
+            .unwrap()
+            .seal
+            .slots
+            .iter()
+            .any(|s| matches!(s.kind, raidish_types::pki::SlotKind::NodeKey { .. }))
+    );
+    up.restart(1, src()).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!up.nodes[1].ca.unsealed());
+    for n in up.nodes {
+        n.stop().await;
+    }
+}
+
+async fn status_all(c: &reqwest::Client, url: &str) -> raidish_types::pki::PkiStatus {
+    c.get(format!("{}/api/v1/pki/status?all=true", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn seal_all(c: &reqwest::Client, url: &str) {
+    let r = c
+        .post(format!("{}/api/v1/pki/seal", url))
+        .json(&crate::api::SealRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+}
+
+/// A change to the CA every node applies (wakes their loops).
+async fn poke(c: &reqwest::Client, url: &str, n: u8) {
+    let r = c
+        .post(format!("{}/api/v1/pki/tokens/{:016x}/revoke", url, n))
+        .json(&crate::api::RevokeTokenRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealed_cluster_says_so_and_warns_once() {
+    // Node certificates of 5 days: within the 10 days warned about.
+    let up = bring_up_with(Some(5)).await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    assert_eq!(up.nodes[0].events.of(EventKind::CaUnsealed).len(), 1);
+
+    // Unsealed: every member asked, no warning.
+    let s = status_all(&admin, &urls[1]).await;
+    let seals: Vec<(String, bool)> = s
+        .nodes
+        .iter()
+        .map(|n| (n.node.clone(), n.unsealed))
+        .collect();
+    assert_eq!(
+        seals,
+        vec![
+            ("node-0".to_string(), true),
+            ("node-1".to_string(), false),
+            ("node-2".to_string(), false)
+        ]
+    );
+    assert!(s.nodes.iter().all(|n| n.reachable));
+    assert_eq!(s.nodes[0].unsealed_by.as_deref(), Some("unseal-once"));
+    assert!(!s.warnings.iter().any(|w| w.contains("no node is unsealed")));
+    for n in &up.nodes {
+        assert!(n.events.of(EventKind::CaUnsealedNone).is_empty());
+    }
+
+    // Sealed: every node says so, and warns once about its own cert.
+    seal_all(&admin, &urls[2]).await;
+    for n in &up.nodes {
+        assert!(wait_for(10, || !n.ca.unsealed()).await);
+    }
+    assert_eq!(up.nodes[2].events.of(EventKind::CaSealed).len(), 1);
+    let s = status_all(&admin, &urls[0]).await;
+    assert!(s.nodes.iter().all(|n| n.reachable && !n.unsealed));
+    let w: Vec<&String> = s
+        .warnings
+        .iter()
+        .filter(|w| w.contains("no node is unsealed"))
+        .collect();
+    assert_eq!(w.len(), 1, "{:?}", s.warnings);
+    assert!(w[0].contains("node-0's certificate") && w[0].contains("node-2's certificate"));
+    for n in &up.nodes {
+        let me = Subject::node(&n.cluster.name);
+        assert!(
+            wait_for(10, || n.events.of(EventKind::CaUnsealedNone).len() == 1).await,
+            "{}: {:?}",
+            n.cluster.name,
+            n.events.of(EventKind::CaUnsealedNone)
+        );
+        assert_eq!(
+            n.events.of(EventKind::CaUnsealedNone)[0].0,
+            me,
+            "its own cert only"
+        );
+    }
+    // Changes since: not said again.
+    poke(&admin, &urls[0], 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for n in &up.nodes {
+        assert_eq!(n.events.of(EventKind::CaUnsealedNone).len(), 1);
+    }
+
+    // A node unsealed: the warning is over (each sealed node clears it at
+    // its next check), and comes back with the next seal.
+    assert_eq!(unseal_with(&admin, &urls[1], &up.recovery_key).await, 200);
+    assert_eq!(
+        up.nodes[1]
+            .events
+            .of(EventKind::CaUnsealed)
+            .last()
+            .unwrap()
+            .1,
+        "node-1 unsealed by recovery-key"
+    );
+    poke(&admin, &urls[0], 2).await;
+    for n in &up.nodes {
+        assert!(
+            wait_for(10, || !n
+                .ca
+                .warned_unsealed_none
+                .load(std::sync::atomic::Ordering::Relaxed))
+            .await,
+            "{} cleared",
+            n.cluster.name
+        );
+    }
+    assert!(
+        !status_all(&admin, &urls[2])
+            .await
+            .warnings
+            .iter()
+            .any(|w| w.contains("no node is unsealed"))
+    );
+    seal_all(&admin, &urls[0]).await;
+    for n in &up.nodes {
+        assert!(
+            wait_for(10, || n.events.of(EventKind::CaUnsealedNone).len() == 2).await,
+            "{} warned again",
+            n.cluster.name
+        );
+    }
+
+    // A member down: "no reachable node".
+    up.nodes[2].stop().await;
+    let s = status_all(&admin, &urls[0]).await;
+    assert!(!s.nodes[2].reachable && s.nodes[2].error.is_some());
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.contains("no reachable node is unsealed")),
+        "{:?}",
+        s.warnings
+    );
     for n in up.nodes {
         n.stop().await;
     }

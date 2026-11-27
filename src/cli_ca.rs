@@ -9,8 +9,9 @@ use crate::config::Config;
 use crate::net::{Answer, try_each};
 use clap::Subcommand;
 use raidish_ca::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, RenewRequest, RevokeCertRequest,
-    RevokeTokenRequest, SignRequest, TokenCreated, TokenRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, NewSlotKind, RenewRequest, RevokeCertRequest,
+    RevokeTokenRequest, SealRequest, SignRequest, SlotCreated, SlotRequest, TokenCreated,
+    TokenRequest, UnsealRequest,
 };
 use raidish_types::pki::{CertListing, PkiStatus, ProfileKind, RevocationReason, Serial, TokenId};
 use raidish_types::types::NodeId;
@@ -71,15 +72,35 @@ pub enum CaCommands {
         #[arg(long)]
         url: Vec<String>,
     },
-    /// Give nodes the key to sign with (after a restart of the cluster):
-    /// the recovery key `ca init` showed, typed or on stdin.
+    /// Give a node the key to sign with (after a restart of the cluster):
+    /// a recovery key (`ca init` showed one) or a passphrase slot's
+    /// passphrase, typed or on stdin. One node is enough: the others' CA
+    /// requests go to it.
     Unseal {
-        /// Unseal this node only (default: every node in the config).
+        /// Nodes to try, in order (default: the config's).
         #[arg(long)]
         url: Vec<String>,
-        /// Read the recovery key from stdin.
+        /// Read the secret from stdin.
         #[arg(long)]
         stdin: bool,
+        /// Unseal every node, not just the first that takes it.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Seal every node now: nothing signs until someone unseals one.
+    /// Storage, mTLS and tokens already issued keep working.
+    Seal {
+        /// Keep node-key slots (those nodes unseal again when they next
+        /// start). Default: they're removed, so a reboot doesn't undo this.
+        #[arg(long)]
+        keep_node_keys: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The ways to unseal the CA.
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommands,
     },
     /// Join tokens for nodes.
     Token {
@@ -148,6 +169,50 @@ pub enum CaCommands {
         reason: Option<RevocationReason>,
         /// Even a node's only certificate (it's cut off until it joins
         /// again with a `ca token create --replace` token).
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SlotCommands {
+    /// The CA's key slots.
+    List {
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Add a slot, on an unsealed node: a new recovery key (shown once),
+    /// a passphrase (typed twice; a recovery key is stronger), or a node's
+    /// own key, for it to unseal itself at start (`ca.unseal_credential`
+    /// or `ca.unseal_key` in its config).
+    Add {
+        #[arg(long, group = "slot_kind")]
+        recovery_key: bool,
+        #[arg(long, group = "slot_kind")]
+        passphrase: bool,
+        /// A key for this node (`node-1`, or `1`): written to --out (mode
+        /// 0600), or printed with how to keep it as a systemd credential.
+        #[arg(long, group = "slot_kind", value_name = "NODE")]
+        node_key: Option<String>,
+        /// With --node-key: the file to write the key to (not there yet).
+        #[arg(long, requires = "node_key")]
+        out: Option<std::path::PathBuf>,
+        /// Who or what it's for ("Alice's", "the safe").
+        #[arg(long, default_value = "")]
+        label: String,
+        /// With --passphrase: read it (once) from stdin.
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Remove a slot (`ca slot list` shows their ids). Whoever is unsealed
+    /// stays so; use `ca seal` for that.
+    Remove {
+        id: String,
+        /// Even the last recovery-key slot.
         #[arg(long)]
         force: bool,
         #[arg(long)]
@@ -578,6 +643,125 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// `raidish ca slot …`.
+async fn run_slot(command: &SlotCommands, config: &Config) {
+    match command {
+        SlotCommands::List { url } => {
+            let s: PkiStatus = ask(&endpoints(url, config), |c, ep| {
+                c.get(format!("{}/api/v1/pki/status", ep))
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            let p = s.pki.unwrap_or_else(|| fail("no CA"));
+            for slot in &p.slots {
+                println!("{}  {}  {}", slot.id, slot.kind, slot.label);
+            }
+        }
+        SlotCommands::Add {
+            recovery_key,
+            passphrase,
+            node_key,
+            out,
+            label,
+            stdin,
+            url,
+        } => {
+            if !*recovery_key && !*passphrase && node_key.is_none() {
+                fail("--recovery-key, --passphrase or --node-key NODE");
+            }
+            if let Some(path) = out
+                && path.exists()
+            {
+                fail(format!("{} exists: not overwritten", path.display()));
+            }
+            let req = if let Some(node) = node_key {
+                SlotRequest {
+                    kind: NewSlotKind::NodeKey,
+                    label: label.clone(),
+                    passphrase: None,
+                    node: Some(parse_member(node).unwrap_or_else(|e| fail(e))),
+                }
+            } else if *passphrase {
+                let p = read_secret("new passphrase: ", *stdin);
+                let p = p.trim_end_matches(['\n', '\r']).to_string();
+                if !*stdin {
+                    let again = read_secret("again: ", false);
+                    if again.trim_end_matches(['\n', '\r']) != p {
+                        fail("the passphrases differ");
+                    }
+                }
+                SlotRequest {
+                    kind: NewSlotKind::Passphrase,
+                    label: label.clone(),
+                    passphrase: Some(p),
+                    node: None,
+                }
+            } else {
+                SlotRequest {
+                    kind: NewSlotKind::RecoveryKey,
+                    label: label.clone(),
+                    passphrase: None,
+                    node: None,
+                }
+            };
+            let made: SlotCreated = ask(&endpoints(url, config), |c, ep| {
+                c.post(format!("{}/api/v1/pki/slots", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            if let Some(k) = &made.node_key {
+                let k = zeroize::Zeroizing::new(k.clone());
+                match out {
+                    Some(path) => {
+                        write_private(path, &format!("{}\n", *k))
+                            .unwrap_or_else(|e| fail(format!("{}: {}", path.display(), e)));
+                        println!(
+                            "key slot {} added; its node key is in {} (mode 0600). Copy it to \
+                             the node and delete it here.",
+                            made.id,
+                            path.display()
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "key slot {} added. Its node key (shown this once) is on stdout.\n\
+                             On the node, keep it as an encrypted systemd credential:\n\
+                             \n  systemd-creds encrypt --name=raidish-unseal - \
+                             /etc/credstore.encrypted/raidish-unseal\n\
+                             \n(paste the key, then Ctrl-D), add to raidish's unit\n\
+                             \n  LoadCredentialEncrypted=raidish-unseal\n\
+                             \nand to its config\n\
+                             \n  ca:\n    unseal_credential: raidish-unseal\n",
+                            made.id
+                        );
+                        println!("{}", *k);
+                    }
+                }
+                return;
+            }
+            match &made.recovery_key {
+                Some(k) => {
+                    eprintln!(
+                        "key slot {} added. Its recovery key (shown this once):",
+                        made.id
+                    );
+                    println!("{}", k);
+                }
+                None => println!("key slot {} added", made.id),
+            }
+        }
+        SlotCommands::Remove { id, force, url } => {
+            ask_ok(&endpoints(url, config), |c, ep| {
+                c.delete(format!("{}/api/v1/pki/slots/{}", ep, id))
+                    .query(&[("force", *force)])
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!("key slot {} removed", id);
+        }
+    }
+}
+
 /// `raidish token create`: an `rdt2` token from the cluster's CA.
 pub async fn create_token(
     name: &str,
@@ -661,21 +845,60 @@ fn read_secret(prompt: &str, stdin: bool) -> Zeroizing<String> {
     s
 }
 
+/// Write `text` to a new file only its owner reads.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
+}
+
 fn print_status(s: &PkiStatus) {
+    let state = match (s.unsealed, &s.unsealed_by) {
+        (true, Some(by)) => format!("unsealed by {}: can sign", by),
+        (true, None) => "unsealed (can sign)".to_string(),
+        (false, _) => "SEALED (can't sign)".to_string(),
+    };
     println!(
         "{}: {}{}",
         s.node,
-        if s.unsealed {
-            "unsealed (can sign)"
-        } else {
-            "SEALED (can't sign)"
-        },
+        state,
         if s.staged {
             ", CA staged (no quorum yet)"
         } else {
             ""
         }
     );
+    if !s.nodes.is_empty() {
+        for n in &s.nodes {
+            let state = match (n.reachable, n.unsealed, &n.unsealed_by) {
+                (false, _, _) => format!(
+                    "unreachable ({})",
+                    n.error.as_deref().unwrap_or("no answer")
+                ),
+                (true, true, Some(by)) => format!("unsealed by {}", by),
+                (true, true, None) => "unsealed".into(),
+                (true, false, _) => "sealed".into(),
+            };
+            println!("  {}: {}", n.node, state);
+        }
+        if s.pki.is_some() && !s.nodes.iter().any(|n| n.unsealed) {
+            println!(
+                "  SEALED: no {}node can sign; joins, renewals and new tokens wait until one \
+                 is unsealed (`raidish ca unseal`)",
+                if s.nodes.iter().all(|n| n.reachable) {
+                    ""
+                } else {
+                    "reachable "
+                }
+            );
+        }
+    }
     match &s.pki {
         None => println!("  no CA"),
         Some(p) => {
@@ -854,17 +1077,19 @@ pub async fn run(command: &CaCommands, config: &Config) {
             );
         }
         CaCommands::Status { url } => {
+            // Every member's seal, asked by the node that answers.
             let s: PkiStatus = ask(&endpoints(url, config), |c, ep| {
                 c.get(format!("{}/api/v1/pki/status", ep))
+                    .query(&[("all", true)])
             })
             .await
             .unwrap_or_else(|e| fail(e));
             print_status(&s);
         }
-        CaCommands::Unseal { url, stdin } => {
-            let key = read_secret("recovery key: ", *stdin);
+        CaCommands::Unseal { url, stdin, all } => {
+            let secret = read_secret("recovery key or passphrase: ", *stdin);
             let body = UnsealRequest {
-                recovery_key: key.trim().to_string(),
+                secret: secret.trim_end_matches(['\n', '\r']).to_string(),
             };
             let client = http();
             let mut ok = 0;
@@ -879,6 +1104,9 @@ pub async fn run(command: &CaCommands, config: &Config) {
                         Ok(s) => {
                             ok += 1;
                             println!("{}: unsealed", s.node);
+                            if !*all {
+                                break;
+                            }
                         }
                         Err(e) => eprintln!("{}: {}", ep, e),
                     },
@@ -898,6 +1126,28 @@ pub async fn run(command: &CaCommands, config: &Config) {
                 fail("no node unsealed");
             }
         }
+        CaCommands::Seal {
+            keep_node_keys,
+            url,
+        } => {
+            let req = SealRequest {
+                keep_node_keys: *keep_node_keys,
+            };
+            let _: PkiStatus = ask(&endpoints(url, config), |c, ep| {
+                c.post(format!("{}/api/v1/pki/seal", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!(
+                "sealed: no node signs until one is unsealed (`raidish ca unseal`){}",
+                if *keep_node_keys {
+                    "; nodes with a node key unseal again when they restart"
+                } else {
+                    ""
+                }
+            );
+        }
+        CaCommands::Slot { command } => run_slot(command, config).await,
         CaCommands::Token { command } => match command {
             CaTokenCommands::Create {
                 member,

@@ -17,6 +17,8 @@ rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
 zeroize = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

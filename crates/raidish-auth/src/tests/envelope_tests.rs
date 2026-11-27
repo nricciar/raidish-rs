@@ -50,15 +50,48 @@ fn slots_unwrap_the_dek_only_with_their_key() {
     ];
     // Either key opens the DEK (multi-slot: rekeying adds a slot, never
     // re-encrypts the CA).
-    assert_eq!(*unwrap_dek(&slots, &cluster, &a).unwrap(), *dek);
-    assert_eq!(*unwrap_dek(&slots, &cluster, &b).unwrap(), *dek);
-    assert!(unwrap_dek(&slots, &cluster, &[0; 32]).is_err());
+    let s = |b: &[u8]| Secret::RecoveryKey(zeroize::Zeroizing::new(b.to_vec()));
+    assert_eq!(*unwrap_dek(&slots, &cluster, &s(&a)).unwrap(), *dek);
+    assert_eq!(*unwrap_dek(&slots, &cluster, &s(&b)).unwrap(), *dek);
+    assert!(unwrap_dek(&slots, &cluster, &s(&[0; 32])).is_err());
     // Slots are bound to their cluster and id.
-    assert!(unwrap_dek(&slots, &[4; 16], &a).is_err());
+    assert!(unwrap_dek(&slots, &[4; 16], &s(&a)).is_err());
     let mut moved = slots.clone();
     moved[0].id = "s9".into();
     moved.truncate(1);
-    assert!(unwrap_dek(&moved, &cluster, &a).is_err());
+    assert!(unwrap_dek(&moved, &cluster, &s(&a)).is_err());
+}
+
+#[test]
+fn a_passphrase_opens_only_passphrase_slots() {
+    let dek = new_key().unwrap();
+    let cluster = [3u8; 16];
+    let phrase = "correct horse battery";
+    assert!(passphrase_slot(&dek, &cluster, "p", "", "too short", kdf()).is_err());
+    assert!(passphrase_slot(&dek, &cluster, "p", "", "RDK1-but-long-enough", kdf()).is_err());
+    let rk = new_recovery_key().unwrap();
+    let slots = vec![
+        recovery_slot(
+            &dek,
+            &cluster,
+            "r",
+            "",
+            &parse_recovery_key(&rk).unwrap(),
+            kdf(),
+        )
+        .unwrap(),
+        passphrase_slot(&dek, &cluster, "p", "", phrase, kdf()).unwrap(),
+    ];
+    let by = |t: &str| unwrap_dek(&slots, &cluster, &Secret::parse(t).unwrap());
+    assert_eq!(*by(phrase).unwrap(), *dek);
+    assert_eq!(*by(&rk).unwrap(), *dek, "a recovery key, as typed");
+    assert!(by("correct horse battery!").is_err());
+    // Typed as RDK1-… it must be a whole key.
+    assert!(Secret::parse("RDK1-12").is_err());
+    // A passphrase slot whose passphrase is a recovery key's bytes isn't
+    // opened by that recovery key (kinds don't mix).
+    let only_pass = vec![slots[1].clone()];
+    assert!(unwrap_dek(&only_pass, &cluster, &Secret::parse(&rk).unwrap()).is_err());
 }
 
 #[test]
@@ -109,4 +142,51 @@ fn subkeys_differ_by_job() {
     assert_ne!(*subkey(&k, "a"), *subkey(&k, "b"));
     assert_eq!(*subkey(&k, "a"), *subkey(&k, "a"));
     assert!(ct_eq(b"abc", b"abc") && !ct_eq(b"abc", b"abd") && !ct_eq(b"ab", b"abc"));
+}
+
+#[test]
+fn a_node_key_opens_only_its_nodes_slots() {
+    let dek = new_key().unwrap();
+    let cluster = [3u8; 16];
+    let (k1, text1) = new_node_key().unwrap();
+    let (k2, _) = new_node_key().unwrap();
+    assert!(text1.starts_with("RNK1-") && text1.len() == 5 + 64);
+    // As written to a file or a credential: a newline, any case.
+    assert_eq!(
+        *parse_node_key(&format!(
+            "{}\n",
+            text1.to_ascii_uppercase().replace("RNK1", "rnk1")
+        ))
+        .unwrap(),
+        *k1
+    );
+    assert!(parse_node_key("RDK1-00").is_err());
+    let (n1, n2) = (NodeId::from_raw(1), NodeId::from_raw(2));
+    let rk = new_recovery_key().unwrap();
+    let slots = vec![
+        recovery_slot(
+            &dek,
+            &cluster,
+            "r",
+            "",
+            &parse_recovery_key(&rk).unwrap(),
+            kdf(),
+        )
+        .unwrap(),
+        node_key_slot(&dek, &cluster, "nk-2", "", n2, &k2).unwrap(),
+        node_key_slot(&dek, &cluster, "nk-1", "", n1, &k1).unwrap(),
+    ];
+    assert_eq!(*unwrap_dek_node(&slots, &cluster, n1, &k1).unwrap(), *dek);
+    assert_eq!(*unwrap_dek_node(&slots, &cluster, n2, &k2).unwrap(), *dek);
+    // Node 2's key isn't tried on node 1's slot, nor the other way.
+    assert!(unwrap_dek_node(&slots, &cluster, n1, &k2).is_err());
+    // Another cluster's slots: no.
+    assert!(unwrap_dek_node(&slots, &[4u8; 16], n1, &k1).is_err());
+    // A slot renamed to another node in Raft opens for no one.
+    let mut moved = slots[2].clone();
+    moved.kind = SlotKind::NodeKey { node: n2 };
+    assert!(unwrap_dek_node(&[moved.clone()], &cluster, n2, &k1).is_err());
+    assert!(unwrap_dek_node(&[moved], &cluster, n1, &k1).is_err());
+    // A recovery key or passphrase opens no node-key slot.
+    assert!(unwrap_dek(&slots[1..], &cluster, &Secret::parse(&rk).unwrap()).is_err());
 }

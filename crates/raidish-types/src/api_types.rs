@@ -131,6 +131,16 @@ event_kinds! {
     VmMovingCold => "vm.moving_cold",
     VmArrived => "vm.arrived",
     VmMigrationRecovered => "vm.migration_recovered",
+    /// A node was unsealed (it can sign).
+    CaUnsealed => "ca.unsealed",
+    /// Every node was sealed (`ca seal`).
+    CaSealed => "ca.sealed",
+    CaSlotAdded => "ca.slot_added",
+    CaSlotRemoved => "ca.slot_removed",
+    /// The cluster DEK was replaced (`ca rekey`).
+    CaRekeyed => "ca.rekeyed",
+    /// No node is unsealed, and something runs out before one is.
+    CaUnsealedNone => "ca.unsealed_none",
 }
 
 impl std::fmt::Display for EventKind {
