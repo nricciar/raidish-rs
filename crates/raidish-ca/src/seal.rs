@@ -16,7 +16,7 @@ use crate::api::{NewSlotKind, SealRequest, SlotCreated, SlotRequest};
 use crate::service::{CaError, CaService, check_dek};
 use raidish_auth::envelope::{self, Key, Secret};
 use raidish_types::api_types::{EventKind, Subject};
-use raidish_types::pki::{PkiOp, PkiState, SlotKind};
+use raidish_types::pki::{Mac, PkiOp, PkiState, Rekey, SealConfig, SlotKind};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
@@ -331,5 +331,132 @@ impl CaService {
             by,
         );
         Ok(())
+    }
+}
+
+/// Tries at a rekey that the CA changed under (an enrollment made or used
+/// meanwhile): each is made again from the CA as it is.
+const REKEY_TRIES: usize = 3;
+
+impl CaService {
+    /// `ca rekey` (CA-3d): a new DEK, everything under the old one sealed
+    /// again under it, and one new recovery key in place of every slot.
+    /// Every other node is sealed by it; this one keeps the new DEK.
+    pub async fn rekey(
+        &self,
+        caller: &[u8],
+        by: Option<String>,
+    ) -> Result<crate::api::Rekeyed, CaError> {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let pki = self.for_caller(caller).await?;
+            let old = self.dek_at(&pki)?;
+            let new = envelope::new_key().map_err(|e| CaError::new(500, e))?;
+            let (op, slot_id, recovery_key) = self.rekey_of(&pki, &old, &new).await?;
+            let removed_slots: Vec<String> = pki.seal.slots.iter().map(|s| s.id.clone()).collect();
+            match self.commit_at(&pki, op).await {
+                Ok(()) => {
+                    // Applied here already (`commit` waits for it): the old
+                    // DEK is dropped; hold the new one.
+                    self.keep_dek(new, pki.seal.epoch + 1, "rekey");
+                    println!(
+                        "ca: rekeyed: a new DEK, one recovery-key slot ({}); {} slots removed",
+                        slot_id,
+                        removed_slots.len()
+                    );
+                    self.event(
+                        EventKind::CaRekeyed,
+                        Subject::Cluster,
+                        format!(
+                            "CA rekeyed: a new DEK and recovery key ({}); every other node is \
+                             sealed, and slots {} are gone",
+                            slot_id,
+                            removed_slots.join(", ")
+                        ),
+                        by,
+                    );
+                    return Ok(crate::api::Rekeyed {
+                        slot_id,
+                        recovery_key: recovery_key.to_string(),
+                        removed_slots,
+                    });
+                }
+                Err(e)
+                    if e.status == 409
+                        && e.msg.contains("make it again")
+                        && tries < REKEY_TRIES =>
+                {
+                    println!("ca: rekey: the CA changed meanwhile ({}): again", e.msg);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// The rekey of `pki` from `old` to `new`, its new slot's id and its
+    /// recovery key.
+    async fn rekey_of(
+        &self,
+        pki: &PkiState,
+        old: &[u8; 32],
+        new: &Key,
+    ) -> Result<(PkiOp, String, zeroize::Zeroizing<String>), CaError> {
+        let internal = |e: String| CaError::new(500, e);
+        let anchor = &pki.anchor.fingerprint;
+        let mut issuer_keys = std::collections::BTreeMap::new();
+        for (id, r) in &pki.issuers {
+            let aad = envelope::issuer_aad(anchor, *id);
+            let key = envelope::open(old, &aad, &r.sealed_key)
+                .map_err(|e| internal(format!("{}'s key: {}", id, e)))?;
+            issuer_keys.insert(*id, envelope::seal(new, &aad, &key).map_err(internal)?);
+        }
+        let token_signer_key = match &pki.token_signer {
+            None => None,
+            Some(t) => {
+                let aad = envelope::token_signer_aad(anchor, &t.serial);
+                let key = envelope::open(old, &aad, &t.sealed_key)
+                    .map_err(|e| internal(format!("the token signer's key: {}", e)))?;
+                Some((
+                    t.serial.clone(),
+                    envelope::seal(new, &aad, &key).map_err(internal)?,
+                ))
+            }
+        };
+        let enrollment_macs = pki
+            .enrollments
+            .iter()
+            .map(|(id, e)| (id.clone(), Mac(envelope::enrollment_mac(new, id, e))))
+            .collect();
+        let (m, t, p) = self.kdf;
+        let kdf = envelope::kdf_params(m, t, p).map_err(internal)?;
+        let recovery_key = envelope::new_recovery_key().map_err(internal)?;
+        let bytes = envelope::parse_recovery_key(&recovery_key).map_err(internal)?;
+        let slot_id = slot_id("recovery-key")?;
+        let (dek, cluster_id, id) = (new.clone(), pki.seal.cluster_id, slot_id.clone());
+        let slot = tokio::task::spawn_blocking(move || {
+            envelope::recovery_slot(
+                &dek,
+                &cluster_id,
+                &id,
+                "recovery key (ca rekey)",
+                &bytes,
+                kdf,
+            )
+        })
+        .await
+        .map_err(|e| internal(e.to_string()))?
+        .map_err(internal)?;
+        let op = PkiOp::Rekey(Box::new(Rekey {
+            seal: SealConfig {
+                cluster_id: pki.seal.cluster_id,
+                slots: vec![slot],
+                epoch: pki.seal.epoch + 1,
+            },
+            issuer_keys,
+            token_signer_key,
+            enrollment_macs,
+        }));
+        Ok((op, slot_id, recovery_key))
     }
 }

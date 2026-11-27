@@ -1241,3 +1241,111 @@ fn the_last_slot_stays_even_for_a_revoked_node() {
     .unwrap();
     assert!(has_slot(&pki, "nk-1"), "never the last slot");
 }
+
+// ---- rekey -----------------------------------------------------------------
+
+fn sealed(b: u8) -> SealedBlob {
+    SealedBlob {
+        v: 1,
+        nonce: [b; 12],
+        ct: vec![b],
+    }
+}
+
+/// A rekey of `pki` as it is now.
+fn rekey_of(pki: &Option<Arc<PkiState>>) -> Rekey {
+    let p = pki.as_deref().unwrap();
+    let mut seal = p.seal.clone();
+    seal.epoch += 1;
+    seal.slots = vec![KeySlot {
+        id: "recovery-new".into(),
+        label: "rekeyed".into(),
+        kind: SlotKind::RecoveryKey(KdfParams {
+            salt: [9; 16],
+            m_kib: 8,
+            t: 1,
+            p: 1,
+        }),
+        wrapped_dek: sealed(9),
+    }];
+    Rekey {
+        seal,
+        issuer_keys: p.issuers.keys().map(|id| (*id, sealed(5))).collect(),
+        token_signer_key: p
+            .token_signer
+            .as_ref()
+            .map(|t| (t.serial.clone(), sealed(6))),
+        enrollment_macs: p
+            .enrollments
+            .keys()
+            .map(|id| (id.clone(), Mac([7; 32])))
+            .collect(),
+    }
+}
+
+#[test]
+fn a_rekey_replaces_what_the_dek_sealed_and_every_slot() {
+    let mut pki = installed();
+    run(&mut pki, slot("pass-1"), T0).unwrap();
+    enroll(&mut pki, 1, node_enrollment(Some(1), false, 1));
+    let before = pki.as_deref().unwrap().clone();
+    let r = rekey_of(&pki);
+    run(&mut pki, PkiOp::Rekey(Box::new(r.clone())), T0).unwrap();
+    let p = pki.as_deref().unwrap();
+    assert_eq!(p.seal, r.seal, "one slot, the next epoch");
+    assert_eq!(p.issuers[&IssuerId(1)].sealed_key, sealed(5));
+    assert_eq!(p.enrollments[&tid(1)].mac, [7; 32]);
+    // Nothing else.
+    assert_eq!(p.certs, before.certs);
+    assert_eq!(p.generation, before.generation);
+    assert_eq!(p.anchor, before.anchor);
+    // Made at the old epoch, it no longer applies; nor bare.
+    assert!(run(&mut pki, PkiOp::Rekey(Box::new(r.clone())), T0).is_err());
+    assert!(
+        apply(&mut pki, &PkiOp::Rekey(Box::new(r)), T0, &checker())
+            .unwrap_err()
+            .contains("seal epoch")
+    );
+}
+
+#[test]
+fn a_rekey_covers_exactly_what_there_is() {
+    let mut pki = installed();
+    enroll(&mut pki, 1, node_enrollment(Some(1), false, 1));
+    let base = rekey_of(&pki);
+    let refused = |pki: &mut Option<Arc<PkiState>>, r: Rekey| {
+        let before = pki.as_deref().unwrap().clone();
+        let e = run(pki, PkiOp::Rekey(Box::new(r)), T0).unwrap_err();
+        assert_eq!(*pki.as_deref().unwrap(), before, "nothing changed");
+        e
+    };
+    // An issuer missing, or one extra.
+    let mut r = base.clone();
+    r.issuer_keys.clear();
+    assert!(refused(&mut pki, r).contains("issuers"));
+    let mut r = base.clone();
+    r.issuer_keys.insert(IssuerId(9), sealed(1));
+    assert!(refused(&mut pki, r).contains("issuers"));
+    // An enrollment made since.
+    enroll(&mut pki, 2, node_enrollment(Some(2), false, 1));
+    assert!(refused(&mut pki, base.clone()).contains("join tokens"));
+    let base = rekey_of(&pki);
+    // A token signer that isn't there.
+    let mut r = base.clone();
+    r.token_signer_key = Some((Serial::from_be_bytes(&[1]), sealed(1)));
+    assert!(refused(&mut pki, r).contains("token signer"));
+    // Its seal: the same cluster, the next epoch, one recovery-key slot.
+    let mut r = base.clone();
+    r.seal.cluster_id = [8; 16];
+    assert!(refused(&mut pki, r).contains("cluster id"));
+    let mut r = base.clone();
+    r.seal.epoch += 1;
+    assert!(refused(&mut pki, r).contains("epoch"));
+    let mut r = base.clone();
+    r.seal.slots.push(r.seal.slots[0].clone());
+    assert!(refused(&mut pki, r).contains("exactly one slot"));
+    let mut r = base.clone();
+    r.seal.slots[0].kind = SlotKind::NodeKey { node: m(1) };
+    assert!(refused(&mut pki, r).contains("exactly one slot"));
+    run(&mut pki, PkiOp::Rekey(Box::new(base)), T0).unwrap();
+}

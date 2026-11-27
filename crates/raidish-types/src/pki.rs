@@ -747,7 +747,33 @@ pub enum PkiOp {
     /// The identity that signs `rdt2` tokens, issued by the active issuer
     /// (D6). Replaces the one there is.
     SetTokenSigner(Box<TokenSignerRecord>),
+    /// A new DEK (`ca rekey`, CA-3d): everything sealed or MACed under the
+    /// old one, again under the new, and one new recovery-key slot in place
+    /// of every slot. Every node drops the old DEK.
+    Rekey(Box<Rekey>),
 }
+
+/// What [`PkiOp::Rekey`] replaces. Exactly what the state holds under the
+/// DEK, no more and no less: an issuer, a token signer or an enrollment
+/// made since it was built makes it refused (built again, it covers them).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Rekey {
+    /// The same `cluster_id`, `epoch + 1`, one recovery-key slot.
+    pub seal: SealConfig,
+    /// Every issuer's key, sealed under the new DEK.
+    pub issuer_keys: BTreeMap<IssuerId, SealedBlob>,
+    /// The token signer's (by its serial, so it's the same one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_signer_key: Option<(Serial, SealedBlob)>,
+    /// Every outstanding enrollment's MAC, under the new DEK.
+    #[serde(default)]
+    pub enrollment_macs: BTreeMap<TokenId, Mac>,
+}
+
+/// An HMAC-SHA256, as hex.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Mac(#[serde(with = "hex_array")] pub [u8; 32]);
 
 impl PkiOp {
     /// Made with the DEK (signed, sealed or MACed under it): comes in
@@ -761,6 +787,7 @@ impl PkiOp {
                 | PkiOp::AddSlot(_)
                 | PkiOp::SetCrl(_)
                 | PkiOp::SetTokenSigner(_)
+                | PkiOp::Rekey(_)
         )
     }
 
@@ -893,6 +920,57 @@ impl PkiState {
     fn has_live_node_cert(&self, member: NodeId, now_ms: u64) -> bool {
         self.member_certs(member, now_ms)
             .any(|(_, c)| c.identity.profile == ProfileKind::Node)
+    }
+
+    /// [`PkiOp::Rekey`]: all or nothing.
+    fn rekey(&mut self, r: &Rekey) -> Result<(), String> {
+        if r.seal.cluster_id != self.seal.cluster_id {
+            return Err("a rekey keeps the cluster id".into());
+        }
+        if r.seal.epoch != self.seal.epoch + 1 {
+            return Err(format!(
+                "a rekey moves the seal epoch to {}, not {}",
+                self.seal.epoch + 1,
+                r.seal.epoch
+            ));
+        }
+        match r.seal.slots.as_slice() {
+            [slot] if matches!(slot.kind, SlotKind::RecoveryKey(_)) => {
+                if slot.id.is_empty() || slot.id.len() > 64 {
+                    return Err("a slot id is 1 to 64 characters".into());
+                }
+            }
+            _ => return Err("a rekey leaves exactly one slot, a recovery key".into()),
+        }
+        if !r.issuer_keys.keys().eq(self.issuers.keys()) {
+            return Err(
+                "the issuers changed since the rekey was made (or it misses some): make it again"
+                    .into(),
+            );
+        }
+        match (&self.token_signer, &r.token_signer_key) {
+            (None, None) => {}
+            (Some(t), Some((serial, _))) if t.serial == *serial => {}
+            _ => {
+                return Err(
+                    "the token signer changed since the rekey was made: make it again".into(),
+                );
+            }
+        }
+        if !r.enrollment_macs.keys().eq(self.enrollments.keys()) {
+            return Err("the join tokens changed since the rekey was made: make it again".into());
+        }
+        for (id, blob) in &r.issuer_keys {
+            self.issuers.get_mut(id).unwrap().sealed_key = blob.clone();
+        }
+        if let (Some(t), Some((_, blob))) = (self.token_signer.as_mut(), &r.token_signer_key) {
+            t.sealed_key = blob.clone();
+        }
+        for (id, mac) in &r.enrollment_macs {
+            self.enrollments.get_mut(id).unwrap().mac = mac.0;
+        }
+        self.seal = r.seal.clone();
+        Ok(())
     }
 
     /// Remove the node-key slots of members left without a live node
@@ -1264,6 +1342,7 @@ impl PkiState {
                 self.token_signer = Some((**record).clone());
                 self.generation += 1;
             }
+            PkiOp::Rekey(r) => self.rekey(r)?,
             PkiOp::SetCrl(record) => {
                 let (active, issuer) = self.active_issuer().ok_or("the CA has no active issuer")?;
                 if record.issuer != active {

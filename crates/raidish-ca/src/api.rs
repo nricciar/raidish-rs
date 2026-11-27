@@ -98,6 +98,18 @@ pub struct SealRequest {
     pub keep_node_keys: bool,
 }
 
+/// `POST /api/v1/pki/rekey`'s answer (CA-3d).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Rekeyed {
+    /// The one slot left: a new recovery key's.
+    pub slot_id: String,
+    /// That key, shown this once.
+    pub recovery_key: String,
+    /// The slots it replaced (passphrases and node keys must be added
+    /// again).
+    pub removed_slots: Vec<String>,
+}
+
 /// What a slot opens with.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]

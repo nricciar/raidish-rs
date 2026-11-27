@@ -436,10 +436,16 @@ impl CaService {
         per_minute(&self.unseals, ip, UNSEALS_PER_MINUTE)
     }
 
+    /// Hold `dek` at `epoch`, quietly (a rekey: this node made it).
+    pub(crate) fn keep_dek(&self, dek: Key, epoch: u64, by: &'static str) {
+        *self.dek.write().unwrap() = Some((dek, epoch, by));
+        self.crl_wake.notify_one();
+    }
+
     /// This node now holds `dek`, opened at `epoch` (`by`: how, as
     /// `ca status` says it).
     pub(crate) fn set_dek(&self, dek: Key, epoch: u64, by: &'static str) {
-        *self.dek.write().unwrap() = Some((dek, epoch, by));
+        self.keep_dek(dek, epoch, by);
         self.event(
             raidish_types::api_types::EventKind::CaUnsealed,
             self.me_subject(),

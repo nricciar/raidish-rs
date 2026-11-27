@@ -1798,3 +1798,108 @@ async fn a_sealed_cluster_says_so_and_warns_once() {
         n.stop().await;
     }
 }
+
+async fn rekey_through(c: &reqwest::Client, url: &str) -> Result<crate::api::Rekeyed, u16> {
+    let r = c
+        .post(format!("{}/api/v1/pki/rekey", url))
+        .send()
+        .await
+        .unwrap();
+    match r.status().is_success() {
+        true => Ok(r.json().await.unwrap()),
+        false => Err(r.status().as_u16()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rekey_replaces_the_dek_and_every_slot() {
+    let up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    let (n0, n1, n2) = (&up.nodes[0], &up.nodes[1], &up.nodes[2]);
+    // Node 1 unsealed too, a passphrase slot, a join token outstanding,
+    // and the token signer (sealed under the DEK as well).
+    assert_eq!(unseal_with(&admin, &urls[1], &up.recovery_key).await, 200);
+    let phrase = "a long enough passphrase";
+    add_slot(&admin, &urls[0], &passphrase(phrase))
+        .await
+        .unwrap();
+    let token = make_token(&admin, &urls[0], &node_token(2, true)).await;
+    assert!(wait_for(10, || n0.cluster.pki().unwrap().token_signer.is_some()).await);
+    let before = n0.cluster.pki().unwrap();
+
+    // Not on a sealed node; not by a token (it grants authority).
+    assert_eq!(rekey_through(&admin, &urls[2]).await.unwrap_err(), 503);
+    let bearer = mint(&admin, &urls[0], "admin", Some(600)).await.unwrap();
+    let r = reqwest::Client::builder()
+        .use_preconfigured_tls(
+            TlsConfig {
+                ca: Some(up.admin_dir.join("ca.pem").to_string_lossy().into()),
+                ..Default::default()
+            }
+            .client_config()
+            .unwrap(),
+        )
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/pki/rekey", urls[0]))
+        .bearer_auth(&bearer.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    let r = rekey_through(&admin, &urls[0]).await.unwrap();
+    assert_eq!(r.removed_slots.len(), 2, "{:?}", r.removed_slots);
+    let after = n0.cluster.pki().unwrap();
+    let ids: Vec<&str> = after.seal.slots.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec![r.slot_id.as_str()]);
+    assert_eq!(after.seal.epoch, before.seal.epoch + 1);
+    assert_ne!(
+        after.issuers[&raidish_types::pki::IssuerId(1)].sealed_key,
+        before.issuers[&raidish_types::pki::IssuerId(1)].sealed_key
+    );
+    assert_eq!(n0.events.of(EventKind::CaRekeyed).len(), 1);
+
+    // Node 0 keeps the new DEK; node 1 is sealed by it.
+    assert!(n0.ca.unsealed());
+    assert_eq!(n0.ca.unsealed_by().as_deref(), Some("rekey"));
+    assert!(wait_for(10, || !n1.ca.unsealed()).await, "node 1 sealed");
+    // The old secrets open nothing; the new key unseals, and that node signs.
+    assert_eq!(unseal_with(&admin, &urls[2], &up.recovery_key).await, 403);
+    assert_eq!(unseal_with(&admin, &urls[2], phrase).await, 403);
+    assert_eq!(unseal_with(&admin, &urls[2], &r.recovery_key).await, 200);
+    assert!(n2.ca.unsealed());
+    issue(
+        &admin,
+        &urls[2],
+        ProfileKind::Readonly,
+        "after-rekey",
+        &up.base.join("after-rekey"),
+    )
+    .await;
+    // Tokens minted before still work; new ones are minted.
+    let r2 = admin
+        .get(format!("{}/api/v1/auth/whoami", urls[1]))
+        .bearer_auth(&bearer.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(r2.status().is_success());
+    mint(&admin, &urls[2], "readonly", Some(60)).await.unwrap();
+
+    // The join token made before still redeems (its MAC is the new DEK's).
+    let m2 = members(&up.paths, up.raft[2]);
+    let j = crate::join::join(&urls[0], &token, m2.me, &m2.fingerprint)
+        .await
+        .unwrap();
+    assert!(
+        n0.cluster
+            .pki()
+            .unwrap()
+            .is_live(&j.serial, crate::now_ms())
+    );
+    for n in up.nodes {
+        n.stop().await;
+    }
+}

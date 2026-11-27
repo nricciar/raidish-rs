@@ -4,9 +4,9 @@
 
 use crate::CaService;
 use crate::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, RemoveSlotQuery, RenewRequest,
-    RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest, SlotCreated, SlotRequest,
-    TokenCreated, TokenRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, Rekeyed, RemoveSlotQuery,
+    RenewRequest, RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest, SlotCreated,
+    SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
 };
 use crate::service::CaError;
 use axum::extract::{ConnectInfo, Extension, Path, State};
@@ -240,6 +240,18 @@ pub async fn seal(
     Ok(Json(ca.status().await))
 }
 
+/// A new DEK and recovery key in place of every slot (CA-3d). It changes
+/// what unlocks the CA, so an admin's own certificate only (D8), on an
+/// unsealed node: the one that keeps the new DEK.
+pub async fn rekey(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
+) -> Result<Json<Rekeyed>, CaError> {
+    let peer = presented(peer)?;
+    ca.rekey(peer.cert(), Some(admin.0.name)).await.map(Json)
+}
+
 /// Add a key slot: it changes how the CA is unlocked, so an admin's own
 /// certificate only (D8), on an unsealed node.
 pub async fn add_slot(
@@ -278,6 +290,7 @@ pub fn router(ca: Arc<CaService>) -> axum::Router {
         .route("/api/v1/pki/enrollments/{id}", delete(cancel_enrollment))
         .route("/api/v1/pki/unseal", post(unseal))
         .route("/api/v1/pki/seal", post(seal))
+        .route("/api/v1/pki/rekey", post(rekey))
         .route("/api/v1/pki/slots", post(add_slot))
         .route("/api/v1/pki/slots/{id}", delete(remove_slot))
         .route("/api/v1/pki/certs", get(certs))

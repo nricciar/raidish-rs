@@ -9,9 +9,9 @@ use crate::config::Config;
 use crate::net::{Answer, try_each};
 use clap::Subcommand;
 use raidish_ca::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, NewSlotKind, RenewRequest, RevokeCertRequest,
-    RevokeTokenRequest, SealRequest, SignRequest, SlotCreated, SlotRequest, TokenCreated,
-    TokenRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, NewSlotKind, Rekeyed, RenewRequest,
+    RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest, SlotCreated, SlotRequest,
+    TokenCreated, TokenRequest, UnsealRequest,
 };
 use raidish_types::pki::{CertListing, PkiStatus, ProfileKind, RevocationReason, Serial, TokenId};
 use raidish_types::types::NodeId;
@@ -94,6 +94,21 @@ pub enum CaCommands {
         /// start). Default: they're removed, so a reboot doesn't undo this.
         #[arg(long)]
         keep_node_keys: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// A new DEK and recovery key, for when a slot's secret has leaked:
+    /// removing the slot isn't enough, as the DEK it opened is the same.
+    /// Every slot is replaced by the one new recovery key, and every node
+    /// but the one that does it is sealed. On an unsealed node.
+    Rekey {
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+        /// Write the new recovery key to this new file (mode 0600) instead
+        /// of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long)]
         url: Vec<String>,
     },
@@ -845,6 +860,87 @@ fn read_secret(prompt: &str, stdin: bool) -> Zeroizing<String> {
     s
 }
 
+/// `raidish ca rekey`.
+async fn rekey(yes: bool, out: Option<&std::path::Path>, url: &[String], config: &Config) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let eps = endpoints(url, config);
+    let s: PkiStatus = ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/status", ep)))
+        .await
+        .unwrap_or_else(|e| fail(e));
+    let p = s.pki.unwrap_or_else(|| fail("no CA"));
+    eprintln!("ca rekey makes a new DEK and one new recovery key. It removes every key slot:");
+    for slot in &p.slots {
+        eprintln!("  {}  {}  {}", slot.id, slot.kind, slot.label);
+    }
+    eprintln!(
+        "Passphrases and node keys must be added again (`raidish ca slot add`), and every \
+         node but the one that rekeys is sealed.\n\
+         It doesn't help if the Raft state leaked along with a secret: the issuer's and \
+         the token signer's keys are exposed then. Rotate the issuer and revoke the old \
+         one, and revoke the token signer (`raidish ca revoke raidish-tokens`)."
+    );
+    // The file first: the key is shown once, and must not be lost to a
+    // path that can't be written.
+    let mut file = out.map(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap_or_else(|e| fail(format!("{}: {}", path.display(), e)))
+    });
+    if !yes {
+        eprint!("type 'rekey' to go on: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if line.trim() != "rekey" {
+            if let Some(path) = out {
+                let _ = std::fs::remove_file(path);
+            }
+            fail("not rekeyed");
+        }
+    }
+    let r: Rekeyed = match ask(&eps, |c, ep| c.post(format!("{}/api/v1/pki/rekey", ep))).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(path) = out {
+                let _ = std::fs::remove_file(path);
+            }
+            fail(format!(
+                "{}\nIf it went in all the same, the node that made it is still unsealed: \
+                 add a recovery key there (`raidish ca slot add --recovery-key --url ...`)",
+                e
+            ))
+        }
+    };
+    let key = Zeroizing::new(r.recovery_key);
+    match (&mut file, out) {
+        (Some(f), Some(path)) => {
+            f.write_all(format!("{}\n", *key).as_bytes())
+                .and_then(|_| f.sync_all())
+                .unwrap_or_else(|e| {
+                    eprintln!("{}: {}; the key, shown this once:", path.display(), e);
+                    println!("{}", *key);
+                    std::process::exit(1);
+                });
+            println!(
+                "rekeyed: key slot {} is the only one; its recovery key is in {} (mode 0600)",
+                r.slot_id,
+                path.display()
+            );
+        }
+        _ => {
+            eprintln!(
+                "rekeyed: key slot {} is the only one. Its recovery key (shown this once; the \
+                 old one opens nothing now):",
+                r.slot_id
+            );
+            println!("{}", *key);
+        }
+    }
+}
+
 /// Write `text` to a new file only its owner reads.
 fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -1147,6 +1243,7 @@ pub async fn run(command: &CaCommands, config: &Config) {
                 }
             );
         }
+        CaCommands::Rekey { yes, out, url } => rekey(*yes, out.as_deref(), url, config).await,
         CaCommands::Slot { command } => run_slot(command, config).await,
         CaCommands::Token { command } => match command {
             CaTokenCommands::Create {
