@@ -142,7 +142,8 @@ async fn start() -> Running {
     let (chain, key) = pki.tls.identity().unwrap().unwrap();
     let server = Server::new(
         LiveCert::new(chain, key).unwrap(),
-        LiveTrust::new(pki.tls.roots().unwrap(), false).unwrap(),
+        LiveTrust::new(pki.tls.roots().unwrap(), false, None).unwrap(),
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

@@ -54,6 +54,7 @@ pub(crate) use raidish_services::frontend;
 pub mod server;
 pub(crate) use raidish_agent::vm_check;
 pub(crate) use raidish_auth::tls;
+pub(crate) use raidish_auth::trust;
 pub(crate) use raidish_vm::vm;
 pub(crate) use raidish_vm::vm_store;
 pub mod vms_api;

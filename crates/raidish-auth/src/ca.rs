@@ -9,7 +9,8 @@
 
 use ::time::OffsetDateTime;
 use raidish_types::pki::{
-    CertChecker, CertFacts, CertFingerprint, IssuerId, KeyId, ProfileKind, Serial,
+    CertChecker, CertFacts, CertFingerprint, CrlFacts, IssuerId, KeyId, ProfileKind,
+    RevocationReason, Serial,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
@@ -223,6 +224,51 @@ impl Signer {
         })
     }
 
+    /// A CRL listing `revoked` (serial, reason, when), number `number`,
+    /// current from now until `next_update_ms` (DER).
+    pub fn sign_crl(
+        &self,
+        revoked: &[(Serial, RevocationReason, u64)],
+        number: u64,
+        next_update_ms: u64,
+    ) -> Result<(Vec<u8>, CrlFacts), String> {
+        let at = |ms: u64| {
+            OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).map_err(err)
+        };
+        let revoked_certs = revoked
+            .iter()
+            .map(|(serial, reason, at_ms)| {
+                Ok(rcgen::RevokedCertParams {
+                    serial_number: SerialNumber::from_slice(&serial_bytes(serial)?),
+                    revocation_time: at(*at_ms)?,
+                    reason_code: Some(match reason {
+                        RevocationReason::Unspecified => rcgen::RevocationReason::Unspecified,
+                        RevocationReason::KeyCompromise => rcgen::RevocationReason::KeyCompromise,
+                        RevocationReason::Superseded => rcgen::RevocationReason::Superseded,
+                        RevocationReason::CessationOfOperation => {
+                            rcgen::RevocationReason::CessationOfOperation
+                        }
+                    }),
+                    invalidity_date: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // Whole seconds: what the CRL can say, so the record matches it.
+        let this = now().replace_nanosecond(0).map_err(err)?;
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: this,
+            next_update: at(next_update_ms - next_update_ms % 1000)?,
+            crl_number: SerialNumber::from_slice(&number.to_be_bytes()),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: self.cert.params().key_identifier_method.clone(),
+        };
+        let crl = params.signed_by(&self.cert, &self.key).map_err(err)?;
+        let der = crl.der().to_vec();
+        let facts = crl_facts(&der)?;
+        Ok((der, facts))
+    }
+
     /// A leaf, its chain (leaf then this issuer) as one PEM: what
     /// `cert.pem` holds, so peers can build the path to the root.
     pub fn chain(&self, leaf_pem: &str) -> String {
@@ -333,6 +379,76 @@ fn check_signed_by(cert: &X509Certificate<'_>, by: &X509Certificate<'_>) -> Resu
     .map_err(|_| "bad signature".to_string())
 }
 
+/// OU `token-signer`, not a CA, and codeSigning its only EKU: a cert that
+/// signs tokens and can do nothing in TLS.
+pub fn check_token_signer_cert(cert: &X509Certificate<'_>) -> Result<(), String> {
+    let ou: Vec<&str> = cert
+        .subject()
+        .iter_organizational_unit()
+        .filter_map(|a| a.as_str().ok())
+        .collect();
+    if ou != [ProfileKind::TokenSigner.spec().ou] {
+        return Err(format!("OU {:?}, not token-signer", ou));
+    }
+    if cert.is_ca() {
+        return Err("a CA certificate".into());
+    }
+    let eku = cert
+        .extended_key_usage()
+        .map_err(err)?
+        .ok_or("no extended key usage")?
+        .value;
+    let only_code_signing = eku.code_signing
+        && !(eku.any
+            || eku.server_auth
+            || eku.client_auth
+            || eku.email_protection
+            || eku.time_stamping
+            || eku.ocsp_signing
+            || !eku.other.is_empty());
+    if !only_code_signing {
+        return Err("its extended key usage isn't codeSigning alone".into());
+    }
+    Ok(())
+}
+
+fn serial_bytes(s: &Serial) -> Result<Vec<u8>, String> {
+    let h = s.as_str();
+    (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(h.get(i..i + 2).unwrap_or("x"), 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("bad serial {}", s))
+}
+
+/// A CRL's number and times (its signature unchecked).
+pub fn crl_facts(der: &[u8]) -> Result<CrlFacts, String> {
+    let (_, crl) =
+        CertificateRevocationList::from_der(der).map_err(|e| format!("bad CRL: {}", e))?;
+    let number = crl.crl_number().ok_or("the CRL has no number")?;
+    if number.bits() > 64 {
+        return Err("CRL number out of range".into());
+    }
+    Ok(CrlFacts {
+        number: number.to_u64_digits().first().copied().unwrap_or(0),
+        this_update_ms: ms(crl.last_update().to_datetime()),
+        next_update_ms: ms(crl
+            .next_update()
+            .ok_or("the CRL has no next update")?
+            .to_datetime()),
+    })
+}
+
+/// The serials a CRL lists.
+pub fn crl_serials(der: &[u8]) -> Result<Vec<Serial>, String> {
+    let (_, crl) =
+        CertificateRevocationList::from_der(der).map_err(|e| format!("bad CRL: {}", e))?;
+    Ok(crl
+        .iter_revoked_certificates()
+        .map(|r| Serial::from_be_bytes(r.raw_serial()))
+        .collect())
+}
+
 impl CertChecker for X509Checker {
     fn anchor(&self, pem: &str, at_ms: u64) -> Result<CertFacts, String> {
         let der = first_der(pem)?;
@@ -357,6 +473,47 @@ impl CertChecker for X509Checker {
         check_ca_constraints(&cert, path_len)?;
         check_valid_at(&cert, at_ms)?;
         facts(&der)
+    }
+
+    fn token_signer(
+        &self,
+        chain_pem: &str,
+        issuer_pem: &str,
+        at_ms: u64,
+    ) -> Result<CertFacts, String> {
+        let chain = pem_certs(chain_pem)?;
+        let [leaf_der, carried] = &chain[..] else {
+            return Err("the chain must be the signer then its issuer".into());
+        };
+        let issuer_der = first_der(issuer_pem)?;
+        if carried.as_ref() != issuer_der.as_ref() {
+            return Err("the chain's issuer isn't the active issuer".into());
+        }
+        let (leaf, issuer) = (parse(leaf_der)?, parse(&issuer_der)?);
+        check_signed_by(&leaf, &issuer)?;
+        check_valid_at(&leaf, at_ms)?;
+        check_token_signer_cert(&leaf)?;
+        facts(leaf_der)
+    }
+
+    fn crl(&self, der: &[u8], issuer_pem: &str) -> Result<CrlFacts, String> {
+        let (_, crl) =
+            CertificateRevocationList::from_der(der).map_err(|e| format!("bad CRL: {}", e))?;
+        let issuer_der = first_der(issuer_pem)?;
+        let issuer = parse(&issuer_der)?;
+        if crl.signature_algorithm.algorithm.to_id_string() != ECDSA_SHA256 {
+            return Err("not signed with ECDSA P-256 / SHA-256".into());
+        }
+        if crl.issuer().as_raw() != issuer.subject().as_raw() {
+            return Err("issued under another name".into());
+        }
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            &issuer.public_key().subject_public_key.data,
+        )
+        .verify(crl.tbs_cert_list.as_ref(), &crl.signature_value.data)
+        .map_err(|_| "bad signature".to_string())?;
+        crl_facts(der)
     }
 }
 

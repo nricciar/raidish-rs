@@ -299,20 +299,39 @@ fn print_next(dir: &Path, name: &str, role: Role) {
 
 #[derive(Subcommand)]
 pub enum TokenCommands {
-    /// Mint a token (for the dashboard, or `Authorization: Bearer`), signed
-    /// with the admin certificate in this config's `tls:` section.
+    /// Mint a token (for the dashboard, or `Authorization: Bearer`): asks
+    /// the cluster's CA (by this config's admin certificate), which signs it
+    /// with its token signer. `--offline` signs it here instead, with that
+    /// admin certificate (an `rdt1` token, for a cluster without a CA).
     Create {
         /// Who it's for (shown in logs and `whoami`).
         name: String,
         /// readonly (the default) or admin.
         #[arg(long, default_value = "readonly")]
         role: Role,
-        /// Lifetime, e.g. 90d, 12h, 30m (default: never expires).
+        /// Lifetime, e.g. 90d, 12h, 30m. Default: as long as the CA's
+        /// token signer lasts (up to two years); `--offline`: never expires.
         #[arg(long)]
         expires: Option<String>,
+        /// Sign it with this config's admin certificate, not the CA.
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        url: Vec<String>,
     },
     /// Decode a token, and check it against this config's CA bundle.
     Inspect { token: String },
+    /// Revoke a token (and the S3/SQS keys made from it) by its id
+    /// (`token inspect` shows it): every node refuses it at once.
+    Revoke {
+        id: String,
+        /// When it expires anyway (RFC 3339, `token inspect` shows it):
+        /// the revocation is kept until then. Default: kept for good.
+        #[arg(long)]
+        expires: Option<String>,
+        #[arg(long)]
+        url: Vec<String>,
+    },
     /// Make an S3/SQS access key (for AWS clients) from a token, or from
     /// this config's admin certificate. A token's key carries the token's
     /// id, role and expiry: revoking the token revokes the key.
@@ -401,10 +420,12 @@ fn when(s: i64) -> String {
 pub fn run_token(command: &TokenCommands, config: &crate::config::Config) {
     use rustls::pki_types::PrivateKeyDer;
     match command {
+        TokenCommands::Create { offline: false, .. } => unreachable!("async"),
         TokenCommands::Create {
             name,
             role,
             expires,
+            ..
         } => {
             let tls = config.tls.as_ref().unwrap_or_else(|| {
                 fail("tokens are signed with an admin certificate: set `tls:` in the config")
@@ -431,7 +452,7 @@ pub fn run_token(command: &TokenCommands, config: &crate::config::Config) {
             eprintln!("revoke it by adding its id to `auth: {{ revoked: [...] }}` on every node");
             println!("{}", token);
         }
-        TokenCommands::S3Key { .. } => unreachable!("async: s3_key"),
+        TokenCommands::S3Key { .. } | TokenCommands::Revoke { .. } => unreachable!("async"),
         TokenCommands::Inspect { token } => {
             let t = crate::auth::parse_token(token).unwrap_or_else(|e| fail(e));
             println!("id:      {}", t.claims.id);
@@ -445,7 +466,11 @@ pub fn run_token(command: &TokenCommands, config: &crate::config::Config) {
             println!(
                 "signer:  {} ({}, cert {})",
                 t.signer.name,
-                t.signer.role.map(|r| r.to_string()).unwrap_or("?".into()),
+                if t.is_rdt2() {
+                    "the CA's token signer".into()
+                } else {
+                    t.signer.role.map(|r| r.to_string()).unwrap_or("?".into())
+                },
                 t.signer.fingerprint
             );
             match &config.tls {

@@ -60,6 +60,8 @@ impl ResolvesServerCert for LiveCert {
 pub struct LiveTrust {
     inner: RwLock<Arc<dyn ClientCertVerifier>>,
     mandatory: bool,
+    /// Also refused: what the node has revoked.
+    revoked: Option<Arc<crate::trust::Trust>>,
 }
 
 fn verifier(
@@ -81,14 +83,17 @@ fn verifier(
 }
 
 impl LiveTrust {
-    /// `mandatory`: refuse clients without a certificate.
+    /// `mandatory`: refuse clients without a certificate. `revoked`: the
+    /// node's live revocations, checked after the chain.
     pub fn new(
         roots: Vec<CertificateDer<'static>>,
         mandatory: bool,
+        revoked: Option<Arc<crate::trust::Trust>>,
     ) -> Result<Arc<LiveTrust>, String> {
         Ok(Arc::new(LiveTrust {
             inner: RwLock::new(verifier(roots, mandatory)?),
             mandatory,
+            revoked,
         }))
     }
 
@@ -126,8 +131,11 @@ impl ClientCertVerifier for LiveTrust {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        self.current()
-            .verify_client_cert(end_entity, intermediates, now)
+        let ok = self
+            .current()
+            .verify_client_cert(end_entity, intermediates, now)?;
+        crate::tls::check_revoked(self.revoked.as_deref(), end_entity)?;
+        Ok(ok)
     }
 
     fn verify_tls12_signature(

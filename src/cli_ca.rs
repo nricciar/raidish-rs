@@ -9,9 +9,10 @@ use crate::config::Config;
 use crate::net::{Answer, try_each};
 use clap::Subcommand;
 use raidish_ca::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, RenewRequest, SignRequest, UnsealRequest,
+    EnrollmentCreated, EnrollmentRequest, Issued, RenewRequest, RevokeCertRequest,
+    RevokeTokenRequest, SignRequest, TokenCreated, TokenRequest, UnsealRequest,
 };
-use raidish_types::pki::{PkiStatus, ProfileKind, TokenId};
+use raidish_types::pki::{CertListing, PkiStatus, ProfileKind, RevocationReason, Serial, TokenId};
 use raidish_types::types::NodeId;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -113,6 +114,42 @@ pub enum CaCommands {
     /// Renew this config's own certificate (a node's, or an admin's) in
     /// place; restart `listen` afterwards.
     Renew {
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The cluster's CRL (DER; `--pem` for PEM), from the first node that
+    /// answers: to a file, or stdout.
+    Crl {
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        pem: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The certificates the cluster has issued (live ones; see the flags).
+    List {
+        /// Only the revoked ones.
+        #[arg(long)]
+        revoked: bool,
+        /// Everything on record: live, expired and revoked.
+        #[arg(long, conflicts_with = "revoked")]
+        all: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Revoke a certificate, by serial or by name (CN). Every node refuses
+    /// it at once, and its open connections are closed.
+    Revoke {
+        /// A serial (as `ca list` shows it) or a CN with one live cert.
+        cert: String,
+        /// compromised, superseded, retired or unspecified (the default).
+        #[arg(long)]
+        reason: Option<RevocationReason>,
+        /// Even a node's only certificate (it's cut off until it joins
+        /// again with a `ca token create --replace` token).
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         url: Vec<String>,
     },
@@ -463,6 +500,138 @@ async fn ask<T: serde::de::DeserializeOwned>(
     r.map_err(|e| e.to_string())
 }
 
+/// Like [`ask`], for answers with no body.
+async fn ask_ok(
+    eps: &[String],
+    req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<(), String> {
+    let client = http();
+    try_each(eps.iter().map(String::as_str), |ep| {
+        let sent = req(&client, ep).send();
+        async move {
+            match sent.await {
+                Err(e) => Answer::Unreachable(e.to_string()),
+                Ok(r) if r.status().as_u16() == 503 => {
+                    Answer::Unreachable(r.text().await.unwrap_or_default().trim().to_string())
+                }
+                Ok(r) if r.status().is_success() => Answer::Got(()),
+                Ok(r) => {
+                    let status = r.status();
+                    Answer::Refused(format!(
+                        "{}: {}",
+                        status,
+                        r.text().await.unwrap_or_default().trim()
+                    ))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// What a listed certificate is now.
+fn cert_state(c: &CertListing, now: u64) -> String {
+    match &c.revoked {
+        Some(r) => format!("revoked ({}, {})", reason_name(r.reason), when(r.at_ms)),
+        None if c.cert.not_after_ms <= now => "expired".into(),
+        None => "live".into(),
+    }
+}
+
+fn reason_name(r: RevocationReason) -> &'static str {
+    match r {
+        RevocationReason::Unspecified => "unspecified",
+        RevocationReason::KeyCompromise => "compromised",
+        RevocationReason::Superseded => "superseded",
+        RevocationReason::CessationOfOperation => "retired",
+    }
+}
+
+fn print_certs(certs: &[&CertListing], now: u64) {
+    println!(
+        "{:<34} {:<12} {:<24} {:<8} {:<8} {:<20} STATUS",
+        "SERIAL", "PROFILE", "CN", "MEMBER", "ISSUER", "EXPIRES"
+    );
+    for c in certs {
+        println!(
+            "{:<34} {:<12} {:<24} {:<8} {:<8} {:<20} {}",
+            c.serial,
+            c.cert.identity.profile.as_str(),
+            c.cert.identity.cn,
+            c.cert
+                .identity
+                .member
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into()),
+            c.cert.issuer.to_string(),
+            when(c.cert.not_after_ms),
+            cert_state(c, now)
+        );
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `raidish token create`: an `rdt2` token from the cluster's CA.
+pub async fn create_token(
+    name: &str,
+    role: crate::pki::Role,
+    ttl_s: Option<i64>,
+    urls: &[String],
+    config: &Config,
+) {
+    let req = TokenRequest {
+        sub: name.to_string(),
+        role: role.to_string(),
+        ttl_s,
+    };
+    let t: TokenCreated = ask(&endpoints(urls, config), |c, ep| {
+        c.post(format!("{}/api/v1/pki/tokens", ep)).json(&req)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        fail(format!(
+            "{}\n(`--offline` signs an rdt1 token with this config's admin certificate instead)",
+            e
+        ))
+    });
+    eprintln!(
+        "token {} for '{}' ({}), expires {}",
+        t.id,
+        t.sub,
+        t.role,
+        when(t.exp.max(0) as u64 * 1000)
+    );
+    eprintln!("revoke it with `raidish token revoke {}`", t.id);
+    println!("{}", t.token);
+}
+
+/// `raidish token revoke`: refuse token (or access key) `id` from now on,
+/// everywhere.
+pub async fn revoke_token(id: &str, expires_ms: Option<u64>, urls: &[String], config: &Config) {
+    let id = TokenId::parse(id).unwrap_or_else(|e| fail(e));
+    let req = RevokeTokenRequest { expires_ms };
+    ask_ok(&endpoints(urls, config), |c, ep| {
+        c.post(format!("{}/api/v1/pki/tokens/{}/revoke", ep, id))
+            .json(&req)
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    println!(
+        "token {} revoked{}",
+        id,
+        expires_ms
+            .map(|e| format!(" (kept until {})", when(e)))
+            .unwrap_or_default()
+    );
+}
+
 fn read_secret(prompt: &str, stdin: bool) -> Zeroizing<String> {
     let mut s = Zeroizing::new(String::new());
     // SAFETY: isatty on a valid fd.
@@ -520,6 +689,19 @@ fn print_status(s: &PkiStatus) {
                     when(i.not_after_ms)
                 );
             }
+            match &p.token_signer {
+                None => println!("  no token signer yet (an unsealed node makes it)"),
+                Some(t) => println!(
+                    "  token signer, serial {}, until {}{}",
+                    t.serial,
+                    when(t.not_after_ms),
+                    if t.revoked {
+                        " (REVOKED: a new one is due)"
+                    } else {
+                        ""
+                    }
+                ),
+            }
             for slot in &p.slots {
                 println!("  key slot {}: {} ({})", slot.id, slot.label, slot.kind);
             }
@@ -538,6 +720,139 @@ fn print_status(s: &PkiStatus) {
 pub async fn run(command: &CaCommands, config: &Config) {
     match command {
         CaCommands::Init { .. } => unreachable!("handled before TLS"),
+        CaCommands::Crl { out, pem, url } => {
+            let r = fetch_crl(&endpoints(url, config), *pem).await;
+            let bytes = r
+                .unwrap_or_else(|e| fail(e))
+                .unwrap_or_else(|| fail("no CRL yet: an unsealed node signs it"));
+            match out {
+                Some(p) => {
+                    std::fs::write(p, &bytes)
+                        .unwrap_or_else(|e| fail(format!("{}: {}", p.display(), e)));
+                    eprintln!("CRL written to {}", p.display());
+                }
+                None => {
+                    use std::io::Write;
+                    std::io::stdout()
+                        .write_all(&bytes)
+                        .unwrap_or_else(|e| fail(e));
+                }
+            }
+        }
+        CaCommands::List { revoked, all, url } => {
+            let certs: Vec<CertListing> = ask(&endpoints(url, config), |c, ep| {
+                c.get(format!("{}/api/v1/pki/certs", ep))
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            let now = now_ms();
+            let shown: Vec<&CertListing> = certs
+                .iter()
+                .filter(|c| {
+                    if *all {
+                        true
+                    } else if *revoked {
+                        c.revoked.is_some()
+                    } else {
+                        c.revoked.is_none() && c.cert.not_after_ms > now
+                    }
+                })
+                .collect();
+            print_certs(&shown, now);
+        }
+        CaCommands::Revoke {
+            cert,
+            reason,
+            force,
+            url,
+        } => {
+            let eps = endpoints(url, config);
+            let certs: Vec<CertListing> =
+                ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/certs", ep)))
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+            let now = now_ms();
+            let by_serial = Serial::parse(cert)
+                .ok()
+                .and_then(|s| certs.iter().find(|c| c.serial == s));
+            // The token signer isn't in the list: by its serial (`ca
+            // status`) or CN. Revoking it ends every rdt2 token.
+            if by_serial.is_none() {
+                let s: PkiStatus = ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/status", ep)))
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                if let Some(t) = s.pki.and_then(|p| p.token_signer).filter(|t| {
+                    Serial::parse(cert).is_ok_and(|s| s == t.serial)
+                        || cert == raidish_ca::token_signer::CN
+                }) {
+                    if t.revoked {
+                        println!("{} is revoked already", t.serial);
+                        return;
+                    }
+                    let req = RevokeCertRequest {
+                        reason: *reason,
+                        force: *force,
+                    };
+                    ask_ok(&eps, |c, ep| {
+                        c.post(format!("{}/api/v1/pki/certs/{}/revoke", ep, t.serial))
+                            .json(&req)
+                    })
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                    println!(
+                        "revoked {} (the token signer): every rdt2 token it signed is refused; \
+                         an unsealed node makes a new one",
+                        t.serial
+                    );
+                    return;
+                }
+            }
+            let target = match by_serial {
+                Some(c) => c,
+                None => {
+                    let named: Vec<&CertListing> = certs
+                        .iter()
+                        .filter(|c| {
+                            c.cert.identity.cn == *cert
+                                && c.revoked.is_none()
+                                && c.cert.not_after_ms > now
+                        })
+                        .collect();
+                    match named[..] {
+                        [] => fail(format!("no live certificate with serial or CN '{}'", cert)),
+                        [one] => one,
+                        _ => {
+                            print_certs(&named, now);
+                            fail(format!(
+                                "{} live certificates are named '{}': give a serial",
+                                named.len(),
+                                cert
+                            ))
+                        }
+                    }
+                }
+            };
+            if target.revoked.is_some() {
+                println!("{} is revoked already", target.serial);
+                return;
+            }
+            let req = RevokeCertRequest {
+                reason: *reason,
+                force: *force,
+            };
+            ask_ok(&eps, |c, ep| {
+                c.post(format!("{}/api/v1/pki/certs/{}/revoke", ep, target.serial))
+                    .json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!(
+                "revoked {} ({} {})",
+                target.serial,
+                target.cert.identity.profile.as_str(),
+                target.cert.identity.cn
+            );
+        }
         CaCommands::Status { url } => {
             let s: PkiStatus = ask(&endpoints(url, config), |c, ep| {
                 c.get(format!("{}/api/v1/pki/status", ep))
@@ -683,6 +998,19 @@ pub async fn run(command: &CaCommands, config: &Config) {
             .unwrap_or_else(|e| fail(e));
             if libvirt {
                 write_libvirt(out, &issued, &key_pem).unwrap_or_else(|e| fail(e));
+                // GnuTLS keeps using a CRL past its next update (checked
+                // with 3.7), so a copy that goes stale refuses what it
+                // lists and nothing else.
+                match fetch_crl(&endpoints(url, config), true).await {
+                    Ok(Some(crl)) => {
+                        for path in LIBVIRT_CRL_FILES {
+                            raidish_ca::write_file(&out.join(path), &crl, 0o644)
+                                .unwrap_or_else(|e| fail(e));
+                        }
+                    }
+                    Ok(None) => eprintln!("no CRL yet (no node unsealed): none written"),
+                    Err(e) => eprintln!("the CRL: {} (none written)", e),
+                }
             } else {
                 raidish_ca::Bundle {
                     ca_pem: issued.ca_pem.clone(),
@@ -702,6 +1030,10 @@ pub async fn run(command: &CaCommands, config: &Config) {
             );
             if libvirt {
                 println!("copy its etc/ to / on that host, then restart libvirtd");
+                println!(
+                    "revocations after this reach it with a fresh CRL: \
+                     `raidish ca crl --pem --out /etc/pki/CA/cacrl.pem` (and qemu's ca-crl.pem)"
+                );
             }
         }
         CaCommands::Renew { url } => {
@@ -748,6 +1080,39 @@ pub async fn run(command: &CaCommands, config: &Config) {
             println!("restart `raidish listen` to serve it");
         }
     }
+}
+
+/// Where libvirtd and qemu look for a CRL next to their CA file.
+const LIBVIRT_CRL_FILES: &[&str] = &["etc/pki/CA/cacrl.pem", "etc/pki/qemu/ca-crl.pem"];
+
+/// The cluster's CRL from the first node that answers (None: none yet).
+async fn fetch_crl(eps: &[String], pem: bool) -> Result<Option<Vec<u8>>, String> {
+    let client = http();
+    try_each(eps.iter().map(String::as_str), |ep| {
+        let sent = client
+            .get(format!(
+                "{}/api/v1/pki/crl?format={}",
+                ep,
+                if pem { "pem" } else { "der" }
+            ))
+            .send();
+        async move {
+            match sent.await {
+                Err(e) => Answer::Unreachable(e.to_string()),
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => Answer::Got(Some(b.to_vec())),
+                    Err(e) => Answer::Unreachable(e.to_string()),
+                },
+                Ok(r) if r.status().as_u16() == 404 => Answer::Got(None),
+                Ok(r) if r.status().as_u16() == 503 => {
+                    Answer::Unreachable(r.text().await.unwrap_or_default())
+                }
+                Ok(r) => Answer::Refused(r.text().await.unwrap_or_default()),
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// A libvirt certificate laid out as libvirt and qemu read theirs.

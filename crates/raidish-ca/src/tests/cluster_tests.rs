@@ -54,6 +54,8 @@ async fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 struct Node {
     cluster: Arc<Cluster>,
     ca: Arc<CaService>,
+    /// Its live revocations, as `listen` wires them.
+    trust: Arc<raidish_auth::trust::Trust>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Its mTLS address.
     url: String,
@@ -131,7 +133,10 @@ async fn start(
         shutdown.clone(),
     )
     .await;
-    let tls = tls_in(tls_dir);
+    let trust = raidish_auth::trust::Trust::new(vec![]);
+    cluster.observe_pki(trust.clone());
+    let mut tls = tls_in(tls_dir);
+    tls.trust = Some(trust.clone());
     let verifier = raidish_auth::auth::Verifier::from_config(&tls, &Default::default()).unwrap();
     let secure = finish(
         routes().merge(raidish_auth::auth::router()),
@@ -147,6 +152,7 @@ async fn start(
     Node {
         cluster,
         ca,
+        trust,
         shutdown,
         url: format!("https://127.0.0.1:{}", tls_port),
     }
@@ -384,6 +390,15 @@ async fn init_join_hand_over_and_refusals() {
         .await
         .unwrap();
     assert_eq!(r, Response::Recorded);
+    // Committed through node 2: wait for node 0 to have applied it, so the
+    // join is refused for its MAC and not as unknown.
+    assert!(
+        wait_for(10, || n0
+            .cluster
+            .pki()
+            .is_some_and(|p| p.enrollments.contains_key(&forged.id)))
+        .await
+    );
     let e = match crate::join::join(&n0.url, &forged, m1.me, &m1.fingerprint).await {
         Err(e) => e,
         Ok(_) => panic!("joined with a forged enrollment"),
@@ -523,6 +538,631 @@ async fn init_join_hand_over_and_refusals() {
     let _: TokenId = t.id;
 
     for n in nodes {
+        n.stop().await;
+    }
+}
+
+/// `ca init` on node 0, the two peers joined, all three started and the
+/// CA in Raft.
+struct Up {
+    _dir: tempfile::TempDir,
+    nodes: Vec<Node>,
+    tls_dirs: Vec<PathBuf>,
+    admin_dir: PathBuf,
+    base: PathBuf,
+    recovery_key: String,
+}
+
+async fn bring_up() -> Up {
+    raidish_auth::tls::install_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_path_buf();
+    let root = base.join("raft");
+    let raft = [free_port(), free_port(), free_port()];
+    let tls = [free_port(), free_port(), free_port()];
+    let paths: Vec<String> = raft
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("http://127.0.0.1:{}/api/v1/disks/{}", p, i))
+        .collect();
+    let tls_dirs: Vec<PathBuf> = (0..3).map(|i| base.join(format!("tls{}", i))).collect();
+    let admin_dir = base.join("admin");
+    let m0 = members(&paths, raft[0]);
+    let out = init(&InitOptions {
+        members: &m0,
+        data_dir: &root.join("node-0"),
+        sans: vec!["127.0.0.1".into()],
+        peer_sans: Default::default(),
+        node_days: None,
+        admin_name: "admin".into(),
+        token_ttl_ms: 3_600_000,
+        unseal_once: true,
+        force: false,
+        kdf: (8, 1, 1),
+    })
+    .unwrap();
+    out.node0.write_dir(&tls_dirs[0]).unwrap();
+    out.admin.write_dir(&admin_dir).unwrap();
+    let n0 = start(&paths, raft[0], tls[0], &root, &tls_dirs[0]).await;
+    for (i, t) in out.tokens.iter().enumerate() {
+        let m = members(&paths, raft[i + 1]);
+        let t = JoinToken::parse(&t.token).unwrap();
+        let j = crate::join::join(&n0.url, &t, m.me, &m.fingerprint)
+            .await
+            .unwrap();
+        j.bundle.write_dir(&tls_dirs[i + 1]).unwrap();
+    }
+    let n1 = start(&paths, raft[1], tls[1], &root, &tls_dirs[1]).await;
+    let n2 = start(&paths, raft[2], tls[2], &root, &tls_dirs[2]).await;
+    let nodes = vec![n0, n1, n2];
+    assert!(
+        wait_for(30, || nodes.iter().all(|n| n.cluster.pki().is_some())).await,
+        "the CA reached every node"
+    );
+    Up {
+        _dir: dir,
+        nodes,
+        tls_dirs,
+        admin_dir,
+        base,
+        recovery_key: out.recovery_key.to_string(),
+    }
+}
+
+/// A new certificate signed by the cluster, written to `dir`.
+async fn issue(
+    admin: &reqwest::Client,
+    url: &str,
+    profile: ProfileKind,
+    cn: &str,
+    dir: &Path,
+) -> Issued {
+    let (key, csr) = raidish_auth::ca::generate_csr(cn).unwrap();
+    let r = admin
+        .post(format!("{}/api/v1/pki/sign", url))
+        .json(&crate::api::SignRequest {
+            csr_pem: csr,
+            profile,
+            cn: cn.into(),
+            sans: vec![],
+            days: None,
+            member: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+    let issued: Issued = r.json().await.unwrap();
+    crate::Bundle {
+        ca_pem: issued.ca_pem.clone(),
+        cert_pem: issued.cert_pem.clone(),
+        key_pem: key,
+    }
+    .write_dir(dir)
+    .unwrap();
+    issued
+}
+
+/// Whether `c` is let in at `url` (a refused handshake, or a 401: not).
+async fn let_in(c: &reqwest::Client, url: &str) -> bool {
+    match c.get(format!("{}/api/v1/auth/whoami", url)).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+async fn revoke(
+    c: &reqwest::Client,
+    url: &str,
+    serial: &raidish_types::pki::Serial,
+    force: bool,
+) -> reqwest::StatusCode {
+    c.post(format!("{}/api/v1/pki/certs/{}/revoke", url, serial))
+        .json(&crate::api::RevokeCertRequest {
+            reason: Some(RevocationReason::KeyCompromise),
+            force,
+        })
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocations_apply_everywhere_at_once() {
+    let up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    let n0 = &up.nodes[0];
+
+    // ---- an admin certificate ----
+    let ops_dir = up.base.join("ops");
+    let ops = issue(&admin, &n0.url, ProfileKind::Admin, "ops", &ops_dir).await;
+    let ops_client = client(&ops_dir);
+    for u in &urls {
+        assert!(let_in(&ops_client, u).await, "{}", u);
+    }
+    // Its connections stay open (keep-alive): the revocation closes them.
+    assert!(
+        up.nodes
+            .iter()
+            .all(|n| n.trust.connections().count(&ops.serial) > 0)
+    );
+    // An admin can't revoke the cert it asks with.
+    assert_eq!(revoke(&ops_client, &n0.url, &ops.serial, false).await, 409);
+    // Through a sealed node: revoking signs nothing.
+    assert!(!up.nodes[1].ca.unsealed());
+    assert_eq!(revoke(&admin, &urls[1], &ops.serial, false).await, 200);
+    for n in &up.nodes {
+        assert!(
+            wait_for(5, || n.trust.connections().count(&ops.serial) == 0).await,
+            "{}: the revoked cert's connections are closed",
+            n.url
+        );
+    }
+    for u in &urls {
+        assert!(
+            !let_in(&ops_client, u).await,
+            "{} still lets a revoked cert in",
+            u
+        );
+    }
+    // Listed as revoked.
+    let certs: Vec<raidish_types::pki::CertListing> = admin
+        .get(format!("{}/api/v1/pki/certs", urls[2]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = certs.iter().find(|c| c.serial == ops.serial).unwrap();
+    assert_eq!(
+        listed.revoked.as_ref().map(|r| r.reason),
+        Some(RevocationReason::KeyCompromise)
+    );
+    assert_eq!(
+        revoke(&admin, &n0.url, &ops.serial, false).await,
+        200,
+        "again: no-op"
+    );
+
+    // ---- a token ----
+    let admin_bundle = std::fs::read_to_string(up.admin_dir.join("cert.pem")).unwrap();
+    let admin_key = std::fs::read_to_string(up.admin_dir.join("key.pem")).unwrap();
+    let admin_der = raidish_auth::ca::first_der(&admin_bundle).unwrap();
+    let key_der = {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(admin_key.as_bytes()).unwrap()
+    };
+    let (token, claims) = raidish_auth::auth::create_token(
+        "dash",
+        raidish_auth::pki::Role::Readonly,
+        Some(3600),
+        &admin_der,
+        key_der.secret_der(),
+    )
+    .unwrap();
+    // No client certificate: the token alone.
+    let anon = reqwest::Client::builder()
+        .use_preconfigured_tls(
+            TlsConfig {
+                ca: Some(up.admin_dir.join("ca.pem").to_string_lossy().into()),
+                ..Default::default()
+            }
+            .client_config()
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let with_token = |u: &str| {
+        anon.get(format!("{}/api/v1/auth/whoami", u))
+            .bearer_auth(&token)
+            .send()
+    };
+    for u in &urls {
+        assert!(with_token(u).await.unwrap().status().is_success(), "{}", u);
+    }
+    // A readonly token can't revoke anything.
+    let r = anon
+        .post(format!(
+            "{}/api/v1/pki/tokens/{}/revoke",
+            urls[0], claims.id
+        ))
+        .bearer_auth(&token)
+        .json(&crate::api::RevokeTokenRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = admin
+        .post(format!(
+            "{}/api/v1/pki/tokens/{}/revoke",
+            urls[2], claims.id
+        ))
+        .json(&crate::api::RevokeTokenRequest {
+            expires_ms: claims.exp.map(|e| e as u64 * 1000),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+    for u in &urls {
+        let mut refused = false;
+        for _ in 0..50 {
+            if with_token(u).await.unwrap().status() == 401 {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(refused, "{} still takes a revoked token", u);
+    }
+
+    // ---- a node ----
+    let pki = n0.cluster.pki().unwrap();
+    let (node2_serial, _) = pki
+        .member_certs(nid(2), crate::now_ms())
+        .find(|(_, c)| c.identity.profile == ProfileKind::Node)
+        .map(|(s, c)| (s.clone(), c.clone()))
+        .unwrap();
+    // Its only node certificate: not without force.
+    assert_eq!(revoke(&admin, &n0.url, &node2_serial, false).await, 409);
+    let node2 = client(&up.tls_dirs[2]);
+    assert!(let_in(&node2, &urls[0]).await);
+    assert!(n0.trust.connections().count(&node2_serial) > 0);
+    assert_eq!(revoke(&admin, &n0.url, &node2_serial, true).await, 200);
+    assert!(
+        wait_for(5, || n0.trust.connections().count(&node2_serial) == 0).await,
+        "node 2's connections to node 0 are closed"
+    );
+    assert!(!let_in(&node2, &urls[0]).await);
+    assert!(!let_in(&node2, &urls[1]).await);
+    // The others are unaffected.
+    assert!(let_in(&client(&up.tls_dirs[1]), &urls[0]).await);
+    assert!(let_in(&admin, &urls[2]).await);
+
+    for n in &up.nodes {
+        n.stop().await;
+    }
+}
+
+async fn crl_of(url: &str) -> Option<Vec<u8>> {
+    let r = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/pki/crl", url))
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    Some(r.bytes().await.ok()?.to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_crl_follows_revocations_on_every_node() {
+    let up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    let n0 = &up.nodes[0];
+    // Node 0 (unsealed by `ca init`) signs the first one as soon as the CA
+    // is in Raft; every node serves it, sealed or not.
+    assert!(
+        wait_for(10, || n0.cluster.pki().unwrap().crl.is_some()).await,
+        "a first CRL"
+    );
+    // Making the token signer is a change too: once it's in, a CRL that
+    // covers it.
+    assert!(
+        wait_for(10, || {
+            let p = n0.cluster.pki().unwrap();
+            p.token_signer.is_some() && p.crl.as_ref().is_some_and(|c| c.generation == p.generation)
+        })
+        .await,
+        "the token signer, and a CRL after it"
+    );
+    let first = n0.cluster.pki().unwrap().crl.clone().unwrap();
+    assert!(
+        raidish_auth::ca::crl_serials(&first.der)
+            .unwrap()
+            .is_empty()
+    );
+    for u in &urls {
+        assert_eq!(crl_of(u).await.as_deref(), Some(&first.der[..]), "{}", u);
+    }
+    // Unseal node 1 too: two signers, still one CRL per change.
+    let r = admin
+        .post(format!("{}/api/v1/pki/unseal", urls[1]))
+        .json(&crate::api::UnsealRequest {
+            recovery_key: up.recovery_key.clone(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+
+    let ops = issue(
+        &admin,
+        &n0.url,
+        ProfileKind::Admin,
+        "ops",
+        &up.base.join("ops"),
+    )
+    .await;
+    assert_eq!(revoke(&admin, &urls[2], &ops.serial, false).await, 200);
+    let listed = |n: &Node| {
+        n.cluster
+            .pki()
+            .and_then(|p| p.crl.clone())
+            .is_some_and(|c| {
+                raidish_auth::ca::crl_serials(&c.der)
+                    .unwrap()
+                    .contains(&ops.serial)
+            })
+    };
+    for n in &up.nodes {
+        assert!(
+            wait_for(10, || listed(n)).await,
+            "{}: the CRL lists it",
+            n.url
+        );
+    }
+    // Let both signers settle, then: exactly one CRL for the change.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let now = n0.cluster.pki().unwrap();
+    let crl = now.crl.clone().unwrap();
+    assert_eq!(crl.generation, now.generation);
+    // The issue was a change too (RecordIssued): at most two newer.
+    assert!(
+        crl.number > first.number && crl.number <= first.number + 2,
+        "{} after {}",
+        crl.number,
+        first.number
+    );
+    let crl_der = crl_of(&urls[1]).await.unwrap();
+    assert!(
+        raidish_auth::ca::crl_serials(&crl_der)
+            .unwrap()
+            .contains(&ops.serial)
+    );
+    // It verifies against the issuer, for anyone (openssl, if it's here).
+    let crl_path = up.base.join("crl.der");
+    std::fs::write(&crl_path, &crl_der).unwrap();
+    let ca_pem = std::fs::read_to_string(up.admin_dir.join("cert.pem")).unwrap();
+    let chain: Vec<_> = ca_pem
+        .split_inclusive("-----END CERTIFICATE-----\n")
+        .collect();
+    let bundle = up.base.join("chain.pem");
+    std::fs::write(
+        &bundle,
+        format!(
+            "{}{}",
+            chain.get(1).copied().unwrap_or(""),
+            std::fs::read_to_string(up.admin_dir.join("ca.pem")).unwrap()
+        ),
+    )
+    .unwrap();
+    if let Ok(out) = std::process::Command::new("openssl")
+        .args(["crl", "-inform", "DER", "-noout", "-in"])
+        .arg(&crl_path)
+        .arg("-CAfile")
+        .arg(&bundle)
+        .output()
+    {
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && all.contains("verify OK"), "{}", all);
+    }
+    // PEM too.
+    let pem = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/pki/crl?format=pem", urls[2]))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(pem.starts_with("-----BEGIN X509 CRL-----"));
+
+    for n in &up.nodes {
+        n.stop().await;
+    }
+}
+
+/// `POST /api/v1/pki/tokens` at `url`.
+async fn mint(
+    c: &reqwest::Client,
+    url: &str,
+    role: &str,
+    ttl_s: Option<i64>,
+) -> Result<crate::api::TokenCreated, (u16, String)> {
+    let r = c
+        .post(format!("{}/api/v1/pki/tokens", url))
+        .json(&crate::api::TokenRequest {
+            sub: "dash".into(),
+            role: role.into(),
+            ttl_s,
+        })
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    if r.status().is_success() {
+        Ok(r.json().await.unwrap())
+    } else {
+        Err((status, r.text().await.unwrap_or_default()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdt2_tokens_work_everywhere_and_are_revoked_everywhere() {
+    let up = bring_up().await;
+    let urls: Vec<String> = up.nodes.iter().map(|n| n.url.clone()).collect();
+    let admin = client(&up.admin_dir);
+    let n0 = &up.nodes[0];
+    // Node 0 (unsealed by `ca init`) makes the token signer; every node
+    // learns it.
+    for n in &up.nodes {
+        assert!(
+            wait_for(10, || n.cluster.pki().unwrap().token_signer.is_some()).await,
+            "{}: a token signer",
+            n.url
+        );
+    }
+    let signer = n0.cluster.pki().unwrap().token_signer.clone().unwrap();
+    // A sealed node can't mint (503: the CLI tries the next); no node role.
+    assert_eq!(
+        mint(&admin, &urls[1], "admin", None).await.unwrap_err().0,
+        503
+    );
+    assert_eq!(
+        mint(&admin, &urls[0], "node", None).await.unwrap_err().0,
+        400
+    );
+    // Clamped to the signer.
+    let t = mint(&admin, &urls[0], "readonly", Some(10 * 365 * 86_400))
+        .await
+        .unwrap();
+    assert_eq!(t.exp, (signer.not_after_ms / 1000) as i64);
+    let t = mint(&admin, &urls[0], "admin", Some(3600)).await.unwrap();
+    assert!(t.token.starts_with("rdt2."));
+
+    let anon = reqwest::Client::builder()
+        .use_preconfigured_tls(
+            TlsConfig {
+                ca: Some(up.admin_dir.join("ca.pem").to_string_lossy().into()),
+                ..Default::default()
+            }
+            .client_config()
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let whoami = |u: &str, tok: &str| {
+        anon.get(format!("{}/api/v1/auth/whoami", u))
+            .bearer_auth(tok)
+            .send()
+    };
+    for u in &urls {
+        let r = whoami(u, &t.token).await.unwrap();
+        assert!(r.status().is_success(), "{}: {:?}", u, r.text().await);
+    }
+    // An admin token grants nothing (D8): no signing, enrolling, minting.
+    let (_, csr) = raidish_auth::ca::generate_csr("x").unwrap();
+    let posts: [(&str, serde_json::Value); 3] = [
+        (
+            "sign",
+            serde_json::to_value(crate::api::SignRequest {
+                csr_pem: csr,
+                profile: ProfileKind::Admin,
+                cn: "x".into(),
+                sans: vec![],
+                days: None,
+                member: None,
+            })
+            .unwrap(),
+        ),
+        (
+            "enrollments",
+            serde_json::to_value(node_token(1, true)).unwrap(),
+        ),
+        (
+            "tokens",
+            serde_json::to_value(crate::api::TokenRequest {
+                sub: "x".into(),
+                role: "admin".into(),
+                ttl_s: None,
+            })
+            .unwrap(),
+        ),
+    ];
+    for (path, body) in &posts {
+        let r = anon
+            .post(format!("{}/api/v1/pki/{}", urls[0], path))
+            .bearer_auth(&t.token)
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "/{}", path);
+    }
+    // But it can revoke (it only takes authority away): another token.
+    let other = mint(&admin, &urls[0], "readonly", Some(3600))
+        .await
+        .unwrap();
+    let r = anon
+        .post(format!("{}/api/v1/pki/tokens/{}/revoke", urls[1], other.id))
+        .bearer_auth(&t.token)
+        .json(&crate::api::RevokeTokenRequest {
+            expires_ms: Some(other.exp as u64 * 1000),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{:?}", r.text().await);
+    let refused = |tok: String| {
+        let urls = urls.clone();
+        let whoami = &whoami;
+        async move {
+            for u in &urls {
+                let mut ok = false;
+                for _ in 0..50 {
+                    if whoami(u, &tok).await.unwrap().status() == 401 {
+                        ok = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                assert!(ok, "{} still takes a revoked token", u);
+            }
+        }
+    };
+    refused(other.token).await;
+    assert!(
+        whoami(&urls[2], &t.token)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    // Revoking the signer ends every token it signed; node 0 makes a new
+    // one, whose tokens work.
+    assert_eq!(revoke(&admin, &urls[2], &signer.serial, false).await, 200);
+    refused(t.token).await;
+    assert!(
+        wait_for(10, || n0
+            .cluster
+            .pki()
+            .unwrap()
+            .token_signer
+            .as_ref()
+            .is_some_and(|s| s.serial != signer.serial))
+        .await,
+        "a new token signer"
+    );
+    let t = mint(&admin, &urls[0], "readonly", Some(60)).await.unwrap();
+    for u in &urls {
+        let mut ok = false;
+        for _ in 0..50 {
+            if whoami(u, &t.token).await.unwrap().status().is_success() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ok, "{}: the new signer's token", u);
+    }
+    for n in up.nodes {
         n.stop().await;
     }
 }

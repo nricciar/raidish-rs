@@ -91,3 +91,49 @@ pub struct UnsealRequest {
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 24 * 3600;
 /// And at most.
 pub const MAX_TOKEN_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// `POST /api/v1/pki/certs/{serial}/revoke`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RevokeCertRequest {
+    /// Default: unspecified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<raidish_types::pki::RevocationReason>,
+    /// Revoke a member's only live node certificate anyway (that node
+    /// is cut off until it joins again).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /api/v1/pki/tokens`: an `rdt2` token, signed by the cluster's
+/// token signer.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TokenRequest {
+    /// Who it's for.
+    pub sub: String,
+    /// `readonly` or `admin`.
+    pub role: String,
+    /// Lifetime in seconds; None: as long as the token signer lasts.
+    /// Clamped to the signer's expiry either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<i64>,
+}
+
+/// A token minted.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TokenCreated {
+    pub token: String,
+    pub id: TokenId,
+    pub sub: String,
+    pub role: String,
+    /// Unix seconds.
+    pub exp: i64,
+}
+
+/// `POST /api/v1/pki/tokens/{id}/revoke`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RevokeTokenRequest {
+    /// When the token expires anyway (the revocation is kept until then).
+    /// None: kept for good.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<u64>,
+}

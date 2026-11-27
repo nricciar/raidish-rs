@@ -737,7 +737,7 @@ async fn a_handoff_over_another_transport_than_the_proxys_is_refused() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let peers: Arc<dyn crate::peer_io::PeerVolumes> = n.shared.clone();
-    tokio::spawn(crate::peer_io::serve(listener, acceptor, peers));
+    tokio::spawn(crate::peer_io::serve(listener, acceptor, peers, None));
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(n.pki.tls.client_config().unwrap()));
     let tls = crate::peer_io::dial(&connector, "127.0.0.1", port)

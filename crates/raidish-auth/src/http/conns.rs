@@ -7,14 +7,16 @@
 //! the connection finished, so the stream's task has to hold the `Peer`
 //! and watch [`Peer::closed`] itself.
 
-use raidish_types::pki::Serial;
+use raidish_types::pki::{KeyId, Serial};
 use rustls::pki_types::CertificateDer;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
-type Entries = HashMap<Serial, HashMap<u64, watch::Sender<bool>>>;
+/// Per serial: each registration's id, its issuer's key id, and its
+/// close signal.
+type Entries = HashMap<Serial, HashMap<u64, (Option<KeyId>, watch::Sender<bool>)>>;
 
 #[derive(Default)]
 pub struct Connections {
@@ -72,6 +74,7 @@ impl Connections {
     /// certificate we can read (the verifier passed it, so not expected).
     pub fn register(&self, der: CertificateDer<'static>) -> Option<Peer> {
         let serial = crate::ca::facts(&der).ok()?.serial;
+        let aki = crate::ca::authority_key_id(&der);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = watch::channel(false);
         self.open
@@ -79,7 +82,7 @@ impl Connections {
             .unwrap()
             .entry(serial.clone())
             .or_default()
-            .insert(id, tx);
+            .insert(id, (aki, tx));
         Some(Peer(Arc::new(Registration {
             der,
             serial,
@@ -95,10 +98,24 @@ impl Connections {
         let Some(m) = open.get(serial) else {
             return 0;
         };
-        for tx in m.values() {
+        for (_, tx) in m.values() {
             let _ = tx.send(true);
         }
         m.len()
+    }
+
+    /// End every connection and stream whose certificate the issuer with
+    /// key id `ski` signed. How many there were.
+    pub fn close_issued_by(&self, ski: &KeyId) -> usize {
+        let open = self.open.lock().unwrap();
+        let mut n = 0;
+        for (aki, tx) in open.values().flat_map(|m| m.values()) {
+            if aki.as_ref() == Some(ski) {
+                let _ = tx.send(true);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// How many are open for `serial`.

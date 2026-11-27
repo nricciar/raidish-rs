@@ -12,6 +12,7 @@ pub mod http;
 pub mod net;
 pub mod pki;
 pub mod tls;
+pub mod trust;
 
 /// A throwaway PKI for tests (here and, with `testutil`, in other crates).
 #[cfg(any(test, feature = "testutil"))]

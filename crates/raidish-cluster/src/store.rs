@@ -15,6 +15,7 @@ use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorag
 use openraft::{
     Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
+use raidish_types::pki::{PkiObserver, PkiState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,6 +67,8 @@ pub struct Store {
     view: Arc<RwLock<ClusterState>>,
     /// This node's disk server fencing, fed every applied state.
     fence: Arc<dyn crate::types::FenceObserver>,
+    /// Told of every change to the CA (see `PkiObserver`).
+    pki_observers: Arc<RwLock<Vec<Arc<dyn PkiObserver>>>>,
 }
 
 /// The file naming the Raft protocol a data directory was written in.
@@ -233,6 +236,7 @@ impl Store {
         Ok(Store {
             view: Arc::new(RwLock::new(sm.state.clone())),
             fence,
+            pki_observers: Default::default(),
             inner: Arc::new(Mutex::new(Inner {
                 dir: dir.to_path_buf(),
                 vote,
@@ -278,7 +282,27 @@ impl Store {
 
     fn publish(&self, state: &ClusterState) {
         observe(&*self.fence, state);
-        *self.view.write().unwrap() = state.clone();
+        let generation =
+            |p: &Option<Arc<PkiState>>| p.as_ref().map(|p| (p.anchor.fingerprint, p.generation));
+        let changed = {
+            let mut view = self.view.write().unwrap();
+            let changed = generation(&view.pki) != generation(&state.pki);
+            *view = state.clone();
+            changed
+        };
+        if changed {
+            for o in self.pki_observers.read().unwrap().iter() {
+                o.observe_pki(state.pki.as_deref());
+            }
+        }
+    }
+
+    /// Tell `o` of every change to the CA from now on, and of the CA as it
+    /// is now.
+    pub fn observe_pki(&self, o: Arc<dyn PkiObserver>) {
+        let mut observers = self.pki_observers.write().unwrap();
+        o.observe_pki(self.view.read().unwrap().pki.as_deref());
+        observers.push(o);
     }
 }
 

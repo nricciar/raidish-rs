@@ -3,7 +3,7 @@
 //! serves them and etcd on whichever node holds each dataset's lease
 //! (`frontend`).
 
-pub(crate) use raidish_auth::{auth, net, pki, tls};
+pub(crate) use raidish_auth::{auth, http, net, pki, tls};
 pub(crate) use raidish_cluster as cluster;
 pub(crate) use raidish_committer as committer;
 #[cfg(test)]

@@ -76,10 +76,12 @@ pub struct PeerExport {
     pub from: Epoch,
 }
 
+/// A peer session's stream: TLS, ended if the peer is revoked.
+pub type PeerStream = crate::net::Revocable<tokio_rustls::server::TlsStream<TcpStream>>;
 /// A peer connection's reading side, after its first line.
-pub type PeerLines = BufReader<tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>>;
+pub type PeerLines = BufReader<tokio::io::ReadHalf<PeerStream>>;
 /// A peer connection's writing side.
-pub type PeerOut = tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>;
+pub type PeerOut = tokio::io::WriteHalf<PeerStream>;
 
 /// What a node serves its peers.
 #[async_trait]
@@ -106,11 +108,18 @@ pub trait PeerVolumes: Send + Sync + 'static {
 
 /// Serve peer I/O on `listener`: `tls` must require a client certificate
 /// (`TlsConfig::server_config(true, ..)`), and only nodes are let in.
-pub async fn serve(listener: TcpListener, tls: TlsAcceptor, volumes: Arc<dyn PeerVolumes>) {
+/// A session ends when its peer's certificate is revoked (`conns`, the
+/// node's registry; see `raidish_auth::trust`).
+pub async fn serve(
+    listener: TcpListener,
+    tls: TlsAcceptor,
+    volumes: Arc<dyn PeerVolumes>,
+    conns: Option<Arc<crate::http::Connections>>,
+) {
     crate::net::accept_loop(listener, "peer-io", move |sock, peer| {
-        let (tls, volumes) = (tls.clone(), volumes.clone());
+        let (tls, volumes, conns) = (tls.clone(), volumes.clone(), conns.clone());
         async move {
-            if let Err(e) = serve_conn(sock, tls, volumes).await {
+            if let Err(e) = serve_conn(sock, tls, volumes, conns.as_deref()).await {
                 eprintln!("peer-io: {}: {}", peer, e);
             }
         }
@@ -122,11 +131,13 @@ async fn serve_conn(
     sock: TcpStream,
     tls: TlsAcceptor,
     volumes: Arc<dyn PeerVolumes>,
+    conns: Option<&crate::http::Connections>,
 ) -> std::io::Result<()> {
     let tls = crate::net::tls_accept(&tls, sock).await?;
     if crate::tls::peer_role(&tls) != Some(Role::Node) {
         return Ok(()); // only nodes proxy volumes
     }
+    let tls = crate::net::revocable(tls, conns);
     let (rd, mut wr) = tokio::io::split(tls);
     let mut rd = BufReader::new(rd);
     let line = tokio::time::timeout(CONNECT_TIMEOUT, read_line(&mut rd))

@@ -15,11 +15,14 @@
 //! * [`routes`]: the `/api/v1/pki/*` endpoints.
 
 pub mod api;
+pub mod crl;
 pub mod init;
 pub mod join;
+mod revoke;
 pub mod routes;
 mod service;
 pub mod token;
+pub mod token_signer;
 
 pub use service::{CaError, CaOptions, CaService};
 
@@ -117,6 +120,19 @@ pub fn url_host(base: &str) -> Option<String> {
             .trim_end_matches(']')
             .to_ascii_lowercase(),
     )
+}
+
+/// A CRL's DER as PEM.
+pub fn crl_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN X509 CRL-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push_str("-----END X509 CRL-----\n");
+    out
 }
 
 pub(crate) fn now_ms() -> u64 {

@@ -30,6 +30,10 @@ pub struct TlsConfig {
     pub cert: Option<String>,
     /// Its private key (overrides `dir/key.pem`).
     pub key: Option<String>,
+    /// The node's live revocations (not configured: `listen` sets it), so
+    /// every verifier made from this config refuses what's revoked.
+    #[serde(skip)]
+    pub trust: Option<Arc<crate::trust::Trust>>,
 }
 
 /// `p`, with a leading `~/` as `$HOME/`.
@@ -100,7 +104,15 @@ impl TlsConfig {
         for c in self.roots()? {
             roots.add(c).map_err(|e| format!("tls: bad CA: {}", e))?;
         }
-        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let server_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("tls: {}", e))?;
+        let builder = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(CheckedServer {
+                inner: server_verifier,
+                trust: self.trust.clone(),
+            }));
         match self.identity()? {
             Some((chain, key)) => builder
                 .with_client_auth_cert(chain, key)
@@ -131,6 +143,10 @@ impl TlsConfig {
             verifier.allow_unauthenticated().build()
         }
         .map_err(|e| format!("tls: {}", e))?;
+        let verifier = Arc::new(CheckedClient {
+            inner: verifier,
+            trust: self.trust.clone(),
+        });
         let (chain, key) = self
             .identity()?
             .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
@@ -140,6 +156,129 @@ impl TlsConfig {
             .map_err(|e| format!("tls: {}", e))?;
         c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(c)
+    }
+}
+
+// ---- revocation, on top of the chain checks (see `crate::trust`) ------------
+
+/// What the process's own client config ([`init`]) checks servers against:
+/// set by `listen` once the node has its [`crate::trust::Trust`] (the
+/// client config is made before, and is one per process anyway).
+static CLIENT_TRUST: OnceLock<Arc<crate::trust::Trust>> = OnceLock::new();
+
+/// Refuse revoked servers from the process's client config from now on.
+/// Only the first call counts (one node per process).
+pub fn check_servers_against(trust: Arc<crate::trust::Trust>) {
+    let _ = CLIENT_TRUST.set(trust);
+}
+
+/// `der` (chain already checked) against `trust`, as a TLS error.
+pub fn check_revoked(
+    trust: Option<&crate::trust::Trust>,
+    der: &CertificateDer<'_>,
+) -> Result<(), rustls::Error> {
+    match trust {
+        Some(t) => t
+            .check_leaf(der)
+            .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)),
+        None => Ok(()),
+    }
+}
+
+/// A client verifier that also refuses what's revoked.
+#[derive(Debug)]
+struct CheckedClient {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    trust: Option<Arc<crate::trust::Trust>>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for CheckedClient {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let ok = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        check_revoked(self.trust.as_deref(), end_entity)?;
+        Ok(ok)
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// A server verifier that also refuses what's revoked: its config's
+/// trust, else the process's ([`check_servers_against`]).
+#[derive(Debug)]
+struct CheckedServer {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    trust: Option<Arc<crate::trust::Trust>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CheckedServer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let ok =
+            self.inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)?;
+        check_revoked(
+            self.trust.as_deref().or(CLIENT_TRUST.get().map(|t| &**t)),
+            end_entity,
+        )?;
+        Ok(ok)
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 

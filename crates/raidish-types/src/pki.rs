@@ -607,6 +607,30 @@ impl Enrollment {
     }
 }
 
+/// The revocation list for the active issuer's certificates (CA-2b),
+/// signed by that issuer. In Raft, so every node serves the same one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CrlRecord {
+    /// The issuer that signed it (the active one when it was made).
+    pub issuer: IssuerId,
+    #[serde(with = "hex_vec")]
+    pub der: Vec<u8>,
+    /// The CRL number: only ever goes up.
+    pub number: u64,
+    pub this_update_ms: u64,
+    pub next_update_ms: u64,
+    /// The `PkiState::generation` it covers: behind if less.
+    pub generation: u64,
+}
+
+/// What [`CertChecker::crl`] reads off a signed CRL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrlFacts {
+    pub number: u64,
+    pub this_update_ms: u64,
+    pub next_update_ms: u64,
+}
+
 // ---- the state -----------------------------------------------------------------
 
 /// The whole CA, as Raft has it (`ClusterState::pki`).
@@ -629,6 +653,10 @@ pub struct PkiState {
     /// Lifetime overrides only.
     #[serde(default)]
     pub profiles: BTreeMap<ProfileKind, ProfileParams>,
+    /// The current CRL (CA-2b). Not counted in `generation`: verifiers
+    /// don't read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crl: Option<CrlRecord>,
     /// Bumped by every change a verifier must see.
     #[serde(default)]
     pub generation: u64,
@@ -685,6 +713,11 @@ pub enum PkiOp {
         kind: ProfileKind,
         params: ProfileParams,
     },
+    /// A newer CRL, signed by the active issuer.
+    SetCrl(Box<CrlRecord>),
+    /// The identity that signs `rdt2` tokens, issued by the active issuer
+    /// (D6). Replaces the one there is.
+    SetTokenSigner(Box<TokenSignerRecord>),
 }
 
 /// What [`CertChecker`] reads off a CA certificate.
@@ -714,6 +747,17 @@ pub trait CertChecker {
         path_len: u8,
         at_ms: u64,
     ) -> Result<CertFacts, String>;
+    /// `der` is a CRL signed by `issuer_pem`'s key under its name.
+    fn crl(&self, der: &[u8], issuer_pem: &str) -> Result<CrlFacts, String>;
+    /// `chain_pem` is a token signer's leaf (OU `token-signer`, its only
+    /// EKU codeSigning, not a CA) then `issuer_pem`, signed by that issuer,
+    /// valid at `at_ms`.
+    fn token_signer(
+        &self,
+        chain_pem: &str,
+        issuer_pem: &str,
+        at_ms: u64,
+    ) -> Result<CertFacts, String>;
 }
 
 /// A checker that accepts nothing: ops that need a certificate checked are
@@ -726,6 +770,12 @@ impl CertChecker for NoCertChecker {
         Err("no certificate checker here".into())
     }
     fn ca(&self, _: &str, _: &str, _: u8, _: u64) -> Result<CertFacts, String> {
+        Err("no certificate checker here".into())
+    }
+    fn crl(&self, _: &[u8], _: &str) -> Result<CrlFacts, String> {
+        Err("no certificate checker here".into())
+    }
+    fn token_signer(&self, _: &str, _: &str, _: u64) -> Result<CertFacts, String> {
         Err("no certificate checker here".into())
     }
 }
@@ -797,9 +847,8 @@ impl PkiState {
         for (id, r) in &self.issuers {
             check_issuer(&self.anchor, *id, r, now_ms, checker)?;
         }
-        if self.token_signer.is_some() {
-            // Checked like `SetTokenSigner` once that exists (CA-2).
-            return Err("a token signer can't be bootstrapped yet".into());
+        if let Some(t) = &self.token_signer {
+            check_token_signer(self, t, now_ms, checker)?;
         }
         for (serial, c) in &self.certs {
             if !self.issuers.contains_key(&c.issuer) {
@@ -903,11 +952,13 @@ impl PkiState {
                 self.generation += 1;
             }
             PkiOp::RevokeCert { serial, reason } => {
-                let cert = self
-                    .certs
-                    .get(serial)
-                    .ok_or_else(|| format!("no certificate {} on record", serial))?;
-                let expires_ms = Some(cert.not_after_ms);
+                // The token signer isn't in `certs`, but can be revoked
+                // (its tokens with it).
+                let expires_ms = match (self.certs.get(serial), &self.token_signer) {
+                    (Some(c), _) => Some(c.not_after_ms),
+                    (None, Some(t)) if t.serial == *serial => Some(t.not_after_ms),
+                    _ => return Err(format!("no certificate {} on record", serial)),
+                };
                 self.revoked_certs
                     .entry(serial.clone())
                     .or_insert(Revocation {
@@ -1052,6 +1103,45 @@ impl PkiState {
                 }
                 self.profiles.insert(*kind, *params);
             }
+            PkiOp::SetTokenSigner(record) => {
+                check_token_signer(self, record, now_ms, checker)?;
+                self.token_signer = Some((**record).clone());
+                self.generation += 1;
+            }
+            PkiOp::SetCrl(record) => {
+                let (active, issuer) = self.active_issuer().ok_or("the CA has no active issuer")?;
+                if record.issuer != active {
+                    return Err(format!(
+                        "a CRL from {}, not the active {}",
+                        record.issuer, active
+                    ));
+                }
+                let facts = checker
+                    .crl(&record.der, &issuer.cert_pem)
+                    .map_err(|e| format!("CRL: {}", e))?;
+                if facts.number != record.number
+                    || facts.this_update_ms != record.this_update_ms
+                    || facts.next_update_ms != record.next_update_ms
+                {
+                    return Err("CRL: record doesn't match the CRL".into());
+                }
+                if let Some(cur) = &self.crl
+                    && cur.issuer == record.issuer
+                    && record.number <= cur.number
+                {
+                    return Err(format!(
+                        "CRL {} is no newer than the current {}",
+                        record.number, cur.number
+                    ));
+                }
+                if record.generation > self.generation {
+                    return Err("CRL: covers a state not reached yet".into());
+                }
+                if record.next_update_ms <= now_ms || record.this_update_ms > now_ms + 5 * 60_000 {
+                    return Err("CRL: not current at this time".into());
+                }
+                self.crl = Some((**record).clone());
+            }
         }
         Ok(())
     }
@@ -1108,6 +1198,11 @@ impl PkiState {
             revoked_certs: self.revoked_certs.len(),
             revoked_tokens: self.revoked_tokens.len(),
             enrollments: self.enrollments.len(),
+            token_signer: self.token_signer.as_ref().map(|t| TokenSignerView {
+                serial: t.serial.clone(),
+                not_after_ms: t.not_after_ms,
+                revoked: self.is_revoked(&t.serial),
+            }),
             generation: self.generation,
         }
     }
@@ -1128,6 +1223,23 @@ fn check_issuer(
         .map_err(|e| format!("{}: {}", id, e))?;
     if facts.serial != r.serial || facts.ski != r.ski || facts.not_after_ms != r.not_after_ms {
         return Err(format!("{}: record doesn't match its certificate", id));
+    }
+    Ok(())
+}
+
+/// `t` is a token signer issued by `pki`'s active issuer, valid at `now_ms`.
+fn check_token_signer(
+    pki: &PkiState,
+    t: &TokenSignerRecord,
+    now_ms: u64,
+    checker: &dyn CertChecker,
+) -> Result<(), String> {
+    let (_, issuer) = pki.active_issuer().ok_or("the CA has no active issuer")?;
+    let facts = checker
+        .token_signer(&t.chain_pem, &issuer.cert_pem, now_ms)
+        .map_err(|e| format!("token signer: {}", e))?;
+    if facts.serial != t.serial || facts.not_after_ms != t.not_after_ms {
+        return Err("token signer: record doesn't match its certificate".into());
     }
     Ok(())
 }
@@ -1188,7 +1300,17 @@ pub struct PkiView {
     pub revoked_certs: usize,
     pub revoked_tokens: usize,
     pub enrollments: usize,
+    /// What signs `rdt2` tokens (revoke it by its serial to end them all).
+    #[serde(default)]
+    pub token_signer: Option<TokenSignerView>,
     pub generation: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TokenSignerView {
+    pub serial: Serial,
+    pub not_after_ms: u64,
+    pub revoked: bool,
 }
 
 /// `GET /api/v1/pki/status`: the CA and this node's part in it.
@@ -1206,6 +1328,14 @@ pub struct PkiStatus {
     /// Problems worth saying (e.g. a leftover one-shot unseal file).
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// What learns the cluster CA's state as it's applied (the node's live
+/// trust, `raidish_auth::live::Trust`; `docs/ca-service-plan.md` §3.7).
+/// Told when `generation` changes, or the CA appears, and once when it's
+/// added. Called while applying: it must only swap in what it builds.
+pub trait PkiObserver: Send + Sync {
+    fn observe_pki(&self, pki: Option<&PkiState>);
 }
 
 /// A certificate in `GET /api/v1/pki/certs` and `ca issue`'s answer.

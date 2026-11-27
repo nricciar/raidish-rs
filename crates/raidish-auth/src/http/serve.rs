@@ -21,11 +21,17 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(cert: Arc<LiveCert>, trust: Arc<LiveTrust>) -> Server {
+    /// `conns`: the registry a revocation closes connections through
+    /// (the node's `crate::trust::Trust`'s; a fresh one if None).
+    pub fn new(
+        cert: Arc<LiveCert>,
+        trust: Arc<LiveTrust>,
+        conns: Option<Arc<Connections>>,
+    ) -> Server {
         Server {
             cert,
             trust,
-            conns: Connections::new(),
+            conns: conns.unwrap_or_default(),
         }
     }
 
@@ -37,7 +43,8 @@ impl Server {
             .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
         Ok(Server::new(
             LiveCert::new(chain, key)?,
-            LiveTrust::new(tls.roots()?, false)?,
+            LiveTrust::new(tls.roots()?, false, tls.trust.clone())?,
+            tls.trust.as_ref().map(|t| t.connections().clone()),
         ))
     }
 

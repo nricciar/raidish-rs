@@ -410,6 +410,12 @@ impl Cluster {
         self.store.pki()
     }
 
+    /// Tell `o` of the CA now and of every change to it (see
+    /// `raidish_types::pki::PkiObserver`).
+    pub fn observe_pki(&self, o: Arc<dyn raidish_types::pki::PkiObserver>) {
+        self.store.observe_pki(o);
+    }
+
     /// This node's Raft directory (`cluster.data_dir/<name>`).
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir

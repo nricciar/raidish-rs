@@ -131,6 +131,14 @@ pub fn issuer_aad(anchor: &CertFingerprint, id: IssuerId) -> Vec<u8> {
     aad
 }
 
+/// The token signer's key: bound to the CA and to its certificate.
+pub fn token_signer_aad(anchor: &CertFingerprint, serial: &raidish_types::pki::Serial) -> Vec<u8> {
+    let mut aad = b"raidish-token-signer".to_vec();
+    aad.extend_from_slice(&anchor.0);
+    aad.extend_from_slice(serial.as_str().as_bytes());
+    aad
+}
+
 fn slot_aad(cluster_id: &[u8; 16], slot_id: &str) -> Vec<u8> {
     let mut aad = b"raidish-slot".to_vec();
     aad.extend_from_slice(cluster_id);

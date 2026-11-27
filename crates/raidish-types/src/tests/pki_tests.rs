@@ -69,6 +69,43 @@ impl CertChecker for FakeChecker {
         }
         Ok(f.facts.clone())
     }
+    /// A fake token signer is `SIGNER:<serial>|<issuer>`; one whose
+    /// serial is 66 has the wrong EKU.
+    fn token_signer(&self, chain: &str, issuer: &str, _at: u64) -> Result<CertFacts, String> {
+        let rest = chain.strip_prefix("SIGNER:").ok_or("not a token signer")?;
+        let (serial, by) = rest.split_once('|').ok_or("not a chain")?;
+        if by != issuer {
+            return Err("not signed by that CA".into());
+        }
+        let serial: u8 = serial.parse().map_err(|_| "bad serial")?;
+        if serial == 66 {
+            return Err("its EKU isn't only codeSigning".into());
+        }
+        Ok(CertFacts {
+            serial: Serial::from_be_bytes(&[serial]),
+            ski: KeyId(vec![serial]),
+            not_before_ms: T0,
+            not_after_ms: T0 + 730 * DAY,
+            fingerprint: CertFingerprint([serial; 32]),
+        })
+    }
+    /// A fake CRL is `<issuer>|<number>|<this>|<next>`.
+    fn crl(&self, der: &[u8], issuer_pem: &str) -> Result<CrlFacts, String> {
+        let s = std::str::from_utf8(der).map_err(|e| e.to_string())?;
+        let f: Vec<&str> = s.split('|').collect();
+        let [by, n, this, next] = f[..] else {
+            return Err("not a CRL".into());
+        };
+        if by != issuer_pem {
+            return Err("not signed by that CA".into());
+        }
+        let num = |x: &str| x.parse::<u64>().map_err(|e| e.to_string());
+        Ok(CrlFacts {
+            number: num(n)?,
+            this_update_ms: num(this)?,
+            next_update_ms: num(next)?,
+        })
+    }
 }
 
 fn checker() -> FakeChecker {
@@ -129,6 +166,7 @@ fn fresh() -> PkiState {
         revoked_tokens: BTreeMap::new(),
         enrollments: BTreeMap::new(),
         profiles: BTreeMap::new(),
+        crl: None,
         generation: 0,
     }
 }
@@ -768,6 +806,182 @@ fn a_year_of_renewals_stays_small() {
         }
         day += 20;
     }
-    let size = serde_json::to_vec(&*pki.unwrap()).unwrap().len();
+    // And a CRL listing a few dozen serials (about 4 KB of DER).
+    let mut state = (*pki.unwrap()).clone();
+    state.crl = Some(CrlRecord {
+        issuer: IssuerId(1),
+        der: vec![0xab; 4096],
+        number: 999,
+        this_update_ms: T0,
+        next_update_ms: T0 + 30 * DAY,
+        generation: state.generation,
+    });
+    let size = serde_json::to_vec(&state).unwrap().len();
     assert!(size < 64 * 1024, "{} bytes", size);
+}
+
+// ---- the CRL -----------------------------------------------------------------
+
+fn crl(issuer: &str, id: u32, number: u64, this: u64, next: u64, generation: u64) -> PkiOp {
+    PkiOp::SetCrl(Box::new(CrlRecord {
+        issuer: IssuerId(id),
+        der: format!("{}|{}|{}|{}", issuer, number, this, next).into_bytes(),
+        number,
+        this_update_ms: this,
+        next_update_ms: next,
+        generation,
+    }))
+}
+
+#[test]
+fn a_crl_is_the_active_issuers_and_only_moves_forward() {
+    let mut pki = installed();
+    let generation = pki.as_deref().unwrap().generation;
+    run(
+        &mut pki,
+        crl("ISSUER1", 1, 1, T0, T0 + 30 * DAY, generation),
+        T0,
+    )
+    .unwrap();
+    let p = pki.as_deref().unwrap();
+    assert_eq!(p.crl.as_ref().unwrap().number, 1);
+    assert_eq!(p.generation, generation, "verifiers don't read it");
+    // Not newer.
+    assert!(
+        run(
+            &mut pki,
+            crl("ISSUER1", 1, 1, T0, T0 + 30 * DAY, generation),
+            T0
+        )
+        .is_err()
+    );
+    run(
+        &mut pki,
+        crl("ISSUER1", 1, 2, T0 + 1, T0 + 30 * DAY, generation),
+        T0 + 1,
+    )
+    .unwrap();
+    // Signed by another CA, or said to be by another issuer.
+    assert!(
+        run(
+            &mut pki,
+            crl("FOREIGN", 1, 3, T0, T0 + 30 * DAY, generation),
+            T0
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            &mut pki,
+            crl("ISSUER1", 2, 3, T0, T0 + 30 * DAY, generation),
+            T0
+        )
+        .is_err()
+    );
+    // A record that doesn't say what its CRL does.
+    let mut op = crl("ISSUER1", 1, 3, T0, T0 + 30 * DAY, generation);
+    if let PkiOp::SetCrl(r) = &mut op {
+        r.next_update_ms += DAY;
+    }
+    assert!(run(&mut pki, op, T0).is_err());
+    // Out of date, from the future, or ahead of the state.
+    assert!(
+        run(
+            &mut pki,
+            crl("ISSUER1", 1, 3, T0, T0 + DAY, generation),
+            T0 + 2 * DAY
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            &mut pki,
+            crl("ISSUER1", 1, 3, T0 + DAY, T0 + 30 * DAY, generation),
+            T0
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            &mut pki,
+            crl("ISSUER1", 1, 3, T0, T0 + 30 * DAY, generation + 1),
+            T0
+        )
+        .is_err()
+    );
+    assert_eq!(pki.as_deref().unwrap().crl.as_ref().unwrap().number, 2);
+}
+
+#[test]
+fn a_new_issuers_crl_starts_its_own_numbers() {
+    let mut pki = installed();
+    let g = pki.as_deref().unwrap().generation;
+    run(&mut pki, crl("ISSUER1", 1, 5, T0, T0 + 30 * DAY, g), T0).unwrap();
+    run(
+        &mut pki,
+        PkiOp::AddIssuer {
+            id: IssuerId(2),
+            record: Box::new(issuer("ISSUER2", 3, T0 + 1460 * DAY)),
+            activate: true,
+        },
+        T0,
+    )
+    .unwrap();
+    // The retired issuer's CRL is no longer taken.
+    assert!(run(&mut pki, crl("ISSUER1", 1, 6, T0, T0 + 30 * DAY, g), T0).is_err());
+    run(&mut pki, crl("ISSUER2", 2, 1, T0, T0 + 30 * DAY, g), T0).unwrap();
+}
+
+fn signer_op(chain: &str, serial: u8) -> PkiOp {
+    PkiOp::SetTokenSigner(Box::new(TokenSignerRecord {
+        chain_pem: chain.into(),
+        serial: Serial::from_be_bytes(&[serial]),
+        not_after_ms: T0 + 730 * DAY,
+        sealed_key: blob(),
+    }))
+}
+
+#[test]
+fn a_token_signer_is_the_active_issuers_and_codesigning_only() {
+    let mut pki = installed();
+    let generation = pki.as_deref().unwrap().generation;
+    // Another CA's, or one with the wrong EKU (clientAuth): refused.
+    assert!(run(&mut pki, signer_op("SIGNER:40|FOREIGN", 40), T0).is_err());
+    assert!(run(&mut pki, signer_op("SIGNER:66|ISSUER1", 66), T0).is_err());
+    // A record that doesn't say what its certificate does.
+    assert!(run(&mut pki, signer_op("SIGNER:40|ISSUER1", 41), T0).is_err());
+    assert!(pki.as_deref().unwrap().token_signer.is_none());
+    run(&mut pki, signer_op("SIGNER:40|ISSUER1", 40), T0).unwrap();
+    let p = pki.as_deref().unwrap();
+    assert_eq!(
+        p.token_signer.as_ref().unwrap().serial,
+        Serial::from_be_bytes(&[40])
+    );
+    assert_eq!(p.generation, generation + 1, "verifiers read it");
+    // Replaced by a newer one.
+    run(&mut pki, signer_op("SIGNER:42|ISSUER1", 42), T0 + DAY).unwrap();
+    assert_eq!(
+        pki.as_deref()
+            .unwrap()
+            .token_signer
+            .as_ref()
+            .unwrap()
+            .serial,
+        Serial::from_be_bytes(&[42])
+    );
+    // Revocable though it isn't in `certs`: its tokens go with it.
+    run(
+        &mut pki,
+        PkiOp::RevokeCert {
+            serial: Serial::from_be_bytes(&[42]),
+            reason: RevocationReason::KeyCompromise,
+        },
+        T0 + DAY,
+    )
+    .unwrap();
+    assert!(
+        pki.as_deref()
+            .unwrap()
+            .is_revoked(&Serial::from_be_bytes(&[42]))
+    );
 }

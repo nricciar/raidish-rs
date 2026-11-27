@@ -145,6 +145,7 @@ pub fn init(opts: &InitOptions) -> Result<InitOutput, String> {
         revoked_tokens: BTreeMap::new(),
         enrollments: BTreeMap::new(),
         profiles: BTreeMap::new(),
+        crl: None,
         generation: 0,
     };
     // Everything after the anchor goes in as the ops the daemon would

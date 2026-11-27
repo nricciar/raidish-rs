@@ -559,7 +559,26 @@ pub async fn main() -> std::io::Result<()> {
         return Ok(());
     }
     if let Commands::Token { command } = &cli.command {
-        if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
+        if let crate::cli_pki::TokenCommands::Revoke { id, expires, url } = command {
+            let expires_ms = expires.as_ref().map(|e| {
+                chrono::DateTime::parse_from_rfc3339(e)
+                    .map(|t| t.timestamp_millis() as u64)
+                    .unwrap_or_else(|err| fail(format!("--expires '{}': {}", e, err)))
+            });
+            crate::cli_ca::revoke_token(id, expires_ms, url, &config).await;
+        } else if let crate::cli_pki::TokenCommands::Create {
+            name,
+            role,
+            expires,
+            offline: false,
+            url,
+        } = command
+        {
+            let ttl = expires
+                .as_deref()
+                .map(|e| crate::pki::parse_duration(e).unwrap_or_else(|e| fail(e)));
+            crate::cli_ca::create_token(name, *role, ttl, url, &config).await;
+        } else if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
             crate::cli_pki::s3_key(command, &config).await;
         } else {
             crate::cli_pki::run_token(command, &config);

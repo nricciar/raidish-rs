@@ -67,14 +67,24 @@ pub async fn listen(
     if let Some(c) = &config.vm {
         c.check()?;
     }
-    let verifier = match &config.tls {
+    // What this node refuses, live: every verifier made from `tls` checks
+    // it, and the cluster feeds it as revocations are applied (CA-2a).
+    let trust = crate::trust::Trust::new(config.auth.revoked.clone());
+    let node_tls = config.tls.clone().map(|mut t| {
+        t.trust = Some(trust.clone());
+        t
+    });
+    if node_tls.is_some() {
+        crate::tls::check_servers_against(trust.clone());
+    }
+    let verifier = match &node_tls {
         Some(t) => Some(
             crate::auth::Verifier::from_config(t, &config.auth)
                 .map_err(|e| format!("tls: {}", e))?,
         ),
         None => None,
     };
-    let mut service_tls = match (&config.services, &config.tls) {
+    let mut service_tls = match (&config.services, &node_tls) {
         (None, _) => None,
         // Access keys come from tokens (see `crate::frontend::keys`),
         // checked against the CA bundle: no TLS, no services.
@@ -88,6 +98,7 @@ pub async fn listen(
     let node = cluster::Cluster::start(&name, members, data_dir, floor.clone())
         .await
         .map_err(|e| format!("cluster: {}", e))?;
+    node.observe_pki(trust.clone());
     let ca = raidish_ca::CaService::start(
         node.clone(),
         raidish_ca::CaOptions {
@@ -147,7 +158,7 @@ pub async fn listen(
             node: name.clone(),
             peers: node.members.peers.clone(),
             vm: vms.clone(),
-            roots: match &config.tls {
+            roots: match &node_tls {
                 Some(t) => t.roots()?,
                 None => Vec::new(),
             },
@@ -201,13 +212,13 @@ pub async fn listen(
         }
         agent = agent.with_facts(facts.clone());
         // Peer I/O (proxied exports, handoffs) is node-to-node TLS.
-        if let Some(tls) = &config.tls {
+        if let Some(tls) = &node_tls {
             agent = agent
                 .with_peer_io(tls)
                 .map_err(|e| format!("peer I/O: {}", e))?;
         }
         if let Some(services) = &config.services {
-            let (Some(tls), Some(service_tls)) = (&config.tls, service_tls.take()) else {
+            let (Some(tls), Some(service_tls)) = (&node_tls, service_tls.take()) else {
                 unreachable!("checked before starting");
             };
             let verifier = crate::auth::Verifier::from_config(tls, &config.auth)
@@ -271,7 +282,7 @@ pub async fn listen(
         }
     }
     let auth = crate::auth::AuthState(verifier);
-    if let Some(t) = &config.tls {
+    if let Some(t) = &node_tls {
         warn_expiry(t);
     }
     println!("dashboard: {}://localhost:{}/", crate::tls::scheme(), port);
@@ -286,7 +297,7 @@ pub async fn listen(
         slot,
         agent_state,
         files,
-        config.tls.as_ref(),
+        node_tls.as_ref(),
         auth,
         nfs_backend,
         vms,

@@ -36,20 +36,20 @@ impl CaError {
             msg: msg.into(),
         }
     }
-    fn bad(msg: impl Into<String>) -> CaError {
+    pub(crate) fn bad(msg: impl Into<String>) -> CaError {
         CaError::new(400, msg)
     }
     fn denied(msg: impl Into<String>) -> CaError {
         CaError::new(403, msg)
     }
-    fn conflict(msg: impl Into<String>) -> CaError {
+    pub(crate) fn conflict(msg: impl Into<String>) -> CaError {
         CaError::new(409, msg)
     }
     fn internal(msg: impl Into<String>) -> CaError {
         CaError::new(500, msg)
     }
     /// This node can't do it now; another may (`503`: try the next).
-    fn unavailable(msg: impl Into<String>) -> CaError {
+    pub(crate) fn unavailable(msg: impl Into<String>) -> CaError {
         CaError::new(503, msg)
     }
     fn sealed() -> CaError {
@@ -58,7 +58,7 @@ impl CaError {
              with `raidish ca unseal`",
         )
     }
-    fn no_ca() -> CaError {
+    pub(crate) fn no_ca() -> CaError {
         CaError::unavailable("no CA here (yet): set one up with `raidish ca init`")
     }
 }
@@ -96,6 +96,9 @@ pub struct CaService {
     warnings: Mutex<Vec<String>>,
     http: reqwest::Client,
     joins: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    /// Wakes the CRL re-signer (`crate::crl`): the CA changed, or this
+    /// node was unsealed.
+    pub(crate) crl_wake: Arc<tokio::sync::Notify>,
 }
 
 impl CaService {
@@ -171,7 +174,9 @@ impl CaService {
             warnings: Mutex::new(warnings),
             http: raidish_auth::tls::http_client(Some(Duration::from_secs(20)))?,
             joins: Mutex::new(HashMap::new()),
+            crl_wake: Arc::new(tokio::sync::Notify::new()),
         });
+        crate::crl::start(&ca);
         if is_staged {
             println!(
                 "ca: staged by `ca init`: answering joins from {} until the cluster's first quorum",
@@ -190,11 +195,35 @@ impl CaService {
         self.cluster.pki()
     }
 
+    /// Whether the CA is only staged here (before the first quorum).
+    pub(crate) async fn is_staged(&self) -> bool {
+        self.staged.lock().await.is_some()
+    }
+
+    pub(crate) fn cluster(&self) -> &Arc<Cluster> {
+        &self.cluster
+    }
+
+    /// The CA as the cluster has it now: staged, else Raft's after a read
+    /// index, so a change just made through another node is seen (for
+    /// what's checked before it's changed: cancelling, revoking).
+    pub(crate) async fn current_linearizable(&self) -> Result<Arc<PkiState>, CaError> {
+        if let Some(s) = self.staged.lock().await.as_ref() {
+            return Ok(Arc::new(s.clone()));
+        }
+        let state = self
+            .cluster
+            .linearizable_state(Duration::from_secs(5))
+            .await
+            .map_err(CaError::unavailable)?;
+        state.pki.ok_or_else(CaError::no_ca)
+    }
+
     pub fn unsealed(&self) -> bool {
         self.dek.read().unwrap().is_some()
     }
 
-    fn dek(&self) -> Option<Key> {
+    pub(crate) fn dek(&self) -> Option<Key> {
         self.dek.read().unwrap().clone()
     }
 
@@ -205,11 +234,18 @@ impl CaService {
         if once.exists() {
             warnings.push(format!("{} is still there: delete it", once.display()));
         }
+        let pki = self.current().await;
+        if let Some(w) = pki
+            .as_deref()
+            .and_then(|p| crate::crl::warning(p, self.unsealed(), now_ms()))
+        {
+            warnings.push(w);
+        }
         PkiStatus {
             node: self.cluster.name.clone(),
             unsealed: self.unsealed(),
             staged,
-            pki: self.current().await.map(|p| p.view()),
+            pki: pki.map(|p| p.view()),
             warnings,
         }
     }
@@ -228,17 +264,18 @@ impl CaService {
         .map_err(CaError::denied)?;
         *self.dek.write().unwrap() = Some(dek);
         println!("ca: unsealed");
+        self.crl_wake.notify_one();
         Ok(())
     }
 
     /// The active issuer, unsealed.
-    fn signer(&self, pki: &PkiState) -> Result<Signer, CaError> {
+    pub(crate) fn signer(&self, pki: &PkiState) -> Result<Signer, CaError> {
         let dek = self.dek().ok_or_else(CaError::sealed)?;
         open_signer(pki, &dek).map_err(CaError::internal)
     }
 
     /// Record `op`: in the staged CA while there is one, else through Raft.
-    async fn commit(&self, op: PkiOp) -> Result<(), CaError> {
+    pub(crate) async fn commit(&self, op: PkiOp) -> Result<(), CaError> {
         {
             let mut staged = self.staged.lock().await;
             if let Some(s) = staged.as_mut() {
@@ -591,7 +628,7 @@ impl CaService {
 
     /// `DELETE /api/v1/pki/enrollments/<id>`.
     pub async fn cancel_enrollment(&self, id: TokenId) -> Result<(), CaError> {
-        let pki = self.current().await.ok_or_else(CaError::no_ca)?;
+        let pki = self.current_linearizable().await?;
         if !pki.enrollments.contains_key(&id) {
             return Err(CaError::new(404, format!("no join token {}", id)));
         }

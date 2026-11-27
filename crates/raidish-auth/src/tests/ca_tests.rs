@@ -226,3 +226,63 @@ fn the_checker_accepts_only_the_real_chain() {
             .is_err()
     );
 }
+
+#[test]
+fn a_crl_verifies_against_its_issuer_and_lists_its_serials() {
+    let ca = ca();
+    let other = self::ca();
+    let a = Serial::parse("8a0f00000000000000000000000000ff").unwrap();
+    let b = Serial::parse("01").unwrap();
+    let next = crate::ca::now().unix_timestamp() as u64 * 1000 + 30 * 86_400_000;
+    let (der, facts) = ca
+        .issuer
+        .sign_crl(
+            &[
+                (
+                    a.clone(),
+                    RevocationReason::KeyCompromise,
+                    1_700_000_000_000,
+                ),
+                (b.clone(), RevocationReason::Superseded, 1_700_000_000_000),
+            ],
+            7,
+            next,
+        )
+        .unwrap();
+    assert_eq!(facts.number, 7);
+    assert_eq!(facts.next_update_ms, next - next % 1000);
+    assert!(facts.this_update_ms < facts.next_update_ms);
+    assert_eq!(X509Checker.crl(&der, &ca.issuer.cert_pem).unwrap(), facts);
+    // Not the other CA's, and not once changed.
+    assert!(X509Checker.crl(&der, &other.issuer.cert_pem).is_err());
+    let mut bad = der.clone();
+    let n = bad.len();
+    bad[n - 5] ^= 1;
+    assert!(X509Checker.crl(&bad, &ca.issuer.cert_pem).is_err());
+    let mut serials = crl_serials(&der).unwrap();
+    serials.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(serials, want);
+    // Its authority key id is the issuer's key id: what finds the issuer.
+    let (_, crl) = CertificateRevocationList::from_der(&der).unwrap();
+    let aki = crl
+        .extensions()
+        .iter()
+        .find_map(|e| match e.parsed_extension() {
+            ParsedExtension::AuthorityKeyIdentifier(k) => {
+                k.key_identifier.as_ref().map(|k| k.0.to_vec())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let ski = facts_of(&ca.issuer.cert_pem);
+    assert_eq!(KeyId(aki), ski);
+    // An empty one too.
+    let (der, _) = ca.issuer.sign_crl(&[], 8, next).unwrap();
+    assert!(crl_serials(&der).unwrap().is_empty());
+}
+
+fn facts_of(pem: &str) -> KeyId {
+    facts(&first_der(pem).unwrap()).unwrap().ski
+}
