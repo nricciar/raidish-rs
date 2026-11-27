@@ -26,7 +26,8 @@ fn main() {
         return;
     }
 
-    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // The workspace root (this crate is crates/raidish-http).
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     for dir in [
         "web/src",
         "web/index.html",

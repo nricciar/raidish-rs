@@ -243,22 +243,83 @@ pub use crate::api_types::{Principal, Via};
 /// Server-side state: None without TLS (no authentication).
 pub struct AuthState(pub Option<Verifier>);
 
-// ---- Rocket request guards ------------------------------------------------
+// ---- request extractors (axum) --------------------------------------------
 
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome, Request};
+use crate::http::Refusal;
+use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
+use axum::http::request::Parts;
 
-fn bearer<'r>(req: &'r Request<'_>) -> Option<&'r str> {
-    if let Some(h) = req.headers().get_one("Authorization") {
-        return h.strip_prefix("Bearer ").map(str::trim);
+/// A request's token: `Authorization: Bearer …`, or `?access_token=…`.
+fn bearer(parts: &Parts) -> Option<String> {
+    if let Some(h) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+        return h
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+            .map(|t| t.trim().to_string());
     }
-    req.query_value::<&str>("access_token").and_then(|r| r.ok())
+    let q: Vec<(String, String)> = serde_urlencoded::from_str(parts.uri.query()?).ok()?;
+    q.into_iter()
+        .find(|(k, _)| k == "access_token")
+        .map(|(_, v)| v)
 }
 
-/// Any authenticated caller, as a request guard. A newtype because
-/// `Principal` is plain data (`crate::api_types`, shared with the web
-/// dashboard): Rocket's `FromRequest` can only be implemented here, for
-/// a type of this crate.
+/// One request's caller, worked out once.
+#[derive(Clone)]
+struct Resolved(Result<Principal, Refusal>);
+
+fn resolve(parts: &Parts) -> Result<Principal, Refusal> {
+    let Some(state) = parts.extensions.get::<Arc<AuthState>>() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no authentication configured for this route".into(),
+        ));
+    };
+    let Some(verifier) = &state.0 else {
+        // No TLS: no authentication, everyone may do anything.
+        return Ok(Principal {
+            name: "anonymous".into(),
+            role: Role::Node,
+            via: Via::Open,
+            exp: None,
+        });
+    };
+    let unauthorized = |e: String| (StatusCode::UNAUTHORIZED, e);
+    // The handshake has already checked a presented certificate's chain.
+    if let Some(peer) = parts.extensions.get::<crate::http::Peer>() {
+        let info = pki::inspect_der(peer.cert()).map_err(unauthorized)?;
+        let role = info
+            .role
+            .ok_or_else(|| unauthorized("client certificate has no raidish role (OU)".into()))?;
+        return Ok(Principal {
+            name: info.name,
+            role,
+            via: Via::Cert,
+            exp: None,
+        });
+    }
+    match bearer(parts) {
+        Some(t) => verifier.verify_token(&t).map_err(unauthorized),
+        None => Err(unauthorized(
+            "authentication required: present a client certificate or a token \
+             (raidish token create)"
+                .into(),
+        )),
+    }
+}
+
+fn caller(parts: &mut Parts) -> Result<Principal, Refusal> {
+    if let Some(Resolved(r)) = parts.extensions.get::<Resolved>() {
+        return r.clone();
+    }
+    let r = resolve(parts);
+    parts.extensions.insert(Resolved(r.clone()));
+    r
+}
+
+/// Any authenticated caller. A newtype because `Principal` is plain data
+/// (`crate::api_types`, shared with the web dashboard).
 #[derive(Clone, Debug)]
 pub struct Authed(pub Principal);
 
@@ -269,46 +330,31 @@ impl std::ops::Deref for Authed {
     }
 }
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for Authed {
-    type Error = String;
+impl<S: Send + Sync> FromRequestParts<S> for Authed {
+    type Rejection = Refusal;
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-        let cached = req
-            .local_cache_async(async {
-                let Some(AuthState(Some(verifier))) = req.rocket().state::<AuthState>() else {
-                    // No TLS: no authentication, everyone may do anything.
-                    return Ok(Principal {
-                        name: "anonymous".into(),
-                        role: Role::Node,
-                        via: Via::Open,
-                        exp: None,
-                    });
-                };
-                // Rocket has already checked a presented certificate's chain.
-                if let Outcome::Success(cert) = req.guard::<rocket::mtls::Certificate<'_>>().await {
-                    let info = pki::inspect_der(cert.as_bytes())?;
-                    let role = info
-                        .role
-                        .ok_or("client certificate has no raidish role (OU)")?;
-                    return Ok(Principal {
-                        name: info.name,
-                        role,
-                        via: Via::Cert,
-                        exp: None,
-                    });
-                }
-                match bearer(req) {
-                    Some(t) => verifier.verify_token(t),
-                    None => Err("authentication required: a client certificate or a token".into()),
-                }
-            })
-            .await;
-        match cached {
-            Ok(p) => Outcome::Success(Authed(p.clone())),
-            Err(e) => Outcome::Error((Status::Unauthorized, e.clone())),
-        }
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Refusal> {
+        caller(parts).map(Authed)
     }
+}
+
+/// The caller, or why there is none (for routes that take either).
+impl<S: Send + Sync> axum::extract::OptionalFromRequestParts<S> for Authed {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> Result<Option<Self>, std::convert::Infallible> {
+        Ok(caller(parts).ok().map(Authed))
+    }
+}
+
+fn forbidden(p: &Principal, why: &str) -> Refusal {
+    (
+        StatusCode::FORBIDDEN,
+        format!("{} '{}' may not do this{}", p.role, p.name, why),
+    )
 }
 
 macro_rules! role_guard {
@@ -316,19 +362,15 @@ macro_rules! role_guard {
         #[doc = $doc]
         pub struct $name(pub Principal);
 
-        #[rocket::async_trait]
-        impl<'r> FromRequest<'r> for $name {
-            type Error = String;
+        impl<S: Send + Sync> FromRequestParts<S> for $name {
+            type Rejection = Refusal;
 
-            async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-                match req.guard::<Authed>().await.map(|a| a.0) {
-                    Outcome::Success($p) if $ok => Outcome::Success($name($p)),
-                    Outcome::Success(p) => Outcome::Error((
-                        Status::Forbidden,
-                        format!("{} '{}' may not do this", p.role, p.name),
-                    )),
-                    Outcome::Error(e) => Outcome::Error(e),
-                    Outcome::Forward(f) => Outcome::Forward(f),
+            async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Refusal> {
+                let $p = caller(parts)?;
+                if $ok {
+                    Ok($name($p))
+                } else {
+                    Err(forbidden(&$p, ""))
                 }
             }
         }
@@ -343,22 +385,25 @@ pub const ON_BEHALF: &str = "X-Raidish-On-Behalf-Of";
 /// request for (None: a node acting on its own).
 pub struct Actor(pub Option<String>);
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for Actor {
-    type Error = String;
+impl<S: Send + Sync> FromRequestParts<S> for Actor {
+    type Rejection = std::convert::Infallible;
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-        let Outcome::Success(Authed(p)) = req.guard::<Authed>().await else {
-            return Outcome::Success(Actor(None));
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> Result<Self, std::convert::Infallible> {
+        let Ok(p) = caller(parts) else {
+            return Ok(Actor(None));
         };
         if p.role == Role::Node {
-            let on_behalf = req
-                .headers()
-                .get_one(ON_BEHALF)
+            let on_behalf = parts
+                .headers
+                .get(ON_BEHALF)
+                .and_then(|v| v.to_str().ok())
                 .map(|n| n.chars().filter(|c| !c.is_control()).take(128).collect());
-            return Outcome::Success(Actor(on_behalf));
+            return Ok(Actor(on_behalf));
         }
-        Outcome::Success(Actor(Some(p.name)))
+        Ok(Actor(Some(p.name)))
     }
 }
 
@@ -380,47 +425,30 @@ role_guard!(
 /// speak for an admin (see `docs/ca-service-plan.md` D8).
 pub struct IsAdminCert(pub Principal);
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for IsAdminCert {
-    type Error = String;
+impl<S: Send + Sync> FromRequestParts<S> for IsAdminCert {
+    type Rejection = Refusal;
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-        match req.guard::<Authed>().await.map(|a| a.0) {
-            Outcome::Success(p)
-                if p.role == Role::Admin
-                    && p.via == Via::Cert
-                    && req.headers().get_one(ON_BEHALF).is_none() =>
-            {
-                Outcome::Success(IsAdminCert(p))
-            }
-            Outcome::Success(p) => Outcome::Error((
-                Status::Forbidden,
-                format!(
-                    "{} '{}' may not do this: it takes an admin certificate, presented directly",
-                    p.role, p.name
-                ),
-            )),
-            Outcome::Error(e) => Outcome::Error(e),
-            Outcome::Forward(f) => Outcome::Forward(f),
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Refusal> {
+        let p = caller(parts)?;
+        if p.role == Role::Admin && p.via == Via::Cert && !parts.headers.contains_key(ON_BEHALF) {
+            Ok(IsAdminCert(p))
+        } else {
+            Err(forbidden(
+                &p,
+                ": it takes an admin certificate, presented directly",
+            ))
         }
     }
 }
 
 /// GET /api/v1/auth/whoami: who the server thinks you are (401 if nobody).
-#[rocket::get("/api/v1/auth/whoami")]
-pub fn whoami(p: Authed) -> rocket::serde::json::Json<Principal> {
-    rocket::serde::json::Json(p.0)
+pub async fn whoami(p: Authed) -> crate::http::Json<Principal> {
+    crate::http::Json(p.0)
 }
 
-/// Turn 401/403 into a short plain-text reason (Rocket's default is HTML).
-#[rocket::catch(401)]
-pub fn unauthorized() -> &'static str {
-    "401 Unauthorized: present a client certificate or a token (raidish token create)\n"
-}
-
-#[rocket::catch(403)]
-pub fn forbidden() -> &'static str {
-    "403 Forbidden: your role may not do this\n"
+/// The routes of this module.
+pub fn router() -> axum::Router {
+    axum::Router::new().route("/api/v1/auth/whoami", axum::routing::get(whoami))
 }
 
 #[cfg(test)]

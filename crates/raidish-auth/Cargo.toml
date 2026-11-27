@@ -2,7 +2,7 @@
 name = "raidish-auth"
 version = "0.1.0"
 edition = "2024"
-description = "RAIDish identity and transport: the cluster PKI, TLS, request authentication, the TCP accept loop."
+description = "RAIDish identity and transport: the cluster PKI, TLS, request authentication, HTTP serving (axum), the TCP accept loop."
 
 [features]
 testutil = ["dep:tempfile", "raidish-types/testutil"]
@@ -13,7 +13,14 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "tim
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-rocket = { workspace = true, features = ["json", "tls", "mtls"] }
+axum = { workspace = true, features = ["http1", "http2", "json", "ws", "tokio", "query"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util = { workspace = true }
+serde_urlencoded = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
 rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
 tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }

@@ -5,8 +5,8 @@
 
 use crate::fs::FileSystemError;
 use crate::writer::CommitError;
-use rocket::http::Status;
-use rocket::response::{self, Responder};
+use axum::http::StatusCode as Status;
+use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -24,11 +24,11 @@ impl ApiError {
 
     /// The caller asked for something malformed.
     pub fn bad(msg: impl Into<String>) -> Self {
-        ApiError::new(Status::BadRequest, msg)
+        ApiError::new(Status::BAD_REQUEST, msg)
     }
 
     fn of(kind: crate::types::ErrorKind, msg: String) -> Self {
-        let status = Status::from_code(kind.http_status()).unwrap_or(Status::InternalServerError);
+        let status = Status::from_u16(kind.http_status()).unwrap_or(Status::INTERNAL_SERVER_ERROR);
         ApiError::new(status, msg)
     }
 }
@@ -63,8 +63,15 @@ impl From<crate::vm::VmError> for ApiError {
     }
 }
 
-impl<'r> Responder<'r, 'static> for ApiError {
-    fn respond_to(self, req: &'r rocket::Request<'_>) -> response::Result<'static> {
-        (self.status, self.msg).respond_to(req)
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, self.msg).into_response()
+    }
+}
+
+/// A refusal from an extractor (`raidish_auth::http::Refusal`).
+impl From<(Status, String)> for ApiError {
+    fn from((status, msg): (Status, String)) -> Self {
+        ApiError::new(status, msg)
     }
 }

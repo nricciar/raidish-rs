@@ -24,8 +24,8 @@ x-node: &node
   init: true
   environment:
     DISK_SIZE: ${DISK_SIZE:-1G}
-    # The disk server listens on 127.0.0.1 unless told otherwise.
-    ROCKET_ADDRESS: 0.0.0.0
+    # `listen` serves on 127.0.0.1 unless told otherwise.
+    RAIDISH_ADDRESS: 0.0.0.0
 
 services:
   node0:
@@ -34,7 +34,7 @@ services:
     hostname: node0
     environment:
       DISK_SIZE: ${DISK_SIZE:-1G}
-      ROCKET_ADDRESS: 0.0.0.0
+      RAIDISH_ADDRESS: 0.0.0.0
       RAIDISH_CA_INIT: "1"
       RAIDISH_PORT: "8881"
     command: --config /etc/raidish/node.yaml listen --port 8881
@@ -57,7 +57,7 @@ services:
       node0: { condition: service_started }
     environment:
       DISK_SIZE: ${DISK_SIZE:-1G}
-      ROCKET_ADDRESS: 0.0.0.0
+      RAIDISH_ADDRESS: 0.0.0.0
       RAIDISH_JOIN: https://node0:8881
       RAIDISH_NODE_ID: "1"
       RAIDISH_PORT: "8882"
@@ -81,7 +81,7 @@ services:
       node0: { condition: service_started }
     environment:
       DISK_SIZE: ${DISK_SIZE:-1G}
-      ROCKET_ADDRESS: 0.0.0.0
+      RAIDISH_ADDRESS: 0.0.0.0
       RAIDISH_JOIN: https://node0:8881
       RAIDISH_NODE_ID: "2"
       RAIDISH_PORT: "8883"

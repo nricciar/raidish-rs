@@ -305,7 +305,7 @@ fn url_pointing_here_is_this_node() {
 struct TestNode {
     cluster: Arc<Cluster>,
     floor: Arc<crate::fence::ServerFence>,
-    shutdown: rocket::Shutdown,
+    shutdown: Arc<tokio::sync::Notify>,
     url: String,
 }
 
@@ -325,20 +325,19 @@ async fn start_node(name: &str, paths: &[String], port: u16, dir: &std::path::Pa
     let cluster = Cluster::start(name, members, dir.join(name), floor.clone())
         .await
         .unwrap();
-    let rocket = rocket::build()
-        .manage(cluster.clone())
-        .configure(
-            rocket::Config::figment()
-                .merge(("port", port))
-                .merge(("log_level", "off")),
-        )
-        .mount("/", routes::routes())
-        .attach(routes::stop_raft_on_shutdown())
-        .ignite()
-        .await
-        .unwrap();
-    let shutdown = rocket.shutdown();
-    tokio::spawn(rocket.launch());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let stop = shutdown.clone();
+    raidish_auth::http::spawn(
+        ("127.0.0.1", port),
+        None,
+        raidish_auth::http::finish(
+            routes::router(cluster.clone()),
+            crate::auth::AuthState(None),
+        ),
+        async move { stop.notified().await },
+    )
+    .await
+    .unwrap();
     TestNode {
         cluster,
         floor,
@@ -348,7 +347,7 @@ async fn start_node(name: &str, paths: &[String], port: u16, dir: &std::path::Pa
 }
 
 async fn stop_node(node: &TestNode) {
-    node.shutdown.clone().notify();
+    node.shutdown.notify_one();
     let _ = node.cluster.raft.shutdown().await;
 }
 
@@ -531,7 +530,7 @@ async fn a_followers_lease_survives_losing_the_leader() {
     );
     tokio::time::sleep(lease::LEASE_TTL / 3 - std::time::Duration::from_millis(300)).await;
     let stopped_ms = now_ms();
-    old.shutdown.clone().notify();
+    stop_node(old).await;
 
     // Well past a TTL later, it's still held, and the new leader renewed it.
     let rest: Vec<&TestNode> = nodes.iter().filter(|n| n.cluster.name != leader).collect();

@@ -25,7 +25,7 @@ time = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
 tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
-rocket = { workspace = true, features = ["json"] }
+axum = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
 tonic = { workspace = true }
 hyper = { workspace = true, features = ["server", "client", "http1", "http2"] }

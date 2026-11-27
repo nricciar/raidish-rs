@@ -126,6 +126,10 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
 
+        /// The address to serve the API on (all interfaces: 0.0.0.0).
+        #[arg(long, env = "RAIDISH_ADDRESS", default_value = "127.0.0.1")]
+        address: String,
+
         /// Never become the pool's committer (leaves the `pool` lease free
         /// for maintenance: fsck --repair, format, defrag).
         #[arg(long)]
@@ -565,8 +569,13 @@ pub async fn main() -> std::io::Result<()> {
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
-    if let Commands::Listen { port, no_committer } = &cli.command {
-        crate::server::listen(&config, spec, opts, *port, *no_committer)
+    if let Commands::Listen {
+        port,
+        address,
+        no_committer,
+    } = &cli.command
+    {
+        crate::server::listen(&config, spec, opts, address, *port, *no_committer)
             .await
             .unwrap_or_else(|e| fail(e));
         return Ok(());

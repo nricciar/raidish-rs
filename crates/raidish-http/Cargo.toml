@@ -1,0 +1,43 @@
+[package]
+name = "raidish-http"
+version = "0.1.0"
+edition = "2024"
+description = "RAIDish's node server (`raidish listen`): config, startup and the HTTP(S) API on axum, with the dashboard and its UI bundle."
+build = "build.rs"
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-core = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-vm = { workspace = true }
+raidish-cluster = { workspace = true }
+raidish-committer = { workspace = true }
+raidish-nfs = { workspace = true }
+raidish-block = { workspace = true }
+raidish-services = { workspace = true }
+raidish-agent = { workspace = true }
+raidish-ca = { workspace = true }
+futures-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+blake3 = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process", "signal"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
+tungstenite = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true, features = ["http1", "http2", "json", "ws", "tokio"] }
+openraft = { workspace = true, features = ["serde"] }
+time = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-core = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+raidish-vm = { workspace = true, features = ["testutil"] }
+raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-committer = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

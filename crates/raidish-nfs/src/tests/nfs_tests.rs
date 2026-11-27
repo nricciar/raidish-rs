@@ -882,7 +882,8 @@ async fn requests_for_a_file_another_node_writes_are_forwarded() {
 /// The node API route other nodes forward to: bincode in, bincode out.
 #[tokio::test]
 async fn the_forward_route_serves_this_nodes_backend() {
-    use rocket::local::asynchronous::Client as Http;
+    use axum::http::StatusCode;
+    use raidish_auth::testing::Client as Http;
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     fs.write_file(Path::new("f"), b"hello").await.unwrap();
@@ -892,17 +893,17 @@ async fn the_forward_route_serves_this_nodes_backend() {
         None,
         "n0".into(),
     ));
-    let rocket = |b: Option<Arc<Backend<Pool>>>| {
-        rocket::custom(rocket::Config::figment().merge(("log_level", "off")))
-            .manage(super::peers::NfsForwarding(b.map(|b| {
-                let v4 = Arc::new(super::v4::Server::new(b.clone(), "n0"));
-                (b, v4)
-            })))
-            .mount("/", super::peers::routes())
+    let app = |b: Option<Arc<Backend<Pool>>>| {
+        let st = super::peers::NfsForwarding(b.map(|b| {
+            let v4 = Arc::new(super::v4::Server::new(b.clone(), "n0"));
+            (b, v4)
+        }));
+        Http::new(
+            super::peers::router(st),
+            raidish_auth::auth::AuthState(None),
+        )
     };
-    let http = Http::untracked(rocket(Some(backend.clone())))
-        .await
-        .unwrap();
+    let http = app(Some(backend.clone()));
     let ask = |req: Forward| bincode::serialize(&req).unwrap();
     let r = http
         .post("/api/v1/nfs/forward")
@@ -911,10 +912,10 @@ async fn the_forward_route_serves_this_nodes_backend() {
             offset: 1,
             count: 3,
         }))
-        .dispatch()
+        .send()
         .await;
-    assert_eq!(r.status(), rocket::http::Status::Ok);
-    let reply: Forwarded = bincode::deserialize(&r.into_bytes().await.unwrap()).unwrap();
+    assert_eq!(r.status, StatusCode::OK);
+    let reply: Forwarded = bincode::deserialize(&r.body).unwrap();
     assert_eq!(
         reply,
         Forwarded::Read {
@@ -930,28 +931,24 @@ async fn the_forward_route_serves_this_nodes_backend() {
             data: b"!".to_vec(),
             stable: true,
         }))
-        .dispatch()
+        .send()
         .await;
-    let reply: Forwarded = bincode::deserialize(&r.into_bytes().await.unwrap()).unwrap();
+    let reply: Forwarded = bincode::deserialize(&r.body).unwrap();
     assert!(
         matches!(reply, Forwarded::Write { ref attr, verifier } if attr.size == 6 && verifier == backend.verifier()),
         "{:?}",
         reply
     );
     // No NFS server on this node: 503, and garbage is a 400.
-    let none = Http::untracked(rocket(None)).await.unwrap();
+    let none = app(None);
     let r = none
         .post("/api/v1/nfs/forward")
         .body(ask(Forward::Getattr { id }))
-        .dispatch()
+        .send()
         .await;
-    assert_eq!(r.status(), rocket::http::Status::ServiceUnavailable);
-    let r = http
-        .post("/api/v1/nfs/forward")
-        .body("junk")
-        .dispatch()
-        .await;
-    assert_eq!(r.status(), rocket::http::Status::BadRequest);
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    let r = http.post("/api/v1/nfs/forward").body("junk").send().await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
 
 /// A `DirectSink` whose namespace changes can be made to fail.

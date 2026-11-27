@@ -15,11 +15,12 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 url = { workspace = true }
-rocket = { workspace = true, features = ["json"] }
+axum = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots"] }
 
 [dev-dependencies]
 raidish-cluster = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
 raidish-committer = { workspace = true, features = ["testutil"] }
 raidish-types = { workspace = true, features = ["testutil"] }
 raidish-core = { workspace = true, features = ["testutil"] }

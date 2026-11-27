@@ -15,6 +15,7 @@ pub async fn listen(
     config: &Config,
     spec: Option<PoolSpec>,
     opts: DiskOptions,
+    address: &str,
     port: Option<u16>,
     no_committer: bool,
 ) -> Result<(), String> {
@@ -277,6 +278,7 @@ pub async fn listen(
     api::listen(
         disks,
         pool,
+        address,
         port,
         node,
         floor,

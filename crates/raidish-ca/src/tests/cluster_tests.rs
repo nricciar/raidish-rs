@@ -54,16 +54,16 @@ async fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 struct Node {
     cluster: Arc<Cluster>,
     ca: Arc<CaService>,
-    shutdowns: Vec<rocket::Shutdown>,
+    shutdown: Arc<tokio::sync::Notify>,
     /// Its mTLS address.
     url: String,
 }
 
 impl Node {
     async fn stop(&self) {
-        for s in &self.shutdowns {
-            s.clone().notify();
-        }
+        // One permit per server (each waits for one).
+        self.shutdown.notify_one();
+        self.shutdown.notify_one();
         let _ = self.cluster.raft.shutdown().await;
     }
 }
@@ -88,11 +88,18 @@ fn members(paths: &[String], port: u16) -> Members {
     derive(paths, "test", |b| is_local_base(b, port)).unwrap()
 }
 
-async fn launch(rocket: rocket::Rocket<rocket::Build>) -> rocket::Shutdown {
-    let rocket = rocket.ignite().await.unwrap();
-    let shutdown = rocket.shutdown();
-    tokio::spawn(rocket.launch());
-    shutdown
+/// Serve `app` on `port` until `stop` is notified.
+async fn launch(
+    port: u16,
+    tls: Option<raidish_auth::http::Server>,
+    app: axum::Router,
+    stop: Arc<tokio::sync::Notify>,
+) {
+    raidish_auth::http::spawn(("127.0.0.1", port), tls, app, async move {
+        stop.notified().await
+    })
+    .await
+    .unwrap();
 }
 
 /// Start a member: Raft (and the CA routes, as peers forward to them) on
@@ -111,49 +118,36 @@ async fn start(
         .await
         .unwrap();
     let ca = CaService::start(cluster.clone(), CaOptions::default()).unwrap();
-    let plain = rocket::build()
-        .manage(cluster.clone())
-        .manage(ca.clone())
-        .configure(
-            rocket::Config::figment()
-                .merge(("port", raft_port))
-                .merge(("log_level", "off")),
-        )
-        .mount("/", raidish_cluster::routes::routes())
-        .mount("/", crate::routes::routes())
-        .attach(raidish_cluster::routes::stop_raft_on_shutdown());
+    use raidish_auth::auth::AuthState;
+    use raidish_auth::http::finish;
+    let routes = || {
+        raidish_cluster::routes::router(cluster.clone()).merge(crate::routes::router(ca.clone()))
+    };
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    launch(
+        raft_port,
+        None,
+        finish(routes(), AuthState(None)),
+        shutdown.clone(),
+    )
+    .await;
     let tls = tls_in(tls_dir);
-    let p = |p: Option<PathBuf>| p.unwrap().to_string_lossy().to_string();
     let verifier = raidish_auth::auth::Verifier::from_config(&tls, &Default::default()).unwrap();
-    let secure = rocket::build()
-        .manage(cluster.clone())
-        .manage(ca.clone())
-        .manage(raidish_auth::auth::AuthState(Some(verifier)))
-        .configure(
-            rocket::Config::figment()
-                .merge(("port", tls_port))
-                .merge(("log_level", "off"))
-                .merge(("tls.certs", p(tls.cert_path())))
-                .merge(("tls.key", p(tls.key_path())))
-                .merge(("tls.mutual.ca_certs", p(tls.ca_path())))
-                .merge(("tls.mutual.mandatory", false)),
-        )
-        .mount("/", rocket::routes![raidish_auth::auth::whoami])
-        .mount("/", raidish_cluster::routes::routes())
-        .mount("/", crate::routes::routes());
-    let shutdowns = vec![launch(plain).await, launch(secure).await];
-    // Launched in the background: listening a moment later.
-    for port in [raft_port, tls_port] {
-        let up = wait_for(10, || {
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-        })
-        .await;
-        assert!(up, "nothing listens on {}", port);
-    }
+    let secure = finish(
+        routes().merge(raidish_auth::auth::router()),
+        AuthState(Some(verifier)),
+    );
+    launch(
+        tls_port,
+        Some(raidish_auth::http::Server::from_config(&tls).unwrap()),
+        secure,
+        shutdown.clone(),
+    )
+    .await;
     Node {
         cluster,
         ca,
-        shutdowns,
+        shutdown,
         url: format!("https://127.0.0.1:{}", tls_port),
     }
 }

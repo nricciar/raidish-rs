@@ -8,115 +8,127 @@ use crate::api::{
     UnsealRequest,
 };
 use crate::service::CaError;
+use axum::extract::{ConnectInfo, Extension, Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
 use raidish_auth::auth::{CanRead, IsAdmin, IsAdminCert};
+use raidish_auth::http::{Json, Peer, Query};
 use raidish_types::pki::{PkiStatus, TokenId};
-use rocket::http::{ContentType, Status};
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, post};
-use std::net::IpAddr;
+use serde::Deserialize;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 type Ca = State<Arc<CaService>>;
 
-impl<'r> rocket::response::Responder<'r, 'static> for CaError {
-    fn respond_to(self, req: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
-        let status = Status::from_code(self.status).unwrap_or(Status::InternalServerError);
-        (status, format!("{}\n", self.msg)).respond_to(req)
+impl IntoResponse for CaError {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, format!("{}\n", self.msg)).into_response()
     }
 }
 
 /// The root, for anyone (a joiner pins it by the fingerprint in its token).
-#[get("/api/v1/pki/ca.pem")]
-pub async fn ca_pem(ca: &Ca) -> Result<(ContentType, String), CaError> {
+pub async fn ca_pem(State(ca): Ca) -> Result<Response, CaError> {
     let pki = ca
         .current()
         .await
         .ok_or_else(|| CaError::new(404, "no CA on this cluster"))?;
     Ok((
-        ContentType::new("application", "x-pem-file"),
+        [(header::CONTENT_TYPE, "application/x-pem-file")],
         pki.anchor.cert_pem.clone(),
-    ))
+    )
+        .into_response())
 }
 
-#[get("/api/v1/pki/status")]
-pub async fn status(_auth: CanRead, ca: &Ca) -> Json<PkiStatus> {
+pub async fn status(_auth: CanRead, State(ca): Ca) -> Json<PkiStatus> {
     Json(ca.status().await)
 }
 
-#[post("/api/v1/pki/join?<forwarded>", data = "<req>")]
+#[derive(Deserialize, Default)]
+pub struct Forwarded {
+    #[serde(default)]
+    forwarded: bool,
+}
+
 pub async fn join(
-    ip: Option<IpAddr>,
-    forwarded: Option<bool>,
+    addr: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Query(Forwarded { forwarded }): Query<Forwarded>,
+    State(ca): Ca,
     req: Json<JoinRequest>,
-    ca: &Ca,
 ) -> Result<Json<Issued>, CaError> {
+    let ip = addr.map(|Extension(ConnectInfo(a))| a.ip());
     if !ca.join_allowed(ip) {
         return Err(CaError::new(
             429,
             "too many joins from this address: wait a minute",
         ));
     }
-    ca.join(req.into_inner(), forwarded.unwrap_or(false))
-        .await
-        .map(Json)
+    ca.join(req.into_inner(), forwarded).await.map(Json)
 }
 
 /// The caller's own certificate (by TLS, never a token), renewed.
-#[post("/api/v1/pki/renew", data = "<req>")]
 pub async fn renew(
-    cert: rocket::mtls::Certificate<'_>,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
     req: Json<RenewRequest>,
-    ca: &Ca,
 ) -> Result<Json<Issued>, CaError> {
-    ca.renew(cert.as_bytes(), &req.csr_pem).await.map(Json)
+    let Some(Extension(peer)) = peer else {
+        return Err(CaError::new(
+            401,
+            "renewing takes the certificate being renewed, presented over TLS",
+        ));
+    };
+    ca.renew(peer.cert(), &req.csr_pem).await.map(Json)
 }
 
-#[post("/api/v1/pki/sign", data = "<req>")]
 pub async fn sign(
     admin: IsAdminCert,
+    State(ca): Ca,
     req: Json<SignRequest>,
-    ca: &Ca,
 ) -> Result<Json<Issued>, CaError> {
     ca.sign(&admin.0, req.into_inner()).await.map(Json)
 }
 
-#[post("/api/v1/pki/enrollments", data = "<req>")]
 pub async fn create_enrollment(
     admin: IsAdminCert,
+    State(ca): Ca,
     req: Json<EnrollmentRequest>,
-    ca: &Ca,
 ) -> Result<Json<EnrollmentCreated>, CaError> {
     ca.create_enrollment(&admin.0, req.into_inner())
         .await
         .map(Json)
 }
 
-#[delete("/api/v1/pki/enrollments/<id>")]
-pub async fn cancel_enrollment(_admin: IsAdmin, id: &str, ca: &Ca) -> Result<(), CaError> {
-    let id = TokenId::parse(id).map_err(|e| CaError::new(400, e))?;
+pub async fn cancel_enrollment(
+    _admin: IsAdmin,
+    Path(id): Path<String>,
+    State(ca): Ca,
+) -> Result<(), CaError> {
+    let id = TokenId::parse(&id).map_err(|e| CaError::new(400, e))?;
     ca.cancel_enrollment(id).await
 }
 
 /// Unseal this node (the one asked).
-#[post("/api/v1/pki/unseal", data = "<req>")]
 pub async fn unseal(
     _admin: IsAdminCert,
+    State(ca): Ca,
     req: Json<UnsealRequest>,
-    ca: &Ca,
 ) -> Result<Json<PkiStatus>, CaError> {
     ca.unseal(&req.recovery_key).await?;
     Ok(Json(ca.status().await))
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        ca_pem,
-        status,
-        join,
-        renew,
-        sign,
-        create_enrollment,
-        cancel_enrollment,
-        unseal
-    ]
+/// The routes, on this node's CA service.
+pub fn router(ca: Arc<CaService>) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/pki/ca.pem", get(ca_pem))
+        .route("/api/v1/pki/status", get(status))
+        .route("/api/v1/pki/join", post(join))
+        .route("/api/v1/pki/renew", post(renew))
+        .route("/api/v1/pki/sign", post(sign))
+        .route("/api/v1/pki/enrollments", post(create_enrollment))
+        .route("/api/v1/pki/enrollments/{id}", delete(cancel_enrollment))
+        .route("/api/v1/pki/unseal", post(unseal))
+        .with_state(ca)
 }

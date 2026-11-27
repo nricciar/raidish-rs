@@ -34,12 +34,13 @@ use crate::object_lease::ObjectLeases;
 use crate::types::{Holder, HolderRole};
 use crate::vdev::Pool;
 use crate::writer::ObjLease;
-use rocket::data::{Data, Limits, ToByteUnit};
-use rocket::futures::stream::{BoxStream, StreamExt};
-use rocket::http::Status;
-use rocket::response::Responder;
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, patch, post, put};
+use axum::body::Body;
+use axum::extract::{Path as UrlPath, State};
+use axum::http::{HeaderMap, StatusCode as Status, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use futures_util::stream::{BoxStream, StreamExt};
+use raidish_auth::http::{Json, Query};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,11 +54,13 @@ pub struct FilesState {
     /// For reads before this node has a writer (no committer yet).
     pub read_only: Option<Arc<FileSystem<Arc<Pool>>>>,
     pub leases: Arc<dyn ObjectLeases>,
+    /// The largest upload (or PATCH body) taken, in bytes.
+    pub upload_limit: u64,
 }
 
 fn unavailable() -> ApiError {
     ApiError::new(
-        Status::ServiceUnavailable,
+        Status::SERVICE_UNAVAILABLE,
         "this node has no pool writer yet (is a committer running?)",
     )
 }
@@ -118,7 +121,7 @@ fn record_stream<D: PoolDevice + 'static>(
         (next < end).then_some(next)
     })
     .filter(move |&at| at < end);
-    rocket::futures::stream::iter(pieces)
+    futures_util::stream::iter(pieces)
         .then(move |offset| {
             let (fs, obj) = (fs.clone(), obj.clone());
             async move {
@@ -136,59 +139,6 @@ fn record_stream<D: PoolDevice + 'static>(
         .boxed()
 }
 
-/// A response body read from a stream of pieces. A piece that fails fails
-/// the read, which ends the body short of its declared `Content-Length`:
-/// the server then cuts the connection (or resets the stream) instead of
-/// ending it as if the file ended there.
-struct PieceReader {
-    pieces: BoxStream<'static, Result<Vec<u8>, FileSystemError>>,
-    buf: Vec<u8>,
-    at: usize,
-}
-
-impl tokio::io::AsyncRead for PieceReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        out: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
-        loop {
-            let me = &mut *self;
-            if me.at < me.buf.len() {
-                let n = out.remaining().min(me.buf.len() - me.at);
-                out.put_slice(&me.buf[me.at..me.at + n]);
-                me.at += n;
-                return Poll::Ready(Ok(()));
-            }
-            match me.pieces.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(b))) => (me.buf, me.at) = (b, 0),
-                Poll::Ready(Some(Err(e))) => {
-                    eprintln!("files: reading records: {}", e);
-                    return Poll::Ready(Err(std::io::Error::other(e.to_string())));
-                }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-            }
-        }
-    }
-}
-
-/// The request's `Range` header, if any.
-pub struct RangeHeader(Option<String>);
-
-#[rocket::async_trait]
-impl<'r> rocket::request::FromRequest<'r> for RangeHeader {
-    type Error = std::convert::Infallible;
-    async fn from_request(
-        req: &'r rocket::Request<'_>,
-    ) -> rocket::request::Outcome<Self, Self::Error> {
-        rocket::request::Outcome::Success(RangeHeader(
-            req.headers().get_one("Range").map(String::from),
-        ))
-    }
-}
-
 pub(crate) use crate::frontend::http::{ByteRange, parse_range};
 
 /// A file's bytes: all of them (`200`) or a range (`206`).
@@ -199,30 +149,36 @@ pub struct FileBody {
     part: Option<(std::ops::Range<u64>, u64)>,
 }
 
-impl<'r> Responder<'r, 'r> for FileBody {
-    fn respond_to(self, _req: &'r rocket::Request<'_>) -> rocket::response::Result<'r> {
-        let mut r = rocket::Response::build()
-            .streamed_body(PieceReader {
-                pieces: self.stream,
-                buf: Vec::new(),
-                at: 0,
-            })
-            .finalize();
+impl IntoResponse for FileBody {
+    fn into_response(self) -> Response {
         // Declared, so a body that ends short is an error to the client:
-        // Rocket ends a streamed body that fails as if it were complete (it
-        // drops hyper's sender rather than aborting it), and hyper closes
-        // the connection when fewer bytes than declared were sent.
-        r.set_raw_header("Content-Length", self.len.to_string());
-        r.set_raw_header("Accept-Ranges", "bytes");
-        r.set_raw_header("Content-Type", "application/octet-stream");
+        // a piece that fails fails the body, and hyper then cuts the
+        // connection (or resets the stream) with fewer bytes than declared
+        // sent, instead of ending it as if the file ended there.
+        let body = Body::from_stream(self.stream.map(|r| {
+            r.map(axum::body::Bytes::from).map_err(|e| {
+                eprintln!("files: reading records: {}", e);
+                std::io::Error::other(e.to_string())
+            })
+        }));
+        let mut r = Response::new(body);
+        let h = r.headers_mut();
+        h.insert(header::CONTENT_LENGTH, self.len.into());
+        h.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        h.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
         if let Some((range, size)) = self.part {
-            r.set_status(Status::PartialContent);
-            r.set_raw_header(
-                "Content-Range",
-                format!("bytes {}-{}/{}", range.start, range.end - 1, size),
+            h.insert(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", range.start, range.end - 1, size)
+                    .parse()
+                    .unwrap(),
             );
+            *r.status_mut() = Status::PARTIAL_CONTENT;
         }
-        Ok(r)
+        r
     }
 }
 
@@ -238,7 +194,7 @@ async fn file_body<D: PoolDevice + 'static>(
         ByteRange::Part(r) => (r.clone(), Some((r, size))),
         ByteRange::Unsatisfiable => {
             return Err(ApiError::new(
-                Status::RangeNotSatisfiable,
+                Status::RANGE_NOT_SATISFIABLE,
                 format!("bytes */{}", size),
             ));
         }
@@ -253,22 +209,28 @@ async fn file_body<D: PoolDevice + 'static>(
         first => first,
     };
     Ok(FileBody {
-        stream: rocket::futures::stream::iter(first).chain(stream).boxed(),
+        stream: futures_util::stream::iter(first).chain(stream).boxed(),
         len,
         part,
     })
 }
 
-#[get("/api/v1/files/<path..>")]
+/// A `{*path}` from the URL as a path (400 if it isn't one).
+fn url_path(p: &str) -> Result<PathBuf, ApiError> {
+    raidish_auth::http::path_buf(p).map_err(ApiError::from)
+}
+
 async fn get_file(
     _auth: crate::auth::CanRead,
-    path: PathBuf,
-    range: RangeHeader,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    headers: HeaderMap,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<FileBody, ApiError> {
+    let path = url_path(&path)?;
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match st.reader()? {
-        Reader::Writer(fs) => file_body(fs, &path, range.0.as_deref()).await,
-        Reader::ReadOnly(fs) => file_body(fs, &path, range.0.as_deref()).await,
+        Reader::Writer(fs) => file_body(fs, &path, range).await,
+        Reader::ReadOnly(fs) => file_body(fs, &path, range).await,
     }
 }
 
@@ -318,21 +280,19 @@ async fn list_any(st: &FilesState, path: &Path) -> Result<Json<Vec<DirEntry>>, A
     r.map(Json).map_err(ApiError::from)
 }
 
-#[get("/api/v1/dir")]
 async fn list_root(
     _auth: crate::auth::CanRead,
-    st: &State<FilesState>,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<Json<Vec<DirEntry>>, ApiError> {
-    list_any(st, Path::new("")).await
+    list_any(&st, Path::new("")).await
 }
 
-#[get("/api/v1/dir/<path..>")]
 async fn list_dir(
     _auth: crate::auth::CanRead,
-    path: PathBuf,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<Json<Vec<DirEntry>>, ApiError> {
-    list_any(st, &path).await
+    list_any(&st, &url_path(&path)?).await
 }
 
 // ---- writes ----
@@ -343,8 +303,8 @@ pub struct Written {
     pub size: u64,
 }
 
-/// Largest upload accepted unless the `upload` limit says otherwise.
-const DEFAULT_UPLOAD_LIMIT_GIB: u64 = 64;
+/// Largest upload accepted (unless the `FilesState` says otherwise).
+pub const UPLOAD_LIMIT: u64 = 64 << 30;
 /// How much of the body is read at a time.
 const UPLOAD_CHUNK: usize = 1 << 20;
 
@@ -352,13 +312,12 @@ const UPLOAD_CHUNK: usize = 1 << 20;
 async fn upload(
     fs: &FileSystem<Pool>,
     path: &Path,
-    data: Data<'_>,
-    limit: rocket::data::ByteUnit,
+    data: Body,
+    limit: u64,
     lease: ObjLease,
 ) -> Result<u64, FileSystemError> {
     let mut f = fs.file_writer(path, Some(lease)).await?;
-    // One byte over the limit tells a body that's too big from one that fits.
-    let mut body = data.open(limit + 1.bytes());
+    let mut body = raidish_auth::http::body_reader(data);
     let mut buf = vec![0u8; UPLOAD_CHUNK];
     loop {
         let n = match body.read(&mut buf).await {
@@ -372,10 +331,10 @@ async fn upload(
                 )));
             }
         };
-        if f.len() + n as u64 > limit.as_u64() {
+        if f.len() + n as u64 > limit {
             f.abort().await;
             return Err(FileSystemError::InvalidArgument(format!(
-                "upload larger than the limit ({})",
+                "upload larger than the limit ({} bytes)",
                 limit
             )));
         }
@@ -389,14 +348,13 @@ async fn upload(
     Ok(size)
 }
 
-#[put("/api/v1/files/<path..>", data = "<data>")]
 async fn put_file(
     _auth: crate::auth::CanWrite,
-    path: PathBuf,
-    data: Data<'_>,
-    limits: &Limits,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
+    data: Body,
 ) -> Result<Json<Written>, ApiError> {
+    let path = url_path(&path)?;
     let fs = st.writer()?;
     fs.refresh_root().await?;
     let existed = match fs.file_id(&path).await {
@@ -425,11 +383,8 @@ async fn put_file(
                 .with_detail(format!("upload {}", path.display())),
         )
         .await
-        .map_err(|m| ApiError::new(Status::Conflict, m))?;
-    let limit = limits
-        .get("upload")
-        .unwrap_or(DEFAULT_UPLOAD_LIMIT_GIB.gibibytes());
-    let r = upload(&fs, &path, data, limit, guard.lease()).await;
+        .map_err(|m| ApiError::new(Status::CONFLICT, m))?;
+    let r = upload(&fs, &path, data, st.upload_limit, guard.lease()).await;
     if r.is_err()
         && let Some(made) = made
     {
@@ -454,12 +409,12 @@ async fn put_file(
 async fn patch_body(
     fs: &FileSystem<Pool>,
     f: &crate::open_file::OpenFile,
-    data: Data<'_>,
-    limit: rocket::data::ByteUnit,
+    data: Body,
+    limit: u64,
     mut offset: u64,
     size: Option<u64>,
 ) -> Result<(), FileSystemError> {
-    let mut body = data.open(limit + 1.bytes());
+    let mut body = raidish_auth::http::body_reader(data);
     let mut buf = vec![0u8; UPLOAD_CHUNK];
     let mut total = 0u64;
     loop {
@@ -474,9 +429,9 @@ async fn patch_body(
             }
         };
         total += n as u64;
-        if total > limit.as_u64() {
+        if total > limit {
             return Err(FileSystemError::InvalidArgument(format!(
-                "body larger than the limit ({})",
+                "body larger than the limit ({} bytes)",
                 limit
             )));
         }
@@ -492,16 +447,21 @@ async fn patch_body(
     Ok(())
 }
 
-#[patch("/api/v1/files/<path..>?<offset>&<size>", data = "<data>")]
-async fn patch_file(
-    _auth: crate::auth::CanWrite,
-    path: PathBuf,
+/// `?offset=N&size=M` on a PATCH.
+#[derive(Deserialize, Default)]
+struct PatchAt {
     offset: Option<u64>,
     size: Option<u64>,
-    data: Data<'_>,
-    limits: &Limits,
-    st: &State<FilesState>,
+}
+
+async fn patch_file(
+    _auth: crate::auth::CanWrite,
+    UrlPath(path): UrlPath<String>,
+    Query(PatchAt { offset, size }): Query<PatchAt>,
+    State(st): State<Arc<FilesState>>,
+    data: Body,
 ) -> Result<Json<Written>, ApiError> {
+    let path = url_path(&path)?;
     let fs = st.writer()?;
     fs.refresh_root().await?;
     let id = fs.file_id(&path).await?;
@@ -513,10 +473,8 @@ async fn patch_file(
                 .with_detail(format!("write {}", path.display())),
         )
         .await
-        .map_err(|m| ApiError::new(Status::Conflict, m))?;
-    let limit = limits
-        .get("upload")
-        .unwrap_or(DEFAULT_UPLOAD_LIMIT_GIB.gibibytes());
+        .map_err(|m| ApiError::new(Status::CONFLICT, m))?;
+    let limit = st.upload_limit;
     let r = async {
         let f = fs.open_file(&path, Some(guard.lease())).await?;
         if f.id != id {
@@ -549,12 +507,12 @@ async fn stat<D: PoolDevice>(fs: &FileSystem<D>, path: &Path) -> Result<Stat, Fi
     Ok(stat_of(id, &d))
 }
 
-#[get("/api/v1/stat/<path..>")]
 async fn stat_path(
     _auth: crate::auth::CanRead,
-    path: PathBuf,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<Json<Stat>, ApiError> {
+    let path = url_path(&path)?;
     let r = match st.reader()? {
         Reader::Writer(fs) => stat(&fs, &path).await,
         Reader::ReadOnly(fs) => stat(&fs, &path).await,
@@ -562,11 +520,10 @@ async fn stat_path(
     r.map(Json).map_err(ApiError::from)
 }
 
-#[post("/api/v1/rename", data = "<req>")]
 async fn rename(
     _auth: crate::auth::CanWrite,
+    State(st): State<Arc<FilesState>>,
     req: Json<RenameRequest>,
-    st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
     let fs = st.writer()?;
     fs.refresh_root().await?;
@@ -576,13 +533,13 @@ async fn rename(
         .map_err(ApiError::from)
 }
 
-#[patch("/api/v1/attrs/<path..>", data = "<req>")]
 async fn set_attrs(
     _auth: crate::auth::CanWrite,
-    path: PathBuf,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
     req: Json<crate::inode::SetAttrs>,
-    st: &State<FilesState>,
 ) -> Result<Json<FileId>, ApiError> {
+    let path = url_path(&path)?;
     let fs = st.writer()?;
     fs.refresh_root().await?;
     fs.set_attrs(&path, &req)
@@ -591,40 +548,42 @@ async fn set_attrs(
         .map_err(ApiError::from)
 }
 
-#[delete("/api/v1/files/<path..>")]
 async fn delete_file(
     _auth: crate::auth::CanWrite,
-    path: PathBuf,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<Json<FileId>, ApiError> {
+    let path = url_path(&path)?;
     let fs = st.writer()?;
     fs.refresh_root().await?;
     fs.delete(&path).await.map(Json).map_err(ApiError::from)
 }
 
-#[put("/api/v1/dir/<path..>")]
 async fn make_dir(
     _auth: crate::auth::CanWrite,
-    path: PathBuf,
-    st: &State<FilesState>,
+    UrlPath(path): UrlPath<String>,
+    State(st): State<Arc<FilesState>>,
 ) -> Result<Json<FileId>, ApiError> {
+    let path = url_path(&path)?;
     let fs = st.writer()?;
     fs.mkdir(&path).await.map(Json).map_err(ApiError::from)
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        get_file,
-        list_root,
-        list_dir,
-        put_file,
-        patch_file,
-        delete_file,
-        make_dir,
-        stat_path,
-        rename,
-        set_attrs
-    ]
+pub fn router(st: Arc<FilesState>) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/v1/files/{*path}",
+            get(get_file)
+                .put(put_file)
+                .patch(patch_file)
+                .delete(delete_file),
+        )
+        .route("/api/v1/dir", get(list_root))
+        .route("/api/v1/dir/{*path}", get(list_dir).put(make_dir))
+        .route("/api/v1/stat/{*path}", get(stat_path))
+        .route("/api/v1/rename", post(rename))
+        .route("/api/v1/attrs/{*path}", axum::routing::patch(set_attrs))
+        .with_state(st)
 }
 
 #[cfg(test)]

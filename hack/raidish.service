@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/var/lib/raidish
-Environment=ROCKET_ADDRESS=0.0.0.0
+Environment=RAIDISH_ADDRESS=0.0.0.0
 ExecStartPre=/bin/sh -c '[ -e /var/lib/raidish/disk ] || truncate -s 6G /var/lib/raidish/disk'
 ExecStart=/usr/local/bin/raidish -c /etc/raidish/raidish.yaml listen --port 8881
 Restart=on-failure

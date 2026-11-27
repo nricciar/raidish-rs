@@ -6,14 +6,15 @@ use crate::fenced_disks::{Expiry, FencedDisks};
 use crate::fs::FileSystem;
 use crate::vdev::Pool;
 use crate::websocket::{WsOp, WsRequest, WsStatus, encode_response};
-use rocket::data::{Data, ToByteUnit};
-use rocket::figment::util::map;
-use rocket::futures::{SinkExt, StreamExt};
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome, Request};
-use rocket::{State, get, post, put, routes};
+use axum::extract::ws::{Message, WebSocketUpgrade};
+use axum::extract::{FromRef, FromRequestParts, Path, State};
+use axum::http::StatusCode as Status;
+use axum::http::request::Parts;
+use axum::response::Response;
+use axum::routing::{get, post};
+use futures_util::{SinkExt, StreamExt};
+use raidish_auth::http::{Json, Query};
 use std::sync::Arc;
-use ws::WebSocket;
 
 /// What this disk server fences writes with (see `crate::fence`).
 pub type EpochFloor = crate::fence::ServerFence;
@@ -26,13 +27,13 @@ pub struct DiskServer {
 /// An HTTP status for a refused block request.
 fn http_status(s: WsStatus) -> Status {
     match s {
-        WsStatus::ErrorNotFound => Status::NotFound,
-        WsStatus::InvalidRequest => Status::BadRequest,
-        WsStatus::StaleEpoch | WsStatus::Fenced => Status::Conflict,
-        WsStatus::Forbidden => Status::Forbidden,
-        WsStatus::NotReady => Status::ServiceUnavailable,
-        WsStatus::Expired => Status::RequestTimeout,
-        WsStatus::Success => Status::Ok,
+        WsStatus::ErrorNotFound => Status::NOT_FOUND,
+        WsStatus::InvalidRequest => Status::BAD_REQUEST,
+        WsStatus::StaleEpoch | WsStatus::Fenced => Status::CONFLICT,
+        WsStatus::Forbidden => Status::FORBIDDEN,
+        WsStatus::NotReady => Status::SERVICE_UNAVAILABLE,
+        WsStatus::Expired => Status::REQUEST_TIMEOUT,
+        WsStatus::Success => Status::OK,
     }
 }
 
@@ -44,6 +45,7 @@ fn http_status(s: WsStatus) -> Status {
 pub async fn listen(
     disks: Arc<DiskSet>,
     pool: Option<Pool>,
+    address: &str,
     port: u16,
     cluster: Arc<Cluster>,
     floor: Arc<EpochFloor>,
@@ -93,6 +95,7 @@ pub async fn listen(
         read_only,
         // This node's own member (followers forward to the leader).
         leases: Arc::new(crate::cluster::lease::LeaseClient::local(cluster.clone())),
+        upload_limit: crate::files_api::UPLOAD_LIMIT,
     };
     // Volume management is done by the committer: ask every node for it.
     let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
@@ -104,99 +107,139 @@ pub async fn listen(
             crate::committer::CommitClient::new(endpoints),
         ),
     };
-    let server = DiskServer { disks };
+    let server = Arc::new(DiskServer { disks });
+    let volumes = Arc::new(volumes);
+    let app = router(Routes {
+        server,
+        files: Arc::new(files),
+        volumes: volumes.clone(),
+        vms: Arc::new(crate::vms_api::VmsState::new(vms, facts)),
+        cluster: cluster.clone(),
+        ca,
+        committer,
+        agent,
+        events,
+        dashboard: Arc::new(crate::dashboard::DashboardState { pool: pool_map }),
+        nfs: crate::nfs::peers::NfsForwarding(nfs),
+    });
+    let app = raidish_auth::http::finish(app, auth);
+    let tls = tls.map(|t| raidish_auth::http::Server::from_config(t).expect("tls"));
+    let listener = crate::net::bind_retrying(address, port, "api").await;
+    // Until asked to stop (SIGINT or SIGTERM), then Raft is stopped at
+    // once: a leader whose heartbeats still get through keeps the followers
+    // from electing anyone while the lease requests they forward to it
+    // fail, long enough for their leases to run out. Stopped, it goes
+    // quiet and the others elect a new leader within an election timeout.
+    raidish_auth::http::serve(listener, tls, app, stop_signal()).await;
+    let _ = cluster.raft.shutdown().await;
+}
 
-    let mut figment = rocket::Config::figment()
-        .merge(("port", port))
-        .merge((
-            "limits",
-            map!["data-form" => "500 MiB", "file" => "500 MiB", "stream" => "500 MiB", "json" => "64 MiB", "upload" => "64 GiB"],
-        ));
-    if let Some(tls) = tls {
-        let path = |p: Option<std::path::PathBuf>, what: &str| {
-            p.map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| panic!("tls: no {} configured", what))
-        };
-        figment = figment
-            .merge(("tls.certs", path(tls.cert_path(), "cert")))
-            .merge(("tls.key", path(tls.key_path(), "key")))
-            // Ask for a client certificate but don't insist: browsers
-            // present a token instead (checked per route, `crate::auth`).
-            .merge(("tls.mutual.ca_certs", path(tls.ca_path(), "ca")))
-            .merge(("tls.mutual.mandatory", false));
+/// SIGINT or SIGTERM.
+async fn stop_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
     }
+    println!("shutting down");
+}
 
-    rocket::build()
-        .manage(auth)
-        .manage(server)
-        .manage(files)
-        .manage(volumes)
-        .manage(crate::vms_api::VmsState::new(vms, facts))
-        .manage(cluster)
-        .manage(ca)
-        .manage(committer)
-        .manage(agent)
-        .manage(events)
-        .manage(crate::dashboard::DashboardState { pool: pool_map })
-        .manage(crate::nfs::peers::NfsForwarding(nfs))
-        .configure(figment)
-        .register(
-            "/",
-            rocket::catchers![crate::auth::unauthorized, crate::auth::forbidden],
+/// Everything the node's routes use.
+pub struct Routes {
+    pub server: Arc<DiskServer>,
+    pub files: Arc<crate::files_api::FilesState>,
+    pub volumes: Arc<crate::volumes_api::VolumesState>,
+    pub vms: Arc<crate::vms_api::VmsState>,
+    pub cluster: Arc<Cluster>,
+    pub ca: Arc<raidish_ca::CaService>,
+    pub committer: crate::committer::CommitterSlot,
+    pub agent: crate::agent::AgentState,
+    pub events: crate::events::EventSink,
+    pub dashboard: Arc<crate::dashboard::DashboardState>,
+    pub nfs: crate::nfs::peers::NfsForwarding,
+}
+
+/// The node's routes, all of them (`raidish_auth::http::finish` makes it
+/// servable).
+pub fn router(r: Routes) -> axum::Router {
+    let disks = DiskRoutes {
+        server: r.server,
+        agent: r.agent.clone(),
+        volumes: r.volumes.clone(),
+    };
+    axum::Router::new()
+        .merge(raidish_auth::auth::router())
+        .merge(disk_router(disks))
+        .merge(crate::cluster::routes::router(r.cluster.clone()))
+        .merge(raidish_ca::routes::router(r.ca))
+        .merge(crate::frontend::routes::router(r.cluster.clone()))
+        .merge(crate::committer::routes::router(r.committer))
+        .merge(crate::files_api::router(r.files))
+        .merge(crate::volumes_api::router(r.volumes.clone()))
+        .merge(crate::vms_api::router(crate::vms_api::VmsCtx {
+            vms: r.vms,
+            volumes: r.volumes,
+            cluster: r.cluster,
+            agent: r.agent,
+            events: r.events,
+        }))
+        .merge(crate::nfs::peers::router(r.nfs))
+        .merge(crate::dashboard::router(r.dashboard))
+        .fallback(crate::dashboard::asset)
+}
+
+/// What the routes in this module use.
+#[derive(Clone)]
+pub struct DiskRoutes {
+    pub server: Arc<DiskServer>,
+    pub agent: crate::agent::AgentState,
+    pub volumes: Arc<crate::volumes_api::VolumesState>,
+}
+
+impl FromRef<DiskRoutes> for Arc<DiskServer> {
+    fn from_ref(r: &DiskRoutes) -> Self {
+        r.server.clone()
+    }
+}
+
+pub fn disk_router(r: DiskRoutes) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/v1/disks/{disk_index}/blocks/{block_id}",
+            get(get_block).put(put_block),
         )
-        .mount("/", rocket::routes![crate::auth::whoami])
-        .mount(
-            "/",
-            routes![
-                get_block,
-                put_block,
-                list_disks,
-                flush_disks,
-                ws_endpoint,
-                agent_status,
-                activity
-            ],
-        )
-        .mount("/", crate::cluster::routes::routes())
-        .mount("/", raidish_ca::routes::routes())
-        .attach(crate::cluster::routes::stop_raft_on_shutdown())
-        .mount("/", crate::frontend::routes::routes())
-        .mount("/", crate::committer::routes::routes())
-        .mount("/", crate::files_api::routes())
-        .mount("/", crate::volumes_api::routes())
-        .mount("/", crate::vms_api::routes())
-        .mount("/", crate::nfs::peers::routes())
-        .mount("/", crate::dashboard::routes())
-        .launch()
-        .await
-        .unwrap();
+        .route("/api/v1/disks", get(list_disks))
+        .route("/api/v1/disks/{disk_index}/flush", post(flush_disks))
+        .route("/ws", get(ws_endpoint))
+        .route("/api/v1/agent/status", get(agent_status))
+        .route("/api/v1/events", get(activity))
+        .with_state(r)
 }
 
 use crate::events::EventQuery;
 
 /// HTTP: GET /api/v1/events - the cluster's activity log (see
 /// `crate::events`), from whichever node is the committer.
-#[get("/api/v1/events?<q..>")]
 async fn activity(
     _auth: crate::auth::CanRead,
-    q: EventQuery,
-    volumes: &State<crate::volumes_api::VolumesState>,
-) -> Result<rocket::serde::json::Json<crate::events::EventPage>, (rocket::http::Status, String)> {
-    volumes
+    Query(q): Query<EventQuery>,
+    State(r): State<DiskRoutes>,
+) -> Result<Json<crate::events::EventPage>, (Status, String)> {
+    r.volumes
         .admin
         .events(&q)
         .await
-        .map(rocket::serde::json::Json)
-        .map_err(|e| (rocket::http::Status::ServiceUnavailable, e.to_string()))
+        .map(Json)
+        .map_err(|e| (Status::SERVICE_UNAVAILABLE, e.to_string()))
 }
 
 /// HTTP: GET /api/v1/agent/status - the volumes this node runs.
-#[get("/api/v1/agent/status")]
 async fn agent_status(
     _auth: crate::auth::CanRead,
-    agent: &State<crate::agent::AgentState>,
-) -> rocket::serde::json::Json<crate::agent::AgentStatus> {
-    rocket::serde::json::Json(agent.read().unwrap().clone())
+    State(r): State<DiskRoutes>,
+) -> Json<crate::agent::AgentStatus> {
+    Json(r.agent.read().unwrap().clone())
 }
 
 /// The fence's startup barrier, its cluster half (audit R1b): the
@@ -259,61 +302,56 @@ async fn refresh_fence_map(pool: Arc<Pool>, fence: Arc<EpochFloor>) {
 /// absent). A header that isn't an epoch is a bad request, not "no lease".
 pub struct HeaderEpoch(crate::types::Epoch);
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for HeaderEpoch {
-    type Error = ();
+impl<S: Send + Sync> FromRequestParts<S> for HeaderEpoch {
+    type Rejection = Status;
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ()> {
-        match req.headers().get_one("X-Raidish-Epoch") {
-            None => Outcome::Success(HeaderEpoch(crate::types::Epoch::NONE)),
-            Some(v) => match v.parse() {
-                Ok(e) => Outcome::Success(HeaderEpoch(e)),
-                Err(_) => Outcome::Error((Status::BadRequest, ())),
-            },
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Status> {
+        match parts.headers.get("X-Raidish-Epoch") {
+            None => Ok(HeaderEpoch(crate::types::Epoch::NONE)),
+            Some(v) => v
+                .to_str()
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(HeaderEpoch)
+                .ok_or(Status::BAD_REQUEST),
         }
     }
 }
 
 /// HTTP: GET /api/v1/disks/{disk_index}/blocks/{block_id}
 /// Reads a block directly from a specific disk in the array
-#[get("/api/v1/disks/<disk_index>/blocks/<block_id>")]
 async fn get_block(
     _auth: crate::auth::CanRead,
-    disk_index: usize,
-    block_id: u64,
-    server: &State<DiskServer>,
+    Path((disk_index, block_id)): Path<(usize, u64)>,
+    State(server): State<Arc<DiskServer>>,
 ) -> Result<Vec<u8>, Status> {
     let r = server
         .disks
         .validate_read(disk_index, block_id, 1)
         .map_err(http_status)?;
     server.disks.read(r, None).await.map_err(|s| match s {
-        WsStatus::ErrorNotFound => Status::InternalServerError,
+        WsStatus::ErrorNotFound => Status::INTERNAL_SERVER_ERROR,
         s => http_status(s),
     })
 }
 
 /// HTTP: PUT /api/v1/disks/{disk_index}/blocks/{block_id}
 /// Writes a block directly to a specific disk in the array
-#[put("/api/v1/disks/<disk_index>/blocks/<block_id>", data = "<data>")]
 async fn put_block(
     _auth: crate::auth::CanWrite,
-    disk_index: usize,
-    block_id: u64,
-    data: Data<'_>,
+    Path((disk_index, block_id)): Path<(usize, u64)>,
     epoch: HeaderEpoch,
-    server: &State<DiskServer>,
+    State(server): State<Arc<DiskServer>>,
+    data: axum::body::Body,
 ) -> Result<Status, Status> {
     if !server.disks.is_local(disk_index) {
-        return Err(Status::NotFound);
+        return Err(Status::NOT_FOUND);
     }
-    let bytes = data
-        .open(10.mebibytes())
-        .into_bytes()
+    let bytes = raidish_auth::http::read_body(data, 10 << 20)
         .await
-        .map_err(|_| Status::BadRequest)?;
+        .map_err(|_| Status::BAD_REQUEST)?;
     if bytes.len() != BLOCK_SIZE {
-        return Err(Status::BadRequest);
+        return Err(Status::BAD_REQUEST);
     }
     // Admitted only once the whole block is here, under its stripe lock,
     // right before it's written: a write that sat streaming its body can't
@@ -327,15 +365,14 @@ async fn put_block(
         .write(w, crate::fence::Stamp::Pool(epoch.0), &Expiry::never())
         .await
         .map_err(|s| match s {
-            WsStatus::ErrorNotFound => Status::InternalServerError,
+            WsStatus::ErrorNotFound => Status::INTERNAL_SERVER_ERROR,
             s => http_status(s),
         })?;
-    Ok(Status::Ok)
+    Ok(Status::OK)
 }
 
 /// HTTP: GET /api/v1/disks - List disk indices and their types (local/remote)
-#[get("/api/v1/disks")]
-async fn list_disks(_auth: crate::auth::CanRead, server: &State<DiskServer>) -> String {
+async fn list_disks(_auth: crate::auth::CanRead, State(server): State<Arc<DiskServer>>) -> String {
     let disk_info: Vec<_> = (0..server.disks.disk_count())
         .map(|i| {
             serde_json::json!({
@@ -350,18 +387,17 @@ async fn list_disks(_auth: crate::auth::CanRead, server: &State<DiskServer>) -> 
 }
 
 /// HTTP: POST /api/v1/flush - Flush all local disks
-#[post("/api/v1/disks/<disk_index>/flush")]
 async fn flush_disks(
     _auth: crate::auth::CanWrite,
-    disk_index: usize,
+    Path(disk_index): Path<usize>,
     epoch: HeaderEpoch,
-    server: &State<DiskServer>,
+    State(server): State<Arc<DiskServer>>,
 ) -> Status {
     let _ = epoch;
     match server.disks.flush(disk_index).await {
-        Ok(()) => Status::Ok,
+        Ok(()) => Status::OK,
         Err(WsStatus::ErrorNotFound) if server.disks.is_local(disk_index) => {
-            Status::InternalServerError
+            Status::INTERNAL_SERVER_ERROR
         }
         Err(s) => http_status(s),
     }
@@ -375,75 +411,92 @@ async fn flush_disks(
 /// the server stops reading, which pushes back on the client.
 const WS_MAX_IN_FLIGHT: usize = 256;
 
-#[get("/ws?<v>")]
+/// `?v=`: the block protocol the client speaks.
+#[derive(serde::Deserialize, Default)]
+struct Version {
+    v: Option<u32>,
+}
+
 async fn ws_endpoint(
     who: crate::auth::Authed,
-    ws: WebSocket,
-    v: Option<u32>,
-    server: &State<DiskServer>,
-) -> Result<ws::Channel<'static>, (rocket::http::Status, String)> {
+    peer: Option<axum::Extension<raidish_auth::http::Peer>>,
+    ws: WebSocketUpgrade,
+    Query(Version { v }): Query<Version>,
+    State(server): State<Arc<DiskServer>>,
+) -> Result<Response, (Status, String)> {
     use crate::websocket::BLOCK_PROTOCOL;
     if v != Some(BLOCK_PROTOCOL) {
         let asked = v.map_or("no block protocol version".to_string(), |v| {
             format!("block protocol {}", v)
         });
         return Err((
-            rocket::http::Status::BadRequest,
+            Status::BAD_REQUEST,
             format!("{} asked for; this node speaks {}", asked, BLOCK_PROTOCOL),
         ));
     }
     let can_write = who.can_write();
     let disks = server.disks.clone();
+    let peer = peer.map(|axum::Extension(p)| p);
 
-    Ok(ws.channel(move |stream| {
-        Box::pin(async move {
-            let (mut sink, mut source) = stream.split();
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(WS_MAX_IN_FLIGHT);
-            let permits = Arc::new(tokio::sync::Semaphore::new(WS_MAX_IN_FLIGHT));
-            // Set once the connection is gone: its client has given up on
-            // whatever it still has in flight (audit D5b).
-            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Ok(ws.on_upgrade(move |stream| async move {
+        let (mut sink, mut source) = stream.split();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(WS_MAX_IN_FLIGHT);
+        let permits = Arc::new(tokio::sync::Semaphore::new(WS_MAX_IN_FLIGHT));
+        // Set once the connection is gone: its client has given up on
+        // whatever it still has in flight (audit D5b).
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            let writer = {
-                let closed = closed.clone();
-                tokio::spawn(async move {
-                    while let Some(response) = rx.recv().await {
-                        if sink.send(ws::Message::Binary(response)).await.is_err() {
-                            break;
-                        }
+        let writer = {
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                while let Some(response) = rx.recv().await {
+                    if sink.send(Message::Binary(response.into())).await.is_err() {
+                        break;
                     }
-                    closed.store(true, std::sync::atomic::Ordering::SeqCst);
-                })
-            };
-
-            while let Some(message) = source.next().await {
-                match message {
-                    Ok(ws::Message::Binary(data)) => {
-                        // The client's clock started before this: the wait
-                        // for a permit counts against its budget.
-                        let received = tokio::time::Instant::now();
-                        let Ok(permit) = permits.clone().acquire_owned().await else {
-                            break;
-                        };
-                        let (disks, tx, closed) = (disks.clone(), tx.clone(), closed.clone());
-                        tokio::spawn(async move {
-                            let reply =
-                                handle_ws_message_as(&data, &disks, can_write, received, closed)
-                                    .await;
-                            let _ = tx.send(reply).await;
-                            drop(permit);
-                        });
-                    }
-                    Ok(ws::Message::Close(_)) | Err(_) => break,
-                    Ok(_) => {}
                 }
-            }
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
 
-            closed.store(true, std::sync::atomic::Ordering::SeqCst);
-            drop(tx);
-            let _ = writer.await;
-            Ok(())
-        })
+        // Until the client goes, or the peer's connections are closed (its
+        // certificate revoked: `raidish_auth::http::Connections`).
+        let revoked = async {
+            match &peer {
+                Some(p) => p.closed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(revoked);
+        loop {
+            let message = tokio::select! {
+                m = source.next() => m,
+                _ = &mut revoked => break,
+            };
+            let Some(message) = message else { break };
+            match message {
+                Ok(Message::Binary(data)) => {
+                    // The client's clock started before this: the wait
+                    // for a permit counts against its budget.
+                    let received = tokio::time::Instant::now();
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let (disks, tx, closed) = (disks.clone(), tx.clone(), closed.clone());
+                    tokio::spawn(async move {
+                        let reply =
+                            handle_ws_message_as(&data, &disks, can_write, received, closed).await;
+                        let _ = tx.send(reply).await;
+                        drop(permit);
+                    });
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+
+        closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(tx);
+        let _ = writer.await;
     }))
 }
 

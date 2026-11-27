@@ -46,7 +46,7 @@ const SEEN: &[u8] = b"S";
 pub use crate::api_types::{Event, EventKind, EventPage, Level, NewEvent, Subject};
 
 /// What to read (`GET /api/v1/events`).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, rocket::FromForm)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EventQuery {
     /// Events numbered after this, oldest first.
     pub after: Option<u64>,
