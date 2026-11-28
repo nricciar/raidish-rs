@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool, ds, vmn};
+use raidish_core::role::CommitterFs;
 
 fn xml(vols: &[&str]) -> String {
     let disks: String = vols
@@ -16,7 +17,7 @@ fn xml(vols: &[&str]) -> String {
     format!("<domain type='kvm'><devices>{}</devices></domain>", disks)
 }
 
-async fn store_with_volumes(fs: &Arc<FileSystem<crate::vdev::Pool>>, vols: &[&str]) {
+async fn store_with_volumes(fs: &Arc<CommitterFs<crate::vdev::Pool>>, vols: &[&str]) {
     for v in vols {
         fs.create_block(&crate::test_util::ds(v), 1 << 20, DEFAULT_VOLBLOCKSIZE)
             .await

@@ -14,6 +14,7 @@ use pb::compare::{CompareResult, CompareTarget, TargetUnion};
 use pb::range_request::{SortOrder, SortTarget};
 use pb::request_op::Request;
 use pb::response_op::Response;
+use raidish_core::role::Mutable;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
@@ -359,8 +360,8 @@ struct Mark {
 }
 
 /// One etcd keyspace, served from this node.
-pub struct EtcdStore<D: PoolDevice> {
-    fs: Arc<FileSystem<D>>,
+pub struct EtcdStore<D: PoolDevice, R: Mutable> {
+    fs: Arc<FileSystem<D, R>>,
     pub name: crate::types::DatasetName,
     pub cluster_id: u64,
     pub member_id: u64,
@@ -377,14 +378,17 @@ pub struct EtcdStore<D: PoolDevice> {
     stopped: watch::Sender<bool>,
 }
 
-impl<D: PoolDevice + 'static> crate::service_tree::Served for EtcdStore<D> {
+impl<D: PoolDevice + 'static, R: Mutable> crate::service_tree::Served for EtcdStore<D, R> {
     fn is_stopped(&self) -> bool {
         *self.stopped.borrow()
     }
 }
 
 /// A request's view of the header fields.
-fn header_of<D: PoolDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseHeader> {
+fn header_of<D: PoolDevice, R: Mutable>(
+    s: &EtcdStore<D, R>,
+    rev: i64,
+) -> Option<pb::ResponseHeader> {
     Some(pb::ResponseHeader {
         cluster_id: s.cluster_id,
         member_id: s.member_id,
@@ -393,11 +397,11 @@ fn header_of<D: PoolDevice>(s: &EtcdStore<D>, rev: i64) -> Option<pb::ResponseHe
     })
 }
 
-impl<D: PoolDevice + 'static> EtcdStore<D> {
+impl<D: PoolDevice + 'static, R: Mutable> EtcdStore<D, R> {
     /// Serve etcd dataset `name` of `fs` (opened as its writer, or as the
     /// committer in tests). Leases start afresh.
     pub async fn open(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<FileSystem<D, R>>,
         name: &crate::types::DatasetName,
         member_id: u64,
         term: u64,
@@ -551,7 +555,7 @@ impl<D: PoolDevice + 'static> EtcdStore<D> {
     async fn write<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a, 'b> FnOnce(
-            &'a mut Writer<'b, D>,
+            &'a mut Writer<'b, D, R>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
@@ -597,7 +601,7 @@ impl<D: PoolDevice + 'static> EtcdStore<D> {
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(
-            &'a Txn<'a, D>,
+            &'a Txn<'a, D, R>,
             &'a Meta,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
@@ -1037,7 +1041,7 @@ fn set_rev(h: &mut Option<pb::ResponseHeader>, rev: i64) {
     }
 }
 
-async fn read_meta<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
+async fn read_meta<D: PoolDevice, R: Mutable>(t: &Txn<'_, D, R>) -> Result<Meta> {
     match t.get(META).await? {
         None => Ok(Meta::default()),
         Some(b) => dec(&b, "meta"),
@@ -1045,8 +1049,8 @@ async fn read_meta<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
 }
 
 /// Every entry with a tree key in `[lo, hi)`.
-async fn scan<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn scan<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     lo: Vec<u8>,
     hi: Vec<u8>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1070,8 +1074,8 @@ async fn scan<D: PoolDevice>(
     Ok(out)
 }
 
-async fn hist_at<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn hist_at<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     key: &[u8],
     main: i64,
     sub: i64,
@@ -1102,8 +1106,8 @@ fn kv_of(key: &[u8], main: i64, h: Hist) -> Option<mvccpb::KeyValue> {
 }
 
 /// The value of `cur` (a live key).
-async fn current_kv<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn current_kv<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     key: &[u8],
     cur: &Current,
 ) -> Result<mvccpb::KeyValue> {
@@ -1129,7 +1133,10 @@ async fn current_kv<D: PoolDevice>(
     })
 }
 
-async fn get_current<D: PoolDevice>(t: &Txn<'_, D>, key: &[u8]) -> Result<Option<Current>> {
+async fn get_current<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
+    key: &[u8],
+) -> Result<Option<Current>> {
     match t.get(&k_key(key)).await? {
         None => Ok(None),
         Some(b) => Ok(Some(dec(&b, "key")?)),
@@ -1137,8 +1144,8 @@ async fn get_current<D: PoolDevice>(t: &Txn<'_, D>, key: &[u8]) -> Result<Option
 }
 
 /// The event for change `c` at `main.sub`.
-async fn event_at<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn event_at<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     c: &Change,
     main: i64,
     sub: i64,
@@ -1183,8 +1190,8 @@ struct Found {
 }
 
 /// The keys of `kr` as of revision `at` (None: as the tree has them now).
-async fn found<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn found<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     kr: &KeyRange,
     at: Option<i64>,
 ) -> Result<Vec<Found>> {
@@ -1280,8 +1287,8 @@ fn found_of(key: Vec<u8>, c: Current) -> Found {
     }
 }
 
-async fn range<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn range<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     meta: &Meta,
     cur: i64,
     r: &pb::RangeRequest,
@@ -1373,7 +1380,7 @@ async fn range<D: PoolDevice>(
     })
 }
 
-async fn value_of<D: PoolDevice>(t: &Txn<'_, D>, f: &Found) -> Result<Vec<u8>> {
+async fn value_of<D: PoolDevice, R: Mutable>(t: &Txn<'_, D, R>, f: &Found) -> Result<Vec<u8>> {
     if let Some(v) = &f.value {
         return Ok(v.clone());
     }
@@ -1388,7 +1395,10 @@ async fn value_of<D: PoolDevice>(t: &Txn<'_, D>, f: &Found) -> Result<Vec<u8>> {
 }
 
 /// Whether every comparison holds (at the current state).
-async fn compares_hold<D: PoolDevice>(t: &Txn<'_, D>, cs: &[pb::Compare]) -> Result<bool> {
+async fn compares_hold<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
+    cs: &[pb::Compare],
+) -> Result<bool> {
     for c in cs {
         let kr = KeyRange::new(&c.key, &c.range_end);
         let keys = found(t, &kr, None).await?;
@@ -1420,8 +1430,8 @@ async fn compares_hold<D: PoolDevice>(t: &Txn<'_, D>, cs: &[pb::Compare]) -> Res
     Ok(true)
 }
 
-async fn compare_one<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn compare_one<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     c: &pb::Compare,
     target: CompareTarget,
     f: &Found,
@@ -1568,8 +1578,8 @@ fn has_txn(ops: &[pb::RequestOp]) -> bool {
 
 /// One write transaction on the keyspace: every change in it is at
 /// revision `meta.rev + 1` (sub-revisions in order), all applied together.
-pub(crate) struct Writer<'a, D: PoolDevice> {
-    t: Txn<'a, D>,
+pub(crate) struct Writer<'a, D: PoolDevice, R: Mutable> {
+    t: Txn<'a, D, R>,
     max_key: usize,
     meta: Meta,
     start_meta: Meta,
@@ -1579,7 +1589,7 @@ pub(crate) struct Writer<'a, D: PoolDevice> {
     leases_removed: Vec<i64>,
 }
 
-impl<D: PoolDevice> Writer<'_, D> {
+impl<D: PoolDevice, R: Mutable> Writer<'_, D, R> {
     /// The revision reads in this transaction see.
     fn cur_rev(&self) -> i64 {
         if self.sub > 0 {

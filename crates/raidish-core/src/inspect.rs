@@ -8,6 +8,7 @@ use crate::disk::{IoStats, PoolDevice, RawDisk};
 use crate::fs::{FileSystem, LabelState, SUPERBLOCK_LBA};
 use crate::inode::ObjType;
 use crate::metaslab::SPACEMAP_SLOTS;
+use crate::role::Role;
 use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::vdev::Topology;
@@ -342,10 +343,10 @@ fn flatten(mut spans: Vec<Span>, total: u64) -> Vec<Span> {
     out
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Health, space and per-disk state of the pool.
     pub async fn pool_report(&self) -> PoolReport {
-        let sb = self.superblock().await;
+        let sb = self.superblock();
         let ub = self.uberblock().await;
         let degraded = self.degraded_disks();
         let mut disks = Vec::new();
@@ -403,16 +404,16 @@ impl<D: PoolDevice> FileSystem<D> {
             fault_tolerance: tolerance,
             failures_left: left,
             disks,
-            txg: ub.as_ref().map_or(Txg::ZERO, |u| u.txg),
-            committed_ms: ub.as_ref().map(|u| u.timestamp),
+            txg: ub.txg,
+            committed_ms: Some(ub.timestamp),
             ring: self
                 .uberblock_ring()
                 .await
                 .iter()
                 .map(|u| (u.txg, u.timestamp))
                 .collect(),
-            total_blocks: sb.as_ref().map_or(0, |s| s.total_blocks),
-            metaslab_count: sb.as_ref().map_or(0, |s| s.metaslab_count),
+            total_blocks: sb.total_blocks,
+            metaslab_count: sb.metaslab_count,
             used_blocks: used,
             free_blocks: free,
             deferred_blocks: deferred,
@@ -443,9 +444,7 @@ impl<D: PoolDevice> FileSystem<D> {
 
     /// Every object in the tree, and the layout of the whole pool.
     pub async fn layout(&self) -> (Layout, Vec<ObjectReport>) {
-        let Some(sb) = self.superblock().await else {
-            return (Layout::default(), Vec::new());
-        };
+        let sb = self.superblock();
         let total = sb.total_blocks;
         let mut spans = Vec::new();
         let mut owners = Vec::new();

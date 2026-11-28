@@ -1,8 +1,9 @@
 //! Opens, with share reservations (state in `state`).
 
 use super::super::*;
+use raidish_core::role::Mutable;
 
-impl<D: PoolDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
     pub(in crate::v4) async fn open(
         &self,
         ctx: &mut Ctx,

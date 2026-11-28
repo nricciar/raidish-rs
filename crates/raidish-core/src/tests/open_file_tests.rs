@@ -1,5 +1,6 @@
 use super::*;
 use crate::inode::{ObjType, SetAttrs};
+use crate::role::CommitterFs;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::vdev::Pool;
@@ -11,14 +12,14 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 /// Commit enough TXGs that every deferred free is released.
-async fn settle(fs: &FileSystem<Pool>) {
+async fn settle(fs: &CommitterFs<Pool>) {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
 }
 
-async fn clean(fs: &FileSystem<Pool>) {
-    let report = fs.fsck(false).await.unwrap();
+async fn clean(fs: &CommitterFs<Pool>) {
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     settle(fs).await;
     assert!(fs.find_orphaned_blocks().await.unwrap().is_empty());

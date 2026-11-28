@@ -25,6 +25,7 @@ use crate::fs::{
     BLOCK_HEADER_SIZE as BLOCK_HEADER, BLOCK_PAYLOAD_SIZE, FileSystem, FileSystemError, Superblock,
 };
 use crate::inode::Extent;
+use crate::role::{Role, View};
 use crate::types::MetaslabIdx;
 use crate::types::Txg;
 use std::collections::{BTreeMap, VecDeque};
@@ -601,12 +602,11 @@ pub(crate) async fn settle_tail(
     tail: &mut crate::tx::CommitTail,
     metaslabs: &[std::sync::Arc<tokio::sync::RwLock<MetaslabState>>],
     scan_hold: &std::sync::atomic::AtomicUsize,
-    uberblock: &tokio::sync::Mutex<Option<crate::fs::Uberblock>>,
+    uberblock: &tokio::sync::Mutex<crate::fs::Uberblock>,
 ) {
     let txg = tail.txg;
-    if tail.uberblock.is_some() {
-        let mut ub = uberblock.lock().await;
-        *ub = tail.uberblock.take();
+    if let Some(u) = tail.uberblock.take() {
+        *uberblock.lock().await = u;
     }
     while let Some(idx) = tail.synced.last().map(|s| s.ms_idx) {
         let mut ms = metaslabs[idx].write().await;
@@ -634,7 +634,7 @@ pub(crate) async fn settle_tail(
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Free the space record `p` occupies (see `free`).
     pub(crate) async fn free_record(
         &self,
@@ -701,10 +701,11 @@ impl<D: PoolDevice> FileSystem<D> {
     /// land (see `MetaslabState::abandon`).
     pub(crate) async fn release_unsettled(&self, start: u64, len: u64) {
         if let Some(idx) = self.layout.metaslab_for_block(start) {
-            self.metaslabs[idx.index()]
-                .write()
-                .await
-                .abandon(start, len, self.writer.is_some());
+            self.metaslabs[idx.index()].write().await.abandon(
+                start,
+                len,
+                self.role.writer().is_some(),
+            );
         }
     }
 
@@ -732,7 +733,7 @@ impl<D: PoolDevice> FileSystem<D> {
     /// written there. If it's no longer lent (being given back), `e` is put
     /// back and None returned: allocate elsewhere.
     fn pinned_alloc(&self, idx: usize, ms: &mut MetaslabState, e: Extent) -> Option<Extent> {
-        let Some(w) = &self.writer else {
+        let Some(w) = self.role.writer() else {
             return Some(e);
         };
         let idx = MetaslabIdx::from_raw(idx as u32);
@@ -900,9 +901,7 @@ impl<D: PoolDevice> FileSystem<D> {
         if self.scan_hold.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return;
         }
-        let Some(txg) = self.uberblock().await.map(|u| u.txg) else {
-            return;
-        };
+        let txg = self.uberblock().await.txg;
         for ms in self.metaslabs.iter() {
             ms.write().await.release_deferred(txg);
         }
@@ -1028,8 +1027,8 @@ impl<D: PoolDevice> FileSystem<D> {
                         "space map: block {} was stale; rebuilt from parity",
                         lba + b as u64
                     );
-                    if !self.read_only {
-                        let _ = self.dev.repair_block(lba + b as u64, block).await;
+                    if let View::Committer(fs) = self.by_role() {
+                        let _ = fs.dev.repair_block(lba + b as u64, block).await;
                     }
                 }
                 bytes.extend_from_slice(payload);

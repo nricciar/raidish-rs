@@ -4,6 +4,7 @@ use super::*;
 use crate::coords::RawDiskBlock;
 use crate::disk::BLOCK_SIZE;
 use crate::fs::FileSystem;
+use crate::role::CommitterFs;
 use crate::test_util::TestPool;
 use crate::test_util::disk;
 use crate::test_util::ds;
@@ -60,7 +61,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 /// Sizes span one block, odd sizes, several records and several stripe chunks.
 const SIZES: [usize; 4] = [1, 7 * 4096 + 5, 200_000, 700_000];
 
-async fn write_set(fs: &FileSystem<Pool>, prefix: &str, seed: u8) {
+async fn write_set(fs: &CommitterFs<Pool>, prefix: &str, seed: u8) {
     for (i, len) in SIZES.iter().enumerate() {
         let path = format!("/{}{}", prefix, i);
         fs.write_file(Path::new(&path), &pattern(*len, seed + i as u8))
@@ -70,7 +71,12 @@ async fn write_set(fs: &FileSystem<Pool>, prefix: &str, seed: u8) {
     fs.sync().await.unwrap();
 }
 
-async fn check_set(fs: &FileSystem<Pool>, prefix: &str, seed: u8, what: &str) {
+async fn check_set<R: crate::role::Role>(
+    fs: &FileSystem<Pool, R>,
+    prefix: &str,
+    seed: u8,
+    what: &str,
+) {
     for (i, len) in SIZES.iter().enumerate() {
         let path = format!("/{}{}", prefix, i);
         let data = fs
@@ -86,7 +92,7 @@ async fn check_set(fs: &FileSystem<Pool>, prefix: &str, seed: u8, what: &str) {
     }
 }
 
-async fn read_set(fs: &FileSystem<Pool>, prefix: &str) -> bool {
+async fn read_set<R: crate::role::Role>(fs: &FileSystem<Pool, R>, prefix: &str) -> bool {
     for i in 0..SIZES.len() {
         if fs
             .read_file(Path::new(&format!("/{}{}", prefix, i)))
@@ -141,7 +147,7 @@ async fn files_and_volumes_round_trip_on_every_layout() {
         fs.block_read(&ds("vol"), 5000, &mut buf).await.unwrap();
         assert!(buf == pattern(buf.len(), 9), "{}: volume differs", what);
 
-        let report = fs.scrub(true).await.unwrap();
+        let report = fs.scrub_repair().await.unwrap();
         assert!(report.is_clean(), "{}: {}", what, report);
         assert_eq!(report.mismatched(), 0, "{}: {}", what, report);
         assert!(
@@ -215,7 +221,7 @@ async fn scrub_repairs_a_corrupted_disk_on_every_layout() {
         assert!(flipped > 0, "{}", what);
 
         check_set(&fs, "f", 5, &what).await;
-        let report = fs.scrub(true).await.unwrap();
+        let report = fs.scrub_repair().await.unwrap();
         assert!(report.is_clean(), "{}: {}", what, report);
         assert!(report.mismatched() > 0, "{}: {}", what, report);
         assert_eq!(
@@ -234,7 +240,7 @@ async fn scrub_repairs_a_corrupted_disk_on_every_layout() {
                 );
             }
         }
-        let again = fs.scrub(true).await.unwrap();
+        let again = fs.scrub_repair().await.unwrap();
         assert_eq!(again.mismatched(), 0, "{}: {}", what, again);
     }
 }
@@ -462,7 +468,7 @@ async fn a_single_disk_pool_is_a_whole_filesystem() {
     let mut buf = vec![0u8; fs.default_volblocksize() as usize + 7];
     fs.block_read(&ds("vol"), 5000, &mut buf).await.unwrap();
     assert!(buf == pattern(buf.len(), 9), "volume differs");
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     assert_eq!(report.mismatched(), 0, "{}", report);
 
@@ -479,7 +485,7 @@ async fn a_single_disk_pool_is_a_whole_filesystem() {
         "a corrupted block with no copy must not read"
     );
     check_set(&fs, "f", 1, "single, after /big was corrupted").await;
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(!report.is_clean(), "{}", report);
     assert_eq!(report.repaired(), 0, "{}", report);
 }

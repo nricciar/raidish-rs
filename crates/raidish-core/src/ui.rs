@@ -1,6 +1,7 @@
 use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::inspect::BlockKind;
+use crate::role::Role;
 
 /// Terminal colors and symbols of the block kinds.
 fn color(k: BlockKind) -> &'static str {
@@ -31,7 +32,7 @@ fn symbol(k: BlockKind) -> &'static str {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Get terminal dimensions, defaulting to 80x24 if detection fails
     fn get_terminal_dimensions() -> (usize, usize) {
         if let Some((w, h)) = term_size::dimensions() {
@@ -43,7 +44,7 @@ impl<D: PoolDevice> FileSystem<D> {
 
     /// Display a visual map of block usage (now async)
     pub async fn display_block_map(&self) {
-        let superblock = self.superblock().await.unwrap();
+        let superblock = self.superblock();
 
         const RESET: &str = "\x1b[0m";
 

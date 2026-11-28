@@ -2,13 +2,13 @@
 
 use super::*;
 use crate::export::BlockExporter;
-use crate::fs::FileSystem;
 use crate::nbd::NbdServer;
 use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
 use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::vdev::Pool;
+use raidish_core::role::{Committer, CommitterFs};
 use std::sync::atomic::AtomicU64;
 
 const MB: u64 = 1 << 20;
@@ -16,8 +16,8 @@ const MB: u64 = 1 << 20;
 /// The writer: its file system, an export of "vol", and the epoch it
 /// writes under (anything else is refused).
 struct Writer {
-    fs: Arc<FileSystem<Pool>>,
-    nbd: Arc<NbdServer<Pool>>,
+    fs: Arc<CommitterFs<Pool>>,
+    nbd: Arc<NbdServer<Pool, Committer>>,
     /// The volume's export (None: taken down).
     held: std::sync::Mutex<Option<crate::export::ExportHandle>>,
     epoch: AtomicU64,

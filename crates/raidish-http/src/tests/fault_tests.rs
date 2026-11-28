@@ -15,6 +15,7 @@ use crate::test_util::dsn;
 use crate::test_util::{FaultDisk, FaultError, FaultPool, FaultStats, TestPool};
 use crate::types::{Epoch, Holding, LeaseRef};
 use crate::vdev::Pool;
+use raidish_core::role::{CommitterFs, WriterFs};
 use std::sync::Arc;
 
 const MB: usize = 1024 * 1024;
@@ -259,7 +260,7 @@ async fn a_fault_pool_reopens_with_its_faults_in_place() {
         drop(fs);
         fp.heal();
         let fs = fp.load().await;
-        assert!(fs.fsck(false).await.unwrap().is_clean());
+        assert!(fs.fsck().await.unwrap().is_clean());
     }
 }
 
@@ -515,7 +516,7 @@ async fn r2a_a_fenced_repair_fails_the_scrub() {
 }
 
 /// MiB `i` of volume "a" holds `pattern(MB, i + 1)`, for every `i < upto`.
-async fn d2_check(fs: &FileSystem<Pool>, upto: u8) {
+async fn d2_check<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>, upto: u8) {
     for i in 0..upto {
         let mut buf = vec![0u8; MB];
         let r = fs
@@ -583,7 +584,7 @@ async fn d2_a_stale_returning_mirror_disk_is_not_read_for_metadata() {
         fs.sync().await.unwrap();
     }
     d2_check(&fs, 12).await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     drop(fs);
 
@@ -637,7 +638,7 @@ async fn d2_stale_slots_that_parse_dont_win() {
             fs.sync().await.unwrap();
         }
         d2_check(&fs, 20).await;
-        let report = fs.fsck(false).await.unwrap();
+        let report = fs.fsck().await.unwrap();
         assert!(report.is_clean(), "stale disk {}: {}", stale, report);
     }
 }
@@ -679,7 +680,7 @@ async fn d3_a_stale_majority_doesnt_win_label_repair() {
     fp.heal();
 
     let fs = fp.load().await;
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(report.label_unrecoverable.is_empty(), "{}", report);
     d2_check(&fs, 8).await;
     drop(fs);
@@ -689,7 +690,7 @@ async fn d3_a_stale_majority_doesnt_win_label_repair() {
     fp.disk(0).set_offline(true);
     let fs = fp.load().await;
     d2_check(&fs, 8).await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -724,7 +725,7 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
         // walk has nothing to check and only the labels can tell.
         fp.disk(1).restore();
         let fs = fp.load().await;
-        let now = fs.uberblock().await.unwrap().txg;
+        let now = fs.uberblock().await.txg;
         fs.mark_degraded(PoolDiskIdx::new(1).unwrap(), now.next());
 
         for &d in &peers {
@@ -756,7 +757,7 @@ async fn i19_a_stale_disk_alone_doesnt_certify_its_own_labels() {
 
 /// raidz2 over 4 disks with `stale` rolled back to an image from four
 /// commits ago and marked degraded from then, loaded.
-async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, FileSystem<Pool>) {
+async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, CommitterFs<Pool>) {
     let fp = FaultPool::raidz(2, 4).await;
     let fs = fp.format().await;
     fs.create_block(&dsn("a"), 32 * MB as u64, fs.default_volblocksize())
@@ -764,7 +765,7 @@ async fn i19_rolled_back(stale: &[usize]) -> (FaultPool, FileSystem<Pool>) {
         .unwrap();
     fs.block_write(&dsn("a"), 0, &pattern(MB, 1)).await.unwrap();
     fs.sync().await.unwrap();
-    let since = fs.uberblock().await.unwrap().txg.next();
+    let since = fs.uberblock().await.txg.next();
     for &d in stale {
         fp.disk(d).snapshot();
     }
@@ -887,7 +888,7 @@ async fn zil_setup() -> ZilSetup {
 }
 
 struct ZilWriter {
-    fs: FileSystem<Pool>,
+    fs: WriterFs<Pool>,
     epoch: Epoch,
     ds_epoch: Epoch,
 }
@@ -1052,10 +1053,10 @@ async fn s4a_a_commit_fallback_writes_no_unflushed_log_records() {
 }
 
 async fn txg(s: &ZilSetup) -> u64 {
-    s.committer.fs().uberblock().await.unwrap().txg.get()
+    s.committer.fs().uberblock().await.txg.get()
 }
 
-async fn read_a(fs: &FileSystem<Pool>, len: usize) -> Vec<u8> {
+async fn read_a<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     let n = fs.block_read(&dsn("a"), 0, &mut buf).await.unwrap();
     buf.truncate(n);
@@ -1161,7 +1162,7 @@ async fn zil_an_in_flight_log_write_landing_after_replay_clobbers_nothing() {
     s.fp.disk(1).set_offline(true);
     let fresh = s.fp.load().await;
     assert_eq!(read_a(&fresh, want.len()).await, want);
-    let report = fresh.fsck(false).await.unwrap();
+    let report = fresh.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1610,7 +1611,7 @@ async fn commit_allocs(
         frees: vec![],
         free_births: vec![],
         missed: vec![],
-        birth_txg: c.fs().open_txg().await.unwrap(),
+        birth_txg: c.fs().open_txg().await,
         log,
         min_birth: None,
     };
@@ -2000,7 +2001,7 @@ async fn s6a_a_lease_lost_while_waiting_for_the_tx_refuses_the_commit() {
 /// Everything a test can see of the pool: the tree under `/` (names and
 /// contents), the volumes and their snapshots, and how many records fsck
 /// walks (a dnode written and left unreferenced still counts).
-async fn s5_seen(fs: &FileSystem<Pool>) -> String {
+async fn s5_seen<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let mut dirs = vec![std::path::PathBuf::from("/")];
@@ -2022,7 +2023,7 @@ async fn s5_seen(fs: &FileSystem<Pool>) -> String {
             writeln!(out, "  snapshot {}", s.name).unwrap();
         }
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     writeln!(out, "records {}", report.records).unwrap();
     out
@@ -2032,10 +2033,13 @@ async fn s5_seen(fs: &FileSystem<Pool>) -> String {
 /// until it succeeds. Each failure must leave the pool as `before` (seen
 /// after healing, so a commit takes whatever the failure left); success
 /// must change it.
-async fn s5_every_failure_point<O>(fp: &FaultPool, fs: &FileSystem<Pool>, op: O)
-where
+async fn s5_every_failure_point<R: raidish_core::role::Role, O>(
+    fp: &FaultPool,
+    fs: &FileSystem<Pool, R>,
+    op: O,
+) where
     O: for<'a> Fn(
-        &'a FileSystem<Pool>,
+        &'a FileSystem<Pool, R>,
     ) -> futures::future::BoxFuture<'a, Result<(), crate::fs::FileSystemError>>,
 {
     let before = s5_seen(fs).await;
@@ -2061,7 +2065,7 @@ where
 }
 
 /// A small tree: `/a`, `/d/b`, `/d/e/` and volume `vol`, committed.
-async fn s5_pool() -> (FaultPool, FileSystem<Pool>) {
+async fn s5_pool() -> (FaultPool, CommitterFs<Pool>) {
     let fp = FaultPool::mirror(2).await;
     let fs = fp.format().await;
     fs.write_file("/a".as_ref(), &pattern(3000, 1))
@@ -2084,7 +2088,7 @@ async fn s5_pool() -> (FaultPool, FileSystem<Pool>) {
 
 macro_rules! s5_op {
     (|$fs:ident, $tx:ident| $body:expr) => {
-        |$fs: &FileSystem<Pool>| -> futures::future::BoxFuture<'_, Result<(), crate::fs::FileSystemError>> {
+        |$fs: &FileSystem<Pool, _>| -> futures::future::BoxFuture<'_, Result<(), crate::fs::FileSystemError>> {
             Box::pin(async move {
                 // The op alone, under its tx: not the commit after it (a
                 // failed commit leaves what it took, by design).
@@ -2099,7 +2103,7 @@ macro_rules! s5_op {
 
 /// `write_file` without its commit.
 async fn s5_write(
-    fs: &FileSystem<Pool>,
+    fs: &CommitterFs<Pool>,
     tx: &mut crate::tx::Tx,
     path: &str,
     data: &[u8],
@@ -2235,7 +2239,7 @@ async fn s5a_a_failed_op_keeps_the_ops_applied_before_it() {
         fs.read_file("/d/b".as_ref()).await.unwrap(),
         pattern(20_000, 2)
     );
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -2359,7 +2363,7 @@ async fn d4_a_scrub_rewrites_a_live_log_record_a_disk_lost() {
     };
     assert_ne!(record(0), record(1), "disk 0 lost the record");
 
-    let report = s.committer.fs().scrub(true).await.unwrap();
+    let report = s.committer.fs().scrub_repair().await.unwrap();
     assert!(report.log_records > 0, "{}", report);
     assert!(report.repaired() > 0, "{}", report);
     assert_eq!(record(0), record(1), "the record is still on one copy");
@@ -2415,14 +2419,14 @@ async fn d3_missed_rewind(fp: FaultPool) {
     let fs = fp.format().await;
     let a1 = pattern(200_000, 1);
     fs.write_file(Path::new("/a"), &a1).await.unwrap();
-    let good = fs.uberblock().await.unwrap().txg;
+    let good = fs.uberblock().await.txg;
     fs.write_file(Path::new("/a"), &pattern(200_000, 2))
         .await
         .unwrap();
     fs.write_file(Path::new("/b"), &pattern(50_000, 2))
         .await
         .unwrap();
-    let newest = fs.uberblock().await.unwrap().txg;
+    let newest = fs.uberblock().await.txg;
     assert!(newest > good);
     drop(fs);
 
@@ -2430,7 +2434,6 @@ async fn d3_missed_rewind(fp: FaultPool) {
     let fs = FileSystem::load_with(
         fp.dev(),
         LoadOptions {
-            read_only: false,
             rewind: Rewind::Txg(good),
         },
     )
@@ -2441,17 +2444,17 @@ async fn d3_missed_rewind(fp: FaultPool) {
     fp.heal();
 
     let fs = fp.load().await;
-    assert!(fs.uberblock().await.unwrap().txg > newest);
+    assert!(fs.uberblock().await.txg > newest);
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert!(fs.read_file(Path::new("/b")).await.is_err());
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(report.label_unrecoverable.is_empty(), "{}", report);
     drop(fs);
 
     // Disk 1 alone: its ring now holds the rewind, not what it discarded.
     fp.disk(0).set_offline(true);
     let fs = fp.load().await;
-    assert!(fs.uberblock().await.unwrap().txg > newest);
+    assert!(fs.uberblock().await.txg > newest);
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert!(fs.read_file(Path::new("/b")).await.is_err());
     let ring: Vec<_> = fs.uberblock_ring().await.iter().map(|u| u.txg).collect();
@@ -2460,7 +2463,7 @@ async fn d3_missed_rewind(fp: FaultPool) {
         "discarded TXGs importable again: {:?}",
         ring
     );
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -2624,11 +2627,11 @@ async fn i2_a_partly_written_uberblock_stops_commits_until_reopened() {
 
     let fs = fp.load().await;
     assert!(!fs.uberblock_in_doubt());
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     fs.block_write(&dsn("a"), 0, &pattern(MB, 4)).await.unwrap();
     fs.sync().await.unwrap();
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -2653,12 +2656,12 @@ async fn i2_a_commit_failing_before_its_uberblock_can_be_retried() {
     fs.sync().await.unwrap();
     drop(fs);
     let fs = fp.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
 /// Free blocks across every metaslab, as allocation sees them now.
-async fn free_now(fs: &FileSystem<Pool>) -> u64 {
+async fn free_now<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) -> u64 {
     let mut n = 0;
     for ms in fs.metaslabs.iter() {
         n += ms.read().await.free_blocks();
@@ -2761,7 +2764,7 @@ async fn i4_an_unreadable_log_record_is_an_error_not_the_end() {
 async fn i5_a_file_writers_record_is_pinned_before_its_written() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    let ws = w.fs.writer.clone().unwrap();
+    let ws = w.fs.writer_state().clone();
     let mut f =
         w.fs.file_writer(std::path::Path::new("f"), None)
             .await
@@ -2817,7 +2820,7 @@ async fn i5_a_file_writers_record_is_pinned_before_its_written() {
 async fn i5_a_dropped_file_write_leaves_no_pin() {
     let s = zil_setup().await;
     let w = ZilWriter::start(&s).await;
-    let ws = w.fs.writer.clone().unwrap();
+    let ws = w.fs.writer_state().clone();
     let mut f =
         w.fs.file_writer(std::path::Path::new("f"), None)
             .await

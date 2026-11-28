@@ -1,4 +1,5 @@
 use super::*;
+use crate::role::CommitterFs;
 use crate::vdev::Pool;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -21,7 +22,7 @@ async fn create_test_disk_file() -> (NamedTempFile, PathBuf) {
 }
 
 /// Helper to create a test RaidZ array with 5 disks
-async fn create_test_fs() -> (FileSystem<Pool>, Vec<NamedTempFile>) {
+async fn create_test_fs() -> (CommitterFs<Pool>, Vec<NamedTempFile>) {
     let mut temp_files = Vec::new();
     let mut paths = Vec::new();
 
@@ -164,5 +165,38 @@ fn label_checksum_covers_the_txg() {
     assert!(matches!(
         parse_label(&buf),
         Err(FileSystemError::ChecksumMismatch)
+    ));
+}
+
+/// No pool value exists without a superblock and an uberblock (I-8): a
+/// blank pool, and one whose uberblock ring is gone (a format that never
+/// wrote one), fail to load, read-only too, rather than coming back
+/// half-loaded.
+#[tokio::test]
+async fn a_pool_without_an_uberblock_does_not_load() {
+    use crate::test_util::TestPool;
+    let pool = TestPool::new().await;
+    assert!(matches!(
+        FileSystem::load(pool.dev().await).await,
+        Err(FileSystemError::NotFormatted)
+    ));
+
+    let header = pool.format().await.header;
+    let dev = pool.dev().await;
+    let zero = [0u8; BLOCK_SIZE];
+    for i in 0..header.uberblock_blocks() {
+        dev.write_block(header.uberblock_start + i, &zero)
+            .await
+            .unwrap();
+    }
+    dev.flush().await.unwrap();
+    assert!(read_superblock_of(&dev).await.is_some(), "superblock kept");
+    assert!(matches!(
+        FileSystem::load(dev).await,
+        Err(FileSystemError::NotFormatted)
+    ));
+    assert!(matches!(
+        FileSystem::load_readonly(pool.dev().await).await,
+        Err(FileSystemError::NotFormatted)
     ));
 }

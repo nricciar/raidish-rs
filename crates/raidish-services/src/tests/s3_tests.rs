@@ -5,8 +5,9 @@ use super::*;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::vdev::Pool;
+use raidish_core::role::{Committer, CommitterFs};
 
-async fn bucket(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<Bucket<Pool>>) {
+async fn bucket(pool: &TestPool) -> (Arc<CommitterFs<Pool>>, Arc<Bucket<Pool, Committer>>) {
     let fs = Arc::new(pool.format().await);
     fs.create_service(&ds("b"), DatasetFormat::S3, Default::default())
         .await
@@ -19,7 +20,7 @@ fn data(n: usize, seed: u8) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(31) ^ seed).collect()
 }
 
-async fn put(b: &Arc<Bucket<Pool>>, key: &str, body: &[u8]) -> ObjectMeta {
+async fn put(b: &Arc<Bucket<Pool, Committer>>, key: &str, body: &[u8]) -> ObjectMeta {
     let mut w = b.new_body(Some(body.len() as u64)).await.unwrap();
     // In uneven pieces, as a network delivers them.
     for piece in body.chunks(777_777) {
@@ -39,7 +40,7 @@ async fn put(b: &Arc<Bucket<Pool>>, key: &str, body: &[u8]) -> ObjectMeta {
     meta
 }
 
-async fn get(b: &Arc<Bucket<Pool>>, key: &str) -> Option<Vec<u8>> {
+async fn get(b: &Arc<Bucket<Pool, Committer>>, key: &str) -> Option<Vec<u8>> {
     let (meta, _hold) = b.head_held(key).await.unwrap()?;
     let mut out = Vec::new();
     for s in &meta.segments {
@@ -56,7 +57,7 @@ async fn get(b: &Arc<Bucket<Pool>>, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Body chunks in the tree.
-async fn chunks(fs: &FileSystem<Pool>) -> usize {
+async fn chunks(fs: &CommitterFs<Pool>) -> usize {
     let ds = fs.open_btree(&ds("b"), DatasetFormat::S3).await.unwrap();
     let t = Txn::begin(fs, &ds.obj).await.unwrap();
     t.range_raw(Bound::Included(b"B"), Bound::Excluded(b"C"), usize::MAX)
@@ -320,6 +321,6 @@ async fn half_written_bodies_are_dropped_on_reopen() {
     b.collect().await.unwrap();
     assert_eq!(chunks(&fs).await, 2);
     assert_eq!(get(&b, "kept").await.unwrap(), data(CHUNK + 1, 5));
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }

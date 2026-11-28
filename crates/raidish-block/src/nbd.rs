@@ -19,6 +19,7 @@ pub(crate) use crate::export::{ExportSession, export_closed};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::DatasetName;
 use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo, ensure_sync_loop};
+use raidish_core::role::Mutable;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -115,16 +116,16 @@ impl Exported for Export {
 }
 
 /// An NBD server exporting any number of volumes of one file system.
-pub struct NbdServer<D: PoolDevice> {
-    fs: Arc<FileSystem<D>>,
+pub struct NbdServer<D: PoolDevice, R: Mutable> {
+    fs: Arc<FileSystem<D, R>>,
     bind: String,
     port: u16,
     exports: Exports,
 }
 
 /// Serve the single volume `zvol_name` on `127.0.0.1:port` (the CLI's `nbd`).
-pub async fn serve_nbd<D>(
-    fs: Arc<FileSystem<D>>,
+pub async fn serve_nbd<D, R: Mutable>(
+    fs: Arc<FileSystem<D, R>>,
     zvol_name: DatasetName,
     port: u16,
 ) -> std::io::Result<()>
@@ -142,12 +143,12 @@ where
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-impl<D> NbdServer<D>
+impl<D, R: Mutable> NbdServer<D, R>
 where
     D: PoolDevice + Send + Sync + 'static,
 {
     /// A server with no exports that `run` binds to `bind:port`.
-    pub fn with_bind(fs: Arc<FileSystem<D>>, bind: impl Into<String>, port: u16) -> Self {
+    pub fn with_bind(fs: Arc<FileSystem<D, R>>, bind: impl Into<String>, port: u16) -> Self {
         NbdServer {
             fs,
             bind: bind.into(),
@@ -185,7 +186,7 @@ where
 }
 
 #[async_trait::async_trait]
-impl<D> BlockExporter for NbdServer<D>
+impl<D, R: Mutable> BlockExporter for NbdServer<D, R>
 where
     D: PoolDevice + Send + Sync + 'static,
 {

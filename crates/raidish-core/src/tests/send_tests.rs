@@ -1,4 +1,5 @@
 use super::*;
+use crate::role::CommitterFs;
 use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::types::{Holding, LeaseRef, ep};
@@ -14,7 +15,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn read(fs: &FileSystem<Pool>, name: &str) -> Vec<u8> {
+async fn read(fs: &CommitterFs<Pool>, name: &str) -> Vec<u8> {
     let mut buf = vec![0xEEu8; VOL as usize];
     let n = match name.split_once('@') {
         Some((v, s)) => fs.snapshot_read(&ds(v), s, 0, &mut buf).await.unwrap(),
@@ -24,12 +25,12 @@ async fn read(fs: &FileSystem<Pool>, name: &str) -> Vec<u8> {
     buf
 }
 
-async fn clean(fs: &FileSystem<Pool>) {
-    let report = fs.fsck(false).await.unwrap();
+async fn clean(fs: &CommitterFs<Pool>) {
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
-async fn allocated(fs: &FileSystem<Pool>) -> u64 {
+async fn allocated(fs: &CommitterFs<Pool>) -> u64 {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
@@ -41,7 +42,7 @@ async fn allocated(fs: &FileSystem<Pool>) -> u64 {
     used
 }
 
-async fn send(fs: &FileSystem<Pool>, snap: &str, from: Option<&str>) -> Vec<u8> {
+async fn send(fs: &CommitterFs<Pool>, snap: &str, from: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     fs.send_snapshot(&ds("vol"), snap, from, &mut out)
         .await
@@ -52,7 +53,7 @@ async fn send(fs: &FileSystem<Pool>, snap: &str, from: Option<&str>) -> Vec<u8> 
 /// A source volume with snapshot s1 of a sparse first version, then
 /// changes (overwrites, a new region, a zeroed range spanning whole
 /// indirect subtrees) and snapshot s2.
-async fn source() -> (TestPool, FileSystem<Pool>) {
+async fn source() -> (TestPool, CommitterFs<Pool>) {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
     fs.create_block(&ds("vol"), VOL, VOLBLOCK_ALIGN)

@@ -13,6 +13,7 @@ pub use raidish_core::fence;
 pub use raidish_core::fs;
 pub use raidish_core::inode;
 pub use raidish_core::inspect;
+pub use raidish_core::role;
 pub(crate) use raidish_core::send;
 pub(crate) use raidish_core::snapshot;
 pub use raidish_core::vdev;

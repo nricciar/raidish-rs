@@ -11,6 +11,7 @@ use crate::api_types::Role;
 use crate::disk::PoolDevice;
 use futures::Stream;
 use pb::watch_request::RequestUnion;
+use raidish_core::role::Mutable;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -31,8 +32,8 @@ pub(super) const WATCH_BYTES: usize = 1 << 20;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(600);
 
 /// The services of one etcd dataset, as this node serves them.
-pub struct EtcdServer<D: PoolDevice> {
-    pub store: Arc<EtcdStore<D>>,
+pub struct EtcdServer<D: PoolDevice, R: Mutable> {
+    pub store: Arc<EtcdStore<D, R>>,
     /// This node's name (the member's).
     pub node: String,
     /// Where clients reach the dataset (every node: they forward).
@@ -121,7 +122,7 @@ fn out<T: Send + 'static>(rx: mpsc::Receiver<std::result::Result<T, Status>>) ->
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-impl<D: PoolDevice + 'static> EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> EtcdServer<D, R> {
     /// The gRPC router of every service, on `store`.
     pub fn router(self) -> tonic::transport::server::Router {
         let s = Arc::new(self);
@@ -144,7 +145,7 @@ impl<D: PoolDevice + 'static> EtcdServer<D> {
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> kv_server::Kv for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> kv_server::Kv for EtcdServer<D, R> {
     async fn range(&self, r: Request<pb::RangeRequest>) -> Res<pb::RangeResponse> {
         self.store
             .range(r.into_inner())
@@ -204,7 +205,7 @@ struct Watcher {
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> watch_server::Watch for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> watch_server::Watch for EtcdServer<D, R> {
     type WatchStream = Out<pb::WatchResponse>;
 
     async fn watch(&self, r: Request<Streaming<pb::WatchRequest>>) -> Res<Self::WatchStream> {
@@ -222,8 +223,8 @@ impl<D: PoolDevice + 'static> watch_server::Watch for EtcdServer<D> {
 /// One watch stream: its watchers, each sent the events of its keys in
 /// revision order, durable ones only (as `durable`, the store's
 /// `durable_rev`, moves).
-pub(super) async fn watch_session<D: PoolDevice + 'static>(
-    store: Arc<EtcdStore<D>>,
+pub(super) async fn watch_session<D: PoolDevice + 'static, R: Mutable>(
+    store: Arc<EtcdStore<D, R>>,
     mut inbound: impl futures::Stream<Item = std::result::Result<pb::WatchRequest, Status>>
     + Unpin
     + Send,
@@ -439,7 +440,7 @@ pub(super) fn chunks(events: Vec<super::pb::mvccpb::Event>) -> Vec<Vec<super::pb
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> lease_server::Lease for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> lease_server::Lease for EtcdServer<D, R> {
     type LeaseKeepAliveStream = Out<pb::LeaseKeepAliveResponse>;
 
     async fn lease_grant(&self, r: Request<pb::LeaseGrantRequest>) -> Res<pb::LeaseGrantResponse> {
@@ -521,7 +522,7 @@ fn unimplemented<T>(what: &str) -> Res<T> {
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> maintenance_server::Maintenance for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> maintenance_server::Maintenance for EtcdServer<D, R> {
     type SnapshotStream = Out<pb::SnapshotResponse>;
 
     async fn alarm(&self, _: Request<pb::AlarmRequest>) -> Res<pb::AlarmResponse> {
@@ -572,7 +573,7 @@ impl<D: PoolDevice + 'static> maintenance_server::Maintenance for EtcdServer<D> 
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> cluster_server::Cluster for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> cluster_server::Cluster for EtcdServer<D, R> {
     async fn member_add(&self, _: Request<pb::MemberAddRequest>) -> Res<pb::MemberAddResponse> {
         unimplemented("MemberAdd")
     }
@@ -617,7 +618,7 @@ fn auth_off<T>() -> Res<T> {
 }
 
 #[tonic::async_trait]
-impl<D: PoolDevice + 'static> auth_server::Auth for EtcdServer<D> {
+impl<D: PoolDevice + 'static, R: Mutable> auth_server::Auth for EtcdServer<D, R> {
     async fn auth_status(&self, _: Request<pb::AuthStatusRequest>) -> Res<pb::AuthStatusResponse> {
         let (rev, _) = self.store.revisions().await.map_err(status)?;
         Ok(Response::new(pb::AuthStatusResponse {

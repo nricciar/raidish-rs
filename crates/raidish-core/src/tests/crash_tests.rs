@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::coords::PoolLba;
+use crate::role::CommitterFs;
+use crate::role::Role;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use std::path::PathBuf;
@@ -10,9 +12,9 @@ use std::sync::Arc;
 
 /// Load an independent view of whatever is committed on disk right now and
 /// check it as if the process had crashed at this moment.
-async fn check_snapshot<D: crate::disk::PoolDevice + Send + Sync + 'static>(
+async fn check_snapshot<D: crate::disk::PoolDevice + Send + Sync + 'static, R: Role>(
     pool: &TestPool,
-    writer: &FileSystem<D>,
+    writer: &FileSystem<D, R>,
 ) -> Result<(), String> {
     // Holding the writer's transaction lock means no device writes are in
     // progress, so the disks hold exactly the last committed state: an exact
@@ -29,7 +31,7 @@ async fn check_snapshot<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     if !orphans.is_empty() {
         return Err(format!("leaked blocks in committed state: {:?}", orphans));
     }
-    let fsck = snap.fsck(false).await.map_err(|e| format!("fsck: {e}"))?;
+    let fsck = snap.fsck().await.map_err(|e| format!("fsck: {e}"))?;
     if !fsck.is_clean() {
         return Err(format!("fsck of committed state: {fsck}"));
     }
@@ -189,8 +191,11 @@ async fn volume_writes_and_commits_stay_consistent() {
     );
 }
 
-async fn write_generation<D: crate::disk::PoolDevice + Send + Sync + 'static>(
-    fs: &FileSystem<D>,
+async fn write_generation<
+    D: crate::disk::PoolDevice + Send + Sync + 'static,
+    R: crate::role::Mutable,
+>(
+    fs: &FileSystem<D, R>,
     generation: u8,
 ) {
     fs.write_file(
@@ -209,8 +214,8 @@ async fn write_generation<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     fs.sync().await.unwrap();
 }
 
-async fn check_generations<D: crate::disk::PoolDevice + Send + Sync + 'static>(
-    fs: &FileSystem<D>,
+async fn check_generations<D: crate::disk::PoolDevice + Send + Sync + 'static, R: Role>(
+    fs: &FileSystem<D, R>,
     upto: u8,
 ) {
     for g in 1..=upto {
@@ -300,7 +305,7 @@ async fn degraded_operation_and_stale_disk_return() {
 
 /// One fixed workload of metadata and volume operations.
 async fn workload<D: crate::disk::PoolDevice + Send + Sync + 'static>(
-    fs: &FileSystem<D>,
+    fs: &crate::role::CommitterFs<D>,
 ) -> Result<(), crate::fs::FileSystemError> {
     let file = |n: u32, v: u8| {
         (
@@ -326,7 +331,7 @@ async fn workload<D: crate::disk::PoolDevice + Send + Sync + 'static>(
     }
     fs.delete(Path::new("/d/f1")).await?;
     // A scrub in the middle: crashing in its commits must be harmless too.
-    let r = fs.scrub(true).await?;
+    let r = fs.scrub_repair().await?;
     assert!(r.is_clean(), "{}", r);
     for slot in 0..40u64 {
         if slot % 3 == 0 {
@@ -376,7 +381,7 @@ async fn crash_at_every_point_of_a_workload() {
         let orphans = fs.find_orphaned_blocks().await.unwrap();
         assert!(orphans.is_empty(), "k={k}/{total}: leaked {:?}", orphans);
         // Every reachable shard (data and parity) and label is consistent.
-        let scrub = fs.scrub(false).await.unwrap();
+        let scrub = fs.scrub().await.unwrap();
         assert!(
             scrub.is_clean() && scrub.mismatched() == 0,
             "k={k}/{total}: {scrub}"
@@ -413,9 +418,9 @@ fn faults_remaining(f: &crate::test_util::FaultSwitch) -> i64 {
 }
 
 /// Reopen `pool` and check it: nothing referenced is free, nothing leaked.
-async fn reopened_clean(pool: &TestPool) -> FileSystem<crate::vdev::Pool> {
+async fn reopened_clean(pool: &TestPool) -> CommitterFs<crate::vdev::Pool> {
     let fs = FileSystem::load(pool.dev().await).await.unwrap();
-    let fsck = fs.fsck(false).await.unwrap();
+    let fsck = fs.fsck().await.unwrap();
     assert!(fsck.is_clean(), "{fsck}");
     fs
 }
@@ -463,7 +468,7 @@ async fn a_commit_dropped_after_its_uberblock_landed_still_advances() {
     fs.write_file(Path::new("/d/a"), &[1u8; 50_000])
         .await
         .unwrap();
-    let before = fs.uberblock().await.unwrap().txg;
+    let before = fs.uberblock().await.txg;
     let ring = fs.header.uberblock_start..fs.header.uberblock_start + fs.header.uberblock_blocks();
     faults.stall_writes(Some(ring));
     {
@@ -484,7 +489,7 @@ async fn a_commit_dropped_after_its_uberblock_landed_still_advances() {
         tokio::select! {
             r = &mut write => panic!("settled through held metaslabs: {r:?}"),
             _ = async {
-                while fs.uberblock().await.map(|u| u.txg) == Some(before) {
+                while fs.uberblock().await.txg == before {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             } => {}

@@ -12,6 +12,7 @@ use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::types::DatasetName;
 use async_trait::async_trait;
+use raidish_core::role::Mutable;
 use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
@@ -44,13 +45,13 @@ pub trait VolumeIo: Send + Sync {
 }
 
 /// This node writes the volume: straight to the file system.
-pub struct LocalIo<D: PoolDevice> {
-    fs: Arc<FileSystem<D>>,
+pub struct LocalIo<D: PoolDevice, R: Mutable> {
+    fs: Arc<FileSystem<D, R>>,
     name: DatasetName,
 }
 
-impl<D: PoolDevice> LocalIo<D> {
-    pub fn new(fs: Arc<FileSystem<D>>, name: &DatasetName) -> Self {
+impl<D: PoolDevice, R: Mutable> LocalIo<D, R> {
+    pub fn new(fs: Arc<FileSystem<D, R>>, name: &DatasetName) -> Self {
         LocalIo {
             fs,
             name: name.clone(),
@@ -59,7 +60,7 @@ impl<D: PoolDevice> LocalIo<D> {
 }
 
 #[async_trait]
-impl<D: PoolDevice + Send + Sync + 'static> VolumeIo for LocalIo<D> {
+impl<D: PoolDevice + Send + Sync + 'static, R: Mutable> VolumeIo for LocalIo<D, R> {
     async fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileSystemError> {
         self.fs.block_read(&self.name, offset, buf).await
     }
@@ -284,7 +285,7 @@ static SYNC_LOOPS: StdMutex<Vec<Weak<dyn Any + Send + Sync>>> = StdMutex::new(Ve
 /// Start the background TXG sync for `fs` unless one is already running.
 /// Shared by every NBD server and NVMe/TCP target on the same file system;
 /// the loop ends once the file system is dropped.
-pub fn ensure_sync_loop<D>(fs: &Arc<FileSystem<D>>, who: &'static str)
+pub fn ensure_sync_loop<D, R: Mutable>(fs: &Arc<FileSystem<D, R>>, who: &'static str)
 where
     D: PoolDevice + Send + Sync + 'static,
 {

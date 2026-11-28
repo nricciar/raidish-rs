@@ -76,7 +76,7 @@ pub struct Tx {
     layout: MetaslabLayout,
     /// What settling a commit tail touches beyond the metaslabs.
     scan_hold: Arc<AtomicUsize>,
-    uberblock: Arc<Mutex<Option<Uberblock>>>,
+    uberblock: Arc<Mutex<Uberblock>>,
 }
 
 impl Tx {
@@ -86,7 +86,7 @@ impl Tx {
         metaslabs: Metaslabs,
         layout: MetaslabLayout,
         scan_hold: Arc<AtomicUsize>,
-        uberblock: Arc<Mutex<Option<Uberblock>>>,
+        uberblock: Arc<Mutex<Uberblock>>,
     ) -> Tx {
         let guard = lock.clone().lock_owned().await;
         Tx {

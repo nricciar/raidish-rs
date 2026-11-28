@@ -11,6 +11,7 @@ use super::xdr::{Reader, Writer, XdrResult};
 use crate::backend::NfsStat;
 use crate::disk::{FileId, PoolDevice};
 use crate::inode::{ObjType, SetAttrs};
+use raidish_core::role::Mutable;
 use std::sync::Arc;
 
 pub const PMAP_PROG: u32 = 100000;
@@ -36,8 +37,8 @@ const ACCESS_EXECUTE: u32 = 0x20;
 const UNSTABLE: u32 = 0;
 const FILE_SYNC: u32 = 2;
 
-pub struct Server<D: PoolDevice> {
-    pub backend: Arc<Backend<D>>,
+pub struct Server<D: PoolDevice, R: Mutable> {
+    pub backend: Arc<Backend<D, R>>,
     /// The port this serves on (what the portmapper answers).
     pub port: u16,
 }
@@ -162,8 +163,8 @@ fn sattr(r: &mut Reader<'_>, now: u64) -> XdrResult<(SetAttrs, Option<u64>)> {
     ))
 }
 
-impl<D: PoolDevice + 'static> Server<D> {
-    pub fn new(backend: Arc<Backend<D>>, port: u16) -> Self {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
+    pub fn new(backend: Arc<Backend<D, R>>, port: u16) -> Self {
         Server { backend, port }
     }
 

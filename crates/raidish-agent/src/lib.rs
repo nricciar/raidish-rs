@@ -36,6 +36,7 @@ mod vms;
 mod volumes;
 
 pub use placement::{place, place_attached, place_on};
+use raidish_core::role::WriterFs;
 use supervisor::NodeSupervisor;
 use vms::VmBook;
 
@@ -66,9 +67,8 @@ use std::time::Duration;
 use tokio::sync::{Notify, watch};
 
 /// This node's writer, once the agent has one.
-pub type WriterSlot = std::sync::Arc<
-    std::sync::RwLock<Option<std::sync::Arc<crate::fs::FileSystem<crate::vdev::Pool>>>>,
->;
+pub type WriterSlot =
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<WriterFs<crate::vdev::Pool>>>>>;
 
 /// How often the agent looks at what should run where.
 pub const TICK: Duration = Duration::from_secs(2);

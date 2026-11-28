@@ -20,6 +20,7 @@
 use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, TreeRoot};
+use crate::role::{Committer, Role};
 use crate::types::Txg;
 use crate::types::{Holding, LeaseRef};
 use serde::{Deserialize, Serialize};
@@ -402,7 +403,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), FileSystemError> {
 /// Longest name in a directory, in bytes.
 pub const MAX_NAME_BYTES: usize = 255;
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Bytes per object table record.
     pub(crate) fn table_blksz(&self) -> usize {
         (self
@@ -435,49 +436,6 @@ impl<D: PoolDevice> FileSystem<D> {
             .ok_or(FileSystemError::FileNotFound)
     }
 
-    /// Set (or, with None, remove) object `id`'s dnode in the open TXG.
-    /// Only the process that commits the pool changes the table, under its
-    /// `tx` (which can undo it).
-    pub(crate) async fn write_dnode(
-        &self,
-        tx: &mut crate::tx::Tx,
-
-        id: FileId,
-        dnode: Option<Dnode>,
-    ) -> Result<(), FileSystemError> {
-        debug_assert!(
-            self.writer.is_none(),
-            "writers don't change the object table"
-        );
-        let leaf = id.get() / DNODES_PER_LEAF;
-        let mut slots = self.table_leaf(leaf).await?;
-        let slot = &mut slots[(id.get() % DNODES_PER_LEAF) as usize];
-        let mut dnode = dnode;
-        if let Some(d) = &mut dnode {
-            // Every rewrite is a change (callers only rewrite to change it).
-            d.change = slot.as_ref().map_or(0, |old| old.change) + 1;
-        }
-        *slot = dnode;
-        let prior = self.objects.dirty_record(leaf);
-        if slots.iter().all(Option::is_none) {
-            self.objects.put_record(leaf, Dirty::Hole);
-            tx.journal(crate::tx::Undo::Record { leaf, prior });
-            return Ok(());
-        }
-        let buf = encode_leaf(&slots)?;
-        if buf.len() > self.objects.blksz {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "object {}: its table record would be {} bytes (at most {})",
-                id,
-                buf.len(),
-                self.objects.blksz
-            )));
-        }
-        self.objects.put_record(leaf, Dirty::Data(buf));
-        tx.journal(crate::tx::Undo::Record { leaf, prior });
-        Ok(())
-    }
-
     /// Every on-disk extent an object occupies (its tree and log regions).
     pub(crate) async fn dnode_extents(
         &self,
@@ -491,19 +449,6 @@ impl<D: PoolDevice> FileSystem<D> {
                 .flat_map(|l| l.regions.iter().map(LogRegion::extent)),
         );
         Ok(out)
-    }
-
-    /// Free an object's space and remove it from the table.
-    pub(crate) async fn free_dnode(
-        &self,
-        tx: &mut crate::tx::Tx,
-        id: FileId,
-        dnode: &Dnode,
-    ) -> Result<(), FileSystemError> {
-        for e in self.dnode_extents(dnode).await? {
-            self.free(tx, e.start, e.len).await?;
-        }
-        self.write_dnode(tx, id, None).await
     }
 
     /// Free a tree that nothing references any more (in the open TXG).
@@ -527,57 +472,6 @@ impl<D: PoolDevice> FileSystem<D> {
             .read_tree(&dnode.tree, dnode.blksz as usize, dnode.size)
             .await?;
         decode_dir(&data)
-    }
-
-    /// Replace directory `id`'s contents with `index` (in the open TXG;
-    /// `dnode` is updated to match).
-    pub(crate) async fn write_dir(
-        &self,
-        tx: &mut crate::tx::Tx,
-        id: FileId,
-        dnode: &mut Dnode,
-        index: &FileIndex,
-    ) -> Result<(), FileSystemError> {
-        let data = if index.files.is_empty() {
-            Vec::new()
-        } else {
-            bincode::serialize(index)?
-        };
-        self.replace_contents(tx, id, dnode, &data).await
-    }
-
-    /// Replace object `id`'s whole contents with `data` (in the open TXG;
-    /// `dnode` is updated to match, and the old tree freed).
-    pub(crate) async fn replace_contents(
-        &self,
-        tx: &mut crate::tx::Tx,
-        id: FileId,
-        dnode: &mut Dnode,
-        data: &[u8],
-    ) -> Result<(), FileSystemError> {
-        let tree = {
-            // The tx gives them back if the op fails or is dropped.
-            let mut allocs = tx.allocs();
-            match self
-                .write_tree(dnode.blksz as usize, data, &mut allocs.ptrs)
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    // Now: in a commit, nothing is journaled.
-                    let ptrs = std::mem::take(&mut allocs.ptrs);
-                    self.release_ptrs(&ptrs).await;
-                    return Err(e);
-                }
-            }
-        };
-        let mut new = dnode.clone();
-        new.tree = tree;
-        new.size = data.len() as u64;
-        new.attrs.touch();
-        self.write_dnode(tx, id, Some(new.clone())).await?;
-        let old = std::mem::replace(dnode, new);
-        self.free_tree(tx, &old.tree).await
     }
 
     /// The directory at `components` (from the root): its object number,
@@ -657,6 +551,94 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         Ok((id, dnode))
     }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// Set (or, with None, remove) object `id`'s dnode in the open TXG.
+    /// Only the process that commits the pool changes the table, under its
+    /// `tx` (which can undo it).
+    pub(crate) async fn write_dnode(
+        &self,
+        tx: &mut crate::tx::Tx,
+
+        id: FileId,
+        dnode: Option<Dnode>,
+    ) -> Result<(), FileSystemError> {
+        let leaf = id.get() / DNODES_PER_LEAF;
+        let mut slots = self.table_leaf(leaf).await?;
+        let slot = &mut slots[(id.get() % DNODES_PER_LEAF) as usize];
+        let mut dnode = dnode;
+        if let Some(d) = &mut dnode {
+            // Every rewrite is a change (callers only rewrite to change it).
+            d.change = slot.as_ref().map_or(0, |old| old.change) + 1;
+        }
+        *slot = dnode;
+        let prior = self.objects.dirty_record(leaf);
+        if slots.iter().all(Option::is_none) {
+            self.objects.put_record(leaf, Dirty::Hole);
+            tx.journal(crate::tx::Undo::Record { leaf, prior });
+            return Ok(());
+        }
+        let buf = encode_leaf(&slots)?;
+        if buf.len() > self.objects.blksz {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "object {}: its table record would be {} bytes (at most {})",
+                id,
+                buf.len(),
+                self.objects.blksz
+            )));
+        }
+        self.objects.put_record(leaf, Dirty::Data(buf));
+        tx.journal(crate::tx::Undo::Record { leaf, prior });
+        Ok(())
+    }
+
+    /// Free an object's space and remove it from the table.
+    pub(crate) async fn free_dnode(
+        &self,
+        tx: &mut crate::tx::Tx,
+        id: FileId,
+        dnode: &Dnode,
+    ) -> Result<(), FileSystemError> {
+        for e in self.dnode_extents(dnode).await? {
+            self.free(tx, e.start, e.len).await?;
+        }
+        self.write_dnode(tx, id, None).await
+    }
+
+    /// Replace object `id`'s whole contents with `data` (in the open TXG;
+    /// `dnode` is updated to match, and the old tree freed).
+    pub(crate) async fn replace_contents(
+        &self,
+        tx: &mut crate::tx::Tx,
+        id: FileId,
+        dnode: &mut Dnode,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
+        let tree = {
+            // The tx gives them back if the op fails or is dropped.
+            let mut allocs = tx.allocs();
+            match self
+                .write_tree(dnode.blksz as usize, data, &mut allocs.ptrs)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    // Now: in a commit, nothing is journaled.
+                    let ptrs = std::mem::take(&mut allocs.ptrs);
+                    self.release_ptrs(&ptrs).await;
+                    return Err(e);
+                }
+            }
+        };
+        let mut new = dnode.clone();
+        new.tree = tree;
+        new.size = data.len() as u64;
+        new.attrs.touch();
+        self.write_dnode(tx, id, Some(new.clone())).await?;
+        let old = std::mem::replace(dnode, new);
+        self.free_tree(tx, &old.tree).await
+    }
 
     /// Create a new object at `l` (from `lookup`, under `begin_tx`) and
     /// link it into its parent. Returns its object number.
@@ -678,38 +660,6 @@ impl<D: PoolDevice> FileSystem<D> {
         self.write_dir(tx, l.parent_id, &mut l.parent, &l.index)
             .await?;
         Ok(id)
-    }
-
-    /// Remove `l`'s entry from its parent and free the object (under
-    /// `begin_tx`). A directory must be empty.
-    pub(crate) async fn unlink(
-        &self,
-        tx: &mut crate::tx::Tx,
-        mut l: Lookup,
-    ) -> Result<FileId, FileSystemError> {
-        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
-        let dnode = self.read_dnode(entry.id).await?;
-        if dnode.is_directory() && dnode.size > 0 && !self.read_dir(&dnode).await?.files.is_empty()
-        {
-            return Err(FileSystemError::NotEmpty(format!("directory '{}'", l.name)));
-        }
-        self.free_dnode(tx, entry.id, &dnode).await?;
-        l.index.files.remove(&l.name);
-        self.write_dir(tx, l.parent_id, &mut l.parent, &l.index)
-            .await?;
-        Ok(entry.id)
-    }
-
-    /// Move `from` to `to` (under `begin_tx`); see `rename_at_locked`.
-    pub async fn rename_locked(
-        &self,
-        tx: &mut crate::tx::Tx,
-        from: &Path,
-        to: &Path,
-    ) -> Result<(FileId, Option<FileId>), FileSystemError> {
-        let src = self.lookup(from).await?;
-        let dst = self.lookup(to).await?;
-        self.rename_at_locked(tx, src, dst).await
     }
 
     /// Move `src`'s entry to `dst` (both from `lookup`, under `begin_tx`).
@@ -792,6 +742,95 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok((moved.id, replaced))
     }
 
+    /// Change object `id`'s attributes (under `begin_tx`).
+    pub(crate) async fn set_attrs_id_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+        id: FileId,
+        set: &SetAttrs,
+    ) -> Result<(), FileSystemError> {
+        let mut d = self.read_dnode(id).await?;
+        if let Some(m) = set.mode {
+            d.attrs.mode = m & 0o7777;
+        }
+        if let Some(u) = set.uid {
+            d.attrs.uid = u;
+        }
+        if let Some(g) = set.gid {
+            d.attrs.gid = g;
+        }
+        if let Some(t) = set.mtime_ns {
+            d.attrs.mtime_ns = t;
+        }
+        d.attrs.ctime_ns = now_ns();
+        self.write_dnode(tx, id, Some(d)).await
+    }
+
+    /// Point file `id` at new contents (under `begin_tx`), freeing the old.
+    pub(crate) async fn replace_file_contents(
+        &self,
+        tx: &mut crate::tx::Tx,
+        id: FileId,
+        mut dnode: Dnode,
+        size: u64,
+        tree: TreeRoot,
+    ) -> Result<(), FileSystemError> {
+        let old = std::mem::replace(&mut dnode.tree, tree);
+        dnode.size = size;
+        dnode.attrs.touch();
+        self.write_dnode(tx, id, Some(dnode)).await?;
+        self.free_tree(tx, &old).await
+    }
+
+    /// Replace directory `id`'s contents with `index` (in the open TXG;
+    /// `dnode` is updated to match).
+    pub(crate) async fn write_dir(
+        &self,
+        tx: &mut crate::tx::Tx,
+        id: FileId,
+        dnode: &mut Dnode,
+        index: &FileIndex,
+    ) -> Result<(), FileSystemError> {
+        let data = if index.files.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(index)?
+        };
+        self.replace_contents(tx, id, dnode, &data).await
+    }
+
+    /// Remove `l`'s entry from its parent and free the object (under
+    /// `begin_tx`). A directory must be empty.
+    pub(crate) async fn unlink(
+        &self,
+        tx: &mut crate::tx::Tx,
+        mut l: Lookup,
+    ) -> Result<FileId, FileSystemError> {
+        let entry = l.entry.ok_or(FileSystemError::FileNotFound)?;
+        let dnode = self.read_dnode(entry.id).await?;
+        if dnode.is_directory() && dnode.size > 0 && !self.read_dir(&dnode).await?.files.is_empty()
+        {
+            return Err(FileSystemError::NotEmpty(format!("directory '{}'", l.name)));
+        }
+        self.free_dnode(tx, entry.id, &dnode).await?;
+        l.index.files.remove(&l.name);
+        self.write_dir(tx, l.parent_id, &mut l.parent, &l.index)
+            .await?;
+        Ok(entry.id)
+    }
+
+    /// Move `from` to `to` (under `begin_tx`); see `rename_at_locked`.
+    pub async fn rename_locked(
+        &self,
+        tx: &mut crate::tx::Tx,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(FileId, Option<FileId>), FileSystemError> {
+        let src = self.lookup(from).await?;
+        let dst = self.lookup(to).await?;
+        self.rename_at_locked(tx, src, dst).await
+    }
+
     /// Create a file or directory `name` in directory `dir` (under
     /// `begin_tx`) with attributes `attrs` (mode, owner; unset: defaults). An existing one of the same
     /// kind is fine, unless `exclusive`: then only if it was created with
@@ -853,46 +892,6 @@ impl<D: PoolDevice> FileSystem<D> {
         let (id, _) = self.stat(path).await?;
         self.set_attrs_id_locked(tx, id, set).await?;
         Ok(id)
-    }
-
-    /// Change object `id`'s attributes (under `begin_tx`).
-    pub(crate) async fn set_attrs_id_locked(
-        &self,
-        tx: &mut crate::tx::Tx,
-        id: FileId,
-        set: &SetAttrs,
-    ) -> Result<(), FileSystemError> {
-        let mut d = self.read_dnode(id).await?;
-        if let Some(m) = set.mode {
-            d.attrs.mode = m & 0o7777;
-        }
-        if let Some(u) = set.uid {
-            d.attrs.uid = u;
-        }
-        if let Some(g) = set.gid {
-            d.attrs.gid = g;
-        }
-        if let Some(t) = set.mtime_ns {
-            d.attrs.mtime_ns = t;
-        }
-        d.attrs.ctime_ns = now_ns();
-        self.write_dnode(tx, id, Some(d)).await
-    }
-
-    /// Point file `id` at new contents (under `begin_tx`), freeing the old.
-    pub(crate) async fn replace_file_contents(
-        &self,
-        tx: &mut crate::tx::Tx,
-        id: FileId,
-        mut dnode: Dnode,
-        size: u64,
-        tree: TreeRoot,
-    ) -> Result<(), FileSystemError> {
-        let old = std::mem::replace(&mut dnode.tree, tree);
-        dnode.size = size;
-        dnode.attrs.touch();
-        self.write_dnode(tx, id, Some(dnode)).await?;
-        self.free_tree(tx, &old).await
     }
 }
 

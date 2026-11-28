@@ -1,8 +1,9 @@
 //! Byte-range locks.
 
 use super::super::*;
+use raidish_core::role::Mutable;
 
-impl<D: PoolDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
     pub(in crate::v4) fn denied(w: &mut Writer, d: &state::Denied) {
         w.u64(d.range.start)
             .u64(d.range.length())

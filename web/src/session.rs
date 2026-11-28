@@ -5,6 +5,7 @@ use raidish_core::disk::{DiskOptions, IoStats};
 use raidish_core::disks::DiskSet;
 use raidish_core::fs::FileSystem;
 use raidish_core::inspect::{Layout, MetaslabReport, PoolMap, PoolReport};
+use raidish_core::role::ReadOnlyFs;
 use raidish_core::vdev::{Pool, Topology};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub struct Session {
 
 /// One read-only look at the pool.
 pub struct Snapshot {
-    pub fs: FileSystem<Pool>,
+    pub fs: ReadOnlyFs<Pool>,
     pub report: PoolReport,
     pub metaslabs: Vec<MetaslabReport>,
 }

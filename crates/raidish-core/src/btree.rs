@@ -48,6 +48,7 @@
 use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, ObjTree};
+use crate::role::{Mutable, Role};
 use crate::zil::KeyedOp;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -307,8 +308,8 @@ fn split_point(sizes: &[usize]) -> usize {
 
 /// One operation on a tree: reads see its own writes, which are applied
 /// together by [`Txn::apply`].
-pub struct Txn<'a, D: PoolDevice> {
-    fs: &'a FileSystem<D>,
+pub struct Txn<'a, D: PoolDevice, R: Role> {
+    fs: &'a FileSystem<D, R>,
     obj: &'a ObjTree,
     lim: Limits,
     pub header: Header,
@@ -320,10 +321,13 @@ pub struct Txn<'a, D: PoolDevice> {
     effects: Vec<KeyedOp>,
 }
 
-impl<'a, D: PoolDevice> Txn<'a, D> {
+impl<'a, D: PoolDevice, R: Role> Txn<'a, D, R> {
     /// Start an operation on the tree in `obj` (an object with no records
     /// is an empty tree).
-    pub async fn begin(fs: &'a FileSystem<D>, obj: &'a ObjTree) -> Result<Self, FileSystemError> {
+    pub async fn begin(
+        fs: &'a FileSystem<D, R>,
+        obj: &'a ObjTree,
+    ) -> Result<Self, FileSystemError> {
         let header = match fs.object_record(obj, 0).await? {
             None => Header::default(),
             Some(buf) => {
@@ -607,71 +611,6 @@ impl<'a, D: PoolDevice> Txn<'a, D> {
         Ok(())
     }
 
-    /// Set `key` to `value`. Returns whether it replaced a value.
-    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
-        self.check_sizes(key, value)?;
-        let val = self.make_val(value).await?;
-        let Some(root) = self.header.root else {
-            let id = self.alloc().await?;
-            self.put_node(id, &Node::Leaf(vec![(key.to_vec(), val)]))?;
-            self.header.root = NonZeroU64::new(id);
-            self.header.height = 0;
-            self.header.entries = 1;
-            self.effects
-                .push(KeyedOp::Put(key.to_vec(), value.to_vec()));
-            return Ok(false);
-        };
-        let (mut path, idxs) = self.descend(root, key).await?;
-        let replaced = {
-            let Some((_, Node::Leaf(entries))) = path.last_mut() else {
-                unreachable!()
-            };
-            match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(i) => Some(std::mem::replace(&mut entries[i].1, val)),
-                Err(i) => {
-                    entries.insert(i, (key.to_vec(), val));
-                    None
-                }
-            }
-        };
-        let was = replaced.is_some();
-        match replaced {
-            Some(old) => self.release_val(&old).await?,
-            None => self.header.entries += 1,
-        }
-        self.header_dirty = true;
-        self.fixup(path, idxs).await?;
-        self.effects
-            .push(KeyedOp::Put(key.to_vec(), value.to_vec()));
-        Ok(was)
-    }
-
-    /// Remove `key`. Returns whether it was there.
-    pub async fn delete(&mut self, key: &[u8]) -> Result<bool, FileSystemError> {
-        let Some(root) = self.header.root else {
-            return Ok(false);
-        };
-        let (mut path, idxs) = self.descend(root, key).await?;
-        let removed = {
-            let Some((_, Node::Leaf(entries))) = path.last_mut() else {
-                unreachable!()
-            };
-            match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(i) => Some(entries.remove(i).1),
-                Err(_) => None,
-            }
-        };
-        let Some(old) = removed else {
-            return Ok(false);
-        };
-        self.release_val(&old).await?;
-        self.header.entries -= 1;
-        self.header_dirty = true;
-        self.fixup(path, idxs).await?;
-        self.effects.push(KeyedOp::Delete(key.to_vec()));
-        Ok(true)
-    }
-
     /// Write back the changed bottom of `path`, splitting what overflows
     /// and merging (or sharing out) what underflows, up to the root.
     async fn fixup(
@@ -859,60 +798,6 @@ impl<'a, D: PoolDevice> Txn<'a, D> {
             }
         }
     }
-
-    /// Apply every change made through this transaction at once, and
-    /// queue them for the intent log as one entry: a replay redoes all of
-    /// them or none, as a commit has them all or none.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn apply_logged(mut self) -> Result<(), FileSystemError> {
-        let op = match self.effects.len() {
-            0 => None,
-            1 => self.effects.pop(),
-            _ => Some(KeyedOp::Batch(std::mem::take(&mut self.effects))),
-        };
-        self.apply(op)
-    }
-
-    /// Redo `op` (an intent log entry) in this transaction.
-    pub(crate) async fn redo(&mut self, op: &KeyedOp) -> Result<(), FileSystemError> {
-        match op {
-            KeyedOp::Put(k, v) => {
-                self.put(k, v).await?;
-            }
-            KeyedOp::Delete(k) => {
-                self.delete(k).await?;
-            }
-            KeyedOp::Batch(ops) => {
-                for op in ops {
-                    Box::pin(self.redo(op)).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply this operation's writes (all at once; see the module docs),
-    /// queuing `op` (its effect) for the intent log if it changed anything
-    /// (None: not logged; durable once committed).
-    pub fn apply(mut self, op: Option<KeyedOp>) -> Result<(), FileSystemError> {
-        if self.header_dirty {
-            let h = encode(&self.header)?;
-            if h.len() > self.lim.blksz {
-                return Err(corrupt("header overflows its record".into()));
-            }
-            self.writes.insert(0, Some(h));
-        }
-        if self.writes.is_empty() {
-            return Ok(());
-        }
-        self.obj.put_records(
-            self.writes
-                .into_iter()
-                .map(|(id, b)| (id, b.map_or(Dirty::Hole, Dirty::Data))),
-            op,
-        );
-        Ok(())
-    }
 }
 
 /// Split an overflowing node in two: (left, separator, right).
@@ -992,7 +877,10 @@ pub struct CheckReport {
 /// and overflow page is used once, that every id below `next_id` is used
 /// or free (none lost), and that every record of the object is the header
 /// or reachable.
-pub(crate) async fn check<D: PoolDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> CheckReport {
+pub(crate) async fn check<D: PoolDevice, R: Role>(
+    fs: &FileSystem<D, R>,
+    obj: &ObjTree,
+) -> CheckReport {
     let mut r = CheckReport::default();
     let t = match Txn::begin(fs, obj).await {
         Ok(t) => t,
@@ -1191,6 +1079,127 @@ pub(crate) async fn check<D: PoolDevice>(fs: &FileSystem<D>, obj: &ObjTree) -> C
         Err(e) => r.errors.push(format!("listing records: {}", e)),
     }
     r
+}
+
+impl<'a, D: PoolDevice, R: Mutable> Txn<'a, D, R> {
+    /// Set `key` to `value`. Returns whether it replaced a value.
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<bool, FileSystemError> {
+        self.check_sizes(key, value)?;
+        let val = self.make_val(value).await?;
+        let Some(root) = self.header.root else {
+            let id = self.alloc().await?;
+            self.put_node(id, &Node::Leaf(vec![(key.to_vec(), val)]))?;
+            self.header.root = NonZeroU64::new(id);
+            self.header.height = 0;
+            self.header.entries = 1;
+            self.effects
+                .push(KeyedOp::Put(key.to_vec(), value.to_vec()));
+            return Ok(false);
+        };
+        let (mut path, idxs) = self.descend(root, key).await?;
+        let replaced = {
+            let Some((_, Node::Leaf(entries))) = path.last_mut() else {
+                unreachable!()
+            };
+            match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                Ok(i) => Some(std::mem::replace(&mut entries[i].1, val)),
+                Err(i) => {
+                    entries.insert(i, (key.to_vec(), val));
+                    None
+                }
+            }
+        };
+        let was = replaced.is_some();
+        match replaced {
+            Some(old) => self.release_val(&old).await?,
+            None => self.header.entries += 1,
+        }
+        self.header_dirty = true;
+        self.fixup(path, idxs).await?;
+        self.effects
+            .push(KeyedOp::Put(key.to_vec(), value.to_vec()));
+        Ok(was)
+    }
+
+    /// Remove `key`. Returns whether it was there.
+    pub async fn delete(&mut self, key: &[u8]) -> Result<bool, FileSystemError> {
+        let Some(root) = self.header.root else {
+            return Ok(false);
+        };
+        let (mut path, idxs) = self.descend(root, key).await?;
+        let removed = {
+            let Some((_, Node::Leaf(entries))) = path.last_mut() else {
+                unreachable!()
+            };
+            match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                Ok(i) => Some(entries.remove(i).1),
+                Err(_) => None,
+            }
+        };
+        let Some(old) = removed else {
+            return Ok(false);
+        };
+        self.release_val(&old).await?;
+        self.header.entries -= 1;
+        self.header_dirty = true;
+        self.fixup(path, idxs).await?;
+        self.effects.push(KeyedOp::Delete(key.to_vec()));
+        Ok(true)
+    }
+
+    /// Apply every change made through this transaction at once, and
+    /// queue them for the intent log as one entry: a replay redoes all of
+    /// them or none, as a commit has them all or none.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_logged(mut self) -> Result<(), FileSystemError> {
+        let op = match self.effects.len() {
+            0 => None,
+            1 => self.effects.pop(),
+            _ => Some(KeyedOp::Batch(std::mem::take(&mut self.effects))),
+        };
+        self.apply(op)
+    }
+
+    /// Apply this operation's writes (all at once; see the module docs),
+    /// queuing `op` (its effect) for the intent log if it changed anything
+    /// (None: not logged; durable once committed).
+    pub fn apply(mut self, op: Option<KeyedOp>) -> Result<(), FileSystemError> {
+        if self.header_dirty {
+            let h = encode(&self.header)?;
+            if h.len() > self.lim.blksz {
+                return Err(corrupt("header overflows its record".into()));
+            }
+            self.writes.insert(0, Some(h));
+        }
+        if self.writes.is_empty() {
+            return Ok(());
+        }
+        self.obj.put_records(
+            self.writes
+                .into_iter()
+                .map(|(id, b)| (id, b.map_or(Dirty::Hole, Dirty::Data))),
+            op,
+        );
+        Ok(())
+    }
+
+    /// Redo `op` (an intent log entry) in this transaction.
+    pub(crate) async fn redo(&mut self, op: &KeyedOp) -> Result<(), FileSystemError> {
+        match op {
+            KeyedOp::Put(k, v) => {
+                self.put(k, v).await?;
+            }
+            KeyedOp::Delete(k) => {
+                self.delete(k).await?;
+            }
+            KeyedOp::Batch(ops) => {
+                for op in ops {
+                    Box::pin(self.redo(op)).await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

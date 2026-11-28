@@ -1,6 +1,7 @@
 use super::*;
 use crate::coords::PoolLba;
 use crate::fs::LabelState;
+use crate::role::CommitterFs;
 use crate::test_util::ds;
 use crate::test_util::{TestPool, check_files, write_files};
 use crate::types::Txg;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// First record of a file.
-async fn first_record(fs: &FileSystem<Pool>, path: &str) -> crate::blkptr::BlockPtr {
+async fn first_record(fs: &CommitterFs<Pool>, path: &str) -> crate::blkptr::BlockPtr {
     let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
     fs.tree_leaves(&d.tree).await.unwrap()[0].1.clone()
 }
@@ -30,7 +31,7 @@ async fn scrub_finds_and_repairs_bad_parity() {
     {
         let fs = FileSystem::load_readonly(pool.dev().await).await.unwrap();
         check_files(&fs, "f", 1, 2).await;
-        let dry = fs.scrub(true).await.unwrap(); // read-only: never repairs
+        let dry = fs.scrub().await.unwrap(); // read-only: only a check
         assert!(!dry.repair);
         assert_eq!(dry.shards.mismatched[3], 1, "{}", dry);
         assert_eq!(dry.shards.mismatched[4], 1, "{}", dry);
@@ -38,11 +39,11 @@ async fn scrub_finds_and_repairs_bad_parity() {
     }
 
     let fs = pool.load().await;
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     assert_eq!(report.shards.repaired[3], 1);
     assert_eq!(report.shards.repaired[4], 1);
-    assert_eq!(fs.scrub(true).await.unwrap().mismatched(), 0);
+    assert_eq!(fs.scrub_repair().await.unwrap().mismatched(), 0);
 }
 
 #[tokio::test]
@@ -61,12 +62,12 @@ async fn scrub_repairs_corrupt_data_and_labels() {
     ); // uberblock parity
 
     let fs = pool.load().await;
-    let report = fs.scrub(true).await.unwrap();
+    let report = fs.scrub_repair().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     assert!(report.shards.repaired[2] >= 1, "{}", report);
     assert!(report.shards.repaired[0] >= 1, "{}", report);
     assert!(report.shards.repaired[4] >= 1, "{}", report);
-    assert_eq!(fs.scrub(true).await.unwrap().mismatched(), 0);
+    assert_eq!(fs.scrub_repair().await.unwrap().mismatched(), 0);
     drop(fs);
 
     // Everything is whole again: two disks can go.
@@ -199,7 +200,7 @@ async fn scrub_runs_safely_alongside_volume_writes() {
     };
     let mut scans = 0;
     while !writer.is_finished() {
-        let r = fs.scrub(true).await.unwrap();
+        let r = fs.scrub_repair().await.unwrap();
         assert!(r.is_clean(), "{}", r);
         assert_eq!(r.mismatched(), 0, "scrub found damage mid-write: {}", r);
         scans += 1;
@@ -216,6 +217,6 @@ async fn scrub_runs_safely_alongside_volume_writes() {
         fs.block_read(&ds("vol"), i * vbs, &mut buf).await.unwrap();
         assert!(buf.iter().all(|&b| b == buf[0]), "record {} torn", i);
     }
-    let r = fs.scrub(true).await.unwrap();
+    let r = fs.scrub_repair().await.unwrap();
     assert_eq!(r.mismatched(), 0, "{}", r);
 }

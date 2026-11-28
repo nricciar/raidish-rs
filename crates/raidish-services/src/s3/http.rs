@@ -22,6 +22,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use md5::{Digest, Md5};
+use raidish_core::role::Mutable;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
@@ -71,7 +72,7 @@ const KEPT_HEADERS: &[&str] = &[
 ];
 const MAX_USER_META: usize = 2048;
 
-pub async fn serve(fe: Arc<Frontend>, l: TcpListener) {
+pub async fn serve<R: Mutable>(fe: Arc<Frontend<R>>, l: TcpListener) {
     fhttp::serve(l, fe.tls().https.clone(), move |req| {
         let fe = fe.clone();
         async move { handle(fe, req).await }
@@ -308,8 +309,8 @@ enum Target {
     Object(String, String),
 }
 
-fn target(
-    fe: &Frontend,
+fn target<R: Mutable>(
+    fe: &Frontend<R>,
     method: &Method,
     uri: &hyper::Uri,
     headers: &HeaderMap,
@@ -417,7 +418,7 @@ impl Req {
     }
 }
 
-async fn handle(fe: Arc<Frontend>, req: Request<Incoming>) -> Response<Body> {
+async fn handle<R: Mutable>(fe: Arc<Frontend<R>>, req: Request<Incoming>) -> Response<Body> {
     let rid = request_id();
     let head = req.method() == Method::HEAD;
     let resource = req.uri().path().to_string();
@@ -450,7 +451,10 @@ async fn handle(fe: Arc<Frontend>, req: Request<Incoming>) -> Response<Body> {
     resp
 }
 
-async fn route(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Response<Body>, Err3> {
+async fn route<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>, Err3> {
     let t = target(fe, req.method(), req.uri(), req.headers())?;
     let bucket_name = match &t {
         Target::Bucket(b) | Target::Object(b, _) => Some(b.clone()),
@@ -538,7 +542,7 @@ fn ok_empty(status: StatusCode) -> Response<Body> {
 
 // ---- the service ------------------------------------------------------------
 
-fn list_buckets(fe: &Frontend) -> Result<Response<Body>, Err3> {
+fn list_buckets<R: Mutable>(fe: &Frontend<R>) -> Result<Response<Body>, Err3> {
     let mut x = Xml::new("ListAllMyBucketsResult");
     x.open("Owner")
         .el("ID", "raidish")
@@ -561,8 +565,8 @@ fn list_buckets(fe: &Frontend) -> Result<Response<Body>, Err3> {
     ))
 }
 
-async fn create_bucket(
-    fe: &Arc<Frontend>,
+async fn create_bucket<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
     name: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
@@ -620,9 +624,9 @@ async fn create_bucket(
 
 // ---- buckets ---------------------------------------------------------------
 
-async fn bucket_op(
-    fe: &Arc<Frontend>,
-    bk: &Arc<Bucket<Pool>>,
+async fn bucket_op<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
     if let Some(sub) = UNSUPPORTED_BUCKET.iter().find(|s| r.has(s)) {
@@ -675,7 +679,10 @@ async fn bucket_op(
     }
 }
 
-async fn delete_bucket(fe: &Arc<Frontend>, bk: &Arc<Bucket<Pool>>) -> Result<Response<Body>, Err3> {
+async fn delete_bucket<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
+) -> Result<Response<Body>, Err3> {
     let not_empty = || {
         e3(
             StatusCode::CONFLICT,
@@ -719,7 +726,10 @@ fn token_decode(s: &str) -> Result<String, Err3> {
         })
 }
 
-async fn list_objects(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>, Err3> {
+async fn list_objects<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    r: &Req,
+) -> Result<Response<Body>, Err3> {
     let v2 = r.q("list-type") == Some("2");
     let prefix = r.q("prefix").unwrap_or("").to_string();
     let delimiter = r
@@ -816,7 +826,10 @@ async fn list_objects(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>,
     Ok(xml_response(StatusCode::OK, x.done("ListBucketResult")))
 }
 
-async fn delete_objects(bk: &Arc<Bucket<Pool>>, r: &mut Req) -> Result<Response<Body>, Err3> {
+async fn delete_objects<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    r: &mut Req,
+) -> Result<Response<Body>, Err3> {
     let body = r.small_body(2 << 20).await?;
     let x = parse_xml(&body)?;
     let quiet = x.text_of("Quiet").as_deref() == Some("true");
@@ -852,7 +865,10 @@ async fn delete_objects(bk: &Arc<Bucket<Pool>>, r: &mut Req) -> Result<Response<
     Ok(xml_response(StatusCode::OK, out.done("DeleteResult")))
 }
 
-async fn list_uploads(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>, Err3> {
+async fn list_uploads<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    r: &Req,
+) -> Result<Response<Body>, Err3> {
     let max: usize = r
         .q("max-uploads")
         .and_then(|m| m.parse().ok())
@@ -909,9 +925,9 @@ async fn list_uploads(bk: &Arc<Bucket<Pool>>, r: &Req) -> Result<Response<Body>,
 
 // ---- objects ---------------------------------------------------------------
 
-async fn object_op(
-    fe: &Arc<Frontend>,
-    bk: &Arc<Bucket<Pool>>,
+async fn object_op<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
     key: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
@@ -1001,8 +1017,8 @@ fn meta_from(r: &Req) -> Result<ObjectMeta, Err3> {
 
 /// Read the request's body into a new body of `bk`: the body, its MD5,
 /// the checksums it was sent with.
-async fn receive(
-    bk: &Arc<Bucket<Pool>>,
+async fn receive<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
     r: &mut Req,
 ) -> Result<(Segment, [u8; 16], Vec<(String, String)>), Err3> {
     let mut rd = r.reader();
@@ -1050,8 +1066,8 @@ fn etag_header(resp: &mut Response<Body>, etag: &str) {
     }
 }
 
-async fn put_object(
-    bk: &Arc<Bucket<Pool>>,
+async fn put_object<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
     key: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
@@ -1147,10 +1163,10 @@ fn plan(meta: &ObjectMeta, start: u64, end: u64) -> Vec<(u64, u64, usize, usize)
 }
 
 /// Bytes `start..=end` of `meta`, as a streamed body.
-fn object_body(
-    bk: &Arc<Bucket<Pool>>,
+fn object_body<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
     meta: &ObjectMeta,
-    hold: Reading<Pool>,
+    hold: Reading<Pool, R>,
     start: u64,
     end: u64,
 ) -> Body {
@@ -1224,7 +1240,11 @@ fn object_headers(resp: &mut Response<Body>, meta: &ObjectMeta, r: &Req, checksu
     }
 }
 
-async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Response<Body>, Err3> {
+async fn get_object<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    key: &str,
+    r: &Req,
+) -> Result<Response<Body>, Err3> {
     let (meta, hold) = bk.head_held(key).await?.ok_or(S3Error::NoSuchKey)?;
     if let Err(code) = conditions(r, "", &meta) {
         let mut resp = ok_empty(code);
@@ -1308,8 +1328,8 @@ async fn get_object(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
 // ---- copies ----------------------------------------------------------------
 
 /// The source of a copy: its metadata and (a range of) its bytes.
-async fn open_source(
-    fe: &Arc<Frontend>,
+async fn open_source<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
     r: &Req,
     range: Option<std::ops::Range<u64>>,
 ) -> Result<(String, String, ObjectMeta, Body), Err3> {
@@ -1480,8 +1500,8 @@ async fn open_source(
 }
 
 /// Copy `body` into a new body of `bk`.
-async fn copy_into(
-    bk: &Arc<Bucket<Pool>>,
+async fn copy_into<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
     mut body: Body,
     expected: Option<u64>,
 ) -> Result<(Segment, [u8; 16]), Err3> {
@@ -1508,9 +1528,9 @@ async fn copy_into(
     Ok(w.finish().await?)
 }
 
-async fn copy_object(
-    fe: &Arc<Frontend>,
-    bk: &Arc<Bucket<Pool>>,
+async fn copy_object<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
     key: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
@@ -1562,7 +1582,11 @@ async fn copy_object(
 
 // ---- multipart -------------------------------------------------------------
 
-async fn create_upload(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Response<Body>, Err3> {
+async fn create_upload<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    key: &str,
+    r: &Req,
+) -> Result<Response<Body>, Err3> {
     let meta = meta_from(r)?;
     let id = bk.create_upload(key, meta).await?;
     let mut x = Xml::new("InitiateMultipartUploadResult");
@@ -1588,7 +1612,10 @@ fn part_number(r: &Req) -> Result<u32, Err3> {
         })
 }
 
-async fn upload_part(bk: &Arc<Bucket<Pool>>, r: &mut Req) -> Result<Response<Body>, Err3> {
+async fn upload_part<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    r: &mut Req,
+) -> Result<Response<Body>, Err3> {
     let n = part_number(r)?;
     let id = r.q("uploadId").unwrap_or("").to_string();
     bk.upload(&id).await?;
@@ -1613,9 +1640,9 @@ async fn upload_part(bk: &Arc<Bucket<Pool>>, r: &mut Req) -> Result<Response<Bod
     Ok(resp)
 }
 
-async fn upload_part_copy(
-    fe: &Arc<Frontend>,
-    bk: &Arc<Bucket<Pool>>,
+async fn upload_part_copy<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {
     let n = part_number(r)?;
@@ -1655,7 +1682,11 @@ async fn upload_part_copy(
     Ok(xml_response(StatusCode::OK, x.done("CopyPartResult")))
 }
 
-async fn list_parts(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Response<Body>, Err3> {
+async fn list_parts<R: Mutable>(
+    bk: &Arc<Bucket<Pool, R>>,
+    key: &str,
+    r: &Req,
+) -> Result<Response<Body>, Err3> {
     let id = r.q("uploadId").unwrap_or("");
     let up = bk.upload(id).await?;
     if up.key != key {
@@ -1695,9 +1726,9 @@ async fn list_parts(bk: &Arc<Bucket<Pool>>, key: &str, r: &Req) -> Result<Respon
     Ok(xml_response(StatusCode::OK, x.done("ListPartsResult")))
 }
 
-async fn complete_upload(
-    fe: &Arc<Frontend>,
-    bk: &Arc<Bucket<Pool>>,
+async fn complete_upload<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    bk: &Arc<Bucket<Pool, R>>,
     key: &str,
     r: &mut Req,
 ) -> Result<Response<Body>, Err3> {

@@ -5,8 +5,9 @@ use super::*;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::vdev::Pool;
+use raidish_core::role::{Committer, CommitterFs};
 
-async fn queue(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<Queue<Pool>>) {
+async fn queue(pool: &TestPool) -> (Arc<CommitterFs<Pool>>, Arc<Queue<Pool, Committer>>) {
     let fs = Arc::new(pool.format().await);
     fs.create_service(&ds("q"), DatasetFormat::Queue, Default::default())
         .await
@@ -242,7 +243,7 @@ async fn survives_a_reload() {
     assert_eq!(got2[0].msg.body, "taken");
     q.delete(vec![got[0].receipt.clone()]).await.unwrap();
     assert_eq!(q.meta().await.unwrap().messages, 1);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 

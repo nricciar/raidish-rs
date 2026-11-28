@@ -35,6 +35,7 @@ pub mod xdr;
 
 use crate::disk::PoolDevice;
 use backend::Backend;
+use raidish_core::role::Mutable;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -80,13 +81,13 @@ impl NfsConfig {
 }
 
 /// Every program on the port: NFS 3 and 4, MOUNT, the portmapper.
-struct Programs<D: PoolDevice> {
-    v3: v3::Server<D>,
-    v4: Arc<v4::Server<D>>,
+struct Programs<D: PoolDevice, R: Mutable> {
+    v3: v3::Server<D, R>,
+    v4: Arc<v4::Server<D, R>>,
 }
 
 #[async_trait::async_trait]
-impl<D: PoolDevice + 'static> rpc::Dispatch for Programs<D> {
+impl<D: PoolDevice + 'static, R: Mutable> rpc::Dispatch for Programs<D, R> {
     async fn call(&self, call: &rpc::Call, args: &mut xdr::Reader<'_>) -> rpc::Reply {
         use v3::{MOUNT_PROG, NFS_PROG, PMAP_PROG};
         match (call.prog, call.vers) {
@@ -106,11 +107,11 @@ impl<D: PoolDevice + 'static> rpc::Dispatch for Programs<D> {
 /// address; runs (with the housekeeping) until the runtime stops.
 /// `cluster`: where the NFSv4 state owner is (None: this node owns its
 /// state). Returns the bound address and the NFSv4 server.
-pub async fn start<D: PoolDevice + 'static>(
+pub async fn start<D: PoolDevice + 'static, R: Mutable>(
     addr: &str,
-    backend: Arc<Backend<D>>,
+    backend: Arc<Backend<D, R>>,
     cluster: Option<Arc<dyn v4::V4Cluster>>,
-) -> std::io::Result<(std::net::SocketAddr, Arc<v4::Server<D>>)> {
+) -> std::io::Result<(std::net::SocketAddr, Arc<v4::Server<D, R>>)> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let v4 = Arc::new(match cluster {

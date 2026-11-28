@@ -29,6 +29,7 @@ use crate::disk::BLOCK_SIZE;
 use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use crate::role::{Mutable, Role};
 use crate::types::Txg;
 use crate::zil::KeyedOp;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -84,24 +85,34 @@ pub(crate) struct Unsettled<'a> {
 impl<'a> Unsettled<'a> {
     /// Guard what's pushed to `ptrs` from now on (not what's already in
     /// it): `build_tree`'s allocations.
-    pub(crate) fn added<D: PoolDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    pub(crate) fn added<D: PoolDevice, R: Role>(
+        fs: &FileSystem<D, R>,
+        ptrs: &'a mut Vec<BlockPtr>,
+    ) -> Self {
         Self::from(fs, ptrs.len(), ptrs)
     }
 
     /// Guard everything in `ptrs`, as it is when dropped: a list the
     /// caller works through, popping each one it's done with.
-    pub(crate) fn all<D: PoolDevice>(fs: &FileSystem<D>, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    pub(crate) fn all<D: PoolDevice, R: Role>(
+        fs: &FileSystem<D, R>,
+        ptrs: &'a mut Vec<BlockPtr>,
+    ) -> Self {
         Self::from(fs, 0, ptrs)
     }
 
-    fn from<D: PoolDevice>(fs: &FileSystem<D>, from: usize, ptrs: &'a mut Vec<BlockPtr>) -> Self {
+    fn from<D: PoolDevice, R: Role>(
+        fs: &FileSystem<D, R>,
+        from: usize,
+        ptrs: &'a mut Vec<BlockPtr>,
+    ) -> Self {
         Unsettled {
             from,
             ptrs,
             reserved: Vec::new(),
             metaslabs: fs.metaslabs.clone(),
             layout: fs.layout,
-            writer: fs.writer.is_some(),
+            writer: fs.role.writer().is_some(),
             armed: true,
         }
     }
@@ -568,7 +579,7 @@ impl ObjTree {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     pub(crate) async fn load_indirect(
         &self,
         obj: &ObjTree,
@@ -998,6 +1009,200 @@ impl<D: PoolDevice> FileSystem<D> {
         }
     }
 
+    /// Blocks the indirect blocks of a new tree over `records` data
+    /// records may take, worst case.
+    pub(crate) fn fresh_indirect_blocks(&self, records: u64) -> u64 {
+        let indirect = self.align_blocks(INDIRECT_MAX_BYTES.div_ceil(BLOCK_SIZE as u64));
+        let mut n = 0;
+        let mut at = records;
+        for _ in 0..levels_for(records) {
+            at = at.div_ceil(INDIRECT_FANOUT);
+            n += at.max(1);
+        }
+        n * indirect
+    }
+
+    /// The first `size` bytes of the tree at `root` (holes read as zeros).
+    pub(crate) async fn read_tree(
+        &self,
+        root: &TreeRoot,
+        blksz: usize,
+        size: u64,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let mut out = vec![0u8; size as usize];
+        let leaves = self.tree_leaves(root).await?;
+        let ptrs: Vec<BlockPtr> = leaves.iter().map(|(_, p)| p.clone()).collect();
+        for ((idx, _), data) in leaves.iter().zip(self.read_records(&ptrs).await?) {
+            let at = (*idx as usize).saturating_mul(blksz);
+            if at >= out.len() {
+                continue;
+            }
+            let n = data.len().min(out.len() - at);
+            out[at..at + n].copy_from_slice(&data[..n]);
+        }
+        Ok(out)
+    }
+
+    /// Record `idx` of `obj` as readers see it (dirty first; None = hole).
+    pub(crate) async fn object_record(
+        &self,
+        obj: &ObjTree,
+        idx: u64,
+    ) -> Result<Option<Arc<Vec<u8>>>, FileSystemError> {
+        let pending = obj.dirty.lock().unwrap().get(idx).cloned();
+        match pending {
+            Some(Dirty::Data(d)) => Ok(Some(Arc::new(d))),
+            Some(Dirty::Hole) => Ok(None),
+            None => self.read_committed_record(obj, idx).await,
+        }
+    }
+
+    /// Every extent a tree occupies (indirects and data records).
+    pub async fn tree_extents(&self, root: &TreeRoot) -> Result<Vec<Extent>, FileSystemError> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(BlockPtr, u8)> =
+            root.ptr.iter().map(|r| (r.clone(), root.levels)).collect();
+        while let Some((ptr, level)) = stack.pop() {
+            out.push(ptr.extent());
+            if level > 0 {
+                let ind: Indirect = bincode::deserialize(&self.read_record(&ptr).await?)?;
+                stack.extend(ind.into_iter().flatten().map(|c| (c, level - 1)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every allocated data record of a committed tree, in index order.
+    pub async fn tree_leaves(
+        &self,
+        root: &TreeRoot,
+    ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
+        let mut out = Vec::new();
+        // Depth first, children pushed in reverse so they pop in index order.
+        let mut stack: Vec<(BlockPtr, u8, u64)> = root
+            .ptr
+            .iter()
+            .map(|r| (r.clone(), root.levels, 0))
+            .collect();
+        while let Some((ptr, level, base)) = stack.pop() {
+            if level == 0 {
+                out.push((base, ptr));
+                continue;
+            }
+            let ind: Indirect = bincode::deserialize(&self.read_record(&ptr).await?)?;
+            let span = INDIRECT_FANOUT.pow((level - 1) as u32);
+            for (slot, child) in ind.into_iter().enumerate().rev() {
+                if let Some(c) = child {
+                    stack.push((c, level - 1, base + slot as u64 * span));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The allocated data records of a committed tree at index `first` or
+    /// later, in index order (subtrees wholly before `first` aren't read).
+    /// The first byte at `offset` or after that is data (`data`) or in a
+    /// hole, by record (unsynced writes included); None: there is none
+    /// before the end. `offset` must be within the object.
+    pub async fn object_seek(
+        &self,
+        obj: &ObjTree,
+        offset: u64,
+        data: bool,
+    ) -> Result<Option<u64>, FileSystemError> {
+        let size = obj.size();
+        let bs = obj.blksz as u64;
+        let (start, last) = (offset / bs, size.saturating_sub(1) / bs);
+        let mut held: std::collections::BTreeSet<u64> = self
+            .tree_leaves_from(obj, &obj.root(), start)
+            .await?
+            .into_iter()
+            .map(|(i, _)| i)
+            .filter(|&i| i <= last)
+            .collect();
+        let dirty = obj.dirty.lock().unwrap().from(start);
+        for (i, is_data) in dirty {
+            if is_data && i <= last {
+                held.insert(i);
+            } else {
+                held.remove(&i);
+            }
+        }
+        let found = if data {
+            held.range(start..).next().copied()
+        } else {
+            let mut i = start;
+            while i <= last && held.contains(&i) {
+                i += 1;
+            }
+            (i <= last).then_some(i)
+        };
+        Ok(found.map(|i| (i * bs).max(offset)))
+    }
+
+    async fn tree_leaves_from(
+        &self,
+        obj: &ObjTree,
+        root: &TreeRoot,
+        first: u64,
+    ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(BlockPtr, u8, u64)> = root
+            .ptr
+            .iter()
+            .map(|r| (r.clone(), root.levels, 0))
+            .collect();
+        while let Some((ptr, level, base)) = stack.pop() {
+            if level == 0 {
+                // (A tree of no levels is just record 0.)
+                if base >= first {
+                    out.push((base, ptr));
+                }
+                continue;
+            }
+            let ind = self.load_indirect(obj, &ptr).await?;
+            let span = INDIRECT_FANOUT.pow((level - 1) as u32);
+            for (slot, child) in ind.iter().enumerate().rev() {
+                let start = base + slot as u64 * span;
+                if let Some(c) = child
+                    && start + span > first
+                {
+                    stack.push((c.clone(), level - 1, start));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Levels a tree of `levels` needs once `records` are written (it never
+/// shrinks).
+fn target_levels(levels: u8, records: &BTreeMap<u64, Dirty>) -> u8 {
+    match records.last_key_value() {
+        Some((&max, _)) => levels.max(levels_for(max + 1)),
+        None => levels,
+    }
+}
+
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    /// Write `data` as a new tree of `blksz`-byte records (the last one
+    /// short). Pushes everything written to `allocated`.
+    pub async fn write_tree(
+        &self,
+        blksz: usize,
+        data: &[u8],
+        allocated: &mut Vec<BlockPtr>,
+    ) -> Result<TreeRoot, FileSystemError> {
+        let mut leaves = Vec::with_capacity(data.len().div_ceil(blksz));
+        for chunk in data.chunks(blksz) {
+            let ptr = self.write_record(chunk).await?;
+            allocated.push(ptr.clone());
+            leaves.push(ptr);
+        }
+        self.fresh_tree(&leaves, allocated).await
+    }
+
     /// Raise `root` to `levels`: each new level is an indirect block whose
     /// first slot is the level below. An empty tree just gets taller.
     async fn grow_root(
@@ -1023,26 +1228,6 @@ impl<D: PoolDevice> FileSystem<D> {
             root.levels += 1;
         }
         Ok(root)
-    }
-
-    /// Write `records` and the indirect blocks above them. Returns the new
-    /// tree without changing anything visible. Everything written is pushed
-    /// to `allocated` (for the caller to release on failure) and every block
-    /// the new tree no longer references to `replaced` (for the caller to
-    /// free once the new root is committed).
-    pub(crate) async fn build_tree(
-        &self,
-        obj: &ObjTree,
-        records: &BTreeMap<u64, Dirty>,
-        allocated: &mut Vec<BlockPtr>,
-        replaced: &mut Vec<BlockPtr>,
-    ) -> Result<TreeRoot, FileSystemError> {
-        // Dropped before returning, what it allocated is given back (I-1).
-        let mut g = Unsettled::added(self, allocated);
-        let r = self.build_tree_in(obj, records, &mut g, replaced).await;
-        debug_assert!(g.reserved.is_empty(), "build_tree left runs reserved");
-        g.disarm();
-        r
     }
 
     async fn build_tree_in(
@@ -1286,17 +1471,24 @@ impl<D: PoolDevice> FileSystem<D> {
         })
     }
 
-    /// Blocks the indirect blocks of a new tree over `records` data
-    /// records may take, worst case.
-    pub(crate) fn fresh_indirect_blocks(&self, records: u64) -> u64 {
-        let indirect = self.align_blocks(INDIRECT_MAX_BYTES.div_ceil(BLOCK_SIZE as u64));
-        let mut n = 0;
-        let mut at = records;
-        for _ in 0..levels_for(records) {
-            at = at.div_ceil(INDIRECT_FANOUT);
-            n += at.max(1);
-        }
-        n * indirect
+    /// Write `records` and the indirect blocks above them. Returns the new
+    /// tree without changing anything visible. Everything written is pushed
+    /// to `allocated` (for the caller to release on failure) and every block
+    /// the new tree no longer references to `replaced` (for the caller to
+    /// free once the new root is committed).
+    pub(crate) async fn build_tree(
+        &self,
+        obj: &ObjTree,
+        records: &BTreeMap<u64, Dirty>,
+        allocated: &mut Vec<BlockPtr>,
+        replaced: &mut Vec<BlockPtr>,
+    ) -> Result<TreeRoot, FileSystemError> {
+        // Dropped before returning, what it allocated is given back (I-1).
+        let mut g = Unsettled::added(self, allocated);
+        let r = self.build_tree_in(obj, records, &mut g, replaced).await;
+        debug_assert!(g.reserved.is_empty(), "build_tree left runs reserved");
+        g.disarm();
+        r
     }
 
     /// Build a new tree over data records already written: `leaves[i]` is
@@ -1323,185 +1515,6 @@ impl<D: PoolDevice> FileSystem<D> {
         let mut replaced = Vec::new();
         self.build_indirects(&scratch, &empty, changes, allocated, &mut replaced)
             .await
-    }
-
-    /// Write `data` as a new tree of `blksz`-byte records (the last one
-    /// short). Pushes everything written to `allocated`.
-    pub async fn write_tree(
-        &self,
-        blksz: usize,
-        data: &[u8],
-        allocated: &mut Vec<BlockPtr>,
-    ) -> Result<TreeRoot, FileSystemError> {
-        let mut leaves = Vec::with_capacity(data.len().div_ceil(blksz));
-        for chunk in data.chunks(blksz) {
-            let ptr = self.write_record(chunk).await?;
-            allocated.push(ptr.clone());
-            leaves.push(ptr);
-        }
-        self.fresh_tree(&leaves, allocated).await
-    }
-
-    /// The first `size` bytes of the tree at `root` (holes read as zeros).
-    pub(crate) async fn read_tree(
-        &self,
-        root: &TreeRoot,
-        blksz: usize,
-        size: u64,
-    ) -> Result<Vec<u8>, FileSystemError> {
-        let mut out = vec![0u8; size as usize];
-        let leaves = self.tree_leaves(root).await?;
-        let ptrs: Vec<BlockPtr> = leaves.iter().map(|(_, p)| p.clone()).collect();
-        for ((idx, _), data) in leaves.iter().zip(self.read_records(&ptrs).await?) {
-            let at = (*idx as usize).saturating_mul(blksz);
-            if at >= out.len() {
-                continue;
-            }
-            let n = data.len().min(out.len() - at);
-            out[at..at + n].copy_from_slice(&data[..n]);
-        }
-        Ok(out)
-    }
-
-    /// Record `idx` of `obj` as readers see it (dirty first; None = hole).
-    pub(crate) async fn object_record(
-        &self,
-        obj: &ObjTree,
-        idx: u64,
-    ) -> Result<Option<Arc<Vec<u8>>>, FileSystemError> {
-        let pending = obj.dirty.lock().unwrap().get(idx).cloned();
-        match pending {
-            Some(Dirty::Data(d)) => Ok(Some(Arc::new(d))),
-            Some(Dirty::Hole) => Ok(None),
-            None => self.read_committed_record(obj, idx).await,
-        }
-    }
-
-    /// Every extent a tree occupies (indirects and data records).
-    pub async fn tree_extents(&self, root: &TreeRoot) -> Result<Vec<Extent>, FileSystemError> {
-        let mut out = Vec::new();
-        let mut stack: Vec<(BlockPtr, u8)> =
-            root.ptr.iter().map(|r| (r.clone(), root.levels)).collect();
-        while let Some((ptr, level)) = stack.pop() {
-            out.push(ptr.extent());
-            if level > 0 {
-                let ind: Indirect = bincode::deserialize(&self.read_record(&ptr).await?)?;
-                stack.extend(ind.into_iter().flatten().map(|c| (c, level - 1)));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Every allocated data record of a committed tree, in index order.
-    pub async fn tree_leaves(
-        &self,
-        root: &TreeRoot,
-    ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
-        let mut out = Vec::new();
-        // Depth first, children pushed in reverse so they pop in index order.
-        let mut stack: Vec<(BlockPtr, u8, u64)> = root
-            .ptr
-            .iter()
-            .map(|r| (r.clone(), root.levels, 0))
-            .collect();
-        while let Some((ptr, level, base)) = stack.pop() {
-            if level == 0 {
-                out.push((base, ptr));
-                continue;
-            }
-            let ind: Indirect = bincode::deserialize(&self.read_record(&ptr).await?)?;
-            let span = INDIRECT_FANOUT.pow((level - 1) as u32);
-            for (slot, child) in ind.into_iter().enumerate().rev() {
-                if let Some(c) = child {
-                    stack.push((c, level - 1, base + slot as u64 * span));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// The allocated data records of a committed tree at index `first` or
-    /// later, in index order (subtrees wholly before `first` aren't read).
-    /// The first byte at `offset` or after that is data (`data`) or in a
-    /// hole, by record (unsynced writes included); None: there is none
-    /// before the end. `offset` must be within the object.
-    pub async fn object_seek(
-        &self,
-        obj: &ObjTree,
-        offset: u64,
-        data: bool,
-    ) -> Result<Option<u64>, FileSystemError> {
-        let size = obj.size();
-        let bs = obj.blksz as u64;
-        let (start, last) = (offset / bs, size.saturating_sub(1) / bs);
-        let mut held: std::collections::BTreeSet<u64> = self
-            .tree_leaves_from(obj, &obj.root(), start)
-            .await?
-            .into_iter()
-            .map(|(i, _)| i)
-            .filter(|&i| i <= last)
-            .collect();
-        let dirty = obj.dirty.lock().unwrap().from(start);
-        for (i, is_data) in dirty {
-            if is_data && i <= last {
-                held.insert(i);
-            } else {
-                held.remove(&i);
-            }
-        }
-        let found = if data {
-            held.range(start..).next().copied()
-        } else {
-            let mut i = start;
-            while i <= last && held.contains(&i) {
-                i += 1;
-            }
-            (i <= last).then_some(i)
-        };
-        Ok(found.map(|i| (i * bs).max(offset)))
-    }
-
-    async fn tree_leaves_from(
-        &self,
-        obj: &ObjTree,
-        root: &TreeRoot,
-        first: u64,
-    ) -> Result<Vec<(u64, BlockPtr)>, FileSystemError> {
-        let mut out = Vec::new();
-        let mut stack: Vec<(BlockPtr, u8, u64)> = root
-            .ptr
-            .iter()
-            .map(|r| (r.clone(), root.levels, 0))
-            .collect();
-        while let Some((ptr, level, base)) = stack.pop() {
-            if level == 0 {
-                // (A tree of no levels is just record 0.)
-                if base >= first {
-                    out.push((base, ptr));
-                }
-                continue;
-            }
-            let ind = self.load_indirect(obj, &ptr).await?;
-            let span = INDIRECT_FANOUT.pow((level - 1) as u32);
-            for (slot, child) in ind.iter().enumerate().rev() {
-                let start = base + slot as u64 * span;
-                if let Some(c) = child
-                    && start + span > first
-                {
-                    stack.push((c.clone(), level - 1, start));
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-/// Levels a tree of `levels` needs once `records` are written (it never
-/// shrinks).
-fn target_levels(levels: u8, records: &BTreeMap<u64, Dirty>) -> u8 {
-    match records.last_key_value() {
-        Some((&max, _)) => levels.max(levels_for(max + 1)),
-        None => levels,
     }
 }
 

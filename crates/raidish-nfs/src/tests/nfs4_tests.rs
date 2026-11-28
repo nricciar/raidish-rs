@@ -3,16 +3,16 @@
 use super::attrs::{self, bitmap_of, read_bitmap, write_bitmap};
 use super::{err, op};
 use crate::backend::{Backend, NfsStat};
-use crate::fs::FileSystem;
 use crate::rpc::Client;
 use crate::test_util::TestPool;
 use crate::v3::NFS_PROG;
 use crate::vdev::Pool;
 use crate::xdr::{Reader, Writer};
+use raidish_core::role::{Committer, CommitterFs};
 use std::path::Path;
 use std::sync::Arc;
 
-async fn serve(fs: Arc<FileSystem<Pool>>) -> std::net::SocketAddr {
+async fn serve(fs: Arc<CommitterFs<Pool>>) -> std::net::SocketAddr {
     let backend = Arc::new(Backend::new(
         Arc::new(move || Some(fs.clone())),
         None,
@@ -555,7 +555,7 @@ async fn files_from_open_to_close() {
         .await;
     assert_eq!(res.status, err::BADNAME);
     drop(v);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -751,7 +751,7 @@ use super::{Server, V4Cluster, V4Forward, V4Forwarded};
 #[derive(Default)]
 struct TestCluster {
     owner: std::sync::Mutex<Option<String>>,
-    servers: std::sync::Mutex<std::collections::HashMap<String, Arc<Server<Pool>>>>,
+    servers: std::sync::Mutex<std::collections::HashMap<String, Arc<Server<Pool, Committer>>>>,
     records: std::sync::Mutex<std::collections::BTreeSet<Vec<u8>>>,
     locations: Vec<String>,
     devices: std::sync::Mutex<Vec<super::Device>>,
@@ -803,7 +803,7 @@ impl TestCluster {
 
 /// Two nodes' NFS servers over one pool, `a` owning the state.
 async fn two_nodes(
-    fs: Arc<FileSystem<Pool>>,
+    fs: Arc<CommitterFs<Pool>>,
 ) -> (Arc<TestCluster>, std::net::SocketAddr, std::net::SocketAddr) {
     let cluster = Arc::new(TestCluster {
         locations: vec!["node-a.example".into(), "10.0.0.2".into()],
@@ -1278,7 +1278,7 @@ async fn seek_and_punch_holes() {
         );
     }
     drop(v);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 

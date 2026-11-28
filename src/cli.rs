@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::disk::PoolDevice;
 use crate::fs::FileSystem;
 use crate::inode::DatasetProps;
+use crate::role::{CommitterFs, ReadOnlyFs, Role, WriterFs};
 use crate::send::StreamReport;
 use crate::snapshot::SnapshotInfo;
 use crate::types::Txg;
@@ -418,12 +419,12 @@ fn load_config(path: &str) -> std::io::Result<Config> {
 /// How often a serving process re-checks disk health (it also reacts to
 /// reconnects immediately).
 const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a volume writer repairs its lent space (as the agent does).
+const HEAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn print_status<D: PoolDevice>(fs: &FileSystem<D>) {
+async fn print_status<D: PoolDevice, R: Role>(fs: &FileSystem<D, R>) {
     let degraded = fs.degraded_disks();
-    if let Some(u) = fs.uberblock().await {
-        println!("pool at TXG {}", u.txg);
-    }
+    println!("pool at TXG {}", fs.uberblock().await.txg);
     let ring: Vec<String> = fs
         .uberblock_ring()
         .await
@@ -492,13 +493,18 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-async fn open_fs<D: PoolDevice>(dev: D, read_only: bool, rewind: fs::Rewind) -> FileSystem<D> {
-    let opened = match (rewind, read_only) {
-        (fs::Rewind::None, false) => FileSystem::load(dev).await,
-        (fs::Rewind::None, true) => FileSystem::load_readonly(dev).await,
-        _ => FileSystem::load_with(dev, fs::LoadOptions { read_only, rewind }).await,
-    };
-    opened.unwrap_or_else(|e| fail(format!("cannot open pool: {}", e)))
+/// Open the pool for inspection: nothing is ever written.
+async fn open_ro<D: PoolDevice>(dev: D, rewind: fs::Rewind) -> ReadOnlyFs<D> {
+    FileSystem::load_readonly_with(dev, rewind)
+        .await
+        .unwrap_or_else(|e| fail(format!("cannot open pool: {}", e)))
+}
+
+/// Open the pool as its committer (this process owns it).
+async fn open_rw<D: PoolDevice>(dev: D, rewind: fs::Rewind) -> CommitterFs<D> {
+    FileSystem::load_with(dev, fs::LoadOptions { rewind })
+        .await
+        .unwrap_or_else(|e| fail(format!("cannot open pool: {}", e)))
 }
 
 #[tokio::main]
@@ -775,12 +781,12 @@ pub async fn main() -> std::io::Result<()> {
 
     match cli.command {
         Commands::Nbd { name, size: _ } => {
-            let fs = Arc::new(open_fs(raid, false, rewind).await);
+            let fs = Arc::new(open_rw(raid, rewind).await);
             crate::committer::health::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             nbd::serve_nbd(fs, name, nbd::NBD_PORT).await.unwrap();
         }
         Commands::Nvme { name } => {
-            let fs = Arc::new(open_fs(raid, false, rewind).await);
+            let fs = Arc::new(open_rw(raid, rewind).await);
             crate::committer::health::spawn_health_monitor(fs.clone(), HEALTH_INTERVAL, None);
             let server = nvme::NvmeTcpServer::new(fs, name, nvme::NVME_PORT)
                 .await
@@ -788,19 +794,19 @@ pub async fn main() -> std::io::Result<()> {
             server.run().await.unwrap();
         }
         Commands::Scrub { dry_run } => {
-            let fs = if dry_run {
-                open_fs(raid, true, rewind).await
+            let report = if dry_run {
+                open_ro(raid, rewind).await.scrub().await
             } else {
-                open_fs(raid, false, rewind).await
-            };
-            let report = fs.scrub(!dry_run).await.unwrap();
+                open_rw(raid, rewind).await.scrub_repair().await
+            }
+            .unwrap();
             println!("{}", report);
             if !report.is_clean() {
                 std::process::exit(2);
             }
         }
         Commands::Resilver => {
-            let fs = open_fs(raid, false, rewind).await;
+            let fs = open_rw(raid, rewind).await;
             if !fs.needs_resilver() {
                 println!("no online disk needs a resilver");
                 print_status(&fs).await;
@@ -818,15 +824,24 @@ pub async fn main() -> std::io::Result<()> {
             rebuild_spacemaps,
             force,
         } => {
-            let fs = open_fs(raid, !(repair || rebuild_spacemaps), rewind).await;
-            if rebuild_spacemaps {
-                let report = fs
-                    .rebuild_spacemaps(force)
-                    .await
-                    .unwrap_or_else(|e| fail(e));
-                println!("{}", report);
+            let report = if repair || rebuild_spacemaps {
+                let fs = open_rw(raid, rewind).await;
+                if rebuild_spacemaps {
+                    let report = fs
+                        .rebuild_spacemaps(force)
+                        .await
+                        .unwrap_or_else(|e| fail(e));
+                    println!("{}", report);
+                }
+                if repair {
+                    fs.fsck_repair().await
+                } else {
+                    fs.fsck().await
+                }
+            } else {
+                open_ro(raid, rewind).await.fsck().await
             }
-            let report = fs.fsck(repair).await.unwrap_or_else(|e| fail(e));
+            .unwrap_or_else(|e| fail(e));
             println!("{}", report);
             if !report.is_clean() {
                 std::process::exit(2);
@@ -840,7 +855,7 @@ pub async fn main() -> std::io::Result<()> {
                 fs::Rewind::None | fs::Rewind::Auto => fs::Rewind::Readable,
                 r => r,
             };
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             let report = fs
                 .salvage(Path::new(&dest))
                 .await
@@ -851,66 +866,67 @@ pub async fn main() -> std::io::Result<()> {
             }
         }
         Commands::Defrag { name, batch, check } => {
-            let fs = open_fs(raid, check, rewind).await;
             if check {
+                let fs = open_ro(raid, rewind).await;
                 let frag = fs.fragmentation(&name).await.unwrap_or_else(|e| fail(e));
                 println!("{}", frag);
                 return Ok(());
             }
+            let fs = open_rw(raid, rewind).await;
             let (before, after) = fs.defrag(&name, batch).await.unwrap_or_else(|e| fail(e));
             println!("before: {}", before);
             println!("after:  {}", after);
         }
         Commands::Status => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             print_status(&fs).await;
         }
         Commands::Block { name, size } => {
-            let fs = open_fs(raid, false, rewind).await;
+            let fs = open_rw(raid, rewind).await;
             volume_command(&VolumeCommands::Create { name, size }, &fs).await;
         }
         Commands::Map => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             fs.display_block_map().await;
         }
         Commands::Metaslab => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             fs.display_metaslab_info().await;
         }
         Commands::Orphaned => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             let orphans = fs.find_orphaned_blocks().await.unwrap();
             println!("orphans: {:?}", orphans);
         }
         Commands::Read { path } => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             let data = fs.read_file(Path::new(&path)).await.unwrap();
             std::fs::write("output.png", data)?;
         }
         Commands::Inode { file } => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             let (id, dnode) = fs.stat(Path::new(&file)).await.unwrap();
             println!("object {}: {:?}", id, dnode);
         }
         Commands::Write { source, dest } => {
-            let fs = open_fs(raid, false, rewind).await;
+            let fs = open_rw(raid, rewind).await;
             let file = Path::new(&source);
             let data = std::fs::read(file).unwrap();
             fs.write_file(Path::new(&dest), &data).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Mkdir { path } => {
-            let fs = open_fs(raid, false, rewind).await;
+            let fs = open_rw(raid, rewind).await;
             fs.mkdir(Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
         Commands::Ls { path } => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             let ls = fs.ls(Path::new(&path)).await.unwrap();
             println!("ls: {:?}", &ls);
         }
         Commands::Delete { path } => {
-            let fs = open_fs(raid, false, rewind).await;
+            let fs = open_rw(raid, rewind).await;
             fs.delete(Path::new(&path)).await.unwrap();
             fs.sync().await.unwrap();
         }
@@ -923,7 +939,7 @@ pub async fn main() -> std::io::Result<()> {
                 }),
             };
             let fs = FileSystem::format(raid, blocks).await.unwrap();
-            let sb = fs.superblock().await.unwrap();
+            let sb = fs.superblock().clone();
             println!(
                 "formatted {} blocks ({:.1} GiB usable): {} metaslabs of {} blocks",
                 blocks,
@@ -933,24 +949,25 @@ pub async fn main() -> std::io::Result<()> {
             );
         }
         Commands::Load => {
-            let fs = open_fs(raid, true, rewind).await;
+            let fs = open_ro(raid, rewind).await;
             println!("root: {:?}", fs.ls(Path::new("")).await.unwrap());
         }
-        Commands::Volume { command } => {
-            let read_only = matches!(
-                command,
-                VolumeCommands::List
-                    | VolumeCommands::Snapshots { .. }
-                    | VolumeCommands::Send { .. }
-            );
-            let fs = open_fs(raid, read_only, rewind).await;
-            match command {
-                VolumeCommands::Send { snapshot, from } => {
-                    send_to_stdout(&fs, &snapshot, from).await
-                }
-                cmd => volume_command(&cmd, &fs).await,
+        Commands::Volume { command } => match command {
+            // Reads open the pool read-only; the rest change it.
+            VolumeCommands::List => {
+                let fs = open_ro(raid, rewind).await;
+                let vols = fs.list_volumes().await.unwrap_or_else(|e| fail(e));
+                print_volumes(&vols, None);
             }
-        }
+            VolumeCommands::Snapshots { name } => {
+                let fs = open_ro(raid, rewind).await;
+                print_snapshots(&fs.list_snapshots(&name).await.unwrap_or_else(|e| fail(e)))
+            }
+            VolumeCommands::Send { snapshot, from } => {
+                send_to_stdout(&open_ro(raid, rewind).await, &snapshot, from).await
+            }
+            cmd => volume_command(&cmd, &open_rw(raid, rewind).await).await,
+        },
         Commands::Listen { .. }
         | Commands::Vm { .. }
         | Commands::Node { .. }
@@ -999,7 +1016,7 @@ trait VolumeAdmin: Sync {
 }
 
 #[async_trait::async_trait]
-impl<D: PoolDevice + 'static> VolumeAdmin for FileSystem<D> {
+impl<D: PoolDevice + 'static> VolumeAdmin for CommitterFs<D> {
     async fn volumes(&self) -> Result<Vec<VolumeInfo>, CommitError> {
         Ok(self.list_volumes().await?)
     }
@@ -1211,8 +1228,8 @@ fn change_props(
 
 /// `volume send`: the stream to stdout (which mustn't be a terminal), the
 /// report to stderr.
-async fn send_to_stdout(
-    fs: &FileSystem<crate::vdev::Pool>,
+async fn send_to_stdout<R: Role>(
+    fs: &FileSystem<crate::vdev::Pool, R>,
     snapshot: &SnapshotRef,
     from: Option<String>,
 ) {
@@ -1491,11 +1508,9 @@ async fn via_committer(
             let writer = VolumeWriter::start(endpoints, spec, opts, name, command.describe())
                 .await
                 .unwrap_or_else(|e| fail(e));
-            crate::committer::health::spawn_health_monitor(
-                writer.fs.clone(),
-                HEALTH_INTERVAL,
-                None,
-            );
+            // The committer resilvers the pool; this writer repairs the
+            // space lent to it, which the committer can't write.
+            crate::committer::health::spawn_lent_healer(writer.fs.clone(), HEAL_INTERVAL, "writer");
             if let Commands::Nbd { .. } = command {
                 nbd::serve_nbd(writer.fs.clone(), name.clone(), nbd::NBD_PORT)
                     .await
@@ -1515,7 +1530,7 @@ async fn via_committer(
 /// A volume writer process (`nbd` / `nvme` with a committer running): its
 /// `writer/...` and `ds/<name>` leases and the pool opened in writer role.
 struct VolumeWriter {
-    fs: Arc<FileSystem<crate::vdev::Pool>>,
+    fs: Arc<WriterFs<crate::vdev::Pool>>,
     /// Held (renewed) for as long as this writer runs.
     _leases: [Arc<cluster::lease::HeldLease>; 2],
 }

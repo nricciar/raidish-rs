@@ -35,7 +35,7 @@ async fn object_table_grows_past_one_record() {
             content(i as u8, 100 + i)
         );
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -94,7 +94,7 @@ async fn deleting_a_directory_needs_it_empty() {
     fs.delete(Path::new("/d/f")).await.unwrap();
     fs.delete(Path::new("/d")).await.unwrap();
     assert!(fs.ls(Path::new("")).await.unwrap().files.is_empty());
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     assert!(fs.find_orphaned_blocks().await.unwrap().is_empty());
 }
@@ -114,7 +114,7 @@ async fn fsck_reports_namespace_damage() {
             .unwrap();
         fs.commit_locked(&mut tx).await.unwrap();
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(!report.is_clean());
     assert!(
         report.errors.iter().any(|e| e.contains("isn't linked")),
@@ -131,7 +131,7 @@ async fn fsck_reports_namespace_damage() {
         fs.write_dnode(&mut tx, id, None).await.unwrap();
         fs.commit_locked(&mut tx).await.unwrap();
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(
         report.errors.iter().any(|e| e.contains("doesn't exist")),
         "{}",

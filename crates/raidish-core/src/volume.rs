@@ -12,6 +12,7 @@ use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{Dirty, levels_for};
+use crate::role::{Committer, Mutable, Role};
 use crate::types::DatasetName;
 use std::sync::Arc;
 
@@ -58,7 +59,7 @@ fn frag_of(leaves: &[(u64, BlockPtr)]) -> FragReport {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Records must be whole stripes so a record never shares a stripe:
     /// volume block sizes are multiples of this.
     pub fn volblock_align(&self) -> u32 {
@@ -77,6 +78,60 @@ impl<D: PoolDevice> FileSystem<D> {
             .min(self.max_volblocksize())
     }
 
+    /// Volume `name`, opened (refused if it's another kind of dataset).
+    pub(crate) async fn open_block(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
+        let ds = self.open_dataset(name).await?;
+        if ds.format != DatasetFormat::Block {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a {} dataset, not a volume",
+                name,
+                ds.format.name()
+            )));
+        }
+        Ok(ds)
+    }
+
+    /// Every volume with its size and placement.
+    pub async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, FileSystemError> {
+        let mut out = Vec::new();
+        for (name, e) in self.datasets().await?.datasets {
+            if e.format != DatasetFormat::Block {
+                continue;
+            }
+            let d = self.read_dnode(e.root).await?;
+            out.push(VolumeInfo {
+                name: DatasetName::try_from(name)?,
+                size_bytes: d.size,
+                volblocksize: d.blksz,
+                props: d.props().cloned().unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read data from a virtual block device at a specific byte offset
+    pub async fn block_read(
+        &self,
+        name: &DatasetName,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FileSystemError> {
+        let vol = self.open_block(name).await?;
+        self.object_read(&vol.obj, offset, buf).await
+    }
+
+    /// How scattered volume `name`'s committed records are.
+    pub async fn fragmentation(&self, name: &DatasetName) -> Result<FragReport, FileSystemError> {
+        let vol = self.open_block(name).await?;
+        let leaves = self.tree_leaves(&vol.obj.root()).await?;
+        Ok(frag_of(&leaves))
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
     /// Create a sparse copy-on-write volume. `volblocksize` must be a multiple
     /// of `volblock_align()` and at most `max_volblocksize()`.
     pub async fn create_block(
@@ -113,22 +168,6 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(file_id)
     }
 
-    /// Volume `name`, opened (refused if it's another kind of dataset).
-    pub(crate) async fn open_block(
-        &self,
-        name: &DatasetName,
-    ) -> Result<Arc<Dataset>, FileSystemError> {
-        let ds = self.open_dataset(name).await?;
-        if ds.format != DatasetFormat::Block {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "'{}' is a {} dataset, not a volume",
-                name,
-                ds.format.name()
-            )));
-        }
-        Ok(ds)
-    }
-
     /// Delete volume `name` (it must have no snapshots).
     pub async fn delete_volume(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         if self.dataset_entry(name).await?.format != DatasetFormat::Block {
@@ -138,73 +177,6 @@ impl<D: PoolDevice> FileSystem<D> {
             )));
         }
         self.delete_dataset(name).await
-    }
-
-    /// Every volume with its size and placement.
-    pub async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, FileSystemError> {
-        let mut out = Vec::new();
-        for (name, e) in self.datasets().await?.datasets {
-            if e.format != DatasetFormat::Block {
-                continue;
-            }
-            let d = self.read_dnode(e.root).await?;
-            out.push(VolumeInfo {
-                name: DatasetName::try_from(name)?,
-                size_bytes: d.size,
-                volblocksize: d.blksz,
-                props: d.props().cloned().unwrap_or_default(),
-            });
-        }
-        Ok(out)
-    }
-
-    /// Read data from a virtual block device at a specific byte offset
-    pub async fn block_read(
-        &self,
-        name: &DatasetName,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, FileSystemError> {
-        let vol = self.open_block(name).await?;
-        self.object_read(&vol.obj, offset, buf).await
-    }
-
-    /// Write data to a virtual block device at a specific byte offset
-    pub async fn block_write(
-        &self,
-        name: &DatasetName,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<usize, FileSystemError> {
-        let vol = self.open_block(name).await?;
-        let done = self
-            .object_modify(&vol.obj, offset, data.len(), Some(data))
-            .await?;
-        if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
-            // Writers that piled up behind a commit (one per request in
-            // flight) don't each run another one once it has drained.
-            self.commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
-                .await?;
-        }
-        Ok(done)
-    }
-
-    /// Zero a range (NBD TRIM / WRITE_ZEROES). Whole records become holes and
-    /// release their space on the next commit.
-    pub async fn block_zero(
-        &self,
-        name: &DatasetName,
-        offset: u64,
-        len: usize,
-    ) -> Result<usize, FileSystemError> {
-        let vol = self.open_block(name).await?;
-        self.object_modify(&vol.obj, offset, len, None).await
-    }
-    /// How scattered volume `name`'s committed records are.
-    pub async fn fragmentation(&self, name: &DatasetName) -> Result<FragReport, FileSystemError> {
-        let vol = self.open_block(name).await?;
-        let leaves = self.tree_leaves(&vol.obj.root()).await?;
-        Ok(frag_of(&leaves))
     }
 
     /// Rewrite volume `name` so its records are laid out in index order,
@@ -272,6 +244,40 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         let after = frag_of(&self.tree_leaves(&vol.obj.root()).await?);
         Ok((before, after))
+    }
+}
+
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    /// Write data to a virtual block device at a specific byte offset
+    pub async fn block_write(
+        &self,
+        name: &DatasetName,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, FileSystemError> {
+        let vol = self.open_block(name).await?;
+        let done = self
+            .object_modify(&vol.obj, offset, data.len(), Some(data))
+            .await?;
+        if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
+            // Writers that piled up behind a commit (one per request in
+            // flight) don't each run another one once it has drained.
+            self.commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
+                .await?;
+        }
+        Ok(done)
+    }
+
+    /// Zero a range (NBD TRIM / WRITE_ZEROES). Whole records become holes and
+    /// release their space on the next commit.
+    pub async fn block_zero(
+        &self,
+        name: &DatasetName,
+        offset: u64,
+        len: usize,
+    ) -> Result<usize, FileSystemError> {
+        let vol = self.open_block(name).await?;
+        self.object_modify(&vol.obj, offset, len, None).await
     }
 }
 

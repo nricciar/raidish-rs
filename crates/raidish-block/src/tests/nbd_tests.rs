@@ -5,6 +5,7 @@ use crate::export::BlockExporter;
 use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
+use raidish_core::role::{Committer, CommitterFs};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -106,7 +107,7 @@ impl Client {
     }
 }
 
-type Fs = Arc<FileSystem<crate::vdev::Pool>>;
+type Fs = Arc<CommitterFs<crate::vdev::Pool>>;
 
 /// Serve `volumes` (name, size) from one NBD server on an ephemeral port.
 /// The exports `serve_many` made, by volume: each is up while held.
@@ -117,7 +118,7 @@ async fn serve_many(
     volumes: &[(&str, u64)],
 ) -> (
     Fs,
-    Arc<NbdServer<crate::vdev::Pool>>,
+    Arc<NbdServer<crate::vdev::Pool, Committer>>,
     std::net::SocketAddr,
     Held,
 ) {

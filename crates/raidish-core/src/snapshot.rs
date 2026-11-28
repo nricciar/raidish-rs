@@ -45,6 +45,7 @@ use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Body, Dnode, Head, Snap, SnapRef};
 use crate::object::{INDIRECT_FANOUT, ObjTree, Sizing, TreeRoot};
+use crate::role::{Committer, Role};
 use crate::types::DatasetName;
 use crate::types::Txg;
 use std::sync::Arc;
@@ -87,7 +88,7 @@ fn short(r: &SnapRef) -> &str {
     r.name.split_once('@').map_or(&r.name, |(_, s)| s)
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// The volume `name` and its dnode (a volume, not a snapshot).
     async fn head(&self, name: &DatasetName) -> Result<(FileId, Dnode), FileSystemError> {
         let e = self.dataset_entry(name).await?;
@@ -164,73 +165,6 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(out)
     }
 
-    /// Snapshot volume `name` as `snap` (`name@snap`), as last committed
-    /// (everything written here so far is committed first). Returns its
-    /// TXG.
-    pub async fn create_snapshot(
-        &self,
-        name: &DatasetName,
-        snap: &str,
-    ) -> Result<Txg, FileSystemError> {
-        self.create_snapshot_as(name, snap, None, None).await
-    }
-
-    /// `create_snapshot`, naming its contents `guid` and dating it
-    /// `created_ns` (a received snapshot keeps the sender's; None: new).
-    pub(crate) async fn create_snapshot_as(
-        &self,
-        name: &DatasetName,
-        snap: &str,
-        guid: Option<u64>,
-        created_ns: Option<u64>,
-    ) -> Result<Txg, FileSystemError> {
-        check_snap_name(snap)?;
-        if self.writer.is_some() {
-            return Err(FileSystemError::InvalidArgument(
-                "snapshots are taken by the committer".into(),
-            ));
-        }
-        let mut tx = self.begin_tx().await;
-        let tx = &mut tx;
-        // Nothing of the open TXG is in the tree after this, so the
-        // snapshot is exactly TXG `txg`, and every block committed from
-        // now on (stamped with the open TXG or later) is born after it.
-        let txg = self.commit_locked(tx).await?;
-        self.raise_birth_floor(txg.next());
-        let (id, mut head) = self.head(name).await?;
-        let (origin, mut snapshots) = head_lineage(&head);
-        if snapshots.iter().any(|s| short(s) == snap) {
-            return Err(FileSystemError::AlreadyExists);
-        }
-        let sid = self.alloc_object();
-        let guid = guid.unwrap_or_else(|| crate::fs::new_guid(sid.get() ^ txg.get()));
-        let mut s = Dnode::volume(head.blksz, head.size, head.tree.levels);
-        s.body = Body::Snapshot(Snap {
-            txg,
-            guid,
-            clones: Vec::new(),
-        });
-        s.tree = head.tree.clone();
-        s.parent = Some(id);
-        if let Some(t) = created_ns {
-            s.attrs.ctime_ns = t;
-            s.attrs.mtime_ns = t;
-        }
-        self.write_dnode(tx, sid, Some(s)).await?;
-        snapshots.push(SnapRef {
-            name: format!("{}@{}", name, snap),
-            id: sid,
-            txg,
-            guid,
-        });
-        set_head_lineage(&mut head, origin, snapshots);
-        let r = self.write_dnode(tx, id, Some(head)).await;
-        // The raised birth floor stays: higher than needed only restamps.
-        tx.check(r).await?;
-        self.commit_locked(tx).await?;
-        Ok(txg)
-    }
-
     /// Volume `name`'s snapshots, oldest first.
     pub async fn list_snapshots(
         &self,
@@ -273,6 +207,116 @@ impl<D: PoolDevice> FileSystem<D> {
             });
         }
         Ok(out)
+    }
+
+    /// Read snapshot `name@snap` at byte `offset`.
+    pub async fn snapshot_read(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FileSystemError> {
+        let obj = self.open_snapshot(name, snap).await?;
+        self.object_read(&obj, offset, buf).await
+    }
+
+    /// Snapshot `name@snap`'s size in bytes.
+    pub async fn snapshot_size(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<u64, FileSystemError> {
+        Ok(self.open_snapshot(name, snap).await?.size())
+    }
+
+    async fn open_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<Arc<ObjTree>, FileSystemError> {
+        let (_, head) = self.head(name).await?;
+        let (_, snapshots) = head_lineage(&head);
+        let r = snapshots
+            .iter()
+            .find(|s| short(s) == snap)
+            .ok_or(FileSystemError::FileNotFound)?;
+        if let Some(t) = self.snap_trees.lock().unwrap().get(&r.id) {
+            return Ok(t.clone());
+        }
+        let d = self.read_dnode(r.id).await?;
+        let t = Arc::new(ObjTree::new(
+            d.blksz as usize,
+            Sizing::Fixed,
+            d.size,
+            d.tree,
+        ));
+        self.snap_trees.lock().unwrap().insert(r.id, t.clone());
+        Ok(t)
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// Snapshot volume `name` as `snap` (`name@snap`), as last committed
+    /// (everything written here so far is committed first). Returns its
+    /// TXG.
+    pub async fn create_snapshot(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+    ) -> Result<Txg, FileSystemError> {
+        self.create_snapshot_as(name, snap, None, None).await
+    }
+
+    /// `create_snapshot`, naming its contents `guid` and dating it
+    /// `created_ns` (a received snapshot keeps the sender's; None: new).
+    pub(crate) async fn create_snapshot_as(
+        &self,
+        name: &DatasetName,
+        snap: &str,
+        guid: Option<u64>,
+        created_ns: Option<u64>,
+    ) -> Result<Txg, FileSystemError> {
+        check_snap_name(snap)?;
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        // Nothing of the open TXG is in the tree after this, so the
+        // snapshot is exactly TXG `txg`, and every block committed from
+        // now on (stamped with the open TXG or later) is born after it.
+        let txg = self.commit_locked(tx).await?;
+        self.raise_birth_floor(txg.next());
+        let (id, mut head) = self.head(name).await?;
+        let (origin, mut snapshots) = head_lineage(&head);
+        if snapshots.iter().any(|s| short(s) == snap) {
+            return Err(FileSystemError::AlreadyExists);
+        }
+        let sid = self.alloc_object();
+        let guid = guid.unwrap_or_else(|| crate::fs::new_guid(sid.get() ^ txg.get()));
+        let mut s = Dnode::volume(head.blksz, head.size, head.tree.levels);
+        s.body = Body::Snapshot(Snap {
+            txg,
+            guid,
+            clones: Vec::new(),
+        });
+        s.tree = head.tree.clone();
+        s.parent = Some(id);
+        if let Some(t) = created_ns {
+            s.attrs.ctime_ns = t;
+            s.attrs.mtime_ns = t;
+        }
+        self.write_dnode(tx, sid, Some(s)).await?;
+        snapshots.push(SnapRef {
+            name: format!("{}@{}", name, snap),
+            id: sid,
+            txg,
+            guid,
+        });
+        set_head_lineage(&mut head, origin, snapshots);
+        let r = self.write_dnode(tx, id, Some(head)).await;
+        // The raised birth floor stays: higher than needed only restamps.
+        tx.check(r).await?;
+        self.commit_locked(tx).await?;
+        Ok(txg)
     }
 
     /// Destroy snapshot `name@snap`, freeing what only it referenced.
@@ -431,52 +475,6 @@ impl<D: PoolDevice> FileSystem<D> {
         self.close_dataset(name);
         self.commit_locked(tx).await?;
         Ok(())
-    }
-
-    /// Read snapshot `name@snap` at byte `offset`.
-    pub async fn snapshot_read(
-        &self,
-        name: &DatasetName,
-        snap: &str,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<usize, FileSystemError> {
-        let obj = self.open_snapshot(name, snap).await?;
-        self.object_read(&obj, offset, buf).await
-    }
-
-    /// Snapshot `name@snap`'s size in bytes.
-    pub async fn snapshot_size(
-        &self,
-        name: &DatasetName,
-        snap: &str,
-    ) -> Result<u64, FileSystemError> {
-        Ok(self.open_snapshot(name, snap).await?.size())
-    }
-
-    async fn open_snapshot(
-        &self,
-        name: &DatasetName,
-        snap: &str,
-    ) -> Result<Arc<ObjTree>, FileSystemError> {
-        let (_, head) = self.head(name).await?;
-        let (_, snapshots) = head_lineage(&head);
-        let r = snapshots
-            .iter()
-            .find(|s| short(s) == snap)
-            .ok_or(FileSystemError::FileNotFound)?;
-        if let Some(t) = self.snap_trees.lock().unwrap().get(&r.id) {
-            return Ok(t.clone());
-        }
-        let d = self.read_dnode(r.id).await?;
-        let t = Arc::new(ObjTree::new(
-            d.blksz as usize,
-            Sizing::Fixed,
-            d.size,
-            d.tree,
-        ));
-        self.snap_trees.lock().unwrap().insert(r.id, t.clone());
-        Ok(t)
     }
 
     /// Before volume `d` (object `id`) is deleted: refuse if it has

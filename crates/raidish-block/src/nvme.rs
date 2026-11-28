@@ -26,6 +26,7 @@ use crate::nbd::DEFAULT_BIND;
 use crate::types::DatasetName;
 use crate::volume_io::ensure_sync_loop;
 use crate::volume_io::{LocalIo, SwitchableIo, VolumeIo};
+use raidish_core::role::Mutable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -310,16 +311,16 @@ struct QueueInfo {
     ctrl: Arc<Controller>,
 }
 
-struct Target<D: PoolDevice> {
-    fs: Arc<FileSystem<D>>,
+struct Target<D: PoolDevice, R: Mutable> {
+    fs: Arc<FileSystem<D, R>>,
     /// By subsystem NQN.
     exports: ExportTable<Export>,
     ctrls: Mutex<HashMap<u16, Arc<Controller>>>,
     next_cntlid: AtomicU16,
 }
 
-struct Conn<D: PoolDevice> {
-    target: Arc<Target<D>>,
+struct Conn<D: PoolDevice, R: Mutable> {
+    target: Arc<Target<D, R>>,
     writer: AsyncMutex<OwnedWriteHalf>,
     queue: Mutex<Option<QueueInfo>>,
     /// Hold on the export this queue connected to.
@@ -333,8 +334,8 @@ struct Conn<D: PoolDevice> {
 }
 
 /// An NVMe/TCP target exporting any number of volumes of one file system.
-pub struct NvmeTcpServer<D: PoolDevice> {
-    target: Arc<Target<D>>,
+pub struct NvmeTcpServer<D: PoolDevice, R: Mutable> {
+    target: Arc<Target<D, R>>,
     bind: String,
     port: u16,
     /// The export `new` made, up for as long as the server.
@@ -346,10 +347,10 @@ pub const NVME_PORT: u16 = 4420;
 
 // The multi-export API is driven by the node agent; until it lands only the
 // single-export CLI wrapper and the tests use all of it.
-impl<D: PoolDevice + Send + Sync + 'static> NvmeTcpServer<D> {
+impl<D: PoolDevice + Send + Sync + 'static, R: Mutable> NvmeTcpServer<D, R> {
     /// Export the single volume `volume` on `127.0.0.1:port` (the CLI's `nvme`).
     pub async fn new(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<FileSystem<D, R>>,
         volume: DatasetName,
         port: u16,
     ) -> Result<Self, FileSystemError> {
@@ -359,7 +360,7 @@ impl<D: PoolDevice + Send + Sync + 'static> NvmeTcpServer<D> {
     }
 
     /// A target with no exports that `run` binds to `bind:port`.
-    pub fn with_bind(fs: Arc<FileSystem<D>>, bind: impl Into<String>, port: u16) -> Self {
+    pub fn with_bind(fs: Arc<FileSystem<D, R>>, bind: impl Into<String>, port: u16) -> Self {
         NvmeTcpServer {
             target: Arc::new(Target {
                 fs,
@@ -405,7 +406,7 @@ impl<D: PoolDevice + Send + Sync + 'static> NvmeTcpServer<D> {
 }
 
 #[async_trait::async_trait]
-impl<D: PoolDevice + Send + Sync + 'static> BlockExporter for NvmeTcpServer<D> {
+impl<D: PoolDevice + Send + Sync + 'static, R: Mutable> BlockExporter for NvmeTcpServer<D, R> {
     /// Exported as subsystem `subsystem_nqn(volume)`.
     async fn add_export(
         &self,
@@ -480,8 +481,8 @@ struct PendingWrite {
     received: usize,
 }
 
-async fn handle_connection<D: PoolDevice + Send + Sync + 'static>(
-    target: Arc<Target<D>>,
+async fn handle_connection<D: PoolDevice + Send + Sync + 'static, R: Mutable>(
+    target: Arc<Target<D, R>>,
     stream: TcpStream,
     peer: String,
 ) -> std::io::Result<()> {
@@ -563,8 +564,8 @@ fn command_bytes(sqe: &Sqe, data: &[u8]) -> usize {
     }
 }
 
-async fn connection_loop<D: PoolDevice + Send + Sync + 'static>(
-    conn: &Arc<Conn<D>>,
+async fn connection_loop<D: PoolDevice + Send + Sync + 'static, R: Mutable>(
+    conn: &Arc<Conn<D, R>>,
     rd: &mut OwnedReadHalf,
 ) -> std::io::Result<()> {
     let mut pending: HashMap<u16, PendingWrite> = HashMap::new();
@@ -725,8 +726,8 @@ async fn connection_loop<D: PoolDevice + Send + Sync + 'static>(
 
 /// Send R2Ts for the writes in `wait`, oldest first, while their data fits
 /// in `R2T_BUDGET` (one always may, when none is outstanding).
-async fn send_r2ts<D: PoolDevice>(
-    conn: &Conn<D>,
+async fn send_r2ts<D: PoolDevice, R: Mutable>(
+    conn: &Conn<D, R>,
     wait: &mut std::collections::VecDeque<Sqe>,
     pending: &mut HashMap<u16, PendingWrite>,
     bytes: &mut usize,
@@ -752,8 +753,8 @@ async fn send_r2ts<D: PoolDevice>(
     Ok(())
 }
 
-async fn send_r2t<D: PoolDevice>(
-    conn: &Conn<D>,
+async fn send_r2t<D: PoolDevice, R: Mutable>(
+    conn: &Conn<D, R>,
     cid: u16,
     ttag: u16,
     offset: u32,
@@ -771,8 +772,8 @@ async fn send_r2t<D: PoolDevice>(
 }
 
 /// Write any C2H data followed by the response capsule, in one piece.
-async fn send_completion<D: PoolDevice>(
-    conn: &Conn<D>,
+async fn send_completion<D: PoolDevice, R: Mutable>(
+    conn: &Conn<D, R>,
     cid: u16,
     c: Completion,
 ) -> std::io::Result<()> {
@@ -818,8 +819,8 @@ async fn send_completion<D: PoolDevice>(
     conn.writer.lock().await.write_all(&out).await
 }
 
-async fn execute<D: PoolDevice + Send + Sync + 'static>(
-    conn: &Conn<D>,
+async fn execute<D: PoolDevice + Send + Sync + 'static, R: Mutable>(
+    conn: &Conn<D, R>,
     sqe: Sqe,
     data: Vec<u8>,
 ) -> std::io::Result<()> {
@@ -883,8 +884,8 @@ fn shutdown_requested(sqe: &Sqe) -> bool {
         && (le32(&sqe.0, 48) >> 14) & 0x3 != 0
 }
 
-fn fabrics<D: PoolDevice>(
-    conn: &Conn<D>,
+fn fabrics<D: PoolDevice, R: Mutable>(
+    conn: &Conn<D, R>,
     queue: &Option<QueueInfo>,
     sqe: &Sqe,
     data: &[u8],
@@ -1030,8 +1031,8 @@ fn fabrics<D: PoolDevice>(
     })
 }
 
-fn admin<D: PoolDevice>(
-    _conn: &Conn<D>,
+fn admin<D: PoolDevice, R: Mutable>(
+    _conn: &Conn<D, R>,
     q: &QueueInfo,
     sqe: &Sqe,
     _data: &[u8],

@@ -24,6 +24,7 @@ use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DNODES_PER_LEAF, Dnode, Extent, Head, ObjType, Snap, decode_leaf};
 use crate::metaslab::TXG_DEFER_SIZE;
 use crate::object::{INDIRECT_FANOUT, TreeRoot};
+use crate::role::{Committer, Role, View};
 use crate::types::Txg;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
@@ -542,7 +543,7 @@ impl Visitor for Collect {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Walk every record reachable from the object table at `table`,
     /// reporting each to `v`, then the namespace from the root directory.
     /// File and volume data records are only read when `verify_data`.
@@ -789,7 +790,7 @@ impl<D: PoolDevice> FileSystem<D> {
 
     /// Roots of the valid ring uberblocks older than the committed one.
     async fn older_roots(&self) -> Vec<TreeRoot> {
-        let txg = self.uberblock().await.map_or(Txg::ZERO, |u| u.txg);
+        let txg = self.uberblock().await.txg;
         self.uberblock_ring()
             .await
             .into_iter()
@@ -829,20 +830,27 @@ impl<D: PoolDevice> FileSystem<D> {
         (leaks, referenced_free, out_of_range)
     }
 
-    /// Check that the space maps agree with the tree; with `repair`, free
-    /// leaked space and re-allocate live space the maps think is free. Holds
-    /// the commit lock throughout (writers wait), so the comparison is exact.
-    pub async fn fsck(&self, repair: bool) -> Result<FsckReport, FileSystemError> {
-        let repair = repair && !self.read_only;
+    /// Check that the space maps agree with the tree, repairing nothing
+    /// (`fsck_repair` repairs). Holds the commit lock throughout (writers
+    /// wait), so the comparison is exact.
+    pub async fn fsck(&self) -> Result<FsckReport, FileSystemError> {
         let mut tx = self.begin_tx().await;
         let tx = &mut tx;
-        if !self.read_only {
-            self.commit_locked(tx).await?;
+        // A committer commits first, so the check covers everything
+        // written so far.
+        if let View::Committer(fs) = self.by_role() {
+            fs.commit_locked(tx).await?;
         }
+        Ok(self.fsck_check(false).await)
+    }
+
+    /// The comparison of `fsck`, under the caller's commit lock. `repair`
+    /// is only recorded in the report.
+    async fn fsck_check(&self, repair: bool) -> FsckReport {
         let (live, walk) = self.live_set().await;
         let (leaks, referenced_free, out_of_range) = self.diff_spacemaps(&live.live).await;
-        let mut report = FsckReport {
-            txg: self.uberblock().await.map_or(Txg::ZERO, |u| u.txg),
+        FsckReport {
+            txg: self.uberblock().await.txg,
             repair,
             records: walk.records,
             live_blocks: live.live.values().sum(),
@@ -853,121 +861,7 @@ impl<D: PoolDevice> FileSystem<D> {
             errors: walk.errors,
             incomplete: walk.incomplete,
             ..Default::default()
-        };
-        if !repair {
-            return Ok(report);
         }
-
-        let mut changed = false;
-        if !report.referenced_free.is_empty() {
-            for &Extent { start: s, len: l } in &report.referenced_free {
-                if let Some(idx) = self.layout.metaslab_for_block(s) {
-                    self.metaslabs[idx.index()]
-                        .write()
-                        .await
-                        .mark_allocated(s, l);
-                }
-            }
-            report.referenced_free_repaired = true;
-            changed = true;
-        }
-        if !report.leaks.is_empty() && !report.incomplete {
-            for &Extent { start: s, len: l } in &report.leaks {
-                self.free(tx, s, l).await?;
-            }
-            report.leaks_repaired = true;
-            changed = true;
-        }
-        if changed {
-            report.txg = self.commit_locked(tx).await?;
-        }
-        Ok(report)
-    }
-
-    /// Replace the space maps with ones derived from the tree: everything
-    /// the committed tree references is allocated, what the older ring
-    /// uberblocks reference is deferred, and the rest is free. Refuses when
-    /// part of the tree is unreadable (that would free live data), unless
-    /// `force`.
-    pub async fn rebuild_spacemaps(&self, force: bool) -> Result<RebuildReport, FileSystemError> {
-        if self.read_only {
-            return Err(FileSystemError::InvalidArgument(
-                "pool opened read-only".into(),
-            ));
-        }
-        let mut tx = self.begin_tx().await;
-        let tx = &mut tx;
-        self.commit_locked(tx).await?;
-        let older = self.older_roots().await;
-        let report = self.rebuild_spacemaps_locked(&older, force).await?;
-        self.commit_locked(tx).await?;
-        Ok(report)
-    }
-
-    /// `rebuild_spacemaps` under the commit lock, without committing.
-    /// `older` are the trees to hold freed space back for.
-    pub(crate) async fn rebuild_spacemaps_locked(
-        &self,
-        older: &[TreeRoot],
-        force: bool,
-    ) -> Result<RebuildReport, FileSystemError> {
-        let (live, walk) = self.live_set().await;
-        if walk.incomplete && !force {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "tree incomplete ({} errors, e.g. {}); rebuilding would free live data",
-                walk.errors.len(),
-                walk.errors.first().map_or("", |s| s.as_str())
-            )));
-        }
-        let protected = self.protected_set(older).await;
-        let release_txg = self
-            .uberblock()
-            .await
-            .map_or(Txg::ZERO, |u| u.txg)
-            .after(TXG_DEFER_SIZE);
-        let mut report = RebuildReport {
-            live_blocks: live.live.values().sum(),
-            errors: walk.errors,
-            ..Default::default()
-        };
-
-        for ms in self.metaslabs.iter() {
-            let mut ms = ms.write().await;
-            let (start, end) = (ms.start_block, ms.start_block + ms.block_count);
-            let live_here = clip(&live.live, start, end);
-            let mut held = clip(&protected, start, end);
-            for (&s, &l) in &live_here {
-                crate::metaslab::MetaslabState::remove_range(&mut held, s, l);
-            }
-            let mut in_use = live_here.clone();
-            for (&s, &l) in &held {
-                insert_range(&mut in_use, s, l);
-            }
-            let free = complement(&in_use, start, end);
-
-            let old_released = ms.released_map();
-            let old_allocated = complement(&old_released, start, end);
-            report.reclaimed += total(&intersect(
-                &old_allocated,
-                &complement(&live_here, start, end),
-            ));
-            report.claimed += total(&intersect(&live_here, &old_released));
-            report.deferred_blocks += held.values().sum::<u64>();
-
-            ms.free_extents = free;
-            ms.freeing.clear();
-            ms.deferred = VecDeque::new();
-            if !held.is_empty() {
-                ms.deferred.push_back((
-                    release_txg,
-                    held.into_iter()
-                        .map(|(start, len)| Extent { start, len })
-                        .collect(),
-                ));
-            }
-            ms.dirty = true;
-        }
-        Ok(report)
     }
 
     /// Find all blocks that are allocated but not referenced by any live data
@@ -1050,6 +944,119 @@ impl<D: PoolDevice> FileSystem<D> {
             }
             item.lost.sort_unstable_by_key(|r| r.start);
             report.items.push(item);
+        }
+        Ok(report)
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// `fsck`, then free leaked space and re-allocate live space the maps
+    /// think is free.
+    pub async fn fsck_repair(&self) -> Result<FsckReport, FileSystemError> {
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        self.commit_locked(tx).await?;
+        let mut report = self.fsck_check(true).await;
+
+        let mut changed = false;
+        if !report.referenced_free.is_empty() {
+            for &Extent { start: s, len: l } in &report.referenced_free {
+                if let Some(idx) = self.layout.metaslab_for_block(s) {
+                    self.metaslabs[idx.index()]
+                        .write()
+                        .await
+                        .mark_allocated(s, l);
+                }
+            }
+            report.referenced_free_repaired = true;
+            changed = true;
+        }
+        if !report.leaks.is_empty() && !report.incomplete {
+            for &Extent { start: s, len: l } in &report.leaks {
+                self.free(tx, s, l).await?;
+            }
+            report.leaks_repaired = true;
+            changed = true;
+        }
+        if changed {
+            report.txg = self.commit_locked(tx).await?;
+        }
+        Ok(report)
+    }
+
+    /// Replace the space maps with ones derived from the tree: everything
+    /// the committed tree references is allocated, what the older ring
+    /// uberblocks reference is deferred, and the rest is free. Refuses when
+    /// part of the tree is unreadable (that would free live data), unless
+    /// `force`.
+    pub async fn rebuild_spacemaps(&self, force: bool) -> Result<RebuildReport, FileSystemError> {
+        let mut tx = self.begin_tx().await;
+        let tx = &mut tx;
+        self.commit_locked(tx).await?;
+        let older = self.older_roots().await;
+        let report = self.rebuild_spacemaps_locked(&older, force).await?;
+        self.commit_locked(tx).await?;
+        Ok(report)
+    }
+
+    /// `rebuild_spacemaps` under the commit lock, without committing.
+    /// `older` are the trees to hold freed space back for.
+    pub(crate) async fn rebuild_spacemaps_locked(
+        &self,
+        older: &[TreeRoot],
+        force: bool,
+    ) -> Result<RebuildReport, FileSystemError> {
+        let (live, walk) = self.live_set().await;
+        if walk.incomplete && !force {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "tree incomplete ({} errors, e.g. {}); rebuilding would free live data",
+                walk.errors.len(),
+                walk.errors.first().map_or("", |s| s.as_str())
+            )));
+        }
+        let protected = self.protected_set(older).await;
+        let release_txg = self.uberblock().await.txg.after(TXG_DEFER_SIZE);
+        let mut report = RebuildReport {
+            live_blocks: live.live.values().sum(),
+            errors: walk.errors,
+            ..Default::default()
+        };
+
+        for ms in self.metaslabs.iter() {
+            let mut ms = ms.write().await;
+            let (start, end) = (ms.start_block, ms.start_block + ms.block_count);
+            let live_here = clip(&live.live, start, end);
+            let mut held = clip(&protected, start, end);
+            for (&s, &l) in &live_here {
+                crate::metaslab::MetaslabState::remove_range(&mut held, s, l);
+            }
+            let mut in_use = live_here.clone();
+            for (&s, &l) in &held {
+                insert_range(&mut in_use, s, l);
+            }
+            let free = complement(&in_use, start, end);
+
+            let old_released = ms.released_map();
+            let old_allocated = complement(&old_released, start, end);
+            report.reclaimed += total(&intersect(
+                &old_allocated,
+                &complement(&live_here, start, end),
+            ));
+            report.claimed += total(&intersect(&live_here, &old_released));
+            report.deferred_blocks += held.values().sum::<u64>();
+
+            ms.free_extents = free;
+            ms.freeing.clear();
+            ms.deferred = VecDeque::new();
+            if !held.is_empty() {
+                ms.deferred.push_back((
+                    release_txg,
+                    held.into_iter()
+                        .map(|(start, len)| Extent { start, len })
+                        .collect(),
+                ));
+            }
+            ms.dirty = true;
         }
         Ok(report)
     }

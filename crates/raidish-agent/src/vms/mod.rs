@@ -184,10 +184,8 @@ impl Agent {
         let Some(vm) = &self.vm else {
             return;
         };
-        if let Some(w) = self.sup.writer()
-            && let Some(sb) = w.fs.superblock().await
-        {
-            vm.set_pool(sb.pool_guid);
+        if let Some(w) = self.sup.writer() {
+            vm.set_pool(w.fs.superblock().pool_guid);
         }
         match self.committer.vms().await {
             Ok(defs) => {

@@ -4,14 +4,14 @@
 use super::pb::etcdserverpb as pb;
 use super::store::{EtcdError, EtcdStore, KeyRange};
 use crate::dataset::DatasetFormat;
-use crate::fs::FileSystem;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::vdev::Pool;
 use pb::request_op::Request;
+use raidish_core::role::{Committer, CommitterFs};
 use std::sync::Arc;
 
-async fn store(pool: &TestPool) -> (Arc<FileSystem<Pool>>, Arc<EtcdStore<Pool>>) {
+async fn store(pool: &TestPool) -> (Arc<CommitterFs<Pool>>, Arc<EtcdStore<Pool, Committer>>) {
     let fs = Arc::new(pool.format().await);
     fs.create_service(&ds("e"), DatasetFormat::Etcd, Default::default())
         .await
@@ -340,7 +340,7 @@ async fn transactions() {
 }
 
 /// How many history entries the tree holds.
-async fn history_len(fs: &FileSystem<Pool>) -> usize {
+async fn history_len(fs: &CommitterFs<Pool>) -> usize {
     let ds = fs.open_btree(&ds("e"), DatasetFormat::Etcd).await.unwrap();
     let t = crate::btree::Txn::begin(fs, &ds.obj).await.unwrap();
     t.range_raw(
@@ -539,7 +539,7 @@ async fn survives_a_reload() {
     assert_eq!(s.range(prefix("k")).await.unwrap().count, 50);
     assert_eq!(s.revisions().await.unwrap().0, 51);
     assert_eq!(s.lease_keep_alive(5).await.unwrap().ttl, 100);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     // Only etcd datasets.
     fs.create_kv(&ds("plain")).await.unwrap();
@@ -553,7 +553,7 @@ async fn survives_a_reload() {
 /// Serve `s` over gRPC on a local port; its address.
 /// Serve `s` (plain TCP: the frontend's TLS is tested elsewhere), every
 /// connection's caller with `role`.
-async fn serve_as(s: Arc<EtcdStore<Pool>>, role: crate::api_types::Role) -> String {
+async fn serve_as(s: Arc<EtcdStore<Pool, Committer>>, role: crate::api_types::Role) -> String {
     use super::server::{Caller, EtcdConn};
     use futures::StreamExt;
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -570,7 +570,7 @@ async fn serve_as(s: Arc<EtcdStore<Pool>>, role: crate::api_types::Role) -> Stri
     addr
 }
 
-async fn serve(s: Arc<EtcdStore<Pool>>) -> String {
+async fn serve(s: Arc<EtcdStore<Pool, Committer>>) -> String {
     serve_as(s, crate::api_types::Role::Admin).await
 }
 

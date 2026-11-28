@@ -18,7 +18,6 @@ pub enum RaidZError {
     SerializationError(bincode::Error),
     IncompleteStripe(StripeId),
     InconsistentStripe(StripeId),
-    NotFormatted,
 }
 
 impl fmt::Display for RaidZError {
@@ -31,7 +30,6 @@ impl fmt::Display for RaidZError {
             RaidZError::InconsistentStripe(stripe) => {
                 write!(f, "stripe {} parity is inconsistent", stripe)
             }
-            RaidZError::NotFormatted => write!(f, "array is not formatted"),
         }
     }
 }

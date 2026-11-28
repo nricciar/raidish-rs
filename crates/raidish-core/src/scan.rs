@@ -25,6 +25,7 @@ use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError, parse_label};
 use crate::fsck::{Node, table_node};
 use crate::object::TreeRoot;
+use crate::role::{Committer, Role, View, Writer};
 use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::vdev::StripeCheck;
@@ -177,17 +178,10 @@ impl std::fmt::Display for ScanReport {
 /// space from being reused while it runs.
 const MIN_FREE_FRACTION: u64 = 50; // 1/50 = 2%
 
-impl<D: PoolDevice> FileSystem<D> {
-    /// Check everything; with `repair`, fix what's wrong and bring degraded
-    /// disks back in sync.
-    pub async fn scrub(&self, repair: bool) -> Result<ScanReport, FileSystemError> {
-        self.scan(Some(Txg::ZERO), repair).await
-    }
-
-    /// Rebuild what degraded (online) disks missed. Does nothing if no
-    /// online disk is degraded.
-    pub async fn resilver(&self) -> Result<ScanReport, FileSystemError> {
-        self.scan(None, true).await
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
+    /// Check everything, repairing nothing (`scrub_repair` repairs).
+    pub async fn scrub(&self) -> Result<ScanReport, FileSystemError> {
+        self.scan(Some(Txg::ZERO), false).await
     }
 
     /// Does any reachable disk need a resilver (or have unrecorded misses)?
@@ -206,7 +200,6 @@ impl<D: PoolDevice> FileSystem<D> {
     /// `since`: None = resilver (worked out from the degraded disks once
     /// the snapshot is taken).
     async fn scan(&self, since: Option<Txg>, repair: bool) -> Result<ScanReport, FileSystemError> {
-        let repair = repair && !self.read_only;
         let _one = self.scan_lock.lock().await;
         let pool = self.dev.pool();
 
@@ -215,11 +208,15 @@ impl<D: PoolDevice> FileSystem<D> {
         let (root, misses_at_start, marks_at_start, since, hold) = {
             let mut tx = self.begin_tx().await;
             let tx = &mut tx;
-            if !self.read_only {
-                self.commit_locked(tx).await?;
+            if let View::Committer(fs) = self.by_role() {
+                fs.commit_locked(tx).await?;
             }
             let misses = self.miss_counts();
-            let marks: Vec<u64> = self.disk_indexes().map(|d| self.degraded_mark(d)).collect();
+            // Only a committer clears a disk (below), so only it counts marks.
+            let marks: Vec<u64> = match self.by_role() {
+                View::Committer(fs) => fs.disk_indexes().map(|d| fs.degraded_mark(d)).collect(),
+                _ => Vec::new(),
+            };
             let degraded = self.degraded_disks();
             let since = match since {
                 Some(s) => s,
@@ -286,7 +283,11 @@ impl<D: PoolDevice> FileSystem<D> {
                 ));
             }
         }
-        if repair && report.certifies() {
+        // Only a committer repairs (`scrub_repair`, `resilver`).
+        if repair
+            && report.certifies()
+            && let View::Committer(fs) = self.by_role()
+        {
             // Under the tx: no commit can write a label or fold a miss in
             // between the label write and the clear (audit D4).
             let mut tx = self.begin_tx().await;
@@ -298,7 +299,7 @@ impl<D: PoolDevice> FileSystem<D> {
                 // something the walk didn't see is missing.
                 let in_sync = pool.disks().is_online(disk)
                     && pool.disks().miss_count(disk) == misses_at_start[d]
-                    && self.degraded_mark(disk) == marks_at_start[d]
+                    && fs.degraded_mark(disk) == marks_at_start[d]
                     && !report.shards.is_unreadable(d)
                     && !report.shards.has_write_failed(d);
                 if !(covered && in_sync) {
@@ -311,12 +312,12 @@ impl<D: PoolDevice> FileSystem<D> {
                     }
                     pool.disks().set_fenced(disk, false);
                 }
-                if self.clear_degraded(&tx, disk, marks_at_start[d], misses_at_start[d]) {
+                if fs.clear_degraded(&tx, disk, marks_at_start[d], misses_at_start[d]) {
                     report.cleared.push(d);
                 }
             }
             if !report.cleared.is_empty() {
-                self.commit_locked(&mut tx).await?;
+                fs.commit_locked(&mut tx).await?;
             }
         }
         Ok(report)
@@ -343,8 +344,7 @@ impl<D: PoolDevice> FileSystem<D> {
             }
             // Only a committer's scan holds freed space (a writer's frees
             // are the committer's to release).
-            if !self.read_only
-                && self.writer.is_none()
+            if matches!(self.by_role(), View::Committer(_))
                 && report.records % 256 == 255
                 && self.allocatable_blocks().await < total / MIN_FREE_FRACTION
             {
@@ -445,6 +445,68 @@ impl<D: PoolDevice> FileSystem<D> {
         Some(data)
     }
 
+    /// Verify the fixed label regions: superblock, uberblock ring and space
+    /// map slots. Must run under the commit lock (commits rewrite them).
+    async fn scan_labels(&self, _tx: &crate::tx::Tx, repair: bool, report: &mut ScanReport) {
+        let pool = self.dev.pool();
+        // A label from past the last commit is a torn, uncommitted write:
+        // never the truth, however many copies hold it.
+        let committed = self.uberblock().await.txg.get();
+        let score = move |b: &[u8]| {
+            parse_label(b)
+                .ok()
+                .map(|(txg, _)| txg.get())
+                .filter(|&t| t <= committed)
+        };
+        // Degraded members missed label writes: their copies don't vote
+        // (audit D3), they're what gets repaired. So may a disk with a
+        // write failed since the snapshot, not yet folded into `degraded`.
+        let stale: Vec<bool> = pool
+            .disks()
+            .indexes()
+            .map(|d| pool.disks().may_lag(d))
+            .collect();
+        let header = (crate::fs::SUPERBLOCK_LBA, self.header.spacemap_start.get());
+        let spacemaps = (
+            crate::coords::PoolLba::new(self.layout.spacemap_start),
+            self.layout.data_start - self.layout.spacemap_start,
+        );
+        for (lba, blocks) in [header, spacemaps] {
+            match pool
+                .verify_labels(lba, blocks, repair, &score, &stale)
+                .await
+            {
+                Ok(scan) => {
+                    report.label_stripes += scan.units;
+                    report.shards.add(&scan.check);
+                    report.label_unrecoverable.extend(scan.unrecoverable);
+                    report.label_stale_votes.extend(scan.stale_votes);
+                }
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("label blocks {}..{}: {}", lba, lba + blocks, e))
+                }
+            }
+        }
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// Check everything, fix what's wrong and bring degraded disks back in
+    /// sync.
+    pub async fn scrub_repair(&self) -> Result<ScanReport, FileSystemError> {
+        self.scan(Some(Txg::ZERO), true).await
+    }
+
+    /// Rebuild what degraded (online) disks missed. Does nothing if no
+    /// online disk is degraded.
+    pub async fn resilver(&self) -> Result<ScanReport, FileSystemError> {
+        self.scan(None, true).await
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Writer> {
     /// On a writer: rebuild what degraded disks missed in the metaslabs lent
     /// to it. The committer's resilver can't write there (its writes are
     /// fenced out while they're lent; a running volume's intent log keeps
@@ -454,9 +516,7 @@ impl<D: PoolDevice> FileSystem<D> {
     /// lent as free). Once they're fixed, the committer's next resilver finds
     /// them good and clears the disk. None: nothing to do.
     pub async fn heal_lent(&self) -> Result<Option<ScanReport>, FileSystemError> {
-        let Some(w) = self.writer.clone() else {
-            return Ok(None);
-        };
+        let w = self.writer_state().clone();
         let pool = self.dev.pool();
         let lent: std::collections::HashSet<crate::types::MetaslabIdx> =
             w.lent.lock().unwrap().iter().copied().collect();
@@ -530,52 +590,6 @@ impl<D: PoolDevice> FileSystem<D> {
             }
         }
         Ok(Some(report))
-    }
-
-    /// Verify the fixed label regions: superblock, uberblock ring and space
-    /// map slots. Must run under the commit lock (commits rewrite them).
-    async fn scan_labels(&self, _tx: &crate::tx::Tx, repair: bool, report: &mut ScanReport) {
-        let pool = self.dev.pool();
-        // A label from past the last commit is a torn, uncommitted write:
-        // never the truth, however many copies hold it.
-        let committed = self.uberblock().await.map_or(0, |u| u.txg.get());
-        let score = move |b: &[u8]| {
-            parse_label(b)
-                .ok()
-                .map(|(txg, _)| txg.get())
-                .filter(|&t| t <= committed)
-        };
-        // Degraded members missed label writes: their copies don't vote
-        // (audit D3), they're what gets repaired. So may a disk with a
-        // write failed since the snapshot, not yet folded into `degraded`.
-        let stale: Vec<bool> = pool
-            .disks()
-            .indexes()
-            .map(|d| pool.disks().may_lag(d))
-            .collect();
-        let header = (crate::fs::SUPERBLOCK_LBA, self.header.spacemap_start.get());
-        let spacemaps = (
-            crate::coords::PoolLba::new(self.layout.spacemap_start),
-            self.layout.data_start - self.layout.spacemap_start,
-        );
-        for (lba, blocks) in [header, spacemaps] {
-            match pool
-                .verify_labels(lba, blocks, repair, &score, &stale)
-                .await
-            {
-                Ok(scan) => {
-                    report.label_stripes += scan.units;
-                    report.shards.add(&scan.check);
-                    report.label_unrecoverable.extend(scan.unrecoverable);
-                    report.label_stale_votes.extend(scan.stale_votes);
-                }
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("label blocks {}..{}: {}", lba, lba + blocks, e))
-                }
-            }
-        }
     }
 }
 
