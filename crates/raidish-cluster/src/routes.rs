@@ -2,15 +2,17 @@
 
 use super::state::Response;
 use super::{Cluster, LeaseOp, TypeConfig};
+use axum::extract::{FromRequestParts, State};
+use axum::http::StatusCode as Status;
+use axum::http::request::Parts;
+use axum::routing::{get, post};
 use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome, Request};
-use rocket::serde::json::Json;
-use rocket::{State, get, post};
+use raidish_auth::http::{Json, Query, Refusal};
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::types::NodeId;
@@ -21,15 +23,15 @@ type Shared = Arc<Cluster>;
 /// mean different nodes.
 pub struct SameLayout;
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for SameLayout {
-    type Error = String;
+fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    parts.headers.get(name).and_then(|v| v.to_str().ok())
+}
 
-    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, String> {
-        let Some(cluster) = req.rocket().state::<Shared>() else {
-            return Outcome::Error((Status::ServiceUnavailable, "no cluster".into()));
-        };
-        let version = req.headers().get_one(super::PROTOCOL_HEADER);
+impl FromRequestParts<Shared> for SameLayout {
+    type Rejection = Refusal;
+
+    async fn from_request_parts(parts: &mut Parts, cluster: &Shared) -> Result<Self, Refusal> {
+        let version = header(parts, super::PROTOCOL_HEADER);
         if version.and_then(|v| v.parse().ok()) != Some(super::RAFT_PROTOCOL) {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -40,25 +42,19 @@ impl<'r> FromRequest<'r> for SameLayout {
                     super::RAFT_PROTOCOL
                 )
             });
-            return Outcome::Error((Status::UpgradeRequired, "other raft protocol".into()));
+            return Err((Status::UPGRADE_REQUIRED, "other raft protocol".into()));
         }
-        let theirs = req
-            .headers()
-            .get_one(super::FINGERPRINT_HEADER)
-            .unwrap_or("");
-        let to = req
-            .headers()
-            .get_one(super::TO_HEADER)
-            .and_then(super::parse_to_header);
+        let theirs = header(parts, super::FINGERPRINT_HEADER).unwrap_or("");
+        let to = header(parts, super::TO_HEADER).and_then(super::parse_to_header);
         if cluster.misconfigured() {
             // Sitting out: see `Cluster::misconfigured`.
-            return Outcome::Error((
-                Status::Conflict,
+            return Err((
+                Status::CONFLICT,
                 "this node's pool config is the odd one out".into(),
             ));
         }
         if theirs == cluster.members.fingerprint && to == Some(cluster.members.me) {
-            return Outcome::Success(SameLayout);
+            return Ok(SameLayout);
         }
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -72,33 +68,31 @@ impl<'r> FromRequest<'r> for SameLayout {
                 cluster.members.me
             )
         });
-        Outcome::Error((Status::Conflict, "different pool layout".into()))
+        Err((Status::CONFLICT, "different pool layout".into()))
     }
 }
 
-#[post("/api/v1/raft/append", data = "<rpc>")]
 pub async fn append(
     _auth: crate::auth::IsNode,
-    rpc: Json<AppendEntriesRequest<TypeConfig>>,
     _layout: SameLayout,
-    cluster: &State<Shared>,
+    State(cluster): State<Shared>,
+    rpc: Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Json<Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>> {
     Json(cluster.raft.append_entries(rpc.into_inner()).await)
 }
 
-#[post("/api/v1/raft/vote", data = "<rpc>")]
 pub async fn vote(
     _auth: crate::auth::IsNode,
-    rpc: Json<VoteRequest<NodeId>>,
     _layout: SameLayout,
-    cluster: &State<Shared>,
+    State(cluster): State<Shared>,
+    rpc: Json<VoteRequest<NodeId>>,
 ) -> Result<Json<Result<VoteResponse<NodeId>, RaftError<NodeId>>>, (Status, &'static str)> {
     // Not even seen by Raft: a node catching up after losing its state
     // must not vote (audit R4b), and refusing outright leaves no trace.
     match cluster.vote_refusal(rpc.vote.leader_id().term) {
         None => Ok(Json(cluster.raft.vote(rpc.into_inner()).await)),
         Some(super::Refusal::CatchingUp) => {
-            Err((Status::ServiceUnavailable, "not voting: catching up"))
+            Err((Status::SERVICE_UNAVAILABLE, "not voting: catching up"))
         }
         // A term this node may have voted in before it lost its state:
         // refused as Raft refuses a stale term, with a newer vote, so the
@@ -111,60 +105,68 @@ pub async fn vote(
     }
 }
 
-#[post("/api/v1/raft/snapshot", data = "<rpc>")]
 pub async fn snapshot(
     _auth: crate::auth::IsNode,
-    rpc: Json<InstallSnapshotRequest<TypeConfig>>,
     _layout: SameLayout,
-    cluster: &State<Shared>,
+    State(cluster): State<Shared>,
+    rpc: Json<InstallSnapshotRequest<TypeConfig>>,
 ) -> Json<Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>> {
     Json(cluster.raft.install_snapshot(rpc.into_inner()).await)
 }
 
-#[post("/api/v1/cluster/lease?<forwarded>", data = "<op>")]
-pub async fn lease(
-    _auth: crate::auth::CanWrite,
-    op: Json<LeaseOp>,
-    forwarded: Option<bool>,
-    cluster: &State<Shared>,
-) -> Json<Result<Response, String>> {
-    Json(cluster.lease(&op, forwarded.unwrap_or(false)).await)
+#[derive(Deserialize, Default)]
+pub struct Forwarded {
+    #[serde(default)]
+    pub forwarded: bool,
 }
 
-#[get("/api/v1/cluster/status")]
-pub async fn status(_auth: crate::auth::CanRead, cluster: &State<Shared>) -> Json<super::Status> {
+pub async fn lease(
+    auth: crate::auth::CanWrite,
+    Query(Forwarded { forwarded }): Query<Forwarded>,
+    State(cluster): State<Shared>,
+    op: Json<LeaseOp>,
+) -> Json<Result<Response, String>> {
+    // CA changes are proposed by a node's CA service in-process, and reach
+    // here only as a node forwarding one to the leader. Anyone else must
+    // go through the CA's own endpoints (which check what they propose).
+    // A node that does is trusted no further for it: what grants
+    // authority is checked when applied or when used (see `crate::pki`).
+    if matches!(*op, LeaseOp::Pki(_))
+        && !(forwarded && auth.0.role == raidish_auth::pki::Role::Node)
+    {
+        return Json(Err(
+            "CA changes go through /api/v1/pki, not the lease API".into()
+        ));
+    }
+    Json(cluster.lease(&op, forwarded).await)
+}
+
+pub async fn status(
+    _auth: crate::auth::CanRead,
+    State(cluster): State<Shared>,
+) -> Json<super::Status> {
     Json(cluster.status())
 }
 
 /// A follower's read index (see `Cluster::linearizable_state`): the leader's
 /// commit index once it has confirmed it leads. Never forwarded further.
-#[get("/api/v1/cluster/read_index")]
 pub async fn read_index(
     _auth: crate::auth::IsNode,
     _layout: SameLayout,
-    cluster: &State<Shared>,
+    State(cluster): State<Shared>,
 ) -> Json<Result<Option<u64>, String>> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     Json(cluster.read_index(true, deadline).await)
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![append, vote, snapshot, lease, status, read_index]
-}
-
-/// Stops this node's Raft member as soon as the server is asked to shut
-/// down. Rocket keeps serving open connections for its grace period
-/// (seconds), and a leader whose heartbeats still get through keeps the
-/// followers from electing anyone while the lease requests they forward to
-/// it fail: long enough for their leases to run out. Stopped, it goes
-/// quiet at once and the others elect a new leader within an election
-/// timeout.
-pub fn stop_raft_on_shutdown() -> rocket::fairing::AdHoc {
-    rocket::fairing::AdHoc::on_shutdown("stop raft", |rocket| {
-        Box::pin(async move {
-            if let Some(cluster) = rocket.state::<Shared>() {
-                let _ = cluster.raft.shutdown().await;
-            }
-        })
-    })
+/// The routes, on this node's member.
+pub fn router(cluster: Shared) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/raft/append", post(append))
+        .route("/api/v1/raft/vote", post(vote))
+        .route("/api/v1/raft/snapshot", post(snapshot))
+        .route("/api/v1/cluster/lease", post(lease))
+        .route("/api/v1/cluster/status", get(status))
+        .route("/api/v1/cluster/read_index", get(read_index))
+        .with_state(cluster)
 }

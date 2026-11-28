@@ -5,40 +5,44 @@
 #   open https://node0:8881/   (after: echo "127.0.0.1 node0 node1 node2" | sudo tee -a /etc/hosts,
 #                               and importing docker/pki/ca.pem as a trusted CA in the browser)
 #
-# Everything is TLS with client certificates: the `pki` service creates a
-# CA and certificates in ./docker/pki on first start. Sign in to the
-# dashboard with the token `init` prints (docker compose logs init).
-# Ports are still published on 127.0.0.1 only.
+# Everything is TLS with client certificates from the cluster's own CA: on
+# its first start node0 runs `raidish ca init` (its certificate, an admin
+# bundle in ./docker/pki/admin, a join token per peer in ./docker/pki/tokens,
+# the recovery keys in ./docker/pki/ca-init.txt), and node1 and node2 run
+# `raidish join` with their tokens before they first listen (see
+# docker/entrypoint.sh). Sign in to the dashboard with the token `init`
+# prints (docker compose logs init). Ports are published on 127.0.0.1 only.
+#
+# Start over with `docker compose down -v && git clean -fdX docker/pki`: the CA
+# lives in the nodes' Raft data (the volumes), the certificates here.
+# After a full `down`/`up` the nodes are sealed (they serve, but can't
+# sign): `docker compose run --rm --entrypoint raidish init ca unseal`
+# with the recovery key from ca-init.txt.
 
 x-node: &node
   image: raidish
   init: true
   environment:
     DISK_SIZE: ${DISK_SIZE:-1G}
-    # The disk server listens on 127.0.0.1 unless told otherwise.
-    ROCKET_ADDRESS: 0.0.0.0
+    # `listen` serves on 127.0.0.1 unless told otherwise.
+    RAIDISH_ADDRESS: 0.0.0.0
 
 services:
-  # Creates the CA, a certificate per node and an admin certificate in
-  # ./docker/pki on first start (a no-op once ca.key exists).
-  pki:
-    image: raidish
-    build: .
-    entrypoint: ["sh", "/pki.sh"]
-    volumes:
-      - ./docker/pki.sh:/pki.sh:ro
-      - ./docker/pki:/pki
-
   node0:
     <<: *node
-    depends_on:
-      pki: { condition: service_completed_successfully }
+    build: .
     hostname: node0
+    environment:
+      DISK_SIZE: ${DISK_SIZE:-1G}
+      RAIDISH_ADDRESS: 0.0.0.0
+      RAIDISH_CA_INIT: "1"
+      RAIDISH_PORT: "8881"
     command: --config /etc/raidish/node.yaml listen --port 8881
     ports: ["127.0.0.1:8881:8881", "127.0.0.1:9000:9000", "127.0.0.1:9324:9324", "127.0.0.1:2379:2379"]
     volumes:
       - ./docker/node0.yaml:/etc/raidish/node.yaml:ro
-      - ./docker/pki/node0:/etc/raidish/tls:ro
+      - ./docker/pki:/pki
+      - ./docker/pki/node0:/etc/raidish/tls
       - node0:/data
     healthcheck:
       test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8881/api/v1/cluster/status"]
@@ -51,11 +55,18 @@ services:
     hostname: node1
     depends_on:
       node0: { condition: service_started }
+    environment:
+      DISK_SIZE: ${DISK_SIZE:-1G}
+      RAIDISH_ADDRESS: 0.0.0.0
+      RAIDISH_JOIN: https://node0:8881
+      RAIDISH_NODE_ID: "1"
+      RAIDISH_PORT: "8882"
     command: --config /etc/raidish/node.yaml listen --port 8882
     ports: ["127.0.0.1:8882:8882"]
     volumes:
       - ./docker/node1.yaml:/etc/raidish/node.yaml:ro
-      - ./docker/pki/node1:/etc/raidish/tls:ro
+      - ./docker/pki/tokens:/pki/tokens:ro
+      - ./docker/pki/node1:/etc/raidish/tls
       - node1:/data
     healthcheck:
       test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8882/api/v1/cluster/status"]
@@ -68,11 +79,18 @@ services:
     hostname: node2
     depends_on:
       node0: { condition: service_started }
+    environment:
+      DISK_SIZE: ${DISK_SIZE:-1G}
+      RAIDISH_ADDRESS: 0.0.0.0
+      RAIDISH_JOIN: https://node0:8881
+      RAIDISH_NODE_ID: "2"
+      RAIDISH_PORT: "8883"
     command: --config /etc/raidish/node.yaml listen --port 8883
     ports: ["127.0.0.1:8883:8883"]
     volumes:
       - ./docker/node2.yaml:/etc/raidish/node.yaml:ro
-      - ./docker/pki/node2:/etc/raidish/tls:ro
+      - ./docker/pki/tokens:/pki/tokens:ro
+      - ./docker/pki/node2:/etc/raidish/tls
       - node2:/data
     healthcheck:
       test: ["CMD", "curl", "-fs", "--cacert", "/etc/raidish/tls/ca.pem", "--cert", "/etc/raidish/tls/cert.pem", "--key", "/etc/raidish/tls/key.pem", "https://localhost:8883/api/v1/cluster/status"]

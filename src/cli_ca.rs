@@ -1,0 +1,1997 @@
+//! `raidish ca …` and `raidish join`: the cluster CA from the command line
+//! (see `raidish_ca` and `docs/ca-service-plan.md`).
+//!
+//! `ca init` and `join` run before this node has certificates (so before
+//! `tls::init`); the rest talk to running nodes with the config's
+//! identity: an admin certificate for everything that grants something.
+
+use crate::config::Config;
+use crate::net::{Answer, try_each};
+use clap::Subcommand;
+use raidish_ca::api::{
+    ClientEnrollmentCreated, ClientEnrollmentRequest, EnrollmentCreated, EnrollmentRequest, Issued,
+    NewSlotKind, RekeyRequest, Rekeyed, RenewRequest, RevokeCertRequest, RevokeTokenRequest,
+    SealRequest, SignRequest, SlotCreated, SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
+};
+use raidish_types::pki::{CertListing, PkiStatus, ProfileKind, RevocationReason, Serial, TokenId};
+use raidish_types::types::NodeId;
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use zeroize::Zeroizing;
+
+#[derive(Subcommand)]
+pub enum CaCommands {
+    /// Make the cluster CA, on node 0 with its config, before its first
+    /// `listen` (or with every node stopped, when moving to it). Writes
+    /// node 0's certificate to its `tls:` paths, an admin certificate,
+    /// `root.enc`, and stages the CA in node 0's data dir; prints the
+    /// recovery keys and a `raidish join` command for every other node.
+    Init {
+        /// A name node 0 is reached by (repeatable; the first is its CN).
+        /// Default: `services.advertise`, else the host name.
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        /// Names for a peer's certificate on top of its host in the pool
+        /// config: `node-1=10.0.0.2` (repeatable; commas for several).
+        #[arg(long = "peer-san")]
+        peer_sans: Vec<String>,
+        /// Node certificates' lifetime in days (default 30; nodes renew
+        /// their own, live, at 2/3 of it).
+        #[arg(long)]
+        node_days: Option<u32>,
+        /// Don't leave the one-shot unseal file: run `ca unseal` after
+        /// node 0 starts.
+        #[arg(long)]
+        no_unseal_once: bool,
+        /// Where to write the sealed root key (keep it off the cluster).
+        #[arg(long, default_value = "root.enc")]
+        root_out: PathBuf,
+        /// Where to write the operator's admin certificate bundle.
+        #[arg(long, default_value = "pki-admin")]
+        admin_out: PathBuf,
+        #[arg(long, default_value = "admin")]
+        admin_name: String,
+        /// How long the peers' join tokens last, in hours.
+        #[arg(long, default_value_t = 72)]
+        token_hours: u64,
+        /// Also write each peer's join token to `<dir>/<node>.token`.
+        #[arg(long)]
+        tokens_out: Option<PathBuf>,
+        /// The port `listen` serves on (to find this node in the pool).
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Replace a staged CA and node 0's certificate files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// The CA as a node sees it, and whether that node can sign.
+    Status {
+        /// Ask this node (default: the config's nodes, first that answers).
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Give a node the key to sign with (after a restart of the cluster):
+    /// a recovery key (`ca init` showed one) or a passphrase slot's
+    /// passphrase, typed or on stdin. One node is enough: the others' CA
+    /// requests go to it.
+    Unseal {
+        /// Nodes to try, in order (default: the config's).
+        #[arg(long)]
+        url: Vec<String>,
+        /// Read the secret from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Unseal every node, not just the first that takes it.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Seal every node now: nothing signs until someone unseals one.
+    /// Storage, mTLS and tokens already issued keep working.
+    Seal {
+        /// Keep node-key slots (those nodes unseal again when they next
+        /// start). Default: they're removed, so a reboot doesn't undo this.
+        #[arg(long)]
+        keep_node_keys: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// A new DEK and recovery key, for when a slot's secret has leaked:
+    /// removing the slot isn't enough, as the DEK it opened is the same.
+    /// Every slot is replaced by the one new recovery key, and every node
+    /// but the one that does it is sealed. On an unsealed node.
+    Rekey {
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+        /// Write the new recovery key to this new file (mode 0600) instead
+        /// of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Make a new issuer with the root (`root.enc` and the root key from
+    /// `ca init`) and make it the active one. Nodes renew onto it by
+    /// themselves; certificates from the old one keep working until it's
+    /// revoked (`--revoke-old`, or `ca revoke-issuer` later).
+    RotateIssuer {
+        #[arg(long, default_value = "root.enc")]
+        root: PathBuf,
+        /// Read the root key from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// The new issuer's lifetime (default two years; at most the
+        /// root's).
+        #[arg(long)]
+        days: Option<u32>,
+        /// Then revoke the old issuer, as `ca revoke-issuer` does.
+        #[arg(long)]
+        revoke_old: bool,
+        /// With --revoke-old: don't wait for the nodes to move off it.
+        #[arg(long, requires = "revoke_old")]
+        force: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Revoke a retired issuer (`issuer-1`): every certificate it signed
+    /// stops working. Waits (up to 10 minutes) for the cluster's own to
+    /// move off it, renews this config's own certificate if it's from
+    /// it, then records the root's CRL saying so (it takes the root).
+    RevokeIssuer {
+        id: String,
+        #[arg(long, default_value = "root.enc")]
+        root: PathBuf,
+        #[arg(long)]
+        stdin: bool,
+        /// Don't wait for the nodes.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The ways to unseal the CA.
+    Slot {
+        #[command(subcommand)]
+        command: SlotCommands,
+    },
+    /// Join tokens for nodes.
+    Token {
+        #[command(subcommand)]
+        command: CaTokenCommands,
+    },
+    /// Issue a certificate (a key made here, signed by the cluster).
+    Issue {
+        /// Its name (CN): who an admin or readonly cert is; the host of a
+        /// libvirt or server cert.
+        cn: String,
+        /// admin, readonly, client, server or libvirt.
+        #[arg(long)]
+        profile: ProfileKind,
+        /// The directory to write it to (`ca.pem`, `cert.pem`, `key.pem`;
+        /// for libvirt, the `etc/pki/…` tree to copy to `/` on that host).
+        #[arg(long)]
+        out: PathBuf,
+        /// More host names or addresses (server and libvirt).
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        #[arg(long)]
+        days: Option<u32>,
+        /// For libvirt: the node it's for (`node-1`).
+        #[arg(long)]
+        member: Option<String>,
+        #[arg(long)]
+        url: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Renew this config's own certificate (an admin's) in place. With
+    /// `--node`: ask running nodes to renew their own now (each `--url`,
+    /// default every node); they do it anyway at 2/3 of its life.
+    Renew {
+        #[arg(long)]
+        node: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The cluster's CRL (DER; `--pem` for PEM), from the first node that
+    /// answers: to a file, or stdout.
+    Crl {
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        pem: bool,
+        /// The root's CRL instead (the issuers it revoked, `ca
+        /// revoke-issuer`), for verifiers outside the cluster.
+        #[arg(long)]
+        root: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// The certificates the cluster has issued (live ones; see the flags).
+    List {
+        /// Only the revoked ones.
+        #[arg(long)]
+        revoked: bool,
+        /// Everything on record: live, expired and revoked.
+        #[arg(long, conflicts_with = "revoked")]
+        all: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Revoke a certificate, by serial or by name (CN). Every node refuses
+    /// it at once, and its open connections are closed.
+    Revoke {
+        /// A serial (as `ca list` shows it) or a CN with one live cert.
+        cert: String,
+        /// compromised, superseded, retired or unspecified (the default).
+        #[arg(long)]
+        reason: Option<RevocationReason>,
+        /// Even a node's only certificate (it's cut off until it joins
+        /// again with a `ca token create --replace` token).
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SlotCommands {
+    /// The CA's key slots.
+    List {
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Add a slot, on an unsealed node: a new recovery key (shown once),
+    /// a passphrase (typed twice; a recovery key is stronger), or a node's
+    /// own key, for it to unseal itself at start (`ca.unseal_credential`
+    /// or `ca.unseal_key` in its config).
+    Add {
+        #[arg(long, group = "slot_kind")]
+        recovery_key: bool,
+        #[arg(long, group = "slot_kind")]
+        passphrase: bool,
+        /// A key for this node (`node-1`, or `1`): written to --out (mode
+        /// 0600), or printed with how to keep it as a systemd credential.
+        #[arg(long, group = "slot_kind", value_name = "NODE")]
+        node_key: Option<String>,
+        /// With --node-key: the file to write the key to (not there yet).
+        #[arg(long, requires = "node_key")]
+        out: Option<std::path::PathBuf>,
+        /// Who or what it's for ("Alice's", "the safe").
+        #[arg(long, default_value = "")]
+        label: String,
+        /// With --passphrase: read it (once) from stdin.
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Remove a slot (`ca slot list` shows their ids). Whoever is unsealed
+    /// stays so; use `ca seal` for that.
+    Remove {
+        id: String,
+        /// Even the last recovery-key slot.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CaTokenCommands {
+    /// A single-use join token for a node; or, with `--client`, an
+    /// enrollment token for someone's client certificate (`raidish
+    /// enroll`).
+    Create {
+        /// Which node (`node-1`, or `1`).
+        #[arg(long, required_unless_present = "client", conflicts_with = "client")]
+        member: Option<String>,
+        /// A client certificate instead: `--profile` and `--cn` say which.
+        #[arg(long, requires = "cn", conflicts_with_all = ["sans", "replace", "compromised"])]
+        client: bool,
+        /// The client certificate's profile (admin, readonly or client).
+        #[arg(long, default_value = "readonly", requires = "client")]
+        profile: ProfileKind,
+        /// The client certificate's name.
+        #[arg(long, requires = "client")]
+        cn: Option<String>,
+        /// Names for its certificate on top of its host in the pool config.
+        #[arg(long = "san")]
+        sans: Vec<String>,
+        /// It replaces a node that has a certificate (a reinstalled host):
+        /// that node's certificates are revoked when this one joins.
+        #[arg(long)]
+        replace: bool,
+        /// …revoked as compromised.
+        #[arg(long)]
+        compromised: bool,
+        /// How long it lasts, in hours (default 24).
+        #[arg(long)]
+        hours: Option<u64>,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+    /// Withdraw a join token by its id.
+    Cancel {
+        id: String,
+        #[arg(long)]
+        url: Vec<String>,
+    },
+}
+
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("Error: {}", msg);
+    std::process::exit(1);
+}
+
+/// `node-1` or `1`.
+fn parse_member(s: &str) -> Result<NodeId, String> {
+    let s = s.trim();
+    s.parse::<NodeId>()
+        .ok()
+        .or_else(|| s.parse::<u64>().ok().map(NodeId::from_raw))
+        .ok_or_else(|| format!("'{}': name a node as node-<n>", s))
+}
+
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if r != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let h = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!h.is_empty()).then_some(h)
+}
+
+/// `ca init` (before `tls::init`: node 0 has no certificate yet).
+pub fn init(command: &CaCommands, config: &Config) {
+    let CaCommands::Init {
+        sans,
+        peer_sans,
+        node_days,
+        no_unseal_once,
+        root_out,
+        admin_out,
+        admin_name,
+        token_hours,
+        tokens_out,
+        port,
+        force,
+    } = command
+    else {
+        unreachable!()
+    };
+    let tls = config
+        .tls
+        .as_ref()
+        .unwrap_or_else(|| fail("the config has no `tls:` section to put node 0's certificate in"));
+    let (Some(ca_path), Some(cert_path), Some(key_path)) =
+        (tls.ca_path(), tls.cert_path(), tls.key_path())
+    else {
+        fail("tls: set `dir` (or `ca`, `cert` and `key`)")
+    };
+    if cert_path.exists() && !force {
+        fail(format!(
+            "{} exists: move the old certificates aside first (or --force)",
+            cert_path.display()
+        ));
+    }
+    let port = port.unwrap_or(8881);
+    let members = config
+        .cluster_members(port)
+        .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
+    if members.me != NodeId::from_raw(0) {
+        eprintln!(
+            "note: this config is {}'s, not node-0's: it will stage the CA and join the others",
+            members.me
+        );
+    }
+    let mut names: Vec<String> = sans.clone();
+    if names.is_empty() {
+        if let Some(a) = config.services.as_ref().and_then(|s| s.advertise.clone()) {
+            names.push(a);
+        }
+        if let Some(h) = hostname() {
+            names.push(h);
+        }
+    }
+    let names: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if !names.iter().any(|n| !is_loopback(n)) {
+        fail(
+            "node 0 needs a name its peers reach it by: pass --san <host> \
+             (as in the other nodes' pool configs)",
+        );
+    }
+    let mut peers: BTreeMap<NodeId, Vec<String>> = BTreeMap::new();
+    for p in peer_sans {
+        let (m, list) = p
+            .split_once('=')
+            .unwrap_or_else(|| fail(format!("--peer-san '{}': node-1=10.0.0.2", p)));
+        let m = parse_member(m).unwrap_or_else(|e| fail(e));
+        peers.entry(m).or_default().extend(
+            list.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    let data_dir = config.data_dir(&members.me.name());
+    let out = raidish_ca::init::init(&raidish_ca::init::InitOptions {
+        members: &members,
+        data_dir: &data_dir,
+        sans: names,
+        peer_sans: peers,
+        node_days: *node_days,
+        admin_name: admin_name.clone(),
+        token_ttl_ms: token_hours * 3600 * 1000,
+        unseal_once: !no_unseal_once,
+        force: *force,
+        kdf: raidish_ca::init::KDF,
+    })
+    .unwrap_or_else(|e| fail(e));
+    out.node0
+        .write(&ca_path, &cert_path, &key_path)
+        .unwrap_or_else(|e| fail(e));
+    out.admin.write_dir(admin_out).unwrap_or_else(|e| fail(e));
+    let env = serde_json::to_vec_pretty(&out.root_envelope).unwrap();
+    raidish_ca::write_file(root_out, &env, 0o600).unwrap_or_else(|e| fail(e));
+    let node0_url = format!("https://{}:{}", out.node0_sans[0], port);
+
+    println!("Cluster CA created (root {}).", out.root_fingerprint);
+    println!(
+        "  {} certificate: {} ({})",
+        members.me,
+        cert_path.display(),
+        out.node0_sans.join(", ")
+    );
+    println!(
+        "  admin certificate '{}': {}/",
+        admin_name,
+        admin_out.display()
+    );
+    println!(
+        "  root key, sealed: {}  (keep it off the cluster)",
+        root_out.display()
+    );
+    println!(
+        "  staged in {}",
+        raidish_ca::bootstrap_path(&data_dir).display()
+    );
+    println!();
+    println!("RECOVERY KEY (unseals the CA after a full restart: `raidish ca unseal`):");
+    println!("  {}", *out.recovery_key);
+    println!(
+        "ROOT KEY (opens {}, to make a new issuer in two years):",
+        root_out.display()
+    );
+    println!("  {}", *out.root_key);
+    println!("Write both down now; they are not stored anywhere.");
+    println!();
+    if *no_unseal_once {
+        println!(
+            "After starting {}, run `raidish ca unseal` against it.",
+            members.me
+        );
+    } else {
+        println!(
+            "{} unseals itself on its first start (one-shot key file).",
+            members.me
+        );
+    }
+    if !out.tokens.is_empty() {
+        println!(
+            "Start {} (`raidish listen`), then on each other node, before its first start:",
+            members.me
+        );
+    }
+    if let Some(dir) = tokens_out {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("{}: {}", dir.display(), e)));
+    }
+    for t in &out.tokens {
+        println!(
+            "  {} ({}):\n    echo '{}' | raidish join {} --token-stdin -c <its config>",
+            t.member, t.base, *t.token, node0_url
+        );
+        if let Some(dir) = tokens_out {
+            let p = dir.join(format!("{}.token", t.member));
+            raidish_ca::write_file(&p, t.token.as_bytes(), 0o600).unwrap_or_else(|e| fail(e));
+        }
+    }
+    if !out.tokens.is_empty() {
+        println!(
+            "The tokens are single-use and last {} hours (`raidish ca token create` makes more).",
+            token_hours
+        );
+    }
+}
+
+/// `raidish join` (before `tls::init`: this node has no certificate yet).
+pub async fn join(
+    url: &str,
+    token_stdin: bool,
+    token_file: Option<&Path>,
+    port: Option<u16>,
+    force: bool,
+    config: &Config,
+) {
+    let token = read_token(token_stdin, token_file);
+    let tls = config
+        .tls
+        .as_ref()
+        .unwrap_or_else(|| fail("the config has no `tls:` section to put the certificate in"));
+    let (Some(ca_path), Some(cert_path), Some(key_path)) =
+        (tls.ca_path(), tls.cert_path(), tls.key_path())
+    else {
+        fail("tls: set `dir` (or `ca`, `cert` and `key`)")
+    };
+    if cert_path.exists() && !force {
+        fail(format!(
+            "{} exists: this node has a certificate already (--force replaces it)",
+            cert_path.display()
+        ));
+    }
+    let members = config
+        .cluster_members(port.unwrap_or(8881))
+        .unwrap_or_else(|e| fail(format!("cluster: {}", e)));
+    let joined = raidish_ca::join::join(url, &token, members.me, &members.fingerprint)
+        .await
+        .unwrap_or_else(|e| fail(e));
+    joined
+        .bundle
+        .write(&ca_path, &cert_path, &key_path)
+        .unwrap_or_else(|e| fail(e));
+    println!(
+        "joined as {}: certificate {} in {}, until {}",
+        members.me,
+        joined.serial,
+        cert_path.display(),
+        when(joined.not_after_ms)
+    );
+    println!("now start it: raidish listen");
+}
+
+fn read_token(token_stdin: bool, token_file: Option<&Path>) -> raidish_ca::token::JoinToken {
+    let text = match (token_stdin, token_file) {
+        (_, Some(p)) => Zeroizing::new(
+            std::fs::read_to_string(p).unwrap_or_else(|e| fail(format!("{}: {}", p.display(), e))),
+        ),
+        (true, None) => {
+            let mut s = Zeroizing::new(String::new());
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .unwrap_or_else(|e| fail(e));
+            s
+        }
+        (false, None) => fail("pass the token with --token-stdin (or --token-file)"),
+    };
+    raidish_ca::token::JoinToken::parse(&text).unwrap_or_else(|e| fail(e))
+}
+
+fn home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| fail("HOME isn't set")))
+}
+
+/// `~/x` as a path.
+fn expand(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
+/// `raidish enroll` (CA-4c).
+pub async fn enroll(
+    url: &str,
+    token_stdin: bool,
+    token_file: Option<&Path>,
+    dir: Option<&Path>,
+    force: bool,
+    config_path: &str,
+) {
+    let token = read_token(token_stdin, token_file);
+    let dir = dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home().join(".raidish/tls"));
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    if dir.join("cert.pem").exists() && !force {
+        fail(format!(
+            "{} has a certificate already (--force replaces it, or --dir elsewhere)",
+            dir.display()
+        ));
+    }
+    let got = raidish_ca::join::enroll(url, &token)
+        .await
+        .unwrap_or_else(|e| fail(e));
+    got.bundle.write_dir(&dir).unwrap_or_else(|e| fail(e));
+    let e = &got.enrolled;
+    println!(
+        "enrolled as '{}' ({}): certificate {} in {}, until {}",
+        e.cn,
+        e.profile,
+        e.issued.serial,
+        dir.display(),
+        when(e.issued.not_after_ms)
+    );
+    let url = url.trim_end_matches('/').to_string();
+    let mut eps = vec![url.clone()];
+    for p in &e.endpoints {
+        let p = p.trim_end_matches('/').to_string();
+        if !eps.contains(&p) {
+            eps.push(p);
+        }
+    }
+    let config = expand(config_path);
+    let text = format!(
+        "# Written by `raidish enroll` ('{}', {}).\nendpoints:\n{}tls:\n  dir: {}\n",
+        e.cn,
+        e.profile,
+        eps.iter()
+            .map(|u| format!("  - {}\n", u))
+            .collect::<String>(),
+        dir.display()
+    );
+    if config.exists() {
+        println!(
+            "{} exists, left as it is: for this certificate, it needs\n{}",
+            config.display(),
+            text
+        );
+        return;
+    }
+    raidish_ca::write_file(&config, text.as_bytes(), 0o600).unwrap_or_else(|e| fail(e));
+    println!(
+        "wrote {} (asks {}): try `raidish ca status`",
+        config.display(),
+        eps.join(", ")
+    );
+    println!("it renews with `raidish ca renew` before it runs out");
+}
+
+fn when(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or("?".into())
+}
+
+fn endpoints(urls: &[String], config: &Config) -> Vec<String> {
+    if !urls.is_empty() {
+        return urls
+            .iter()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .collect();
+    }
+    let mut eps = config.lease_endpoints().unwrap_or_else(|e| fail(e));
+    if eps.is_empty() {
+        eps.push(format!("{}://127.0.0.1:8881", crate::tls::scheme()));
+    }
+    eps
+}
+
+fn http() -> reqwest::Client {
+    crate::tls::http_client(Some(Duration::from_secs(60))).unwrap_or_else(|e| fail(e))
+}
+
+/// Send what `req` builds to each endpoint until one answers: a `503`
+/// (sealed, no CA yet) or no answer means the next.
+async fn ask<T: serde::de::DeserializeOwned>(
+    eps: &[String],
+    req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<T, String> {
+    ask_with(&http(), eps, req).await
+}
+
+/// As [`ask`], with `client`.
+async fn ask_with<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    eps: &[String],
+    req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<T, String> {
+    let r = try_each(eps.iter().map(String::as_str), |ep| {
+        let sent = req(client, ep).send();
+        async move {
+            match sent.await {
+                Err(e) => Answer::Unreachable(e.to_string()),
+                Ok(r) if r.status().as_u16() == 503 => {
+                    Answer::Unreachable(r.text().await.unwrap_or_default().trim().to_string())
+                }
+                Ok(r) if r.status().is_success() => match r.json::<T>().await {
+                    Ok(v) => Answer::Got(v),
+                    Err(e) => Answer::Unreachable(e.to_string()),
+                },
+                Ok(r) => {
+                    let status = r.status();
+                    Answer::Refused(format!(
+                        "{}: {}",
+                        status,
+                        r.text().await.unwrap_or_default().trim()
+                    ))
+                }
+            }
+        }
+    })
+    .await;
+    r.map_err(|e| e.to_string())
+}
+
+/// Like [`ask`], for answers with no body.
+async fn ask_ok(
+    eps: &[String],
+    req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<(), String> {
+    ask_ok_with(&http(), eps, req).await
+}
+
+async fn ask_ok_with(
+    client: &reqwest::Client,
+    eps: &[String],
+    req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+) -> Result<(), String> {
+    try_each(eps.iter().map(String::as_str), |ep| {
+        let sent = req(client, ep).send();
+        async move {
+            match sent.await {
+                Err(e) => Answer::Unreachable(e.to_string()),
+                Ok(r) if r.status().as_u16() == 503 => {
+                    Answer::Unreachable(r.text().await.unwrap_or_default().trim().to_string())
+                }
+                Ok(r) if r.status().is_success() => Answer::Got(()),
+                Ok(r) => {
+                    let status = r.status();
+                    Answer::Refused(format!(
+                        "{}: {}",
+                        status,
+                        r.text().await.unwrap_or_default().trim()
+                    ))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// What a listed certificate is now.
+fn cert_state(c: &CertListing, now: u64) -> String {
+    match &c.revoked {
+        Some(r) => format!("revoked ({}, {})", reason_name(r.reason), when(r.at_ms)),
+        None if c.cert.not_after_ms <= now => "expired".into(),
+        None => "live".into(),
+    }
+}
+
+fn reason_name(r: RevocationReason) -> &'static str {
+    match r {
+        RevocationReason::Unspecified => "unspecified",
+        RevocationReason::KeyCompromise => "compromised",
+        RevocationReason::Superseded => "superseded",
+        RevocationReason::CessationOfOperation => "retired",
+    }
+}
+
+fn print_certs(certs: &[&CertListing], now: u64) {
+    println!(
+        "{:<34} {:<12} {:<24} {:<8} {:<8} {:<20} STATUS",
+        "SERIAL", "PROFILE", "CN", "MEMBER", "ISSUER", "EXPIRES"
+    );
+    for c in certs {
+        println!(
+            "{:<34} {:<12} {:<24} {:<8} {:<8} {:<20} {}",
+            c.serial,
+            c.cert.identity.profile.as_str(),
+            c.cert.identity.cn,
+            c.cert
+                .identity
+                .member
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into()),
+            c.cert.issuer.to_string(),
+            when(c.cert.not_after_ms),
+            cert_state(c, now)
+        );
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `raidish ca slot …`.
+async fn run_slot(command: &SlotCommands, config: &Config) {
+    match command {
+        SlotCommands::List { url } => {
+            let s: PkiStatus = ask(&endpoints(url, config), |c, ep| {
+                c.get(format!("{}/api/v1/pki/status", ep))
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            let p = s.pki.unwrap_or_else(|| fail("no CA"));
+            for slot in &p.slots {
+                println!("{}  {}  {}", slot.id, slot.kind, slot.label);
+            }
+        }
+        SlotCommands::Add {
+            recovery_key,
+            passphrase,
+            node_key,
+            out,
+            label,
+            stdin,
+            url,
+        } => {
+            if !*recovery_key && !*passphrase && node_key.is_none() {
+                fail("--recovery-key, --passphrase or --node-key NODE");
+            }
+            if let Some(path) = out
+                && path.exists()
+            {
+                fail(format!("{} exists: not overwritten", path.display()));
+            }
+            let req = if let Some(node) = node_key {
+                SlotRequest {
+                    kind: NewSlotKind::NodeKey,
+                    label: label.clone(),
+                    passphrase: None,
+                    node: Some(parse_member(node).unwrap_or_else(|e| fail(e))),
+                }
+            } else if *passphrase {
+                let p = read_secret("new passphrase: ", *stdin);
+                let p = p.trim_end_matches(['\n', '\r']).to_string();
+                if !*stdin {
+                    let again = read_secret("again: ", false);
+                    if again.trim_end_matches(['\n', '\r']) != p {
+                        fail("the passphrases differ");
+                    }
+                }
+                SlotRequest {
+                    kind: NewSlotKind::Passphrase,
+                    label: label.clone(),
+                    passphrase: Some(p),
+                    node: None,
+                }
+            } else {
+                SlotRequest {
+                    kind: NewSlotKind::RecoveryKey,
+                    label: label.clone(),
+                    passphrase: None,
+                    node: None,
+                }
+            };
+            let made: SlotCreated = ask(&endpoints(url, config), |c, ep| {
+                c.post(format!("{}/api/v1/pki/slots", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            if let Some(k) = &made.node_key {
+                let k = zeroize::Zeroizing::new(k.clone());
+                match out {
+                    Some(path) => {
+                        write_private(path, &format!("{}\n", *k))
+                            .unwrap_or_else(|e| fail(format!("{}: {}", path.display(), e)));
+                        println!(
+                            "key slot {} added; its node key is in {} (mode 0600). Copy it to \
+                             the node and delete it here.",
+                            made.id,
+                            path.display()
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "key slot {} added. Its node key (shown this once) is on stdout.\n\
+                             On the node, keep it as an encrypted systemd credential:\n\
+                             \n  systemd-creds encrypt --name=raidish-unseal - \
+                             /etc/credstore.encrypted/raidish-unseal\n\
+                             \n(paste the key, then Ctrl-D), add to raidish's unit\n\
+                             \n  LoadCredentialEncrypted=raidish-unseal\n\
+                             \nand to its config\n\
+                             \n  ca:\n    unseal_credential: raidish-unseal\n",
+                            made.id
+                        );
+                        println!("{}", *k);
+                    }
+                }
+                return;
+            }
+            match &made.recovery_key {
+                Some(k) => {
+                    eprintln!(
+                        "key slot {} added. Its recovery key (shown this once):",
+                        made.id
+                    );
+                    println!("{}", k);
+                }
+                None => println!("key slot {} added", made.id),
+            }
+        }
+        SlotCommands::Remove { id, force, url } => {
+            ask_ok(&endpoints(url, config), |c, ep| {
+                c.delete(format!("{}/api/v1/pki/slots/{}", ep, id))
+                    .query(&[("force", *force)])
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!("key slot {} removed", id);
+        }
+    }
+}
+
+/// `raidish token create`: an `rdt2` token from the cluster's CA.
+pub async fn create_token(
+    name: &str,
+    role: crate::pki::Role,
+    ttl_s: Option<i64>,
+    urls: &[String],
+    config: &Config,
+) {
+    let req = TokenRequest {
+        sub: name.to_string(),
+        role: role.to_string(),
+        ttl_s,
+    };
+    let t: TokenCreated = ask(&endpoints(urls, config), |c, ep| {
+        c.post(format!("{}/api/v1/pki/tokens", ep)).json(&req)
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    eprintln!(
+        "token {} for '{}' ({}), expires {}",
+        t.id,
+        t.sub,
+        t.role,
+        when(t.exp.max(0) as u64 * 1000)
+    );
+    eprintln!("revoke it with `raidish token revoke {}`", t.id);
+    println!("{}", t.token);
+}
+
+/// `raidish token revoke`: refuse token (or access key) `id` from now on,
+/// everywhere.
+pub async fn revoke_token(id: &str, expires_ms: Option<u64>, urls: &[String], config: &Config) {
+    let id = TokenId::parse(id).unwrap_or_else(|e| fail(e));
+    let req = RevokeTokenRequest { expires_ms };
+    ask_ok(&endpoints(urls, config), |c, ep| {
+        c.post(format!("{}/api/v1/pki/tokens/{}/revoke", ep, id))
+            .json(&req)
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    println!(
+        "token {} revoked{}",
+        id,
+        expires_ms
+            .map(|e| format!(" (kept until {})", when(e)))
+            .unwrap_or_default()
+    );
+}
+
+fn read_secret(prompt: &str, stdin: bool) -> Zeroizing<String> {
+    let mut s = Zeroizing::new(String::new());
+    // SAFETY: isatty on a valid fd.
+    let tty = unsafe { libc::isatty(0) } == 1;
+    if stdin || !tty {
+        std::io::stdin()
+            .read_line(&mut s)
+            .unwrap_or_else(|e| fail(e));
+        return s;
+    }
+    eprint!("{}", prompt);
+    // No echo while it's typed.
+    // SAFETY: termios on stdin, restored below.
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let have = unsafe { libc::tcgetattr(0, &mut old) } == 0;
+    if have {
+        let mut quiet = old;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) };
+    }
+    let r = std::io::stdin().read_line(&mut s);
+    if have {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+    }
+    eprintln!();
+    r.unwrap_or_else(|e| fail(e));
+    s
+}
+
+/// `raidish ca rekey`.
+async fn rekey(yes: bool, out: Option<&std::path::Path>, url: &[String], config: &Config) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let eps = endpoints(url, config);
+    let s: PkiStatus = ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/status", ep)))
+        .await
+        .unwrap_or_else(|e| fail(e));
+    let p = s.pki.unwrap_or_else(|| fail("no CA"));
+    eprintln!("ca rekey makes a new DEK and one new recovery key. It removes every key slot:");
+    for slot in &p.slots {
+        eprintln!("  {}  {}  {}", slot.id, slot.kind, slot.label);
+    }
+    eprintln!(
+        "Passphrases and node keys must be added again (`raidish ca slot add`), and every \
+         node but the one that rekeys is sealed.\n\
+         It doesn't help if the Raft state leaked along with a secret: the issuer's and \
+         the token signer's keys are exposed then. Rotate the issuer and revoke the old \
+         one, and revoke the token signer (`raidish ca revoke raidish-tokens`)."
+    );
+    // The key is made here, and kept (in --out, or memory) before the
+    // rekey is sent: an answer lost on the way back loses nothing.
+    let key = raidish_auth::envelope::new_recovery_key().unwrap_or_else(|e| fail(e));
+    if let Some(path) = out {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap_or_else(|e| fail(format!("{}: {}", path.display(), e)));
+        f.write_all(format!("{}\n", *key).as_bytes())
+            .and_then(|_| f.sync_all())
+            .unwrap_or_else(|e| {
+                let _ = std::fs::remove_file(path);
+                fail(format!("{}: {}", path.display(), e))
+            });
+    }
+    let unmade = || {
+        if let Some(path) = out {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    if !yes {
+        eprint!("type 'rekey' to go on: ");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if line.trim() != "rekey" {
+            unmade();
+            fail("not rekeyed");
+        }
+    }
+    let req = RekeyRequest {
+        recovery_key: Some(key.to_string()),
+    };
+    let r: Result<Rekeyed, String> = ask(&eps, |c, ep| {
+        c.post(format!("{}/api/v1/pki/rekey", ep)).json(&req)
+    })
+    .await;
+    let show_key = |why: &str| match out {
+        Some(path) => eprintln!(
+            "{}; the new recovery key is in {} (mode 0600)",
+            why,
+            path.display()
+        ),
+        None => {
+            eprintln!(
+                "{}. The new recovery key (shown this once; the old one opens nothing now):",
+                why
+            );
+            println!("{}", *key);
+        }
+    };
+    match r {
+        Ok(r) => {
+            if !r.dropped_enrollments.is_empty() {
+                eprintln!(
+                    "WARNING: join tokens {} were in Raft without the signer's MAC (put there \
+                     by a node without the DEK: a compromised member?). They're removed.",
+                    r.dropped_enrollments.join(", ")
+                );
+            }
+            if !r.held {
+                eprintln!(
+                    "the CA was sealed meanwhile: no node holds the new DEK; unseal one with \
+                     the new key"
+                );
+            }
+            show_key(&format!("rekeyed: key slot {} is the only one", r.slot_id));
+        }
+        Err(e) => {
+            // Did it go in all the same (the answer lost)? The seal epoch
+            // says.
+            eprintln!("{}", e);
+            let now: Result<PkiStatus, String> =
+                ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/status", ep))).await;
+            match now.ok().and_then(|s| s.pki) {
+                Some(n) if n.seal_epoch == p.seal_epoch => {
+                    unmade();
+                    fail("not rekeyed: nothing changed (run it again)");
+                }
+                Some(_) => {
+                    show_key(
+                        "the CA's seal moved all the same: it was most likely rekeyed (`ca slot \
+                         list` shows one recovery-key slot if so) and is sealed",
+                    );
+                    std::process::exit(1);
+                }
+                None => {
+                    show_key(
+                        "no node answers now: if the rekey went in, this key is the only one \
+                         that unseals the CA",
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Write `text` to a new file only its owner reads.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
+}
+
+fn print_status(s: &PkiStatus) {
+    let state = match (s.unsealed, &s.unsealed_by) {
+        (true, Some(by)) => format!("unsealed by {}: can sign", by),
+        (true, None) => "unsealed (can sign)".to_string(),
+        (false, _) => "SEALED (can't sign)".to_string(),
+    };
+    println!(
+        "{}: {}{}",
+        s.node,
+        state,
+        if s.staged {
+            ", CA staged (no quorum yet)"
+        } else {
+            ""
+        }
+    );
+    if !s.nodes.is_empty() {
+        for n in &s.nodes {
+            let state = match (n.reachable, n.unsealed, &n.unsealed_by) {
+                (false, _, _) => format!(
+                    "unreachable ({})",
+                    n.error.as_deref().unwrap_or("no answer")
+                ),
+                (true, true, Some(by)) => format!("unsealed by {}", by),
+                (true, true, None) => "unsealed".into(),
+                (true, false, _) => "sealed".into(),
+            };
+            println!("  {}: {}", n.node, state);
+        }
+        if s.pki.is_some() && !s.nodes.iter().any(|n| n.unsealed) {
+            println!(
+                "  SEALED: no {}node can sign; joins, renewals and new tokens wait until one \
+                 is unsealed (`raidish ca unseal`)",
+                if s.nodes.iter().all(|n| n.reachable) {
+                    ""
+                } else {
+                    "reachable "
+                }
+            );
+        }
+    }
+    match &s.pki {
+        None => println!("  no CA"),
+        Some(p) => {
+            println!("  root {}", p.anchor_fingerprint);
+            for i in &p.issuers {
+                println!(
+                    "  {} ({:?}), serial {}, until {}",
+                    i.id,
+                    i.status,
+                    i.serial,
+                    when(i.not_after_ms)
+                );
+            }
+            if let Some((n, until)) = p.root_crl {
+                println!("  root CRL {}, until {}", n, when(until));
+            }
+            match &p.token_signer {
+                None => println!("  no token signer yet (an unsealed node makes it)"),
+                Some(t) => println!(
+                    "  token signer, serial {}, until {}{}",
+                    t.serial,
+                    when(t.not_after_ms),
+                    if t.revoked {
+                        " (REVOKED: a new one is due)"
+                    } else {
+                        ""
+                    }
+                ),
+            }
+            for slot in &p.slots {
+                println!("  key slot {}: {} ({})", slot.id, slot.label, slot.kind);
+            }
+            println!(
+                "  {} certificates on record, {} revoked; {} join tokens outstanding",
+                p.certs, p.revoked_certs, p.enrollments
+            );
+        }
+    }
+    for w in &s.warnings {
+        println!("  WARNING: {}", w);
+    }
+}
+
+/// The `ca` commands that talk to running nodes.
+pub async fn run(command: &CaCommands, config: &Config) {
+    match command {
+        CaCommands::Init { .. } => unreachable!("handled before TLS"),
+        CaCommands::Crl {
+            out,
+            pem,
+            root,
+            url,
+        } => {
+            let route = if *root { "root-crl" } else { "crl" };
+            let r = fetch_crl(&endpoints(url, config), route, *pem).await;
+            let bytes = r.unwrap_or_else(|e| fail(e)).unwrap_or_else(|| {
+                fail(match root {
+                    true => "no root CRL: no issuer has been revoked",
+                    false => "no CRL yet: an unsealed node signs it",
+                })
+            });
+            match out {
+                Some(p) => {
+                    std::fs::write(p, &bytes)
+                        .unwrap_or_else(|e| fail(format!("{}: {}", p.display(), e)));
+                    eprintln!("CRL written to {}", p.display());
+                }
+                None => {
+                    use std::io::Write;
+                    std::io::stdout()
+                        .write_all(&bytes)
+                        .unwrap_or_else(|e| fail(e));
+                }
+            }
+        }
+        CaCommands::List { revoked, all, url } => {
+            let certs: Vec<CertListing> = ask(&endpoints(url, config), |c, ep| {
+                c.get(format!("{}/api/v1/pki/certs", ep))
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            let now = now_ms();
+            let shown: Vec<&CertListing> = certs
+                .iter()
+                .filter(|c| {
+                    if *all {
+                        true
+                    } else if *revoked {
+                        c.revoked.is_some()
+                    } else {
+                        c.revoked.is_none() && c.cert.not_after_ms > now
+                    }
+                })
+                .collect();
+            print_certs(&shown, now);
+        }
+        CaCommands::Revoke {
+            cert,
+            reason,
+            force,
+            url,
+        } => {
+            let eps = endpoints(url, config);
+            let certs: Vec<CertListing> =
+                ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/certs", ep)))
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+            let now = now_ms();
+            let by_serial = Serial::parse(cert)
+                .ok()
+                .and_then(|s| certs.iter().find(|c| c.serial == s));
+            // The token signer isn't in the list: by its serial (`ca
+            // status`) or CN. Revoking it ends every rdt2 token.
+            if by_serial.is_none() {
+                let s: PkiStatus = ask(&eps, |c, ep| c.get(format!("{}/api/v1/pki/status", ep)))
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                if let Some(t) = s.pki.and_then(|p| p.token_signer).filter(|t| {
+                    Serial::parse(cert).is_ok_and(|s| s == t.serial)
+                        || cert == raidish_ca::token_signer::CN
+                }) {
+                    if t.revoked {
+                        println!("{} is revoked already", t.serial);
+                        return;
+                    }
+                    let req = RevokeCertRequest {
+                        reason: *reason,
+                        force: *force,
+                    };
+                    ask_ok(&eps, |c, ep| {
+                        c.post(format!("{}/api/v1/pki/certs/{}/revoke", ep, t.serial))
+                            .json(&req)
+                    })
+                    .await
+                    .unwrap_or_else(|e| fail(e));
+                    println!(
+                        "revoked {} (the token signer): every rdt2 token it signed is refused; \
+                         an unsealed node makes a new one",
+                        t.serial
+                    );
+                    return;
+                }
+            }
+            let target = match by_serial {
+                Some(c) => c,
+                None => {
+                    let named: Vec<&CertListing> = certs
+                        .iter()
+                        .filter(|c| {
+                            c.cert.identity.cn == *cert
+                                && c.revoked.is_none()
+                                && c.cert.not_after_ms > now
+                        })
+                        .collect();
+                    match named[..] {
+                        [] => fail(format!("no live certificate with serial or CN '{}'", cert)),
+                        [one] => one,
+                        _ => {
+                            print_certs(&named, now);
+                            fail(format!(
+                                "{} live certificates are named '{}': give a serial",
+                                named.len(),
+                                cert
+                            ))
+                        }
+                    }
+                }
+            };
+            if target.revoked.is_some() {
+                println!("{} is revoked already", target.serial);
+                return;
+            }
+            let req = RevokeCertRequest {
+                reason: *reason,
+                force: *force,
+            };
+            ask_ok(&eps, |c, ep| {
+                c.post(format!("{}/api/v1/pki/certs/{}/revoke", ep, target.serial))
+                    .json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!(
+                "revoked {} ({} {})",
+                target.serial,
+                target.cert.identity.profile.as_str(),
+                target.cert.identity.cn
+            );
+        }
+        CaCommands::Status { url } => {
+            // Every member's seal, asked by the node that answers.
+            let s: PkiStatus = ask(&endpoints(url, config), |c, ep| {
+                c.get(format!("{}/api/v1/pki/status", ep))
+                    .query(&[("all", true)])
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            print_status(&s);
+        }
+        CaCommands::Unseal { url, stdin, all } => {
+            let secret = read_secret("recovery key or passphrase: ", *stdin);
+            let body = UnsealRequest {
+                secret: secret.trim_end_matches(['\n', '\r']).to_string(),
+            };
+            let client = http();
+            let mut ok = 0;
+            for ep in endpoints(url, config) {
+                let r = client
+                    .post(format!("{}/api/v1/pki/unseal", ep))
+                    .json(&body)
+                    .send()
+                    .await;
+                match r {
+                    Ok(r) if r.status().is_success() => match r.json::<PkiStatus>().await {
+                        Ok(s) => {
+                            ok += 1;
+                            println!("{}: unsealed", s.node);
+                            if !*all {
+                                break;
+                            }
+                        }
+                        Err(e) => eprintln!("{}: {}", ep, e),
+                    },
+                    Ok(r) => {
+                        let st = r.status();
+                        eprintln!(
+                            "{}: {}: {}",
+                            ep,
+                            st,
+                            r.text().await.unwrap_or_default().trim()
+                        );
+                        // The slots are the same on every node: a wrong
+                        // secret is wrong everywhere (and each try costs
+                        // Argon2id there).
+                        if matches!(st.as_u16(), 400 | 403) {
+                            break;
+                        }
+                    }
+                    Err(e) => eprintln!("{}: {}", ep, e),
+                }
+            }
+            if ok == 0 {
+                fail("no node unsealed");
+            }
+        }
+        CaCommands::Seal {
+            keep_node_keys,
+            url,
+        } => {
+            let req = SealRequest {
+                keep_node_keys: *keep_node_keys,
+            };
+            let _: PkiStatus = ask(&endpoints(url, config), |c, ep| {
+                c.post(format!("{}/api/v1/pki/seal", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            println!(
+                "sealed: no node signs until one is unsealed (`raidish ca unseal`){}",
+                if *keep_node_keys {
+                    "; nodes with a node key unseal again when they restart"
+                } else {
+                    ""
+                }
+            );
+        }
+        CaCommands::Rekey { yes, out, url } => rekey(*yes, out.as_deref(), url, config).await,
+        CaCommands::Slot { command } => run_slot(command, config).await,
+        CaCommands::Token { command } => match command {
+            CaTokenCommands::Create {
+                client: true,
+                profile,
+                cn,
+                hours,
+                url,
+                ..
+            } => {
+                let req = ClientEnrollmentRequest {
+                    profile: *profile,
+                    cn: cn.clone().unwrap_or_default(),
+                    ttl_secs: hours.map(|h| h * 3600),
+                };
+                let eps = endpoints(url, config);
+                let e: ClientEnrollmentCreated = ask(&eps, |c, ep| {
+                    c.post(format!("{}/api/v1/pki/enrollments/client", ep))
+                        .json(&req)
+                })
+                .await
+                .unwrap_or_else(|e| fail(e));
+                eprintln!(
+                    "enrollment token {} for '{}' ({}), single-use, until {}",
+                    e.id,
+                    e.cn,
+                    e.profile,
+                    when(e.expires_ms)
+                );
+                eprintln!(
+                    "on their machine: raidish enroll {} --token-stdin",
+                    eps.first()
+                        .map(String::as_str)
+                        .unwrap_or("<a node's https URL>")
+                );
+                println!("{}", e.token);
+            }
+            CaTokenCommands::Create {
+                member,
+                sans,
+                replace,
+                compromised,
+                hours,
+                url,
+                ..
+            } => {
+                let member = member
+                    .as_deref()
+                    .unwrap_or_else(|| fail("--member or --client"));
+                let req = EnrollmentRequest {
+                    member: parse_member(member).unwrap_or_else(|e| fail(e)),
+                    extra_sans: sans.clone(),
+                    replace: *replace,
+                    compromised: *compromised,
+                    ttl_secs: hours.map(|h| h * 3600),
+                };
+                let eps = endpoints(url, config);
+                let e: EnrollmentCreated = ask(&eps, |c, ep| {
+                    c.post(format!("{}/api/v1/pki/enrollments", ep)).json(&req)
+                })
+                .await
+                .unwrap_or_else(|e| fail(e));
+                eprintln!(
+                    "join token {} for {}, single-use, until {}{}",
+                    e.id,
+                    e.member,
+                    when(e.expires_ms),
+                    if *replace {
+                        " (its old certificates are revoked when it joins)"
+                    } else {
+                        ""
+                    }
+                );
+                eprintln!(
+                    "on {}: raidish join <a node's https URL> --token-stdin",
+                    e.member
+                );
+                println!("{}", e.token);
+            }
+            CaTokenCommands::Cancel { id, url } => {
+                let id = TokenId::parse(id).unwrap_or_else(|e| fail(e));
+                let client = http();
+                let eps = endpoints(url, config);
+                let r = try_each(eps.iter().map(String::as_str), |ep| {
+                    let sent = client
+                        .delete(format!("{}/api/v1/pki/enrollments/{}", ep, id))
+                        .send();
+                    async move {
+                        match sent.await {
+                            Err(e) => Answer::Unreachable(e.to_string()),
+                            Ok(r) if r.status().as_u16() == 503 => {
+                                Answer::Unreachable(r.text().await.unwrap_or_default())
+                            }
+                            Ok(r) if r.status().is_success() => Answer::Got(()),
+                            Ok(r) => Answer::Refused(r.text().await.unwrap_or_default()),
+                        }
+                    }
+                })
+                .await;
+                r.unwrap_or_else(|e| fail(e));
+                println!("join token {} withdrawn", id);
+            }
+        },
+        CaCommands::Issue {
+            cn,
+            profile,
+            out,
+            sans,
+            days,
+            member,
+            url,
+            force,
+        } => {
+            let libvirt = *profile == ProfileKind::Libvirt;
+            let first = if libvirt {
+                out.join(crate::pki::LIBVIRT_FILES[1].0)
+            } else {
+                out.join("cert.pem")
+            };
+            if first.exists() && !force {
+                fail(format!("{} exists (--force replaces it)", first.display()));
+            }
+            let (key_pem, csr_pem) = raidish_auth::ca::generate_csr(cn).unwrap_or_else(|e| fail(e));
+            let req = SignRequest {
+                csr_pem,
+                profile: *profile,
+                cn: cn.clone(),
+                sans: sans.clone(),
+                days: *days,
+                member: member
+                    .as_deref()
+                    .map(|m| parse_member(m).unwrap_or_else(|e| fail(e))),
+            };
+            let issued: Issued = ask(&endpoints(url, config), |c, ep| {
+                c.post(format!("{}/api/v1/pki/sign", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            if libvirt {
+                write_libvirt(out, &issued, &key_pem).unwrap_or_else(|e| fail(e));
+                // GnuTLS keeps using a CRL past its next update (checked
+                // with 3.7), so a copy that goes stale refuses what it
+                // lists and nothing else.
+                match fetch_crl(&endpoints(url, config), "crl", true).await {
+                    Ok(Some(crl)) => {
+                        for path in LIBVIRT_CRL_FILES {
+                            raidish_ca::write_file(&out.join(path), &crl, 0o644)
+                                .unwrap_or_else(|e| fail(e));
+                        }
+                    }
+                    Ok(None) => eprintln!("no CRL yet (no node unsealed): none written"),
+                    Err(e) => eprintln!("the CRL: {} (none written)", e),
+                }
+            } else {
+                raidish_ca::Bundle {
+                    ca_pem: issued.ca_pem.clone(),
+                    cert_pem: issued.cert_pem.clone(),
+                    key_pem,
+                }
+                .write_dir(out)
+                .unwrap_or_else(|e| fail(e));
+            }
+            println!(
+                "{} certificate for '{}' ({}), until {}: {}/",
+                profile,
+                cn,
+                issued.serial,
+                when(issued.not_after_ms),
+                out.display()
+            );
+            if libvirt {
+                println!("copy its etc/ to / on that host, then restart libvirtd");
+                println!(
+                    "revocations after this reach it with a fresh CRL: \
+                     `raidish ca crl --pem --out /etc/pki/CA/cacrl.pem` (and qemu's ca-crl.pem)"
+                );
+            }
+        }
+        CaCommands::Renew { node: true, url } => {
+            let client = http();
+            let mut ok = 0;
+            for ep in endpoints(url, config) {
+                match client
+                    .post(format!("{}/api/v1/pki/self/renew", ep))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        ok += 1;
+                        println!("{}: renewing (its log says how it went)", ep);
+                    }
+                    Ok(r) => eprintln!(
+                        "{}: {}: {}",
+                        ep,
+                        r.status(),
+                        r.text().await.unwrap_or_default().trim()
+                    ),
+                    Err(e) => eprintln!("{}: {}", ep, e),
+                }
+            }
+            if ok == 0 {
+                fail("no node took it");
+            }
+        }
+        CaCommands::RotateIssuer {
+            root,
+            stdin,
+            days,
+            revoke_old,
+            force,
+            url,
+        } => {
+            let eps = endpoints(url, config);
+            let view = pki_view(&http(), &eps).await;
+            let root = open_root(root, *stdin, &view);
+            let next = raidish_types::pki::IssuerId(
+                view.issuers.iter().map(|i| i.id.0).max().unwrap_or(0) + 1,
+            );
+            let req = root
+                .issuer(next, days.unwrap_or(raidish_ca::init::ISSUER_DAYS))
+                .unwrap_or_else(|e| fail(e));
+            let added: raidish_ca::api::IssuerAdded = ask(&eps, |c, ep| {
+                c.post(format!("{}/api/v1/pki/issuers", ep)).json(&req)
+            })
+            .await
+            .unwrap_or_else(|e| fail(e));
+            drop(req);
+            println!(
+                "{} is the active issuer (serial {}, until {})",
+                added.id,
+                added.serial,
+                when(added.not_after_ms)
+            );
+            if !added.retired.is_empty() {
+                println!(
+                    "retired: {} (its certificates keep working until it's revoked)",
+                    added
+                        .retired
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            println!("nodes renew onto it now; the token signer and CRL follow");
+            if *revoke_old {
+                for old in &added.retired {
+                    revoke_issuer(config, &eps, &root, *old, *force).await;
+                }
+            }
+        }
+        CaCommands::RevokeIssuer {
+            id,
+            root,
+            stdin,
+            force,
+            url,
+        } => {
+            let eps = endpoints(url, config);
+            let id = raidish_types::pki::IssuerId(
+                id.trim_start_matches("issuer-")
+                    .parse()
+                    .unwrap_or_else(|_| fail(format!("'{}': an issuer is issuer-N", id))),
+            );
+            let view = pki_view(&http(), &eps).await;
+            match view.issuers.iter().find(|i| i.id == id).map(|i| &i.status) {
+                None => fail(format!("no {}", id)),
+                Some(raidish_types::pki::IssuerStatus::Active) => fail(format!(
+                    "{} is the active issuer: `ca rotate-issuer` first",
+                    id
+                )),
+                _ => {}
+            }
+            let root = open_root(root, *stdin, &view);
+            revoke_issuer(config, &eps, &root, id, *force).await;
+        }
+        CaCommands::Renew { node: false, url } => {
+            renew_own(config, &endpoints(url, config)).await;
+            println!(
+                "a `raidish listen` on these files keeps serving its own: it renews \
+                 itself (`raidish ca renew --node` for now)"
+            );
+        }
+    }
+}
+
+/// Renew this config's own certificate in place, and present the new one
+/// from here on in this process. Its serial before and after.
+async fn renew_own(config: &Config, eps: &[String]) -> (Serial, Serial) {
+    let tls = config
+        .tls
+        .as_ref()
+        .unwrap_or_else(|| fail("the config has no `tls:` section"));
+    let (Some(cert_path), Some(key_path)) = (tls.cert_path(), tls.key_path()) else {
+        fail("tls: no certificate configured");
+    };
+    let current = crate::pki::read_pem_certs(
+        &std::fs::read_to_string(&cert_path)
+            .unwrap_or_else(|e| fail(format!("{}: {}", cert_path.display(), e))),
+    )
+    .unwrap_or_else(|e| fail(e));
+    let leaf = current
+        .first()
+        .unwrap_or_else(|| fail(format!("{}: no certificate", cert_path.display())));
+    let name = crate::pki::inspect_der(leaf)
+        .map(|i| i.name)
+        .unwrap_or_default();
+    let old = raidish_auth::ca::facts(leaf)
+        .unwrap_or_else(|e| fail(e))
+        .serial;
+    let (key_pem, csr_pem) = raidish_auth::ca::generate_csr(&name).unwrap_or_else(|e| fail(e));
+    // Not a pooled connection or a resumed session: the certificate
+    // presented is the one renewed.
+    let fresh = raidish_ca::renew::client(crate::tls::client()).unwrap_or_else(|e| fail(e));
+    let issued: Issued = ask_with(&fresh, eps, |c, ep| {
+        c.post(format!("{}/api/v1/pki/renew", ep))
+            .json(&RenewRequest {
+                csr_pem: csr_pem.clone(),
+            })
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    // Both files, as a pair (a crash between them is finished the next
+    // time a config with them is read).
+    raidish_auth::tls::swap_identity(&cert_path, &key_path, &issued.cert_pem, &key_pem)
+        .unwrap_or_else(|e| fail(e));
+    if let Some(live) = crate::tls::identity() {
+        use rustls::pki_types::pem::PemObject;
+        let chain = raidish_auth::ca::pem_certs(&issued.cert_pem).unwrap_or_else(|e| fail(e));
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .unwrap_or_else(|e| fail(e));
+        live.set(chain, key).unwrap_or_else(|e| fail(e));
+    }
+    println!(
+        "renewed '{}': certificate {} until {} in {}",
+        name,
+        issued.serial,
+        when(issued.not_after_ms),
+        cert_path.display()
+    );
+    (old, issued.serial)
+}
+
+/// The CA's status from the first node that answers.
+async fn pki_view(client: &reqwest::Client, eps: &[String]) -> raidish_types::pki::PkiView {
+    let s: PkiStatus = ask_with(client, eps, |c, ep| {
+        c.get(format!("{}/api/v1/pki/status", ep))
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    s.pki.unwrap_or_else(|| fail("no CA on this cluster"))
+}
+
+/// `root.enc`, opened with the root key (typed, or a line of stdin).
+fn open_root(
+    path: &Path,
+    stdin: bool,
+    view: &raidish_types::pki::PkiView,
+) -> raidish_ca::rotate::Root {
+    let env = std::fs::read(path).unwrap_or_else(|e| fail(format!("{}: {}", path.display(), e)));
+    let key = read_secret("root key (from `ca init`): ", stdin);
+    raidish_ca::rotate::Root::open(&env, &key, &view.anchor_fingerprint).unwrap_or_else(|e| fail(e))
+}
+
+/// How long `ca revoke-issuer` waits for the cluster to move off.
+const MOVE_WAIT: Duration = Duration::from_secs(600);
+
+/// `ca revoke-issuer`: wait until nothing of the cluster's own is on
+/// `id` (unless `force`), renew this config's own certificate if it's
+/// from it, say what else stops working, revoke it, and record the root's
+/// CRL saying so.
+async fn revoke_issuer(
+    config: &Config,
+    eps: &[String],
+    root: &raidish_ca::rotate::Root,
+    id: raidish_types::pki::IssuerId,
+    force: bool,
+) {
+    use raidish_types::pki::IssuerUse;
+    let path = format!("api/v1/pki/issuers/{}", id);
+    let started = std::time::Instant::now();
+    let mut said = String::new();
+    let mut u: IssuerUse = loop {
+        let u: IssuerUse = ask(eps, |c, ep| c.get(format!("{}/{}", ep, path)))
+            .await
+            .unwrap_or_else(|e| fail(e));
+        if u.clear() || force {
+            break u;
+        }
+        let now = raidish_ca::issuers::describe(&u);
+        if now != said {
+            println!("waiting for {} to move off {}…", now, id);
+            said = now;
+        }
+        if started.elapsed() > MOVE_WAIT {
+            fail(format!(
+                "{} still has {} after {} minutes: try again later, or --force",
+                id,
+                said,
+                MOVE_WAIT.as_secs() / 60
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    if !force {
+        println!("nothing of the cluster's own is on {} any more", id);
+    }
+    // This config's own certificate, if it's one of them.
+    let mine = config
+        .tls
+        .as_ref()
+        .and_then(|t| t.identity().ok().flatten())
+        .and_then(|(chain, _)| raidish_auth::ca::facts(&chain[0]).ok())
+        .map(|f| f.serial);
+    if let Some(m) = &mine
+        && u.others.iter().any(|c| &c.serial == m)
+    {
+        let (old, _) = renew_own(config, eps).await;
+        u.others.retain(|c| c.serial != old);
+    }
+    if !u.others.is_empty() {
+        println!("these stop working (reissue them with `raidish ca issue` or a token):");
+        for c in &u.others {
+            println!(
+                "  {}  '{}' ({}), until {}",
+                c.serial,
+                c.cert.identity.cn,
+                c.cert.identity.profile,
+                when(c.cert.not_after_ms)
+            );
+        }
+    }
+    // A client opened now presents the renewed certificate (a pooled
+    // connection would carry the one before).
+    let fresh = raidish_ca::renew::client(crate::tls::client()).unwrap_or_else(|e| fail(e));
+    let _: IssuerUse = ask_with(&fresh, eps, |c, ep| {
+        c.post(format!("{}/{}/revoke", ep, path))
+            .query(&[("force", force)])
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    println!("{} revoked", id);
+    // The root's CRL: every issuer revoked so far. Over `fresh` too: a
+    // connection opened before the renewal carries the certificate just
+    // revoked with its issuer.
+    let view = pki_view(&fresh, eps).await;
+    let now = now_ms();
+    let mut revoked: Vec<_> = view
+        .issuers
+        .iter()
+        .filter_map(|i| match i.status {
+            raidish_types::pki::IssuerStatus::Revoked { at_ms } => Some((i.serial.clone(), at_ms)),
+            _ => None,
+        })
+        .collect();
+    if let Some(i) = view.issuers.iter().find(|i| i.id == id)
+        && !revoked.iter().any(|(s, _)| *s == i.serial)
+    {
+        revoked.push((i.serial.clone(), now));
+    }
+    let number = view.root_crl.map_or(1, |(n, _)| n + 1);
+    let crl_pem = root.crl(&revoked, number).unwrap_or_else(|e| fail(e));
+    ask_ok_with(&fresh, eps, |c, ep| {
+        c.post(format!("{}/api/v1/pki/root-crl", ep))
+            .json(&raidish_ca::api::RootCrlRequest {
+                crl_pem: crl_pem.clone(),
+            })
+    })
+    .await
+    .unwrap_or_else(|e| fail(e));
+    println!(
+        "root CRL {} recorded ({} revoked issuer(s)): `raidish ca crl --root` gets it",
+        number,
+        revoked.len()
+    );
+}
+
+/// Where libvirtd and qemu look for a CRL next to their CA file.
+const LIBVIRT_CRL_FILES: &[&str] = &["etc/pki/CA/cacrl.pem", "etc/pki/qemu/ca-crl.pem"];
+
+/// The cluster's CRL from the first node that answers (None: none yet).
+async fn fetch_crl(eps: &[String], route: &str, pem: bool) -> Result<Option<Vec<u8>>, String> {
+    let client = http();
+    try_each(eps.iter().map(String::as_str), |ep| {
+        let sent = client
+            .get(format!(
+                "{}/api/v1/pki/{}?format={}",
+                ep,
+                route,
+                if pem { "pem" } else { "der" }
+            ))
+            .send();
+        async move {
+            match sent.await {
+                Err(e) => Answer::Unreachable(e.to_string()),
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Ok(b) => Answer::Got(Some(b.to_vec())),
+                    Err(e) => Answer::Unreachable(e.to_string()),
+                },
+                Ok(r) if r.status().as_u16() == 404 => Answer::Got(None),
+                Ok(r) if r.status().as_u16() == 503 => {
+                    Answer::Unreachable(r.text().await.unwrap_or_default())
+                }
+                Ok(r) => Answer::Refused(r.text().await.unwrap_or_default()),
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// A libvirt certificate laid out as libvirt and qemu read theirs.
+///
+/// GnuTLS (libvirt, qemu) checks a certificate against the CA file alone,
+/// so that file has the issuer as well as the root: the certificate files
+/// hold the leaf and its issuer, and the issuer is what signed the leaf.
+fn write_libvirt(out: &Path, issued: &Issued, key_pem: &str) -> Result<(), String> {
+    // The chain's PEM after the leaf: its issuer.
+    const END: &str = "-----END CERTIFICATE-----";
+    let issuers = issued
+        .cert_pem
+        .find(END)
+        .map(|i| issued.cert_pem[i + END.len()..].trim_start())
+        .unwrap_or("");
+    let ca = format!("{}\n{}", issued.ca_pem.trim_end(), issuers);
+    for (path, secret) in crate::pki::LIBVIRT_FILES {
+        let is_ca = path.ends_with("/cacert.pem") || path.ends_with("/ca-cert.pem");
+        let (body, mode) = match (*secret, is_ca) {
+            (true, _) => (key_pem, 0o600),
+            (false, true) => (ca.as_str(), 0o644),
+            (false, false) => (issued.cert_pem.as_str(), 0o644),
+        };
+        raidish_ca::write_file(&out.join(path), body.as_bytes(), mode)?;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    for (path, _) in crate::pki::LIBVIRT_FILES {
+        let mut d = out.join(path);
+        while d.pop() && d != out {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("{}: {}", d.display(), e))?;
+        }
+    }
+    Ok(())
+}

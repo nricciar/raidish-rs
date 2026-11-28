@@ -17,6 +17,8 @@ raidish-nfs = { path = "crates/raidish-nfs" }
 raidish-block = { path = "crates/raidish-block" }
 raidish-services = { path = "crates/raidish-services" }
 raidish-agent = { path = "crates/raidish-agent" }
+raidish-ca = { path = "crates/raidish-ca" }
+raidish-http = { path = "crates/raidish-http" }
 reed-solomon-simd = "3.1.0"
 tokio = "1"
 futures-util = "0.3"
@@ -35,8 +37,11 @@ serde_json = "1.0.133"
 tokio-tungstenite = "0.28.0"
 tungstenite = "0.28"
 serde_yaml = "0.9"
-rocket = "0.5.1"
-ws = { package = "rocket_ws", version = "0.1.1" }
+# HTTP serving (HTTP-1). axum 0.8.8: 0.8.9 moves to tungstenite 0.29.
+axum = { version = "0.8.8", default-features = false }
+tower = { version = "0.5", default-features = false }
+tokio-util = "0.7"
+serde_urlencoded = "0.7"
 openraft = "=0.9.26"
 reqwest = { version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false }
@@ -44,6 +49,9 @@ tokio-rustls = { version = "0.26", default-features = false }
 rcgen = { version = "0.13", default-features = false }
 x509-parser = "0.16"
 ring = "0.17"
+# Passphrase and recovery-key KDF for the cluster CA's key slots.
+argon2 = "0.5"
+zeroize = "1"
 base64 = "0.22"
 time = "0.3"
 clap = "4.5"
@@ -76,7 +84,6 @@ tempfile = "3.24.0"
 name = "raidish"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -85,87 +92,27 @@ path = "src/lib.rs"
 name = "raidish"
 path = "src/main.rs"
 
-# What builds for wasm32 too (the web dashboard).
 [dependencies]
+raidish-http = { workspace = true }
 raidish-types = { workspace = true }
 raidish-core = { workspace = true }
 raidish-auth = { workspace = true }
 raidish-vm = { workspace = true }
 raidish-cluster = { workspace = true }
 raidish-committer = { workspace = true }
-raidish-etcd = { workspace = true }
 raidish-csi = { workspace = true }
-raidish-nfs = { workspace = true }
 raidish-block = { workspace = true }
 raidish-services = { workspace = true }
 raidish-agent = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-futures-util = { workspace = true }
-futures = { workspace = true }
+raidish-ca = { workspace = true }
 serde = { workspace = true }
-url = { workspace = true }
-bincode = { workspace = true }
-blake3 = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-dashmap = { workspace = true }
-crossbeam-queue = { workspace = true }
-web-time = { workspace = true }
-
-# Servers, cluster and the command line.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process"] }
-tokio-stream = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "fs", "io-util", "process", "signal"] }
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio-tungstenite = { workspace = true, features = ["__rustls-tls"] }
-tungstenite = { workspace = true }
-serde_yaml = { workspace = true }
-rocket = { workspace = true, features = ["json", "uuid", "tls", "mtls"] }
-ws = { workspace = true }
-openraft = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots", "stream"] }
 rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
-tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
-rcgen = { workspace = true, features = ["crypto", "pem", "ring", "x509-parser"] }
-x509-parser = { workspace = true }
-ring = { workspace = true }
-base64 = { workspace = true }
-time = { workspace = true }
-clap = { workspace = true, features = ["derive", "color"] }
-term_size = { workspace = true }
-quick-xml = { workspace = true }
-# The etcd v3 API (see `crate::etcd`).
-tonic = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
+clap = { workspace = true, features = ["derive", "color", "env"] }
 libc = { workspace = true }
-# The S3 and SQS endpoints (see `crate::s3`, `crate::sqs`).
-hyper = { workspace = true, features = ["server", "client", "http1", "http2"] }
-hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
-http-body-util = { workspace = true }
-bytes = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
-md-5 = { workspace = true }
-sha1 = { workspace = true }
-hex = { workspace = true }
-percent-encoding = { workspace = true }
+zeroize = { workspace = true }
 
-# The browser disk backend (websocket via web-sys).
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { workspace = true }
-wasm-bindgen-futures = { workspace = true }
-js-sys = { workspace = true }
-gloo-timers = { workspace = true, features = ["futures"] }
-chrono = { workspace = true, features = ["wasmbind"] }
-web-sys = { workspace = true, features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Event", "ErrorEvent", "console"] }
-
-[dev-dependencies]
-raidish-types = { workspace = true, features = ["testutil"] }
-raidish-core = { workspace = true, features = ["testutil"] }
-raidish-auth = { workspace = true, features = ["testutil"] }
-raidish-vm = { workspace = true, features = ["testutil"] }
-raidish-cluster = { workspace = true, features = ["testutil"] }
-raidish-committer = { workspace = true, features = ["testutil"] }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }

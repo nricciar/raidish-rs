@@ -269,7 +269,7 @@ pub fn check(
             }
             if let Some(e) = &p.migrate_tls_error {
                 v.cold(format!(
-                    "the last live migration {} → {} failed on qemu's TLS ({}): {}'s /etc/pki/qemu needs its `raidish cert libvirt` certificates, keys readable by qemu's group (or migrate_tls_x509_cert_dir in its qemu.conf naming where they are)",
+                    "the last live migration {} → {} failed on qemu's TLS ({}): {}'s /etc/pki/qemu needs its libvirt certificates (`raidish ca issue --profile libvirt`), keys readable by qemu's group (or migrate_tls_x509_cert_dir in its qemu.conf naming where they are)",
                     s.node, to, e, to
                 ));
             }

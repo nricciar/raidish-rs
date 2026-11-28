@@ -2,70 +2,35 @@
 
 Identity and transport for [RAIDish](../../README.md) nodes and clients.
 
-`raidish-auth` implements the cluster's private PKI, rustls TLS configuration and HTTP/WebSocket clients, stateless request authentication (mTLS client certificates and signed bearer tokens) with Rocket request guards, and the shared TCP accept loop used by RAIDish's protocol listeners.
+`raidish-auth` holds what the cluster's CA (`raidish-ca`) signs with and every process checks with: X.509 issuance and checking, sealing, rustls TLS configuration with live-swappable identity and trust, HTTP/WebSocket clients, stateless request authentication (mTLS client certificates and signed bearer tokens) with axum extractors, and the shared TCP accept loop used by RAIDish's protocol listeners.
 
 ## Scope
 
 **What's in this crate:**
-- Private ECDSA P-256 CA (`Ca`), per-identity certificate bundles (`node`, `admin`, `readonly`, plus libvirt/QEMU migration certs), and rolling CA trust-bundle management (`trust` / `untrust`)
-- Process-wide rustls client/server TLS setup (`TlsConfig`, `reqwest` HTTP clients, `tokio-tungstenite` WebSocket connectors, and peer role extraction)
-- Stateless authentication via mTLS client certificates or admin-signed `rdt1` bearer tokens (`create_token`, `Verifier`) with config-based revocation
-- Rocket request guards enforcing role hierarchy (`Authed`, `CanRead`, `CanWrite`, `IsNode`, `Actor`)
+- The managed CA's X.509 side (`ca`): issuers under an offline root, CSR signing per profile, CRLs, the token signer's certificate, and fingerprints; and its sealing (`envelope`): the DEK, key slots, and `root.enc`
+- Reading certificates (`pki`): `CertInfo`, `inspect_der`, and where a host's libvirt/qemu files go (`LIBVIRT_FILES`)
+- Process-wide rustls client/server TLS setup (`TlsConfig`, a live identity renewals swap in place, `reqwest` HTTP clients, `tokio-tungstenite` WebSocket connectors, and peer role extraction)
+- Stateless authentication via mTLS client certificates or bearer tokens (`rdt2`, signed by the CA's token signer; older `rdt1` ones are still accepted) through `Verifier`, with live revocation
+- axum extractors enforcing role hierarchy (`Authed`, `CanRead`, `CanWrite`, `IsAdmin`, `IsAdminCert`, `IsNode`, `Actor`)
 - Shared TCP listener utilities (`accept_loop`, `bind_retrying`, `tls_accept`) with backoff on transient accept errors and handshake timeouts
+- With `testutil`: a throwaway offline CA (`pki::Ca`) and PKI (`testing`) for other crates' tests
 
 ## Module Map
 
 | Module | Purpose |
 |---|---|
-| `pki` | Cluster CA initialization (`Ca::init` / `Ca::load`), issuing identity and libvirt certs, PEM/DER inspection, and CA trust-bundle rotation |
-| `tls` | `TlsConfig` loading (`dir` or explicit PEM paths), rustls client/server configs, process-wide `tls::init`, and configured `reqwest` / WebSocket clients |
-| `auth` | Admin-signed `rdt1` bearer tokens, `Verifier` for certificates and tokens, revocation checks, and Rocket request guards (`Authed`, `CanRead`, `CanWrite`, `IsNode`) |
+| `ca` | X.509 for the cluster CA: issuers, CSR signing, CRLs, checks (`X509Checker`), `key_matches` |
+| `envelope` | Sealing: AES-GCM under the DEK, key slots (recovery key, passphrase), the root's envelope |
+| `pki` | Reading certificates (`CertInfo`, `inspect_der`, `read_pem_certs`), `LIBVIRT_FILES`, `parse_duration` |
+| `tls` | `TlsConfig` loading (`dir` or explicit PEM paths), rustls configs, the live identity and its paired file swap (`swap_identity`), process-wide `tls::init`, and configured `reqwest` / WebSocket clients |
+| `auth` | `rdt1`/`rdt2` bearer tokens, `Verifier` for certificates and tokens, revocation checks, and request extractors |
+| `http` | Serving HTTP(S) with axum |
+| `trust` | What a node refuses, live: revoked certificates, issuers and tokens, fed from Raft |
 | `net` | Shared `accept_loop`, retry-on-bind helper, timed `tls_accept`, log throttling, and `disk_server_base` URL parsing |
 
-## Setting Up a Cluster PKI
+## Certificates
 
-Although the CLI lives in the root `raidish` crate, `raidish cert` is a thin wrapper around `raidish_auth::pki`. You can run it from any machine—`ca.key` never needs to be copied onto cluster nodes.
-
-```bash
-# 1. Create the CA (pki/ca.key + pki/ca.pem)
-raidish cert init --dir pki
-
-# 2. Issue a node cert for every host in the pool config's disk URLs
-raidish -c cluster.yaml cert issue-nodes --dir pki
-# ...or issue nodes individually (name, localhost, and 127.0.0.1 are always added as SANs)
-raidish cert issue node0 --role node --san 10.0.0.10 --dir pki
-
-# 3. Issue an admin bundle for the CLI (and optionally a readonly bundle)
-raidish cert issue admin --role admin --dir pki
-
-# 4. Verify the trust bundle, SANs, and expiry
-raidish cert status --dir pki
-```
-
-Certificates do not expire by default; pass `--days <N>` on `init` or `issue` / `issue-nodes` to set a lifetime.
-
-Each issued identity gets a self-contained directory `pki/<name>/` holding `ca.pem`, `cert.pem`, and `key.pem`. Copy each node's bundle to that host (e.g., `/etc/raidish/tls`) and enable TLS in its config using `https://` for remote disk URLs:
-
-```yaml
-tls:
-  dir: /etc/raidish/tls
-```
-
-## Renewing & Rotating Certificates
-
-**Renewing a node or client certificate** (expiring cert, new SAN, or replaced key):
-
-```bash
-# Reissue one certificate
-raidish cert issue node0 --role node --days 365 --force --dir pki
-
-# Or reissue all node certificates from the cluster config
-raidish -c cluster.yaml cert issue-nodes --days 365 --force --dir pki
-```
-
-Nodes log a warning at startup if their certificate expires within 30 days. Restart nodes **one at a time** during any rotation so the cluster maintains quorum.
-
-Reissue in place with `--force`, copy the updated bundle to the host, and restart that node.
+The cluster's CA is `raidish ca` (the `raidish-ca` crate): `raidish ca init` on node 0, `raidish join` for the other nodes, `raidish ca issue` / `raidish enroll` for clients. Nodes renew their own certificates live; see the main [README](../../README.md#certificates).
 
 ## Building & Testing
 

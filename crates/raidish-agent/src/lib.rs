@@ -174,6 +174,8 @@ struct PeerConf {
     acceptor: tokio_rustls::TlsAcceptor,
     connector: tokio_rustls::TlsConnector,
     port: u16,
+    /// What a revocation closes sessions through.
+    conns: Option<Arc<raidish_auth::http::Connections>>,
 }
 
 impl Agent {
@@ -241,6 +243,7 @@ impl Agent {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls.server_config(true, &[])?)),
             connector: tokio_rustls::TlsConnector::from(Arc::new(tls.client_config()?)),
             port: self.config.peer_port(),
+            conns: tls.trust.as_ref().map(|t| t.connections().clone()),
         });
         Ok(self)
     }
@@ -296,7 +299,7 @@ impl Agent {
                 Ok(l) => {
                     println!("agent: peer I/O on {}:{}", addr.0, addr.1);
                     let (acceptor, shared) = (p.acceptor.clone(), self.shared.clone());
-                    tokio::spawn(crate::peer_io::serve(l, acceptor, shared));
+                    tokio::spawn(crate::peer_io::serve(l, acceptor, shared, p.conns.clone()));
                 }
                 Err(e) => {
                     eprintln!(

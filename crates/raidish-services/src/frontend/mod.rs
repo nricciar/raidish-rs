@@ -58,6 +58,8 @@ pub struct ServiceTls {
     pub etcd: TlsAcceptor,
     /// To other nodes (proxying), as this node.
     pub connector: TlsConnector,
+    /// What a revocation closes etcd sessions through (the node's).
+    pub conns: Option<Arc<crate::http::Connections>>,
 }
 
 impl ServiceTls {
@@ -66,6 +68,7 @@ impl ServiceTls {
             https: TlsAcceptor::from(Arc::new(cfg.server_config(false, &[b"h2", b"http/1.1"])?)),
             etcd: TlsAcceptor::from(Arc::new(cfg.server_config(true, &[b"h2"])?)),
             connector: TlsConnector::from(Arc::new(cfg.client_config()?)),
+            conns: cfg.trust.as_ref().map(|t| t.connections().clone()),
         })
     }
 
@@ -418,6 +421,9 @@ impl Frontend {
         let Some(peer) = peer_role(&tls) else {
             return; // no raidish role: nothing allowed
         };
+        // Watches and lease keep-alives stay open: they end when the
+        // client's certificate is revoked, here or forwarded on.
+        let tls = crate::net::revocable(tls, self.tls.conns.as_deref());
         let (io, forwarded) = match read_preamble(tls).await {
             Ok(x) => x,
             Err(_) => return,

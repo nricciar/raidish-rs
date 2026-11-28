@@ -396,7 +396,7 @@ pub async fn probe_tls(
         );
     };
     let cert = summary(&der);
-    // Its name as its certificate has it (what `cert libvirt` was given).
+    // Its name as its certificate has it (what `ca issue` was given).
     let cn = cert
         .as_ref()
         .map(|c| c.subject.clone())
@@ -408,7 +408,7 @@ pub async fn probe_tls(
         format!(" --san {}", host)
     };
     let reissue = format!(
-        "reissue it: raidish cert libvirt {}{} --force, and install it on {}",
+        "reissue it: raidish ca issue {} --profile libvirt{} --out <dir> --force, and install it on {}",
         cn, san, node
     );
     let mut p = match verified {
@@ -471,9 +471,9 @@ pub async fn probe_virsh(node: &str, host: &str, bin: &str) -> Result<(), Probe>
                 || e.contains("clientkey")
                 || e.contains("client certificate")
             {
-                "this node has no libvirt client certificate: raidish cert libvirt <this node> and install it here".to_string()
+                "this node has no libvirt client certificate: raidish ca issue <this node> --profile libvirt --out <dir> and install it here".to_string()
             } else if e.contains("cacert") {
-                "this node has no /etc/pki/CA/cacert.pem: install its raidish cert libvirt tree"
+                "this node has no /etc/pki/CA/cacert.pem: install its `raidish ca issue --profile libvirt` tree"
                     .to_string()
             } else {
                 String::new()

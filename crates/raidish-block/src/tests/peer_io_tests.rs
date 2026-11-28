@@ -63,6 +63,12 @@ struct Setup {
 }
 
 async fn setup() -> Setup {
+    setup_with(None).await
+}
+
+/// With the writer's sessions registered in `conns` (so revoking a
+/// client's certificate ends them).
+async fn setup_with(conns: Option<Arc<crate::http::Connections>>) -> Setup {
     let pool = TestPool::new().await;
     let fs = Arc::new(pool.format().await);
     fs.create_block(&ds("vol"), 16 * MB, DEFAULT_VOLBLOCKSIZE)
@@ -82,7 +88,7 @@ async fn setup() -> Setup {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let w: Arc<dyn PeerVolumes> = writer.clone();
-    tokio::spawn(async move { serve(listener, acceptor, w).await });
+    tokio::spawn(async move { serve(listener, acceptor, w, conns).await });
     Setup {
         _pool: pool,
         fixture,
@@ -427,4 +433,30 @@ async fn a_handoff_from_another_writer_owes_an_idle_proxys_writes() {
         !p.owed_on_handoff(Epoch::from_raw(7)),
         "the writer that acknowledged them handed them off"
     );
+}
+
+/// Revoking the proxy's certificate ends its session at the writer even
+/// while it's idle: the session's reader is parked, and the last reply was
+/// written from another task (`Revocable` keeps a waker per side).
+#[tokio::test]
+async fn revoking_the_proxy_ends_its_idle_session() {
+    let conns = crate::http::Connections::new();
+    let s = setup_with(Some(conns.clone())).await;
+    let p = Arc::new(s.proxy(epoch(7)));
+    p.write(0, &[1u8; 4096]).await.unwrap();
+    p.flush().await.unwrap();
+    let (chain, _) = s.fixture.tls.identity().unwrap().unwrap();
+    let serial = raidish_auth::ca::facts(&chain[0]).unwrap().serial;
+    assert_eq!(conns.count(&serial), 1, "the proxy's session is registered");
+    // Idle now. Revoked:
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(conns.close(&serial), 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while conns.count(&serial) > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the idle session outlived the revocation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

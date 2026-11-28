@@ -20,9 +20,11 @@ use crate::committer::PoolAdmin;
 use crate::committer::{Admin, CreateVolume, NewName};
 use crate::inode::DatasetProps;
 use crate::types::DatasetName;
-use rocket::http::Status;
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, post, put};
+use axum::extract::{Path, State};
+use axum::http::StatusCode as Status;
+use axum::routing::{get, post, put};
+use raidish_auth::http::Json;
+use std::sync::Arc;
 
 pub use crate::api_types::VolumeView;
 
@@ -31,10 +33,9 @@ pub struct VolumesState {
     pub admin: Admin,
 }
 
-#[get("/api/v1/volumes")]
 async fn list(
     _auth: crate::auth::CanRead,
-    st: &State<VolumesState>,
+    State(st): State<Arc<VolumesState>>,
 ) -> Result<Json<Vec<VolumeView>>, ApiError> {
     let volumes = st.admin.volumes().await?;
     let mut out = Vec::with_capacity(volumes.len());
@@ -46,11 +47,10 @@ async fn list(
     Ok(Json(out))
 }
 
-#[post("/api/v1/volumes", data = "<req>")]
 async fn create(
     auth: crate::auth::CanWrite,
+    State(st): State<Arc<VolumesState>>,
     req: Json<CreateVolume>,
-    st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
     st.admin
         .on_behalf(&auth.0)
@@ -60,13 +60,12 @@ async fn create(
         .map_err(ApiError::from)
 }
 
-#[delete("/api/v1/volumes/<name>")]
 async fn remove(
     auth: crate::auth::CanWrite,
-    name: &str,
-    st: &State<VolumesState>,
+    Path(name): Path<String>,
+    State(st): State<Arc<VolumesState>>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
         .delete_volume(name)
@@ -75,14 +74,13 @@ async fn remove(
         .map_err(ApiError::from)
 }
 
-#[put("/api/v1/volumes/<name>/props", data = "<props>")]
 async fn props(
     auth: crate::auth::CanWrite,
-    name: &str,
+    Path(name): Path<String>,
+    State(st): State<Arc<VolumesState>>,
     props: Json<DatasetProps>,
-    st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
         .set_props(name, &props)
@@ -91,14 +89,13 @@ async fn props(
         .map_err(ApiError::from)
 }
 
-#[post("/api/v1/volumes/<name>/snapshots", data = "<req>")]
 async fn snapshot(
     auth: crate::auth::CanWrite,
-    name: &str,
+    Path(name): Path<String>,
+    State(st): State<Arc<VolumesState>>,
     req: Json<NewName>,
-    st: &State<VolumesState>,
 ) -> Result<Json<crate::types::Txg>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
         .create_snapshot(name, &req.name)
@@ -107,46 +104,41 @@ async fn snapshot(
         .map_err(ApiError::from)
 }
 
-#[delete("/api/v1/volumes/<name>/snapshots/<snap>")]
 async fn destroy_snapshot(
     auth: crate::auth::CanWrite,
-    name: &str,
-    snap: &str,
-    st: &State<VolumesState>,
+    Path((name, snap)): Path<(String, String)>,
+    State(st): State<Arc<VolumesState>>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
-        .destroy_snapshot(name, snap)
+        .destroy_snapshot(name, &snap)
         .await
         .map(Json)
         .map_err(ApiError::from)
 }
 
-#[post("/api/v1/volumes/<name>/snapshots/<snap>/clone", data = "<req>")]
 async fn clone_snapshot(
     auth: crate::auth::CanWrite,
-    name: &str,
-    snap: &str,
+    Path((name, snap)): Path<(String, String)>,
+    State(st): State<Arc<VolumesState>>,
     req: Json<NewName>,
-    st: &State<VolumesState>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
-        .clone_snapshot(name, snap, &dataset(&req.name)?)
+        .clone_snapshot(name, &snap, &dataset(&req.name)?)
         .await
         .map(Json)
         .map_err(ApiError::from)
 }
 
-#[post("/api/v1/volumes/<name>/rollback")]
 async fn rollback(
     auth: crate::auth::CanWrite,
-    name: &str,
-    st: &State<VolumesState>,
+    Path(name): Path<String>,
+    State(st): State<Arc<VolumesState>>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &dataset(name)?;
+    let name = &dataset(&name)?;
     st.admin
         .on_behalf(&auth.0)
         .rollback(name)
@@ -155,20 +147,26 @@ async fn rollback(
         .map_err(ApiError::from)
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        list,
-        create,
-        remove,
-        props,
-        snapshot,
-        destroy_snapshot,
-        clone_snapshot,
-        rollback
-    ]
+pub fn router(st: Arc<VolumesState>) -> axum::Router {
+    let v = "/api/v1/volumes";
+    axum::Router::new()
+        .route(v, get(list).post(create))
+        .route(&format!("{v}/{{name}}"), axum::routing::delete(remove))
+        .route(&format!("{v}/{{name}}/props"), put(props))
+        .route(&format!("{v}/{{name}}/snapshots"), post(snapshot))
+        .route(
+            &format!("{v}/{{name}}/snapshots/{{snap}}"),
+            axum::routing::delete(destroy_snapshot),
+        )
+        .route(
+            &format!("{v}/{{name}}/snapshots/{{snap}}/clone"),
+            post(clone_snapshot),
+        )
+        .route(&format!("{v}/{{name}}/rollback"), post(rollback))
+        .with_state(st)
 }
 
 /// A dataset name from the request, or 400 saying why it isn't one.
 fn dataset(name: &str) -> Result<DatasetName, ApiError> {
-    DatasetName::try_from(name).map_err(|e| ApiError::new(Status::BadRequest, e.to_string()))
+    DatasetName::try_from(name).map_err(|e| ApiError::new(Status::BAD_REQUEST, e.to_string()))
 }

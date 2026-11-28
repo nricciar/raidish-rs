@@ -46,7 +46,7 @@ fn keys_from_tokens_and_certs() {
     let ro = caller(Role::Readonly, Via::Token("0011223344556677".into()), None);
     assert_eq!(
         make_key(&ro, &req(Some("admin"), None), &sk).unwrap_err().0,
-        rocket::http::Status::Forbidden
+        axum::http::StatusCode::FORBIDDEN
     );
     assert!(make_key(&ro, &req(Some("node"), None), &sk).is_err());
     // A node (certificate) makes admin keys of their own id.

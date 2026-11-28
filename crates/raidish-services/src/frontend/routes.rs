@@ -5,9 +5,9 @@ use super::keys::{self, AccessKey};
 use crate::auth::{AuthState, Authed, Principal, Via};
 use crate::cluster::Cluster;
 use crate::pki::Role;
-use rocket::http::Status;
-use rocket::serde::json::Json;
-use rocket::{State, post};
+use axum::extract::{Extension, State};
+use axum::http::StatusCode as Status;
+use raidish_auth::http::{Json, Refusal};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ type Res<T> = Result<T, (Status, String)>;
 
 /// Make the key `req` asks for, as `caller`.
 pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res<KeyResponse> {
-    let bad = |m: String| (Status::BadRequest, m);
+    let bad = |m: String| (Status::BAD_REQUEST, m);
     let top = caller.role.min(Role::Admin);
     let role = match &req.role {
         Some(r) => r.parse::<Role>().map_err(bad)?,
@@ -51,7 +51,7 @@ pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res
     }
     if role > top {
         return Err((
-            Status::Forbidden,
+            Status::FORBIDDEN,
             format!("{} '{}' can't make {} keys", caller.role, caller.name, role),
         ));
     }
@@ -85,34 +85,36 @@ pub fn make_key(caller: &Principal, req: &KeyRequest, service_key: &[u8]) -> Res
     })
 }
 
-#[post("/api/v1/services/keys", data = "<req>")]
 pub async fn create_key(
-    caller: Result<Authed, String>,
+    caller: Result<Authed, Refusal>,
+    Extension(auth): Extension<Arc<AuthState>>,
+    State(cluster): State<Arc<Cluster>>,
     req: Json<KeyRequest>,
-    auth: &State<AuthState>,
-    cluster: &State<Arc<Cluster>>,
 ) -> Res<Json<KeyResponse>> {
     let Some(verifier) = &auth.0 else {
         return Err((
-            Status::BadRequest,
+            Status::BAD_REQUEST,
             "S3 and SQS need TLS (`tls:` in the config)".into(),
         ));
     };
     let caller = match &req.token {
         Some(t) => verifier
             .verify_token(t)
-            .map_err(|e| (Status::Unauthorized, e))?,
-        None => caller.map_err(|e| (Status::Unauthorized, e))?.0,
+            .map_err(|e| (Status::UNAUTHORIZED, e))?,
+        None => caller?.0,
     };
     let service_key = cluster
         .ensure_service_key()
         .await
-        .map_err(|e| (Status::ServiceUnavailable, e))?;
+        .map_err(|e| (Status::SERVICE_UNAVAILABLE, e))?;
     make_key(&caller, &req, &service_key).map(Json)
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![create_key]
+/// The routes, on this node's member.
+pub fn router(cluster: Arc<Cluster>) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/services/keys", axum::routing::post(create_key))
+        .with_state(cluster)
 }
 
 #[cfg(test)]

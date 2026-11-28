@@ -32,7 +32,7 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
-      # The release build bundles the web dashboard (see build.rs).
+      # The release build bundles the web dashboard (see crates/raidish-http/build.rs).
       - name: Install trunk
         uses: taiki-e/install-action@v2
         with:

@@ -131,6 +131,26 @@ event_kinds! {
     VmMovingCold => "vm.moving_cold",
     VmArrived => "vm.arrived",
     VmMigrationRecovered => "vm.migration_recovered",
+    /// A node was unsealed (it can sign).
+    CaUnsealed => "ca.unsealed",
+    /// Every node was sealed (`ca seal`).
+    CaSealed => "ca.sealed",
+    CaSlotAdded => "ca.slot_added",
+    CaSlotRemoved => "ca.slot_removed",
+    /// The cluster DEK was replaced (`ca rekey`).
+    CaRekeyed => "ca.rekeyed",
+    /// No node is unsealed, and something runs out before one is.
+    CaUnsealedNone => "ca.unsealed_none",
+    /// A node's own certificate isn't renewing (said once, until it does).
+    CaRenewFailed => "ca.renew_failed",
+    /// It renewed again after failing.
+    CaRenewed => "ca.renewed",
+    /// A new issuer is the active one (`ca rotate-issuer`).
+    CaIssuerAdded => "ca.issuer_added",
+    /// An issuer was revoked: its certificates stop working.
+    CaIssuerRevoked => "ca.issuer_revoked",
+    /// The root's CRL was replaced.
+    CaRootCrl => "ca.root_crl",
 }
 
 impl std::fmt::Display for EventKind {

@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 pub(crate) use raidish_auth::testing;
-pub(crate) use raidish_auth::{net, tls};
+pub(crate) use raidish_auth::{http, net, tls};
 pub(crate) use raidish_core::{disk, fs};
 #[cfg(test)]
 pub(crate) use raidish_core::{metaslab, test_util, vdev};

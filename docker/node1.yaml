@@ -12,7 +12,7 @@ automount:
   helper: none
   # Reachable from the compose network (the nfs-client container).
   bind: 0.0.0.0
-# The certificate bundle `pki` made for this node (see docker-compose.yml).
+# This node's certificate, from the cluster CA (ca init / join, see docker-compose.yml).
 tls:
   dir: /etc/raidish/tls
 # NFS (3 and 4.1) for the compose network (try it with: docker compose
@@ -25,3 +25,8 @@ nfs:
 # (`raidish token s3-key`); see "Services" in the README.
 services:
   advertise: node1
+# This node's own key (`raidish ca slot add --node-key node-1 --out ...`),
+# to unseal itself at start: a plain file, so a copy of this volume opens
+# the CA (a real host keeps it in a systemd credential: unseal_credential).
+ca:
+  unseal_key: /data/unseal.key

@@ -15,9 +15,8 @@ use crate::disk::FileId;
 use crate::types::{Epoch, Holder, HolderRole, Holding};
 use crate::vdev::Pool;
 use async_trait::async_trait;
-use rocket::data::{Data, ToByteUnit};
-use rocket::http::Status;
-use rocket::{State, post};
+use axum::extract::State;
+use axum::http::StatusCode as Status;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -259,58 +258,40 @@ pub type NfsServers = (Arc<Backend<Pool>>, Arc<v4::Server<Pool>>);
 /// This node's NFS server, if it runs one (for forwarded requests).
 pub struct NfsForwarding(pub Option<NfsServers>);
 
-#[post("/api/v1/nfs/forward", data = "<body>")]
 async fn forward(
     _auth: crate::auth::IsNode,
-    body: Data<'_>,
-    st: &State<NfsForwarding>,
+    State(st): State<Arc<NfsForwarding>>,
+    body: axum::body::Body,
 ) -> Result<Vec<u8>, (Status, String)> {
     let Some((backend, _)) = &st.0 else {
-        return Err((Status::ServiceUnavailable, "no NFS server here".into()));
+        return Err((Status::SERVICE_UNAVAILABLE, "no NFS server here".into()));
     };
-    let bytes = body
-        .open(MAX_FORWARD.bytes())
-        .into_bytes()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?;
-    if !bytes.is_complete() {
-        return Err((
-            Status::PayloadTooLarge,
-            "forwarded request too large".into(),
-        ));
-    }
+    let bytes = raidish_auth::http::read_body(body, MAX_FORWARD as usize).await?;
     let req: Forward =
-        bincode::deserialize(&bytes).map_err(|e| (Status::BadRequest, e.to_string()))?;
+        bincode::deserialize(&bytes).map_err(|e| (Status::BAD_REQUEST, e.to_string()))?;
     let reply = backend.serve_forward(req).await;
-    bincode::serialize(&reply).map_err(|e| (Status::InternalServerError, e.to_string()))
+    bincode::serialize(&reply).map_err(|e| (Status::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-#[post("/api/v1/nfs/v4", data = "<body>")]
 async fn forward_v4(
     _auth: crate::auth::IsNode,
-    body: Data<'_>,
-    st: &State<NfsForwarding>,
+    State(st): State<Arc<NfsForwarding>>,
+    body: axum::body::Body,
 ) -> Result<Vec<u8>, (Status, String)> {
     let Some((_, server)) = &st.0 else {
-        return Err((Status::ServiceUnavailable, "no NFS server here".into()));
+        return Err((Status::SERVICE_UNAVAILABLE, "no NFS server here".into()));
     };
-    let bytes = body
-        .open(MAX_FORWARD.bytes())
-        .into_bytes()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?;
-    if !bytes.is_complete() {
-        return Err((
-            Status::PayloadTooLarge,
-            "forwarded request too large".into(),
-        ));
-    }
+    let bytes = raidish_auth::http::read_body(body, MAX_FORWARD as usize).await?;
     let req: V4Forward =
-        bincode::deserialize(&bytes).map_err(|e| (Status::BadRequest, e.to_string()))?;
+        bincode::deserialize(&bytes).map_err(|e| (Status::BAD_REQUEST, e.to_string()))?;
     let reply = server.serve_forward(req).await;
-    bincode::serialize(&reply).map_err(|e| (Status::InternalServerError, e.to_string()))
+    bincode::serialize(&reply).map_err(|e| (Status::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![forward, forward_v4]
+/// The routes, on this node's NFS servers (if it runs them).
+pub fn router(st: NfsForwarding) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/nfs/forward", axum::routing::post(forward))
+        .route("/api/v1/nfs/v4", axum::routing::post(forward_v4))
+        .with_state(Arc::new(st))
 }

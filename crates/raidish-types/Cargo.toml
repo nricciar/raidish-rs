@@ -10,7 +10,7 @@ description = "RAIDish's plain data: identifiers, the HTTP API's types, cluster 
 testutil = []
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

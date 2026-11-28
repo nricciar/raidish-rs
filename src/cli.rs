@@ -126,6 +126,10 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
 
+        /// The address to serve the API on (all interfaces: 0.0.0.0).
+        #[arg(long, env = "RAIDISH_ADDRESS", default_value = "127.0.0.1")]
+        address: String,
+
         /// Never become the pool's committer (leaves the `pool` lease free
         /// for maintenance: fsck --repair, format, defrag).
         #[arg(long)]
@@ -175,15 +179,53 @@ enum Commands {
         #[command(subcommand)]
         command: crate::cli_vm::NodeCommands,
     },
-    /// The cluster's certificate authority: issue node and client certs.
-    Cert {
-        #[command(subcommand)]
-        command: crate::cli_pki::CertCommands,
-    },
-    /// Tokens for the dashboard and scripts (signed by your admin cert).
+    /// Tokens for the dashboard and scripts (from the cluster CA).
     Token {
         #[command(subcommand)]
         command: crate::cli_pki::TokenCommands,
+    },
+    /// The cluster's own CA: set it up, join nodes, issue and renew.
+    Ca {
+        #[command(subcommand)]
+        command: crate::cli_ca::CaCommands,
+    },
+    /// Get a client certificate from the cluster CA with an enrollment
+    /// token (`raidish ca token create --client`): the key is made here
+    /// and never leaves. Writes the bundle to `--dir`, and the config
+    /// (`-c`, default ~/.raidish.yaml) pointing at it, unless there is one.
+    Enroll {
+        /// A running node (`https://node0:8881`).
+        url: String,
+        /// Read the token from stdin.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Read the token from a file.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// Where the bundle goes (default ~/.raidish/tls).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Replace a bundle that's there.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Get this node's certificate from the cluster CA with a join token
+    /// (from `ca init` or `ca token create`), before its first `listen`.
+    Join {
+        /// A running node (`https://node0:8881`).
+        url: String,
+        /// Read the token from stdin.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Read the token from a file.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// The port this node's `listen` serves on (to find it in the pool).
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Replace this node's certificate files.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -479,28 +521,85 @@ pub async fn main() -> std::io::Result<()> {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    // Certificates are managed without (or before there is) a config.
-    if let Commands::Cert { command } = &cli.command {
-        let config_path = cli.config.clone();
-        crate::cli_pki::run(command, &move || {
-            let config = load_config(&config_path).unwrap_or_else(|e| fail(e));
-            config
-                .pool_spec()
-                .unwrap_or_else(|e| fail(e))
-                .map(|s| s.paths)
-                .unwrap_or_default()
-        });
+    // A client's first certificate, before it has a config.
+    if let Commands::Enroll {
+        url,
+        token_stdin,
+        token_file,
+        dir,
+        force,
+    } = &cli.command
+    {
+        crate::cli_ca::enroll(
+            url,
+            *token_stdin,
+            token_file.as_deref(),
+            dir.as_deref(),
+            *force,
+            &cli.config,
+        )
+        .await;
         return Ok(());
     }
     let config = load_config(&cli.config)?;
+    // Made before this node has certificates to init TLS with.
+    match &cli.command {
+        Commands::Ca {
+            command: command @ crate::cli_ca::CaCommands::Init { .. },
+        } => {
+            crate::cli_ca::init(command, &config);
+            return Ok(());
+        }
+        Commands::Join {
+            url,
+            token_stdin,
+            token_file,
+            port,
+            force,
+        } => {
+            crate::cli_ca::join(
+                url,
+                *token_stdin,
+                token_file.as_deref(),
+                *port,
+                *force,
+                &config,
+            )
+            .await;
+            return Ok(());
+        }
+        _ => {}
+    }
     crate::tls::init(config.tls.as_ref()).unwrap_or_else(|e| fail(e));
     // The storage core's remote disks speak the same TLS.
     let _ = crate::disk::ws::set_tls_client(crate::tls::client());
     if let Ok(Some(spec)) = config.pool_spec() {
         crate::tls::check_urls(&spec.paths).unwrap_or_else(|e| fail(e));
     }
+    if let Commands::Ca { command } = &cli.command {
+        crate::cli_ca::run(command, &config).await;
+        return Ok(());
+    }
     if let Commands::Token { command } = &cli.command {
-        if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
+        if let crate::cli_pki::TokenCommands::Revoke { id, expires, url } = command {
+            let expires_ms = expires.as_ref().map(|e| {
+                chrono::DateTime::parse_from_rfc3339(e)
+                    .map(|t| t.timestamp_millis() as u64)
+                    .unwrap_or_else(|err| fail(format!("--expires '{}': {}", e, err)))
+            });
+            crate::cli_ca::revoke_token(id, expires_ms, url, &config).await;
+        } else if let crate::cli_pki::TokenCommands::Create {
+            name,
+            role,
+            expires,
+            url,
+        } = command
+        {
+            let ttl = expires
+                .as_deref()
+                .map(|e| crate::pki::parse_duration(e).unwrap_or_else(|e| fail(e)));
+            crate::cli_ca::create_token(name, *role, ttl, url, &config).await;
+        } else if let crate::cli_pki::TokenCommands::S3Key { .. } = command {
             crate::cli_pki::s3_key(command, &config).await;
         } else {
             crate::cli_pki::run_token(command, &config);
@@ -510,8 +609,13 @@ pub async fn main() -> std::io::Result<()> {
     let opts = config.disk_options();
     let spec = config.pool_spec().unwrap_or_else(|e| fail(e));
 
-    if let Commands::Listen { port, no_committer } = &cli.command {
-        crate::server::listen(&config, spec, opts, *port, *no_committer)
+    if let Commands::Listen {
+        port,
+        address,
+        no_committer,
+    } = &cli.command
+    {
+        crate::server::listen(&config, spec, opts, address, *port, *no_committer)
             .await
             .unwrap_or_else(|e| fail(e));
         return Ok(());
@@ -852,8 +956,10 @@ pub async fn main() -> std::io::Result<()> {
         | Commands::Node { .. }
         | Commands::Cluster { .. }
         | Commands::Csi { .. }
-        | Commands::Cert { .. }
         | Commands::Token { .. }
+        | Commands::Ca { .. }
+        | Commands::Join { .. }
+        | Commands::Enroll { .. }
         | Commands::Dataset { .. } => unreachable!(),
     }
     if let Some(lease) = lease {

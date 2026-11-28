@@ -41,10 +41,13 @@ use crate::types::VmName;
 use crate::vm::{VmRuntime, VmSpec};
 use crate::vm_store::{DefSpec, VmDef};
 use crate::volumes_api::VolumesState;
-use rocket::futures::{SinkExt, StreamExt};
-use rocket::http::Status;
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, post, put};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRef, Path, State};
+use axum::http::StatusCode as Status;
+use axum::response::Response;
+use axum::routing::{get, post};
+use futures_util::{SinkExt, StreamExt};
+use raidish_auth::http::{Json, Query};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -93,7 +96,7 @@ fn peer_url(cluster: &Cluster, node: &str) -> Result<Option<String>, ApiError> {
         .members
         .peer_url(node)
         .map(|u| Some(u.to_string()))
-        .ok_or_else(|| ApiError::new(Status::BadGateway, format!("no address for {}", node)))
+        .ok_or_else(|| ApiError::new(Status::BAD_GATEWAY, format!("no address for {}", node)))
 }
 
 async fn local_view(
@@ -116,14 +119,13 @@ async fn local_view(
     view
 }
 
-#[get("/api/v1/vm/local")]
 async fn local(
     _auth: crate::auth::CanRead,
-    st: &State<VmsState>,
-    cluster: &State<Arc<Cluster>>,
-    agent: &State<crate::agent::AgentState>,
+    State(st): State<Arc<VmsState>>,
+    State(cluster): State<Arc<Cluster>>,
+    State(agent): State<crate::agent::AgentState>,
 ) -> Json<LocalView> {
-    Json(local_view(st, cluster, agent).await)
+    Json(local_view(&st, &cluster, &agent).await)
 }
 
 /// Do `action` to this node's domain `name` (`-` with `poke`).
@@ -131,7 +133,7 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
     let rt = st
         .runtime
         .as_ref()
-        .ok_or_else(|| ApiError::new(Status::NotFound, "this node runs no VMs".to_string()))?;
+        .ok_or_else(|| ApiError::new(Status::NOT_FOUND, "this node runs no VMs".to_string()))?;
     if action == "poke" {
         rt.poke();
         return Ok(());
@@ -140,12 +142,12 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
     // Only a domain this node started (see `crate::vm::DomMeta::pool`).
     let ours = match (rt.ident(), rt.virsh.meta(name).await) {
         (Some(me), Ok(Some(m))) => me.owns(&m),
-        (_, Err(e)) => return Err(ApiError::new(Status::ServiceUnavailable, e.to_string())),
+        (_, Err(e)) => return Err(ApiError::new(Status::SERVICE_UNAVAILABLE, e.to_string())),
         _ => false,
     };
     if !ours {
         return Err(ApiError::new(
-            Status::NotFound,
+            Status::NOT_FOUND,
             format!("no VM '{}' runs here", name),
         ));
     }
@@ -165,14 +167,12 @@ async fn local_do(st: &VmsState, name: &str, action: &str) -> Result<(), ApiErro
     r.map_err(ApiError::from)
 }
 
-#[post("/api/v1/vm/local/<name>/<action>")]
 async fn local_action(
     _auth: crate::auth::CanWrite,
-    name: &str,
-    action: &str,
-    st: &State<VmsState>,
+    Path((name, action)): Path<(String, String)>,
+    State(st): State<Arc<VmsState>>,
 ) -> Result<Json<()>, ApiError> {
-    local_do(st, name, action).await.map(Json)
+    local_do(&st, &name, &action).await.map(Json)
 }
 
 /// Do `action` to `name` on `node`, here or there.
@@ -191,23 +191,23 @@ async fn on_node(
         .post(format!("{}/api/v1/vm/local/{}/{}", base, name, action))
         .send()
         .await
-        .map_err(|e| ApiError::new(Status::BadGateway, format!("{}: {}", node, e)))?;
+        .map_err(|e| ApiError::new(Status::BAD_GATEWAY, format!("{}: {}", node, e)))?;
     if resp.status().is_success() {
         return Ok(());
     }
-    let code = Status::from_code(resp.status().as_u16()).unwrap_or(Status::BadGateway);
+    let code = Status::from_u16(resp.status().as_u16()).unwrap_or(Status::BAD_GATEWAY);
     Err(ApiError::new(code, resp.text().await.unwrap_or_default()))
 }
 
-#[get("/api/v1/vms")]
 async fn list(
     _auth: crate::auth::CanRead,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
-    cluster: &State<Arc<Cluster>>,
-    agent: &State<crate::agent::AgentState>,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
+    State(cluster): State<Arc<Cluster>>,
+    State(agent): State<crate::agent::AgentState>,
 ) -> Result<Json<Vec<VmView>>, ApiError> {
-    let specs = specs(volumes).await?;
+    let (st, cluster) = (&*st, &*cluster);
+    let specs = specs(&volumes).await?;
     let intent = cluster.status().state.vms;
     // Ask each node with a VM's disks once.
     let mut views: BTreeMap<String, Result<LocalView, String>> = BTreeMap::new();
@@ -219,7 +219,7 @@ async fn list(
             continue;
         }
         let view = match peer_url(cluster, &node) {
-            Ok(None) => Ok(local_view(st, cluster, agent).await),
+            Ok(None) => Ok(local_view(st, cluster, &agent).await),
             Ok(Some(base)) => {
                 async {
                     st.http
@@ -301,7 +301,7 @@ async fn spec(volumes: &VolumesState, name: &VmName) -> Result<VmSpec, ApiError>
     specs(volumes)
         .await?
         .remove(name)
-        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no VM '{}'", name)))
+        .ok_or_else(|| ApiError::new(Status::NOT_FOUND, format!("no VM '{}'", name)))
 }
 
 /// A VM name from the URL (400 if it isn't one).
@@ -312,55 +312,61 @@ fn vm(name: &str) -> Result<VmName, ApiError> {
 // ---- definitions ------------------------------------------------------------
 
 /// GET /api/v1/vms/<name>/definition: its XML and change number.
-#[get("/api/v1/vms/<name>/definition")]
 async fn definition(
     _auth: crate::auth::CanRead,
-    name: &str,
-    volumes: &State<VolumesState>,
+    Path(name): Path<String>,
+    State(volumes): State<Arc<VolumesState>>,
 ) -> Result<Json<VmDef>, ApiError> {
-    let name = &vm(name)?;
+    let name = &vm(&name)?;
     volumes
         .admin
         .vms()
         .await?
         .remove(name)
         .map(Json)
-        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no VM '{}'", name)))
+        .ok_or_else(|| ApiError::new(Status::NOT_FOUND, format!("no VM '{}'", name)))
 }
 
 /// PUT /api/v1/vms/<name>[?create=true][&change=N], the domain XML as the
 /// body: store it, once it checks out (see `crate::vm_store`). `create`:
 /// refuse if there is one; `change`: refuse unless the one there is that
 /// change.
-#[put("/api/v1/vms/<name>?<create>&<change>", data = "<body>")]
+/// `?create=&change=` on a PUT.
+#[derive(Deserialize, Default)]
+struct PutAt {
+    #[serde(default)]
+    create: bool,
+    change: Option<u64>,
+}
+
 async fn put_definition(
     auth: crate::auth::CanWrite,
-    name: &str,
-    create: Option<bool>,
-    change: Option<u64>,
-    body: rocket::Data<'_>,
-    volumes: &State<VolumesState>,
+    Path(name): Path<String>,
+    Query(PutAt { create, change }): Query<PutAt>,
+    State(volumes): State<Arc<VolumesState>>,
+    body: axum::body::Body,
 ) -> Result<Json<VmDef>, ApiError> {
-    let name = &vm(name)?;
-    use rocket::data::ToByteUnit;
-    let xml = body
-        .open((crate::vm_store::MAX_XML + 1).bytes())
-        .into_string()
+    let name = &vm(&name)?;
+    let bytes = raidish_auth::http::read_body(body, crate::vm_store::MAX_XML)
         .await
-        .map_err(|e| ApiError::bad(e.to_string()))?;
-    if !xml.is_complete() {
-        return Err(ApiError::new(
-            Status::PayloadTooLarge,
-            format!(
-                "a VM definition is at most {} bytes",
-                crate::vm_store::MAX_XML
-            ),
-        ));
-    }
+        .map_err(|(s, m)| {
+            if s == Status::PAYLOAD_TOO_LARGE {
+                ApiError::new(
+                    s,
+                    format!(
+                        "a VM definition is at most {} bytes",
+                        crate::vm_store::MAX_XML
+                    ),
+                )
+            } else {
+                ApiError::new(s, m)
+            }
+        })?;
+    let xml = String::from_utf8(bytes.to_vec()).map_err(|e| ApiError::bad(e.to_string()))?;
     let req = PutVm {
         name: name.clone(),
-        xml: xml.into_inner(),
-        create: create.unwrap_or(false),
+        xml,
+        create,
         change,
     };
     volumes
@@ -375,26 +381,31 @@ async fn put_definition(
 /// DELETE /api/v1/vms/<name>[?change=N]: delete its definition (its
 /// volumes stay). A running VM is stopped by its node, as for any VM that
 /// has no definition.
-#[delete("/api/v1/vms/<name>?<change>")]
+/// `?change=` on a DELETE.
+#[derive(Deserialize, Default)]
+struct ChangeAt {
+    change: Option<u64>,
+}
+
 async fn delete_definition(
     auth: crate::auth::CanWrite,
-    name: &str,
-    change: Option<u64>,
-    st: &State<VmsState>,
-    cluster: &State<Arc<Cluster>>,
-    volumes: &State<VolumesState>,
+    Path(name): Path<String>,
+    Query(ChangeAt { change }): Query<ChangeAt>,
+    State(st): State<Arc<VmsState>>,
+    State(cluster): State<Arc<Cluster>>,
+    State(volumes): State<Arc<VolumesState>>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &vm(name)?;
-    let spec = spec(volumes, name).await.ok();
+    let name = &vm(&name)?;
+    let spec = spec(&volumes, name).await.ok();
     volumes
         .admin
         .on_behalf(&auth.0)
         .delete_vm(name, change)
         .await?;
     // Nothing should run it any more.
-    set_intent(cluster, name, false).await?;
+    set_intent(&cluster, name, false).await?;
     if let Some(spec) = spec {
-        poke(st, cluster, &spec).await;
+        poke(&st, &cluster, &spec).await;
     }
     Ok(Json(()))
 }
@@ -408,7 +419,7 @@ async fn set_intent(cluster: &Cluster, name: &VmName, running: bool) -> Result<(
         .lease(&op, false)
         .await
         .map(|_| ())
-        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e))
+        .map_err(|e| ApiError::new(Status::SERVICE_UNAVAILABLE, e))
 }
 
 /// Tell the VM's node to look now (best effort: it looks every tick anyway).
@@ -431,12 +442,11 @@ fn live_nodes(cluster: &Cluster) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-#[get("/api/v1/nodes/facts")]
 async fn nodes_facts(
     _auth: crate::auth::CanRead,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
-    cluster: &State<Arc<Cluster>>,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
+    State(cluster): State<Arc<Cluster>>,
 ) -> Result<Json<FactsView>, ApiError> {
     let mut nodes = volumes.admin.node_facts().await?;
     // This node's own, as fresh as it has them.
@@ -445,17 +455,16 @@ async fn nodes_facts(
     }
     Ok(Json(FactsView {
         nodes,
-        live: live_nodes(cluster).into_iter().collect(),
+        live: live_nodes(&cluster).into_iter().collect(),
     }))
 }
 
 /// POST /api/v1/vm/check (nodes only): what this node says now about
 /// running a VM with that CPU (see `crate::vm_check::Live`).
-#[post("/api/v1/vm/check", data = "<ask>")]
 async fn check_here(
     _node: crate::auth::IsNode,
+    State(st): State<Arc<VmsState>>,
     ask: Json<crate::vm_check::LiveAsk>,
-    st: &State<VmsState>,
 ) -> Json<crate::vm_check::Live> {
     let cpu = match (&st.runtime, &ask.cpu) {
         (Some(rt), Some(cpu)) => Some(rt.virsh.cpu_compare(cpu).await.map_err(String::from)),
@@ -478,15 +487,20 @@ pub struct SourceNow {
     pub domain: Option<String>,
 }
 
+/// `?vm=` on a probe.
+#[derive(Deserialize, Default)]
+struct VmAt {
+    vm: Option<String>,
+}
+
 /// POST /api/v1/vm/probe/<node>[?vm=] (nodes only): see `SourceNow`.
-#[post("/api/v1/vm/probe/<node>?<vm>")]
 async fn probe_now(
     _n: crate::auth::IsNode,
-    node: &str,
-    vm: Option<&str>,
-    st: &State<VmsState>,
+    Path(node): Path<String>,
+    Query(VmAt { vm }): Query<VmAt>,
+    State(st): State<Arc<VmsState>>,
 ) -> Json<SourceNow> {
-    Json(source_now(st, node, vm).await)
+    Json(source_now(&st, &node, vm.as_deref()).await)
 }
 
 async fn source_now(st: &VmsState, to: &str, vm: Option<&str>) -> SourceNow {
@@ -606,7 +620,7 @@ async fn check_vm(
     }
     if let Some(o) = only {
         if verdicts.is_empty() && running_on.as_deref() != Some(o) {
-            return Err(ApiError::new(Status::NotFound, format!("no node '{}'", o)));
+            return Err(ApiError::new(Status::NOT_FOUND, format!("no node '{}'", o)));
         }
     }
     Ok(CheckView {
@@ -616,21 +630,27 @@ async fn check_vm(
     })
 }
 
+/// `?nodes=a,b`.
+#[derive(Deserialize, Default)]
+struct NodesAt {
+    nodes: Option<String>,
+}
+
 /// GET /api/v1/vm/cpu-baseline[?nodes=a,b]: the CPU every one of those
 /// nodes (default: all that run VMs) can give a guest, migratable, as a
 /// `<cpu>` for a domain's XML. Worked out by this node's libvirt from the
 /// nodes' stored domcapabilities.
-#[get("/api/v1/vm/cpu-baseline?<nodes>")]
 async fn cpu_baseline(
     _auth: crate::auth::CanRead,
-    nodes: Option<&str>,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
+    Query(NodesAt { nodes }): Query<NodesAt>,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
 ) -> Result<String, ApiError> {
+    let nodes = nodes.as_deref();
     let rt = st.runtime.as_ref().ok_or_else(|| {
         // Another node may: the CLI tries the next on a 5xx.
         ApiError::new(
-            Status::ServiceUnavailable,
+            Status::SERVICE_UNAVAILABLE,
             "this node runs no VMs (no libvirt to work it out): ask one that does".to_string(),
         )
     })?;
@@ -668,31 +688,38 @@ async fn cpu_baseline(
     ))
 }
 
-#[get("/api/v1/vms/<name>/check?<node>")]
-async fn check_route(
-    _auth: crate::auth::CanRead,
-    name: &str,
-    node: Option<&str>,
-    st: &State<VmsState>,
-    cluster: &State<Arc<Cluster>>,
-    volumes: &State<VolumesState>,
-) -> Result<Json<CheckView>, ApiError> {
-    let name = &vm(name)?;
-    check_vm(st, cluster, volumes, name, node).await.map(Json)
+/// `?node=`.
+#[derive(Deserialize, Default)]
+struct NodeAt {
+    node: Option<String>,
 }
 
-#[post("/api/v1/vms/<name>/move", data = "<to>")]
+async fn check_route(
+    _auth: crate::auth::CanRead,
+    Path(name): Path<String>,
+    Query(NodeAt { node }): Query<NodeAt>,
+    State(st): State<Arc<VmsState>>,
+    State(cluster): State<Arc<Cluster>>,
+    State(volumes): State<Arc<VolumesState>>,
+) -> Result<Json<CheckView>, ApiError> {
+    let name = &vm(&name)?;
+    check_vm(&st, &cluster, &volumes, name, node.as_deref())
+        .await
+        .map(Json)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn move_vm(
     auth: crate::auth::CanWrite,
-    name: &str,
+    Path(name): Path<String>,
+    State(events): State<crate::events::EventSink>,
+    State(st): State<Arc<VmsState>>,
+    State(cluster): State<Arc<Cluster>>,
+    State(volumes): State<Arc<VolumesState>>,
     to: Json<MoveTo>,
-    events: &State<crate::events::EventSink>,
-    st: &State<VmsState>,
-    cluster: &State<Arc<Cluster>>,
-    volumes: &State<VolumesState>,
 ) -> Result<Json<CheckView>, ApiError> {
-    let name = &vm(name)?;
+    let (st, cluster, volumes) = (&*st, &*cluster, &*volumes);
+    let name = &vm(&name)?;
     let spec = spec(volumes, name).await?;
     let Some(anchor) = spec.anchor() else {
         return Err(ApiError::bad(spec.error().unwrap_or_default().to_string()));
@@ -704,13 +731,13 @@ async fn move_vm(
         use crate::vm_check::Mode;
         if v.mode == Mode::No {
             return Err(ApiError::new(
-                Status::Conflict,
+                Status::CONFLICT,
                 format!("VM '{}' can't run on {}: {}", name, to.node, v.why()),
             ));
         }
         if to.live && view.running_on.is_some() && v.mode != Mode::Live {
             return Err(ApiError::new(
-                Status::Conflict,
+                Status::CONFLICT,
                 format!("VM '{}' can't move to {} live: {}", name, to.node, v.why()),
             ));
         }
@@ -719,11 +746,11 @@ async fn move_vm(
         .admin
         .volumes()
         .await
-        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e.to_string()))?;
+        .map_err(|e| ApiError::new(Status::SERVICE_UNAVAILABLE, e.to_string()))?;
     let mut props = vols
         .into_iter()
         .find(|v| &v.name == anchor)
-        .ok_or_else(|| ApiError::new(Status::NotFound, format!("no volume '{}'", anchor)))?
+        .ok_or_else(|| ApiError::new(Status::NOT_FOUND, format!("no volume '{}'", anchor)))?
         .props;
     if !props.nodes.is_empty() && !props.nodes.contains(&to.node) {
         props.nodes.insert(0, to.node.clone());
@@ -734,7 +761,7 @@ async fn move_vm(
         .on_behalf(&auth.0)
         .set_props(anchor, &props)
         .await
-        .map_err(|e| ApiError::new(Status::ServiceUnavailable, e.to_string()))?;
+        .map_err(|e| ApiError::new(Status::SERVICE_UNAVAILABLE, e.to_string()))?;
     events.emit(
         crate::events::Level::Info,
         EventKind::VmMove,
@@ -746,18 +773,17 @@ async fn move_vm(
     Ok(Json(view))
 }
 
-#[post("/api/v1/vms/<name>/<action>", rank = 2)]
 async fn action(
     auth: crate::auth::CanWrite,
-    name: &str,
-    action: &str,
-    events: &State<crate::events::EventSink>,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
-    cluster: &State<Arc<Cluster>>,
+    Path((name, action)): Path<(String, String)>,
+    State(events): State<crate::events::EventSink>,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
+    State(cluster): State<Arc<Cluster>>,
 ) -> Result<Json<()>, ApiError> {
-    let name = &vm(name)?;
-    let spec = spec(volumes, name).await?;
+    let (st, cluster, action) = (&*st, &*cluster, action.as_str());
+    let name = &vm(&name)?;
+    let spec = spec(&volumes, name).await?;
     match action {
         "start" => {
             if let Some(e) = spec.error() {
@@ -773,13 +799,13 @@ async fn action(
         "kill" => {
             set_intent(cluster, name, false).await?;
             let node = vm_node(cluster, &spec).ok_or_else(|| {
-                ApiError::new(Status::Conflict, format!("'{}' isn't running", name))
+                ApiError::new(Status::CONFLICT, format!("'{}' isn't running", name))
             })?;
             on_node(st, cluster, &node, name, "kill").await?;
         }
         "reboot" | "reset" | "restart" => {
             let node = vm_node(cluster, &spec).ok_or_else(|| {
-                ApiError::new(Status::Conflict, format!("'{}' isn't running", name))
+                ApiError::new(Status::CONFLICT, format!("'{}' isn't running", name))
             })?;
             on_node(st, cluster, &node, name, action).await?;
         }
@@ -804,43 +830,44 @@ async fn action(
 
 // ---- console --------------------------------------------------------------
 
-#[get("/api/v1/vms/<name>/console")]
 async fn console(
     _auth: crate::auth::CanWrite,
-    name: &str,
-    ws: ws::WebSocket,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
-    cluster: &State<Arc<Cluster>>,
-) -> Result<ws::Channel<'static>, ApiError> {
-    let name = &vm(name)?;
-    let spec = spec(volumes, name).await?;
-    let node = vm_node(cluster, &spec)
-        .ok_or_else(|| ApiError::new(Status::Conflict, format!("'{}' isn't running", name)))?;
-    match peer_url(cluster, &node)? {
+    Path(name): Path<String>,
+    peer: Option<axum::Extension<raidish_auth::http::Peer>>,
+    ws: WebSocketUpgrade,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
+    State(cluster): State<Arc<Cluster>>,
+) -> Result<Response, ApiError> {
+    let peer = peer.map(|axum::Extension(p)| p);
+    let name = &vm(&name)?;
+    let spec = spec(&volumes, name).await?;
+    let node = vm_node(&cluster, &spec)
+        .ok_or_else(|| ApiError::new(Status::CONFLICT, format!("'{}' isn't running", name)))?;
+    match peer_url(&cluster, &node)? {
         None => {
             let rt = st.runtime.as_ref().ok_or_else(|| {
-                ApiError::new(Status::NotFound, "this node runs no VMs".to_string())
+                ApiError::new(Status::NOT_FOUND, "this node runs no VMs".to_string())
             })?;
             // Only a domain this node started (as `local_do`).
             let ours = match (rt.ident(), rt.virsh.meta(name).await) {
                 (Some(me), Ok(Some(m))) => me.owns(&m),
                 (_, Err(e)) => {
-                    return Err(ApiError::new(Status::ServiceUnavailable, e.to_string()));
+                    return Err(ApiError::new(Status::SERVICE_UNAVAILABLE, e.to_string()));
                 }
                 _ => false,
             };
             if !ours {
                 return Err(ApiError::new(
-                    Status::Conflict,
+                    Status::CONFLICT,
                     format!("'{}' isn't running here", name),
                 ));
             }
             let port = rt.virsh.vnc_port(name).await.ok_or_else(|| {
-                ApiError::new(Status::Conflict, format!("'{}' has no console", name))
+                ApiError::new(Status::CONFLICT, format!("'{}' has no console", name))
             })?;
             let host = rt.console.clone();
-            Ok(ws.channel(move |stream| Box::pin(bridge_tcp(stream, host, port))))
+            Ok(ws.on_upgrade(move |s| until_closed(peer, bridge_tcp(s, host, port))))
         }
         Some(base) => {
             let url = format!(
@@ -849,31 +876,50 @@ async fn console(
                     .replacen("http://", "ws://", 1),
                 name
             );
-            Ok(ws.channel(move |stream| Box::pin(bridge_ws(stream, url))))
+            Ok(ws.on_upgrade(move |s| until_closed(peer, bridge_ws(s, url))))
         }
     }
 }
 
+/// Run a console bridge until it ends, or until its peer's connections
+/// are closed (its certificate revoked: `raidish_auth::http::Connections`).
+async fn until_closed(
+    peer: Option<raidish_auth::http::Peer>,
+    bridge: impl std::future::Future<Output = std::io::Result<()>>,
+) {
+    let closed = async {
+        match &peer {
+            Some(p) => p.closed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        r = bridge => if let Err(e) = r {
+            eprintln!("console: {}", e);
+        },
+        _ = closed => {}
+    }
+}
+
+fn ws_err(e: axum::Error) -> std::io::Error {
+    std::io::Error::other(e)
+}
+
 /// Browser ⇄ the VNC server on `host`:`port`.
-#[allow(clippy::result_large_err)] // rocket_ws's error type
-async fn bridge_tcp(
-    stream: ws::stream::DuplexStream,
-    host: String,
-    port: u16,
-) -> ws::result::Result<()> {
+async fn bridge_tcp(stream: WebSocket, host: String, port: u16) -> std::io::Result<()> {
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true)?;
     let (mut rd, mut wr) = tcp.into_split();
     let (mut sink, mut source) = stream.split();
     let up = async {
         while let Some(m) = source.next().await {
-            match m? {
-                ws::Message::Binary(b) => wr.write_all(&b).await?,
-                ws::Message::Close(_) => break,
+            match m.map_err(ws_err)? {
+                Message::Binary(b) => wr.write_all(&b).await?,
+                Message::Close(_) => break,
                 _ => {}
             }
         }
-        Ok::<_, ws::result::Error>(())
+        Ok::<_, std::io::Error>(())
     };
     let down = async {
         let mut buf = vec![0u8; 64 * 1024];
@@ -882,10 +928,12 @@ async fn bridge_tcp(
             if n == 0 {
                 break;
             }
-            sink.send(ws::Message::Binary(buf[..n].to_vec())).await?;
+            sink.send(Message::Binary(buf[..n].to_vec().into()))
+                .await
+                .map_err(ws_err)?;
         }
-        let _ = sink.send(ws::Message::Close(None)).await;
-        Ok::<_, ws::result::Error>(())
+        let _ = sink.send(Message::Close(None)).await;
+        Ok::<_, std::io::Error>(())
     };
     tokio::select! {
         r = up => r,
@@ -894,8 +942,7 @@ async fn bridge_tcp(
 }
 
 /// Browser ⇄ the console on the node that runs the VM (as this node).
-#[allow(clippy::result_large_err)] // rocket_ws's error type
-async fn bridge_ws(stream: ws::stream::DuplexStream, url: String) -> ws::result::Result<()> {
+async fn bridge_ws(stream: WebSocket, url: String) -> std::io::Result<()> {
     use tokio_tungstenite::tungstenite::Message as M;
     let (peer, _) = tokio_tungstenite::connect_async_tls_with_config(
         url.as_str(),
@@ -909,30 +956,30 @@ async fn bridge_ws(stream: ws::stream::DuplexStream, url: String) -> ws::result:
     let (mut sink, mut source) = stream.split();
     let up = async {
         while let Some(m) = source.next().await {
-            match m? {
-                ws::Message::Binary(b) => {
+            match m.map_err(ws_err)? {
+                Message::Binary(b) => {
                     psink
-                        .send(M::Binary(b.into()))
+                        .send(M::Binary(b))
                         .await
                         .map_err(std::io::Error::other)?;
                 }
-                ws::Message::Close(_) => break,
+                Message::Close(_) => break,
                 _ => {}
             }
         }
         let _ = psink.send(M::Close(None)).await;
-        Ok::<_, ws::result::Error>(())
+        Ok::<_, std::io::Error>(())
     };
     let down = async {
         while let Some(m) = psource.next().await {
             match m.map_err(std::io::Error::other)? {
-                M::Binary(b) => sink.send(ws::Message::Binary(b.to_vec())).await?,
+                M::Binary(b) => sink.send(Message::Binary(b)).await.map_err(ws_err)?,
                 M::Close(_) => break,
                 _ => {}
             }
         }
-        let _ = sink.send(ws::Message::Close(None)).await;
-        Ok::<_, ws::result::Error>(())
+        let _ = sink.send(Message::Close(None)).await;
+        Ok::<_, std::io::Error>(())
     };
     tokio::select! {
         r = up => r,
@@ -941,17 +988,16 @@ async fn bridge_ws(stream: ws::stream::DuplexStream, url: String) -> ws::result:
 }
 
 /// Is this node ready for VM `name` to migrate here (see the module doc)?
-#[post("/api/v1/vm/incoming/<name>")]
 async fn incoming(
     _node: crate::auth::IsNode,
-    name: &str,
-    st: &State<VmsState>,
-    volumes: &State<VolumesState>,
-    agent: &State<crate::agent::AgentState>,
+    Path(name): Path<String>,
+    State(st): State<Arc<VmsState>>,
+    State(volumes): State<Arc<VolumesState>>,
+    State(agent): State<crate::agent::AgentState>,
 ) -> Result<Json<crate::vm::Incoming>, ApiError> {
-    let name = &vm(name)?;
-    let not_yet = |m: String| ApiError::new(Status::Conflict, m);
-    let never = |m: &str| ApiError::new(Status::UnprocessableEntity, m.to_string());
+    let name = &vm(&name)?;
+    let not_yet = |m: String| ApiError::new(Status::CONFLICT, m);
+    let never = |m: &str| ApiError::new(Status::UNPROCESSABLE_ENTITY, m.to_string());
     let rt = st
         .runtime
         .as_ref()
@@ -959,7 +1005,7 @@ async fn incoming(
     if rt.ident().is_none() {
         return Err(not_yet("the pool isn't open here yet".into()));
     }
-    let spec = spec(volumes, name).await?;
+    let spec = spec(&volumes, name).await?;
     if let Some(e) = spec.error() {
         return Err(ApiError::bad(e.to_string()));
     }
@@ -996,22 +1042,60 @@ async fn incoming(
     }))
 }
 
-pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        incoming,
-        check_here,
-        check_route,
-        probe_now,
-        cpu_baseline,
-        nodes_facts,
-        local,
-        local_action,
-        list,
-        definition,
-        put_definition,
-        delete_definition,
-        move_vm,
-        action,
-        console
-    ]
+/// What the VM routes use.
+#[derive(Clone)]
+pub struct VmsCtx {
+    pub vms: Arc<VmsState>,
+    pub volumes: Arc<VolumesState>,
+    pub cluster: Arc<Cluster>,
+    pub agent: crate::agent::AgentState,
+    pub events: crate::events::EventSink,
+}
+
+impl FromRef<VmsCtx> for Arc<VmsState> {
+    fn from_ref(c: &VmsCtx) -> Self {
+        c.vms.clone()
+    }
+}
+impl FromRef<VmsCtx> for Arc<VolumesState> {
+    fn from_ref(c: &VmsCtx) -> Self {
+        c.volumes.clone()
+    }
+}
+impl FromRef<VmsCtx> for Arc<Cluster> {
+    fn from_ref(c: &VmsCtx) -> Self {
+        c.cluster.clone()
+    }
+}
+impl FromRef<VmsCtx> for crate::agent::AgentState {
+    fn from_ref(c: &VmsCtx) -> Self {
+        c.agent.clone()
+    }
+}
+impl FromRef<VmsCtx> for crate::events::EventSink {
+    fn from_ref(c: &VmsCtx) -> Self {
+        c.events.clone()
+    }
+}
+
+pub fn router(ctx: VmsCtx) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/vm/incoming/{name}", post(incoming))
+        .route("/api/v1/vm/check", post(check_here))
+        .route("/api/v1/vms/{name}/check", get(check_route))
+        .route("/api/v1/vm/probe/{node}", post(probe_now))
+        .route("/api/v1/vm/cpu-baseline", get(cpu_baseline))
+        .route("/api/v1/nodes/facts", get(nodes_facts))
+        .route("/api/v1/vm/local", get(local))
+        .route("/api/v1/vm/local/{name}/{action}", post(local_action))
+        .route("/api/v1/vms", get(list))
+        .route("/api/v1/vms/{name}/definition", get(definition))
+        .route(
+            "/api/v1/vms/{name}",
+            axum::routing::put(put_definition).delete(delete_definition),
+        )
+        .route("/api/v1/vms/{name}/move", post(move_vm))
+        .route("/api/v1/vms/{name}/{action}", post(action))
+        .route("/api/v1/vms/{name}/console", get(console))
+        .with_state(ctx)
 }

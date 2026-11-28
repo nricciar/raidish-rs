@@ -27,6 +27,11 @@ pub struct Config {
     /// and no `pool`, the legacy raidz2 pool).
     #[serde(default)]
     pub disks: Option<Vec<String>>,
+    /// Nodes to ask, for a config without `pool:` (a client's, as
+    /// `raidish enroll` writes it): the CA and other API commands use them.
+    /// Commands that open the pool itself still need `pool:`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
     /// The pool layout.
     #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
     pub pool: Option<VdevConfig>,
@@ -52,6 +57,60 @@ pub struct Config {
     /// Run VMs whose disks are volumes, through libvirt (see `crate::vm`).
     /// Absent: this node runs none.
     pub vm: Option<crate::vm::VmConfig>,
+    /// The cluster CA (see `raidish_ca`).
+    #[serde(default)]
+    pub ca: CaConfig,
+}
+
+/// ```yaml
+/// ca:
+///   unseal_once: false   # ignore `ca init`'s one-shot unseal file
+///   # This node's own key (`raidish ca slot add --node-key`), to unseal
+///   # itself at start. One of:
+///   unseal_credential: raidish-unseal   # $CREDENTIALS_DIRECTORY/<name>
+///   unseal_key: /etc/raidish/unseal.key # a plain file: a copy of the
+///                                       # disk opens the CA
+/// ```
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CaConfig {
+    /// Unseal at start from the one-shot file `ca init` leaves (default on).
+    #[serde(default = "yes")]
+    pub unseal_once: bool,
+    #[serde(default)]
+    pub unseal_key: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub unseal_credential: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for CaConfig {
+    fn default() -> Self {
+        CaConfig {
+            unseal_once: true,
+            unseal_key: None,
+            unseal_credential: None,
+        }
+    }
+}
+
+impl CaConfig {
+    /// Where this node's own key is, if anywhere.
+    pub fn node_key(&self) -> Result<Option<raidish_ca::NodeKeySource>, String> {
+        use raidish_ca::NodeKeySource;
+        match (&self.unseal_key, &self.unseal_credential) {
+            (Some(_), Some(_)) => Err("ca: unseal_key or unseal_credential, not both".into()),
+            (Some(p), None) => Ok(Some(NodeKeySource::File(p.clone()))),
+            (None, Some(c)) if c.is_empty() || c.contains('/') => {
+                Err(format!("ca.unseal_credential '{}': a credential's name", c))
+            }
+            (None, Some(c)) => Ok(Some(NodeKeySource::Credential(c.clone()))),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -217,7 +276,23 @@ impl Config {
 
     /// Where to ask for leases: every `listen` node that serves one of the
     /// pool's remote disks. Empty for a pool of local disks only.
+    /// Node `name`'s Raft data dir (`cluster.data_dir/<name>`).
+    pub fn data_dir(&self, name: &str) -> std::path::PathBuf {
+        match self.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
+            Some(d) => crate::tls::expand(d).join(name),
+            None => crate::cluster::default_data_dir(name),
+        }
+    }
+
+    /// The nodes to ask: the pool's disk servers, else `endpoints`.
     pub fn lease_endpoints(&self) -> Result<Vec<String>, String> {
+        if self.pool_spec()?.is_none() {
+            return Ok(self
+                .endpoints
+                .iter()
+                .map(|e| e.trim_end_matches('/').to_string())
+                .collect());
+        }
         let mut out: Vec<String> = Vec::new();
         for path in self.pool_spec()?.map(|s| s.paths).unwrap_or_default() {
             let Some(base) = disk_server_base(&path) else {

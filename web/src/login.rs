@@ -108,7 +108,7 @@ impl Component for Root {
                                 { "This node requires a token. Create one where your admin certificate is:" }
                             </p>
                             <pre class="mono">{ "raidish token create <your name>" }</pre>
-                            <textarea ref={self.input.clone()} rows="4" placeholder="rdt1.…"
+                            <textarea ref={self.input.clone()} rows="4" placeholder="rdt2.…"
                                 autocomplete="off" spellcheck="false" />
                             if let Some(e) = error {
                                 <p class="bad">{ e }</p>

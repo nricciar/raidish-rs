@@ -283,3 +283,120 @@ where
     }
     Err(Tried::Nobody(why))
 }
+
+/// A stream that fails (reads and writes) once its peer is revoked: what
+/// a long-lived session over a TLS connection is wrapped in, so a
+/// revocation ends it (`crate::trust`). Without a registration, a plain
+/// stream.
+///
+/// Reads and writes each wait on the revocation with their own future, so
+/// each keeps its own waker. With one, whichever polled last would hold it:
+/// split in two (`tokio::io::split`) with replies written from other tasks
+/// (NBD), a revocation would wake a writer that had already finished and
+/// leave the parked reader, and the idle session, open.
+pub struct Revocable<S> {
+    io: S,
+    read_closed: Option<Closed>,
+    write_closed: Option<Closed>,
+    ended: bool,
+}
+
+type Closed = std::pin::Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
+#[derive(Clone, Copy)]
+enum Side {
+    Read,
+    Write,
+}
+
+impl<S> Revocable<S> {
+    /// `io`, ended when `peer` is closed (None: never).
+    pub fn new(io: S, peer: Option<crate::http::Peer>) -> Self {
+        let closed = |p: &crate::http::Peer| {
+            let p = p.clone();
+            Box::pin(async move { p.closed().await }) as Closed
+        };
+        Revocable {
+            io,
+            read_closed: peer.as_ref().map(closed),
+            write_closed: peer.as_ref().map(closed),
+            ended: false,
+        }
+    }
+
+    fn check(&mut self, side: Side, cx: &mut std::task::Context<'_>) -> std::io::Result<()> {
+        let closed = match side {
+            Side::Read => &mut self.read_closed,
+            Side::Write => &mut self.write_closed,
+        };
+        if !self.ended
+            && let Some(c) = closed
+            && c.as_mut().poll(cx).is_ready()
+        {
+            self.ended = true;
+        }
+        if self.ended {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the peer's certificate was revoked",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The server side of a TLS connection, ended when its client's
+/// certificate is revoked (registered in `conns`; None: never).
+pub fn revocable<T>(
+    tls: tokio_rustls::server::TlsStream<T>,
+    conns: Option<&crate::http::Connections>,
+) -> Revocable<tokio_rustls::server::TlsStream<T>> {
+    let peer = conns.and_then(|c| {
+        let der = tls.get_ref().1.peer_certificates()?.first()?.clone();
+        c.register(der.into_owned())
+    });
+    Revocable::new(tls, peer)
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Revocable<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(e) = self.check(Side::Read, cx) {
+            return std::task::Poll::Ready(Err(e));
+        }
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Revocable<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Err(e) = self.check(Side::Write, cx) {
+            return std::task::Poll::Ready(Err(e));
+        }
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(e) = self.check(Side::Write, cx) {
+            return std::task::Poll::Ready(Err(e));
+        }
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}

@@ -7,7 +7,6 @@ use crate::config::{Config, PoolSpec};
 use crate::disk::DiskOptions;
 use crate::disks::DiskSet;
 use crate::{api, cluster};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Serve this node until it is asked to stop. Err: the config can't be
@@ -16,6 +15,7 @@ pub async fn listen(
     config: &Config,
     spec: Option<PoolSpec>,
     opts: DiskOptions,
+    address: &str,
     port: Option<u16>,
     no_committer: bool,
 ) -> Result<(), String> {
@@ -35,10 +35,7 @@ pub async fn listen(
         .map_err(|e| format!("cluster: {}", e))?;
     // The node's name comes from its id: the pool position of its first disk.
     let name = members.me.name();
-    let data_dir = match config.cluster.as_ref().and_then(|c| c.data_dir.as_deref()) {
-        Some(d) => expand_tilde(d).join(&name),
-        None => cluster::default_data_dir(&name),
-    };
+    let data_dir = config.data_dir(&name);
     println!(
         "cluster: node {} ({}), {} member{}",
         members.me,
@@ -70,14 +67,34 @@ pub async fn listen(
     if let Some(c) = &config.vm {
         c.check()?;
     }
-    let verifier = match &config.tls {
+    // What this node refuses, live: every verifier made from `tls` checks
+    // it, and the cluster feeds it as revocations are applied (CA-2a).
+    let trust = crate::trust::Trust::new(config.auth.revoked.clone());
+    // One live identity for every acceptor and connector (the process's,
+    // from `tls::init`): a renewal (CA-4a) reaches them all at once.
+    let node_tls = config.tls.clone().map(|mut t| {
+        t.trust = Some(trust.clone());
+        t.live = crate::tls::identity();
+        t
+    });
+    let identity = node_tls.as_ref().and_then(|t| {
+        Some(raidish_ca::NodeIdentity {
+            live: t.live.clone()?,
+            cert_path: t.cert_path()?,
+            key_path: t.key_path()?,
+        })
+    });
+    if node_tls.is_some() {
+        crate::tls::check_servers_against(trust.clone());
+    }
+    let verifier = match &node_tls {
         Some(t) => Some(
             crate::auth::Verifier::from_config(t, &config.auth)
                 .map_err(|e| format!("tls: {}", e))?,
         ),
         None => None,
     };
-    let mut service_tls = match (&config.services, &config.tls) {
+    let mut service_tls = match (&config.services, &node_tls) {
         (None, _) => None,
         // Access keys come from tokens (see `crate::frontend::keys`),
         // checked against the CA bundle: no TLS, no services.
@@ -91,6 +108,21 @@ pub async fn listen(
     let node = cluster::Cluster::start(&name, members, data_dir, floor.clone())
         .await
         .map_err(|e| format!("cluster: {}", e))?;
+    node.observe_pki(trust.clone());
+    // What happens on this node goes to the activity log (through
+    // whichever node is the committer).
+    let events = crate::events::EventSink::new(&name);
+    let ca = raidish_ca::CaService::start(
+        node.clone(),
+        raidish_ca::CaOptions {
+            unseal_once: config.ca.unseal_once,
+            node_key: config.ca.node_key()?,
+            events: Some(Arc::new(CaEventSink(events.clone()))),
+            identity,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("ca: {}", e))?;
     let slot: crate::committer::CommitterSlot = Default::default();
     let agent_state: crate::agent::AgentState = Default::default();
     let files: crate::files_api::WriterSlot = Default::default();
@@ -104,9 +136,6 @@ pub async fn listen(
         ))
     });
     let me = format!("{}://127.0.0.1:{}", crate::tls::scheme(), port);
-    // What happens on this node goes to the activity log (through
-    // whichever node is the committer).
-    let events = crate::events::EventSink::new(&name);
     // The committer is wherever the `pool` lease is: here in process,
     // else ask every node.
     let endpoints: Vec<String> = {
@@ -143,7 +172,7 @@ pub async fn listen(
             node: name.clone(),
             peers: node.members.peers.clone(),
             vm: vms.clone(),
-            roots: match &config.tls {
+            roots: match &node_tls {
                 Some(t) => t.roots()?,
                 None => Vec::new(),
             },
@@ -197,13 +226,13 @@ pub async fn listen(
         }
         agent = agent.with_facts(facts.clone());
         // Peer I/O (proxied exports, handoffs) is node-to-node TLS.
-        if let Some(tls) = &config.tls {
+        if let Some(tls) = &node_tls {
             agent = agent
                 .with_peer_io(tls)
                 .map_err(|e| format!("peer I/O: {}", e))?;
         }
         if let Some(services) = &config.services {
-            let (Some(tls), Some(service_tls)) = (&config.tls, service_tls.take()) else {
+            let (Some(tls), Some(service_tls)) = (&node_tls, service_tls.take()) else {
                 unreachable!("checked before starting");
             };
             let verifier = crate::auth::Verifier::from_config(tls, &config.auth)
@@ -267,13 +296,14 @@ pub async fn listen(
         }
     }
     let auth = crate::auth::AuthState(verifier);
-    if let Some(t) = &config.tls {
+    if let Some(t) = &node_tls {
         warn_expiry(t);
     }
     println!("dashboard: {}://localhost:{}/", crate::tls::scheme(), port);
     api::listen(
         disks,
         pool,
+        address,
         port,
         node,
         floor,
@@ -281,18 +311,20 @@ pub async fn listen(
         slot,
         agent_state,
         files,
-        config.tls.as_ref(),
+        node_tls.as_ref(),
         auth,
         nfs_backend,
         vms,
         facts,
         events,
+        ca,
     )
     .await;
     Ok(())
 }
 
-/// Warn if this node's certificate expires within 30 days (or has).
+/// Warn if this node's certificate has less than a third of its life, at
+/// most 30 days, left (or has run out).
 fn warn_expiry(tls: &crate::tls::TlsConfig) {
     let Ok(Some((chain, _))) = tls.identity() else {
         return;
@@ -301,29 +333,61 @@ fn warn_expiry(tls: &crate::tls::TlsConfig) {
         return;
     };
     let left = info.not_after - ::time::OffsetDateTime::now_utc();
+    let life = chain
+        .first()
+        .and_then(|c| raidish_auth::ca::facts(c).ok())
+        .map(|f| ::time::Duration::milliseconds((f.not_after_ms - f.not_before_ms) as i64))
+        .unwrap_or(::time::Duration::days(90));
     println!(
         "tls: serving as '{}' ({}), certificate expires {}",
         info.name,
         info.role.map(|r| r.to_string()).unwrap_or("?".into()),
         info.expiry()
     );
-    if left < ::time::Duration::days(30) {
+    let soon: ::time::Duration = std::cmp::min(life / 3, ::time::Duration::days(30));
+    if left < soon {
         eprintln!(
-            "WARNING: this node's certificate {} on {}: reissue it with `raidish cert issue {} --role node --force`",
+            "WARNING: this node's certificate ('{}') {} on {}: nodes renew their own, \
+             so see why not in `raidish ca status` and this log; `raidish ca renew --node` \
+             renews it now",
+            info.name,
             if left.is_negative() {
                 "expired"
             } else {
                 "expires"
             },
-            info.not_after.date(),
-            info.name
+            info.not_after.date()
         );
     }
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(path),
+/// The CA's events, into this node's `EventSink` (`raidish-ca` doesn't
+/// depend on the committer).
+struct CaEventSink(crate::events::EventSink);
+
+impl raidish_ca::CaEvents for CaEventSink {
+    fn emit(
+        &self,
+        level: crate::api_types::Level,
+        kind: crate::api_types::EventKind,
+        subject: crate::api_types::Subject,
+        message: String,
+        by: Option<String>,
+    ) {
+        self.0.emit(level, kind, subject, message, by);
+    }
+
+    fn once(
+        &self,
+        level: crate::api_types::Level,
+        kind: crate::api_types::EventKind,
+        subject: crate::api_types::Subject,
+        message: String,
+    ) -> bool {
+        self.0.once(level, kind, subject, message)
+    }
+
+    fn clear(&self, subject: &crate::api_types::Subject) -> bool {
+        self.0.clear(subject)
     }
 }

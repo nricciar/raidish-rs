@@ -1,0 +1,31 @@
+[package]
+name = "raidish-ca"
+version = "0.1.0"
+edition = "2024"
+description = "The RAIDish cluster CA: staged bootstrap, the signer, join and the PKI routes."
+
+[dependencies]
+raidish-types = { workspace = true }
+raidish-auth = { workspace = true }
+raidish-cluster = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "fs", "sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls-manual-roots"] }
+axum = { workspace = true }
+rustls = { workspace = true, features = ["std", "tls12", "ring", "logging"] }
+zeroize = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+raidish-types = { workspace = true, features = ["testutil"] }
+raidish-auth = { workspace = true, features = ["testutil"] }
+raidish-cluster = { workspace = true, features = ["testutil"] }
+tempfile = { workspace = true }
+x509-parser = { workspace = true }
+tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
+tokio = { workspace = true, features = ["test-util"] }
