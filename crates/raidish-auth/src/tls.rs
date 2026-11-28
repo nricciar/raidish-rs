@@ -34,6 +34,11 @@ pub struct TlsConfig {
     /// every verifier made from this config refuses what's revoked.
     #[serde(skip)]
     pub trust: Option<Arc<crate::trust::Trust>>,
+    /// The identity as it is now (not configured: [`init`] makes it from
+    /// the files), so every acceptor and connector made from this config
+    /// follows a renewal (CA-4a). None: the files, as read.
+    #[serde(skip)]
+    pub live: Option<Arc<crate::http::LiveIdentity>>,
 }
 
 /// `p`, with a leading `~/` as `$HOME/`.
@@ -113,6 +118,9 @@ impl TlsConfig {
                 inner: server_verifier,
                 trust: self.trust.clone(),
             }));
+        if let Some(live) = &self.live {
+            return Ok(builder.with_client_cert_resolver(live.clone()));
+        }
         match self.identity()? {
             Some((chain, key)) => builder
                 .with_client_auth_cert(chain, key)
@@ -147,13 +155,17 @@ impl TlsConfig {
             inner: verifier,
             trust: self.trust.clone(),
         });
-        let (chain, key) = self
-            .identity()?
-            .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
-        let mut c = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(chain, key)
-            .map_err(|e| format!("tls: {}", e))?;
+        let b = rustls::ServerConfig::builder().with_client_cert_verifier(verifier);
+        let mut c = match &self.live {
+            Some(live) => b.with_cert_resolver(live.clone()),
+            None => {
+                let (chain, key) = self
+                    .identity()?
+                    .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
+                b.with_single_cert(chain, key)
+                    .map_err(|e| format!("tls: {}", e))?
+            }
+        };
         c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(c)
     }
@@ -288,17 +300,132 @@ pub fn install_provider() {
 }
 
 static CLIENT: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+static IDENTITY: OnceLock<Arc<crate::http::LiveIdentity>> = OnceLock::new();
 
 /// Set the process's TLS client config (once, at startup). `None`: plain
 /// HTTP. Disk URLs must use `https://` with TLS and `http://` without.
+/// With a certificate, it's presented through the process's
+/// [`identity`], so a renewal reaches this client too.
 pub fn init(cfg: Option<&TlsConfig>) -> Result<(), String> {
     let client = match cfg {
-        Some(c) => Some(Arc::new(c.client_config()?)),
+        Some(c) => {
+            let mut c = c.clone();
+            if let (Some(cert), Some(key)) = (c.cert_path(), c.key_path())
+                && let Some(what) = finish_swap(&cert, &key)
+            {
+                eprintln!("tls: {}", what);
+            }
+            if c.live.is_none()
+                && let Some((chain, key)) = c.identity()?
+            {
+                let live = crate::http::LiveIdentity::new(chain, key)?;
+                let _ = IDENTITY.set(live.clone());
+                c.live = Some(live);
+            }
+            Some(Arc::new(c.client_config()?))
+        }
         None => None,
     };
     CLIENT
         .set(client)
         .map_err(|_| "tls: already initialised".to_string())
+}
+
+fn new_path(p: &std::path::Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".new");
+    PathBuf::from(s)
+}
+
+fn tmp_path(p: &std::path::Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// `path` whole or not at all (a `.tmp` beside it, renamed).
+fn write_new(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let tmp = tmp_path(path);
+    let say = |e: std::io::Error| format!("{}: {}", tmp.display(), e);
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .map_err(say)?;
+    f.write_all(bytes).map_err(say)?;
+    f.sync_all().map_err(say)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(say)?;
+    std::fs::rename(&tmp, path).map_err(say)
+}
+
+fn sync_dir(path: &std::path::Path) {
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(f) = std::fs::File::open(d)
+    {
+        let _ = f.sync_all();
+    }
+}
+
+/// Replace the certificate and key files together (a renewal). Two files
+/// can't be renamed at once, so: both written as `.new` (each there only
+/// once whole), the key's first, then the key renamed, then the
+/// certificate. [`finish_swap`] completes (or undoes)
+/// one cut short, so a crash never leaves a key with another's
+/// certificate.
+pub fn swap_identity(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    let (cert_new, key_new) = (new_path(cert), new_path(key));
+    write_new(&key_new, key_pem.as_bytes(), 0o600)?;
+    write_new(&cert_new, cert_pem.as_bytes(), 0o644)?;
+    sync_dir(cert);
+    std::fs::rename(&key_new, key).map_err(|e| format!("{}: {}", key.display(), e))?;
+    sync_dir(key);
+    std::fs::rename(&cert_new, cert).map_err(|e| format!("{}: {}", cert.display(), e))?;
+    sync_dir(cert);
+    Ok(())
+}
+
+/// Finish a [`swap_identity`] a crash cut short: both `.new` there, both
+/// go in; the certificate's alone (the key went in), it goes in; the key's
+/// alone (the certificate never got written), it's dropped. What it did.
+pub fn finish_swap(cert: &std::path::Path, key: &std::path::Path) -> Option<String> {
+    let (cert_new, key_new) = (new_path(cert), new_path(key));
+    // Half-written: never one of the pair.
+    let _ = std::fs::remove_file(tmp_path(&key_new));
+    let _ = std::fs::remove_file(tmp_path(&cert_new));
+    match (key_new.exists(), cert_new.exists()) {
+        (true, true) => {
+            std::fs::rename(&key_new, key).ok()?;
+            std::fs::rename(&cert_new, cert).ok()?;
+            Some(format!("{}: finished a renewal cut short", cert.display()))
+        }
+        (false, true) => {
+            std::fs::rename(&cert_new, cert).ok()?;
+            Some(format!("{}: finished a renewal cut short", cert.display()))
+        }
+        (true, false) => {
+            std::fs::remove_file(&key_new).ok()?;
+            Some(format!(
+                "{}: dropped a renewal cut short",
+                key_new.display()
+            ))
+        }
+        (false, false) => None,
+    }
+}
+
+/// The process's own certificate, live (set by [`init`] when it has one):
+/// `listen` serves it and renews it in place.
+pub fn identity() -> Option<Arc<crate::http::LiveIdentity>> {
+    IDENTITY.get().cloned()
 }
 
 /// The process's client config, None without TLS.
@@ -368,4 +495,40 @@ pub fn check_urls<'a>(urls: impl IntoIterator<Item = &'a String>) -> Result<(), 
 pub fn peer_role<S>(tls: &tokio_rustls::server::TlsStream<S>) -> Option<crate::pki::Role> {
     let der = tls.get_ref().1.peer_certificates()?.first()?;
     crate::pki::inspect_der(der).ok()?.role
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    fn read(p: &std::path::Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn a_swap_cut_short_is_finished_or_dropped_never_mixed() {
+        let d = tempfile::tempdir().unwrap();
+        let (cert, key) = (d.path().join("cert.pem"), d.path().join("key.pem"));
+        swap_identity(&cert, &key, "c1", "k1").unwrap();
+        assert_eq!((read(&cert), read(&key)), ("c1".into(), "k1".into()));
+        assert!(finish_swap(&cert, &key).is_none());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Both written, neither in: both go in.
+        std::fs::write(new_path(&key), "k2").unwrap();
+        std::fs::write(new_path(&cert), "c2").unwrap();
+        assert!(finish_swap(&cert, &key).is_some());
+        assert_eq!((read(&cert), read(&key)), ("c2".into(), "k2".into()));
+        // The key in, the certificate not yet: it goes in.
+        std::fs::write(&key, "k3").unwrap();
+        std::fs::write(new_path(&cert), "c3").unwrap();
+        assert!(finish_swap(&cert, &key).is_some());
+        assert_eq!((read(&cert), read(&key)), ("c3".into(), "k3".into()));
+        // Only the new key written: dropped, the pair as it was.
+        std::fs::write(new_path(&key), "k4").unwrap();
+        assert!(finish_swap(&cert, &key).is_some());
+        assert_eq!((read(&cert), read(&key)), ("c3".into(), "k3".into()));
+        assert!(!new_path(&key).exists() && !new_path(&cert).exists());
+    }
 }

@@ -78,6 +78,20 @@ pub struct CaOptions {
     /// Argon2id cost for new passphrase and recovery-key slots (m KiB, t,
     /// p). Tests make it cheap.
     pub kdf: (u32, u32, u32),
+    /// Node certificates this node signs live this many seconds instead
+    /// of the profile's days. For tests (CA-4a's 30-second certificates);
+    /// not in `CaConfig`.
+    pub node_life_s: Option<u64>,
+    /// This node's own certificate, renewed in place (CA-4a). None: not
+    /// renewed (no TLS, or tests that don't want it).
+    pub identity: Option<crate::renew::NodeIdentity>,
+    /// The TLS this node calls its peers' CA routes with, and where
+    /// (tests: the peers' mTLS ports). Default: the process's, and the
+    /// members' pool URLs.
+    pub peers: Option<(
+        Arc<rustls::ClientConfig>,
+        std::collections::BTreeMap<NodeId, String>,
+    )>,
     /// Where this node's own key is (`ca.unseal_key` or
     /// `ca.unseal_credential`): it unseals itself with it from a node-key
     /// slot naming it (CA-3b).
@@ -92,6 +106,9 @@ impl Default for CaOptions {
         CaOptions {
             node_key: None,
             events: None,
+            node_life_s: None,
+            identity: None,
+            peers: None,
             unseal_once: true,
             kdf: (envelope::KDF_M_KIB, envelope::KDF_T, envelope::KDF_P),
         }
@@ -125,6 +142,8 @@ pub struct CaService {
     staged: tokio::sync::Mutex<Option<PkiState>>,
     warnings: Mutex<Vec<String>>,
     http: reqwest::Client,
+    /// For `/renew` as this node (`crate::renew::client`).
+    pub(crate) renew_http: reqwest::Client,
     joins: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     unseals: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     pub(crate) kdf: (u32, u32, u32),
@@ -139,6 +158,14 @@ pub struct CaService {
     /// Wakes the node-key unsealer: the CA changed.
     pub(crate) node_key_wake: Arc<tokio::sync::Notify>,
     pub(crate) events: Option<Arc<dyn crate::CaEvents>>,
+    /// Where the peers' CA routes are, if not at their pool URLs.
+    peer_urls: Option<std::collections::BTreeMap<NodeId, String>>,
+    node_life_s: Option<u64>,
+    /// This node's own certificate, renewed by `crate::renew`.
+    pub(crate) identity: Option<crate::renew::NodeIdentity>,
+    /// Wakes the renewer: the CA changed, or a renewal was asked for.
+    pub(crate) renew_wake: Arc<tokio::sync::Notify>,
+    pub(crate) renewer: crate::renew::Renewer,
     /// A `ca.unsealed_none` is on (cleared when a node is unsealed).
     pub(crate) warned_unsealed_none: std::sync::atomic::AtomicBool,
 }
@@ -214,7 +241,26 @@ impl CaService {
             dek: RwLock::new(dek),
             staged: tokio::sync::Mutex::new(staged),
             warnings: Mutex::new(warnings),
-            http: raidish_auth::tls::http_client(Some(Duration::from_secs(20)))?,
+            http: match &opts.peers {
+                Some((c, _)) => reqwest::Client::builder()
+                    .use_preconfigured_tls((**c).clone())
+                    .connect_timeout(raidish_auth::tls::CONNECT_TIMEOUT)
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .map_err(|e| e.to_string())?,
+                None => raidish_auth::tls::http_client(Some(Duration::from_secs(20)))?,
+            },
+            renew_http: crate::renew::client(
+                opts.peers
+                    .as_ref()
+                    .map(|(c, _)| c.clone())
+                    .or_else(raidish_auth::tls::client),
+            )?,
+            peer_urls: opts.peers.as_ref().map(|(_, u)| u.clone()),
+            node_life_s: opts.node_life_s,
+            identity: opts.identity,
+            renew_wake: Arc::new(tokio::sync::Notify::new()),
+            renewer: Default::default(),
             joins: Mutex::new(HashMap::new()),
             unseals: Mutex::new(HashMap::new()),
             kdf: opts.kdf,
@@ -240,6 +286,7 @@ impl CaService {
         }
         ca.cluster.observe_pki(Arc::new(Watch(Arc::downgrade(&ca))));
         crate::crl::start(&ca);
+        crate::renew::start(&ca);
         if is_staged {
             println!(
                 "ca: staged by `ca init`: answering joins from {} until the cluster's first quorum",
@@ -318,6 +365,18 @@ impl CaService {
         self.http.clone()
     }
 
+    /// The other members' base URLs, for their CA routes.
+    pub(crate) fn peer_urls(&self) -> std::collections::BTreeMap<NodeId, String> {
+        self.peer_urls
+            .clone()
+            .unwrap_or_else(|| self.cluster.members.peers.clone())
+    }
+
+    /// The lifetime override for `profile`'s certificates, if any.
+    fn life_s(&self, profile: ProfileKind) -> Option<u64> {
+        self.node_life_s.filter(|_| profile == ProfileKind::Node)
+    }
+
     /// The DEK, to make something for `pki` with: only if it was opened
     /// at `pki`'s seal epoch. Opened at an older one (a `Seal` applied
     /// since), it's dropped. `pki` behind it (a stale view): 503.
@@ -355,6 +414,7 @@ impl CaService {
         }
         self.crl_wake.notify_one();
         self.node_key_wake.notify_one();
+        self.renew_wake.notify_one();
     }
 
     pub async fn status(&self) -> PkiStatus {
@@ -462,6 +522,8 @@ impl CaService {
         *held = Some((dek, epoch, by));
         drop(held);
         self.crl_wake.notify_one();
+        // A renewal waiting on a node that can sign.
+        self.renew_wake.notify_one();
         Ok(())
     }
 
@@ -538,7 +600,13 @@ impl CaService {
         let signer = self.signer(&pki)?;
         let days = pki.params(ProfileKind::Node).default_days;
         // Signed first: a bad CSR mustn't use the token up.
-        let issued = sign(&signer, &req.csr_pem, &identity, days)?;
+        let issued = sign(
+            &signer,
+            &req.csr_pem,
+            &identity,
+            days,
+            self.life_s(identity.profile),
+        )?;
         // At the epoch the MAC was checked at: after a `ca seal` or `ca
         // rekey` this node hasn't applied yet, the token isn't used up (nor
         // a replaced member's certificates revoked) for a certificate that
@@ -562,7 +630,7 @@ impl CaService {
 
     async fn forward_join(&self, req: &JoinRequest) -> Result<Issued, CaError> {
         let mut why = Vec::new();
-        for (id, base) in &self.cluster.members.peers {
+        for (id, base) in &self.peer_urls() {
             let url = format!("{}/api/v1/pki/join?forwarded=true", base);
             match self.http.post(&url).json(req).send().await {
                 Err(e) => why.push(format!("{}: {}", id, e)),
@@ -657,6 +725,7 @@ impl CaService {
             csr_pem,
             &identity,
             pki.params(profile).default_days,
+            self.life_s(profile),
         )?;
         self.record(
             &pki,
@@ -731,7 +800,13 @@ impl CaService {
             member,
         };
         let signer = self.signer(&pki)?;
-        let issued = sign(&signer, &req.csr_pem, &identity, days)?;
+        let issued = sign(
+            &signer,
+            &req.csr_pem,
+            &identity,
+            days,
+            self.life_s(identity.profile),
+        )?;
         self.record(&pki, &signer, &identity, &issued, None).await?;
         println!(
             "ca: {} issued a {} certificate for '{}' ({})",
@@ -931,6 +1006,7 @@ fn sign(
     csr_pem: &str,
     identity: &Identity,
     days: u32,
+    life_s: Option<u64>,
 ) -> Result<raidish_auth::ca::Issued, CaError> {
     signer
         .sign(
@@ -940,6 +1016,7 @@ fn sign(
                 cn: identity.cn.clone(),
                 sans: identity.sans.clone(),
                 days,
+                life_s,
             },
         )
         .map_err(CaError::bad)

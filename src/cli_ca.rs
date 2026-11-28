@@ -147,9 +147,12 @@ pub enum CaCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Renew this config's own certificate (a node's, or an admin's) in
-    /// place; restart `listen` afterwards.
+    /// Renew this config's own certificate (an admin's) in place. With
+    /// `--node`: ask running nodes to renew their own now (each `--url`,
+    /// default every node); they do it anyway at 2/3 of its life.
     Renew {
+        #[arg(long)]
+        node: bool,
         #[arg(long)]
         url: Vec<String>,
     },
@@ -1427,7 +1430,33 @@ pub async fn run(command: &CaCommands, config: &Config) {
                 );
             }
         }
-        CaCommands::Renew { url } => {
+        CaCommands::Renew { node: true, url } => {
+            let client = http();
+            let mut ok = 0;
+            for ep in endpoints(url, config) {
+                match client
+                    .post(format!("{}/api/v1/pki/self/renew", ep))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        ok += 1;
+                        println!("{}: renewing (its log says how it went)", ep);
+                    }
+                    Ok(r) => eprintln!(
+                        "{}: {}: {}",
+                        ep,
+                        r.status(),
+                        r.text().await.unwrap_or_default().trim()
+                    ),
+                    Err(e) => eprintln!("{}: {}", ep, e),
+                }
+            }
+            if ok == 0 {
+                fail("no node took it");
+            }
+        }
+        CaCommands::Renew { node: false, url } => {
             let tls = config
                 .tls
                 .as_ref()
@@ -1455,11 +1484,9 @@ pub async fn run(command: &CaCommands, config: &Config) {
             })
             .await
             .unwrap_or_else(|e| fail(e));
-            // Each file whole (renamed into place); `listen` reads them
-            // only when it starts.
-            raidish_ca::write_file(&key_path, key_pem.as_bytes(), 0o600)
-                .unwrap_or_else(|e| fail(e));
-            raidish_ca::write_file(&cert_path, issued.cert_pem.as_bytes(), 0o644)
+            // Both files, as a pair (a crash between them is finished
+            // the next time a config with them is read).
+            raidish_auth::tls::swap_identity(&cert_path, &key_path, &issued.cert_pem, &key_pem)
                 .unwrap_or_else(|e| fail(e));
             println!(
                 "renewed '{}': certificate {} until {} in {}",
@@ -1468,7 +1495,10 @@ pub async fn run(command: &CaCommands, config: &Config) {
                 when(issued.not_after_ms),
                 cert_path.display()
             );
-            println!("restart `raidish listen` to serve it");
+            println!(
+                "a `raidish listen` on these files keeps serving its own: it renews \
+                 itself (`raidish ca renew --node` for now)"
+            );
         }
     }
 }

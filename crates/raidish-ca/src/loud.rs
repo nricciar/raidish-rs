@@ -112,7 +112,8 @@ impl CaService {
             unsealed_by: self.unsealed_by(),
             error: None,
         };
-        let peers = self.cluster().members.peers.iter().map(|(id, base)| {
+        let urls = self.peer_urls();
+        let peers = urls.iter().map(|(id, base)| {
             let url = format!("{}/api/v1/pki/status", base);
             let http = self.http();
             async move {

@@ -165,8 +165,46 @@ async fn start_with(
     tls_dir: &Path,
     node_key: Option<crate::NodeKeySource>,
 ) -> Node {
+    start_full(paths, raft_port, tls_port, root, tls_dir, node_key, None).await
+}
+
+/// How a node renews its own certificate in a test: certificates of
+/// `.0` seconds, the peers' mTLS ports `.1` (by member index).
+type Renewing = (u64, [u16; 3]);
+
+async fn start_full(
+    paths: &[String],
+    raft_port: u16,
+    tls_port: u16,
+    root: &Path,
+    tls_dir: &Path,
+    node_key: Option<crate::NodeKeySource>,
+    renewing: Option<Renewing>,
+) -> Node {
     let m = members(paths, raft_port);
     let name = m.me.name();
+    let me = m.me;
+    // As `listen`: one live identity for the server and the client.
+    let mut tls = tls_in(tls_dir);
+    let mut renew_opts = (None, None, None);
+    if let Some((life, ports)) = renewing {
+        let (chain, key) = tls.identity().unwrap().unwrap();
+        let live = raidish_auth::http::LiveIdentity::new(chain, key).unwrap();
+        tls.live = Some(live.clone());
+        let peers = (0..3u64)
+            .map(|i| (nid(i), format!("https://127.0.0.1:{}", ports[i as usize])))
+            .filter(|(n, _)| *n != me)
+            .collect();
+        renew_opts = (
+            Some(life),
+            Some(crate::NodeIdentity {
+                live,
+                cert_path: tls.cert_path().unwrap(),
+                key_path: tls.key_path().unwrap(),
+            }),
+            Some((Arc::new(tls.client_config().unwrap()), peers)),
+        );
+    }
     let cluster = Cluster::start(&name, m, root.join(&name), Arc::new(NoFence))
         .await
         .unwrap();
@@ -177,6 +215,9 @@ async fn start_with(
             kdf: (8, 1, 1),
             node_key,
             events: Some(events.clone()),
+            node_life_s: renew_opts.0,
+            identity: renew_opts.1,
+            peers: renew_opts.2,
             ..Default::default()
         },
     )
@@ -196,7 +237,6 @@ async fn start_with(
     .await;
     let trust = raidish_auth::trust::Trust::new(vec![]);
     cluster.observe_pki(trust.clone());
-    let mut tls = tls_in(tls_dir);
     tls.trust = Some(trust.clone());
     let verifier = raidish_auth::auth::Verifier::from_config(&tls, &Default::default()).unwrap();
     let secure = finish(
@@ -622,6 +662,7 @@ struct Up {
     paths: Vec<String>,
     raft: [u16; 3],
     tls: [u16; 3],
+    renewing: Option<Renewing>,
 }
 
 impl Up {
@@ -630,13 +671,14 @@ impl Up {
         self.nodes[i].stop().await;
         // Its servers let go of their ports.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        self.nodes[i] = start_with(
+        self.nodes[i] = start_full(
             &self.paths,
             self.raft[i],
             self.tls[i],
             &self.base.join("raft"),
             &self.tls_dirs[i],
             key,
+            self.renewing,
         )
         .await;
     }
@@ -648,12 +690,23 @@ async fn bring_up() -> Up {
 
 /// As `bring_up`, with node certificates of `node_days`.
 async fn bring_up_with(node_days: Option<u32>) -> Up {
+    bring_up_full(node_days, None).await
+}
+
+/// As `bring_up`, each node renewing its own certificate (`life` seconds
+/// long once renewed), through its peers' mTLS ports.
+async fn bring_up_renewing(life: u64) -> Up {
+    bring_up_full(None, Some(life)).await
+}
+
+async fn bring_up_full(node_days: Option<u32>, life: Option<u64>) -> Up {
     raidish_auth::tls::install_provider();
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().to_path_buf();
     let root = base.join("raft");
     let raft = [free_port(), free_port(), free_port()];
     let tls = [free_port(), free_port(), free_port()];
+    let renewing = life.map(|l| (l, tls));
     let paths: Vec<String> = raft
         .iter()
         .enumerate()
@@ -677,7 +730,7 @@ async fn bring_up_with(node_days: Option<u32>) -> Up {
     .unwrap();
     out.node0.write_dir(&tls_dirs[0]).unwrap();
     out.admin.write_dir(&admin_dir).unwrap();
-    let n0 = start(&paths, raft[0], tls[0], &root, &tls_dirs[0]).await;
+    let n0 = start_full(&paths, raft[0], tls[0], &root, &tls_dirs[0], None, renewing).await;
     for (i, t) in out.tokens.iter().enumerate() {
         let m = members(&paths, raft[i + 1]);
         let t = JoinToken::parse(&t.token).unwrap();
@@ -686,8 +739,8 @@ async fn bring_up_with(node_days: Option<u32>) -> Up {
             .unwrap();
         j.bundle.write_dir(&tls_dirs[i + 1]).unwrap();
     }
-    let n1 = start(&paths, raft[1], tls[1], &root, &tls_dirs[1]).await;
-    let n2 = start(&paths, raft[2], tls[2], &root, &tls_dirs[2]).await;
+    let n1 = start_full(&paths, raft[1], tls[1], &root, &tls_dirs[1], None, renewing).await;
+    let n2 = start_full(&paths, raft[2], tls[2], &root, &tls_dirs[2], None, renewing).await;
     let nodes = vec![n0, n1, n2];
     assert!(
         wait_for(30, || nodes.iter().all(|n| n.cluster.pki().is_some())).await,
@@ -703,6 +756,7 @@ async fn bring_up_with(node_days: Option<u32>) -> Up {
         paths,
         raft,
         tls,
+        renewing,
     }
 }
 
@@ -2009,6 +2063,156 @@ async fn rekey_replaces_the_dek_and_every_slot() {
     );
     assert!(!n0.ca.unsealed());
     for n in up.nodes {
+        n.stop().await;
+    }
+}
+
+/// A TLS connection to `port`, presenting the bundle in `dir`, kept open.
+async fn connect(dir: &Path, port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut cfg = tls_in(dir).client_config().unwrap();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect("127.0.0.1".try_into().unwrap(), tcp)
+        .await
+        .unwrap()
+}
+
+/// The certificate the server presented on `s`.
+fn served(s: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+    s.get_ref().1.peer_certificates().unwrap()[0].to_vec()
+}
+
+/// One keep-alive request on `s`: its status line.
+async fn get_on(s: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    s.write_all(b"GET /api/v1/pki/status HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    s.flush().await.unwrap();
+    // Headers, then the body by its length.
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        assert_eq!(
+            s.read(&mut byte).await.unwrap(),
+            1,
+            "the connection is open"
+        );
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8(buf).unwrap();
+    let len: usize = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().unwrap())
+        })
+        .expect("a content-length");
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).await.unwrap();
+    head.lines().next().unwrap().to_string()
+}
+
+fn serial_of(der: &[u8]) -> raidish_types::pki::Serial {
+    raidish_auth::ca::facts(der).unwrap().serial
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_renew_their_own_certificates_live() {
+    const LIFE: u64 = 30;
+    let up = bring_up_renewing(LIFE).await;
+    let admin = client(&up.admin_dir);
+    let leaf = |i: usize| {
+        up.nodes[i]
+            .ca
+            .identity
+            .as_ref()
+            .unwrap()
+            .live
+            .leaf()
+            .to_vec()
+    };
+    let first: Vec<_> = (0..3).map(|i| serial_of(&leaf(i))).collect();
+    // Opened before any renewal, and kept.
+    let mut kept = connect(&up.admin_dir, up.tls[1]).await;
+    assert_eq!(serial_of(&served(&kept)), first[1]);
+    assert!(get_on(&mut kept).await.contains("200"));
+    assert!(up.nodes[0].ca.unsealed() && !up.nodes[1].ca.unsealed());
+
+    // The certificates from `ca init` and `join` aren't due for months:
+    // asked for, every node renews now (1 and 2 through node 0, sealed).
+    for n in &up.nodes {
+        let r = admin
+            .post(format!("{}/api/v1/pki/self/renew", n.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+    }
+    assert!(
+        wait_for(30, || (0..3).all(|i| serial_of(&leaf(i)) != first[i])).await,
+        "every node renewed when asked"
+    );
+
+    // Then by themselves, at 2/3 of 30 s: twice more each, at least.
+    let mut seen: Vec<Vec<_>> = (0..3).map(|i| vec![first[i].clone()]).collect();
+    let end = tokio::time::Instant::now() + Duration::from_secs(4 * LIFE);
+    while seen.iter().any(|s| s.len() < 4) && tokio::time::Instant::now() < end {
+        for (i, s) in seen.iter_mut().enumerate() {
+            let now = serial_of(&leaf(i));
+            if s.last() != Some(&now) {
+                s.push(now);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        seen.iter().all(|s| s.len() >= 4),
+        "each renewed three times: {:?}",
+        seen
+    );
+
+    let pki = up.nodes[0].ca.current_linearizable().await.unwrap();
+    for (i, s) in seen.iter().enumerate() {
+        // Each renewed from the one before it: the node presented its
+        // current certificate every time, never a pooled or resumed one.
+        for w in s.windows(2) {
+            let rec = pki.certs.get(&w[1]).expect("on record");
+            assert_eq!(rec.renews.as_ref(), Some(&w[0]), "node {}", i);
+            assert_eq!(rec.identity.member, Some(nid(i as u64)));
+            assert!(
+                rec.not_after_ms - rec.not_before_ms
+                    <= raidish_auth::ca::BACKDATE_MS + LIFE * 1000 + 1000
+            );
+        }
+        // The files hold what's served (key and certificate as a pair).
+        let tls = tls_in(&up.tls_dirs[i]);
+        let (chain, _key) = tls.identity().unwrap().unwrap();
+        assert_eq!(chain[0].to_vec(), leaf(i));
+        let dir = &up.tls_dirs[i];
+        assert!(!dir.join("cert.pem.new").exists() && !dir.join("key.pem.new").exists());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(tls.key_path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // A new connection gets the new certificate; the old one, whose
+    // server certificate has run out since, is still up.
+    let fresh = connect(&up.admin_dir, up.tls[1]).await;
+    assert_eq!(served(&fresh), leaf(1));
+    assert_ne!(serial_of(&served(&kept)), serial_of(&leaf(1)));
+    assert!(get_on(&mut kept).await.contains("200"));
+    // Node to node too: node 1's peers took its newest (it renewed
+    // through them with it), and Raft never stopped.
+    assert!(up.nodes.iter().all(|n| n.cluster.pki().is_some()));
+    for n in &up.nodes {
         n.stop().await;
     }
 }

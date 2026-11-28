@@ -19,6 +19,7 @@ pub mod crl;
 pub mod init;
 pub mod join;
 pub mod loud;
+pub mod renew;
 mod revoke;
 pub mod routes;
 mod seal;
@@ -27,6 +28,7 @@ pub mod token;
 pub mod token_signer;
 
 pub use loud::CaEvents;
+pub use renew::NodeIdentity;
 pub use seal::NodeKeySource;
 pub use service::{CaError, CaOptions, CaService};
 

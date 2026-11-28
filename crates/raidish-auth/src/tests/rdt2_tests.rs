@@ -36,6 +36,7 @@ fn leaf(ca: &Ca, profile: ProfileKind, days: u32) -> (Vec<CertificateDer<'static
                 cn: "raidish-tokens".into(),
                 sans: vec![],
                 days,
+                life_s: None,
             },
         )
         .unwrap();

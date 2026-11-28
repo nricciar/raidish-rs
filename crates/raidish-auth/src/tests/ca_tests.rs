@@ -24,6 +24,7 @@ fn spec(profile: ProfileKind, cn: &str, sans: &[&str]) -> LeafSpec {
         cn: cn.into(),
         sans: sans.iter().map(|s| s.to_string()).collect(),
         days: 30,
+        life_s: None,
     }
 }
 

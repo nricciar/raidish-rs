@@ -1,6 +1,10 @@
-//! A server certificate and a client verifier that can be replaced while
-//! the server runs. rustls asks for them on every handshake, so a swap
+//! A process's certificate and a client verifier that can be replaced
+//! while it runs. rustls asks for them on every handshake, so a swap
 //! applies to the next connection; connections already open are unaffected.
+//!
+//! [`LiveIdentity`] is both the server's certificate and the one it
+//! presents as a client: one swap (a renewal, CA-4a) reaches every acceptor
+//! and connector made from the same `TlsConfig`.
 
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -10,9 +14,9 @@ use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use std::sync::{Arc, RwLock};
 
-/// This server's certificate chain and key.
+/// This process's certificate chain and key, as server and as client.
 #[derive(Debug)]
-pub struct LiveCert(RwLock<Arc<CertifiedKey>>);
+pub struct LiveIdentity(RwLock<Arc<CertifiedKey>>);
 
 fn certified(
     chain: Vec<CertificateDer<'static>>,
@@ -23,15 +27,15 @@ fn certified(
     Ok(Arc::new(CertifiedKey::new(chain, key)))
 }
 
-impl LiveCert {
+impl LiveIdentity {
     pub fn new(
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
-    ) -> Result<Arc<LiveCert>, String> {
-        Ok(Arc::new(LiveCert(RwLock::new(certified(chain, key)?))))
+    ) -> Result<Arc<LiveIdentity>, String> {
+        Ok(Arc::new(LiveIdentity(RwLock::new(certified(chain, key)?))))
     }
 
-    /// Serve `chain` from the next handshake on.
+    /// Serve and present `chain` from the next handshake on.
     pub fn set(
         &self,
         chain: Vec<CertificateDer<'static>>,
@@ -48,9 +52,19 @@ impl LiveCert {
     }
 }
 
-impl ResolvesServerCert for LiveCert {
+impl ResolvesServerCert for LiveIdentity {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.read().unwrap().clone())
+    }
+}
+
+impl rustls::client::ResolvesClientCert for LiveIdentity {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.read().unwrap().clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 

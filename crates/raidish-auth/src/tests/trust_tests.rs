@@ -44,6 +44,7 @@ fn leaf(signer: &Signer, cn: &str) -> Vec<u8> {
                 cn: cn.into(),
                 sans: vec![],
                 days: 30,
+                life_s: None,
             },
         )
         .unwrap();

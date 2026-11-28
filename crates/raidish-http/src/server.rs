@@ -70,9 +70,19 @@ pub async fn listen(
     // What this node refuses, live: every verifier made from `tls` checks
     // it, and the cluster feeds it as revocations are applied (CA-2a).
     let trust = crate::trust::Trust::new(config.auth.revoked.clone());
+    // One live identity for every acceptor and connector (the process's,
+    // from `tls::init`): a renewal (CA-4a) reaches them all at once.
     let node_tls = config.tls.clone().map(|mut t| {
         t.trust = Some(trust.clone());
+        t.live = crate::tls::identity();
         t
+    });
+    let identity = node_tls.as_ref().and_then(|t| {
+        Some(raidish_ca::NodeIdentity {
+            live: t.live.clone()?,
+            cert_path: t.cert_path()?,
+            key_path: t.key_path()?,
+        })
     });
     if node_tls.is_some() {
         crate::tls::check_servers_against(trust.clone());
@@ -108,6 +118,7 @@ pub async fn listen(
             unseal_once: config.ca.unseal_once,
             node_key: config.ca.node_key()?,
             events: Some(Arc::new(CaEventSink(events.clone()))),
+            identity,
             ..Default::default()
         },
     )

@@ -141,6 +141,10 @@ event_kinds! {
     CaRekeyed => "ca.rekeyed",
     /// No node is unsealed, and something runs out before one is.
     CaUnsealedNone => "ca.unsealed_none",
+    /// A node's own certificate isn't renewing (said once, until it does).
+    CaRenewFailed => "ca.renew_failed",
+    /// It renewed again after failing.
+    CaRenewed => "ca.renewed",
 }
 
 impl std::fmt::Display for EventKind {

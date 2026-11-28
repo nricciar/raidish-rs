@@ -1,7 +1,7 @@
 //! The accept loop: TLS (or not), then hyper serving an axum `Router`,
 //! each request carrying its connection's [`Peer`] and address.
 
-use super::{Connections, LiveCert, LiveTrust, Peer};
+use super::{Connections, LiveIdentity, LiveTrust, Peer};
 use axum::Router;
 use axum::extract::ConnectInfo;
 use hyper::body::Incoming;
@@ -15,7 +15,7 @@ use tower::ServiceExt;
 /// What a TLS server swaps and closes at runtime.
 #[derive(Clone)]
 pub struct Server {
-    pub cert: Arc<LiveCert>,
+    pub cert: Arc<LiveIdentity>,
     pub trust: Arc<LiveTrust>,
     pub conns: Arc<Connections>,
 }
@@ -24,7 +24,7 @@ impl Server {
     /// `conns`: the registry a revocation closes connections through
     /// (the node's `crate::trust::Trust`'s; a fresh one if None).
     pub fn new(
-        cert: Arc<LiveCert>,
+        cert: Arc<LiveIdentity>,
         trust: Arc<LiveTrust>,
         conns: Option<Arc<Connections>>,
     ) -> Server {
@@ -38,11 +38,17 @@ impl Server {
     /// From a `tls:` config: its certificate, and its bundle for clients
     /// (who may present a certificate, or come with a token instead).
     pub fn from_config(tls: &crate::tls::TlsConfig) -> Result<Server, String> {
-        let (chain, key) = tls
-            .identity()?
-            .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
+        let cert = match &tls.live {
+            Some(live) => live.clone(),
+            None => {
+                let (chain, key) = tls
+                    .identity()?
+                    .ok_or("tls: serving needs this node's cert.pem and key.pem")?;
+                LiveIdentity::new(chain, key)?
+            }
+        };
         Ok(Server::new(
-            LiveCert::new(chain, key)?,
+            cert,
             LiveTrust::new(tls.roots()?, false, tls.trust.clone())?,
             tls.trust.as_ref().map(|t| t.connections().clone()),
         ))

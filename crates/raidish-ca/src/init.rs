@@ -186,6 +186,7 @@ pub fn init(opts: &InitOptions) -> Result<InitOutput, String> {
                 cn: identity.cn.clone(),
                 sans: identity.sans.clone(),
                 days,
+                life_s: None,
             },
         )?;
         state(PkiOp::RecordIssued {

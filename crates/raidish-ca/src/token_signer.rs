@@ -78,6 +78,7 @@ impl CaService {
                     cn: CN.into(),
                     sans: vec![],
                     days: pki.params(ProfileKind::TokenSigner).default_days,
+                    life_s: None,
                 },
             )
             .map_err(|e| CaError::new(500, e))?;

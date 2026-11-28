@@ -1,6 +1,6 @@
 //! Serving HTTP(S) with axum (HTTP-1, `docs/ca-service-plan.md` §5, D1).
 //!
-//! * [`LiveCert`] / [`LiveTrust`]: the server certificate and the client
+//! * [`LiveIdentity`] / [`LiveTrust`]: the server certificate and the client
 //!   verifier, swappable while serving (renewal, trust changes). A swap
 //!   applies from the next handshake; open connections keep theirs.
 //! * [`Peer`]: the client's certificate, in every request's extensions,
@@ -20,7 +20,7 @@ mod live;
 mod serve;
 
 pub use conns::{Connections, Peer};
-pub use live::{LiveCert, LiveTrust};
+pub use live::{LiveIdentity, LiveTrust};
 pub use serve::{Server, serve};
 
 use axum::extract::{FromRequest, Request};

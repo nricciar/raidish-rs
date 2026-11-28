@@ -26,4 +26,5 @@ raidish-types = { workspace = true, features = ["testutil"] }
 raidish-auth = { workspace = true, features = ["testutil"] }
 raidish-cluster = { workspace = true, features = ["testutil"] }
 tempfile = { workspace = true }
+tokio-rustls = { workspace = true, features = ["ring", "tls12", "logging"] }
 tokio = { workspace = true, features = ["test-util"] }

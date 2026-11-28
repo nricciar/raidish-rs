@@ -97,6 +97,14 @@ pub async fn renew(
     ca.renew(peer.cert(), &req.csr_pem).await.map(Json)
 }
 
+/// Renew this node's own certificate now (CA-4a): it changes nobody's
+/// authority, so an admin's certificate or token. It answers at once; the
+/// renewal is the renewer's (`ca status` and the log say how it went).
+pub async fn renew_self(_admin: IsAdmin, State(ca): Ca) -> Result<StatusCode, CaError> {
+    ca.renew_now()?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// The certificate a request came with (`IsAdminCert` means there is one).
 fn presented(peer: Option<Extension<Peer>>) -> Result<Peer, CaError> {
     peer.map(|Extension(p)| p)
@@ -288,6 +296,7 @@ pub fn router(ca: Arc<CaService>) -> axum::Router {
         .route("/api/v1/pki/status", get(status))
         .route("/api/v1/pki/join", post(join))
         .route("/api/v1/pki/renew", post(renew))
+        .route("/api/v1/pki/self/renew", post(renew_self))
         .route("/api/v1/pki/sign", post(sign))
         .route("/api/v1/pki/enrollments", post(create_enrollment))
         .route("/api/v1/pki/enrollments/{id}", delete(cancel_enrollment))

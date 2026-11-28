@@ -2,7 +2,7 @@
 //! certificate in requests, a WebSocket route, and closing a serial's
 //! connections and streams.
 
-use crate::http::{LiveCert, LiveTrust, Peer, Server, serve};
+use crate::http::{LiveIdentity, LiveTrust, Peer, Server, serve};
 use crate::pki::{Ca, Role};
 use crate::testing::Pki;
 use crate::tls::TlsConfig;
@@ -141,7 +141,7 @@ async fn start() -> Running {
     let pki = Pki::new(vec![]);
     let (chain, key) = pki.tls.identity().unwrap().unwrap();
     let server = Server::new(
-        LiveCert::new(chain, key).unwrap(),
+        LiveIdentity::new(chain, key).unwrap(),
         LiveTrust::new(pki.tls.roots().unwrap(), false, None).unwrap(),
         None,
     );

@@ -172,7 +172,14 @@ pub struct LeafSpec {
     pub cn: String,
     pub sans: Vec<String>,
     pub days: u32,
+    /// In place of `days`, a lifetime in seconds (tests: CA-4a's
+    /// 30-second node certificates).
+    pub life_s: Option<u64>,
 }
+
+/// How far back a leaf's `notBefore` is set (clocks slightly behind): its
+/// usable life is `notAfter - notBefore - BACKDATE_MS`.
+pub const BACKDATE_MS: u64 = 3_600_000;
 
 /// A certificate signed.
 #[derive(Clone, Debug)]
@@ -321,8 +328,11 @@ fn leaf_params(spec: &LeafSpec) -> Result<CertificateParams, String> {
     params.serial_number = Some(random_serial()?);
     let t = now();
     // A little slack for clocks slightly behind.
-    params.not_before = t - ::time::Duration::hours(1);
-    params.not_after = t + ::time::Duration::days(spec.days as i64);
+    params.not_before = t - ::time::Duration::milliseconds(BACKDATE_MS as i64);
+    params.not_after = match spec.life_s {
+        Some(s) => t + ::time::Duration::seconds(s as i64),
+        None => t + ::time::Duration::days(spec.days as i64),
+    };
     Ok(params)
 }
 
