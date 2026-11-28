@@ -12,7 +12,8 @@ RAIDish is organized as a Cargo workspace with library crates under `crates/`, t
 |---|---|
 | [`raidish-types`](crates/raidish-types/README.md) | Shared plain data: typed IDs, validated names, HTTP DTOs, VM models, and deterministic Raft cluster state (native + `wasm32`) |
 | [`raidish-core`](crates/raidish-core/README.md) | Storage engine: local/WebSocket disks, RAID-Z/mirror/stripe vdevs, COW object trees, filesystems, volumes, B+tree KV, ZIL, snapshots, send/recv, scrub, and `fsck` (native + `wasm32`) |
-| [`raidish-auth`](crates/raidish-auth/README.md) | Cluster PKI (ECDSA P-256 CA), rustls TLS config, stateless mTLS/`rdt1` token auth with Rocket guards, and shared TCP accept loop |
+| [`raidish-auth`](crates/raidish-auth/README.md) | X.509 and sealing for the cluster CA, rustls TLS with a live identity, stateless mTLS/token auth with axum extractors, and shared TCP accept loop |
+| [`raidish-ca`](crates/raidish-ca/README.md) | Embedded cluster CA service: staged bootstrap, pin-verified node join and client enrollment, live self-renewal, sealing/slots, CRLs, and issuer rotation |
 | [`raidish-cluster`](crates/raidish-cluster/README.md) | Embedded `openraft` Raft group, pool-derived membership, local JSON state persistence, and `HeldLease` client |
 | [`raidish-committer`](crates/raidish-committer/README.md) | Single-writer `pool` committer failover loop, metaslab lending, `PoolAdmin` API, automatic resilvering, and `.events` activity log |
 | [`raidish-block`](crates/raidish-block/README.md) | Dynamic NBD (`10809`) and NVMe/TCP (`4420`) volume exports, live-swappable `SwitchableIo`, and mTLS peer I/O (`10810`) |
@@ -22,6 +23,7 @@ RAIDish is organized as a Cargo workspace with library crates under `crates/`, t
 | [`raidish-vm`](crates/raidish-vm/README.md) | Libvirt domain XML validation, transient rendering, `virsh` lifecycle/migration, and the `.vms` store |
 | [`raidish-csi`](crates/raidish-csi/README.md) | Kubernetes CSI (`csi.raidish.io`) gRPC driver for `ext4`/`xfs` and `ReadWriteMany` raw block volumes |
 | [`raidish-agent`](crates/raidish-agent/README.md) | Per-node placement controller: volumes, services, VMs, kernel auto-mount, volume handoff, live migration, and host facts |
+| [`raidish-http`](crates/raidish-http/README.md) | Node server (`raidish listen`): YAML config, subsystem wiring, fenced disk server, `axum` HTTP(S)/WS APIs, and bundled web dashboard |
 
 ## Setup
 
@@ -377,19 +379,28 @@ docker compose exec nfs-client sh -c 'mkdir -p /mnt/pool && mount -t nfs \
 
 ### Certificates
 
-`raidish cert` is the whole PKI, no openssl needed. Run it anywhere (the CA's
-key never has to be on a node):
+The cluster runs its own CA (`raidish ca`, no openssl needed). Its root's
+key stays with you; an issuer under it, sealed in Raft, signs. On node 0,
+with its config and before its first `listen`:
 
 ```
-raidish cert init --dir pki                        # pki/ca.key + pki/ca.pem (the trust bundle)
-raidish -c cluster.yaml cert issue-nodes --dir pki # pki/<host>/ for every host in the disk URLs
-raidish cert issue admin --role admin --dir pki    # pki/admin/, for the command line
-raidish cert issue nas --role node --san 10.0.0.5 --dir pki   # or one at a time
-raidish cert status --dir pki                      # what's trusted and issued, and expiry
+raidish ca init --san node0 --admin-out pki/admin --tokens-out pki/join
 ```
 
-Each `pki/<name>/` is a bundle (`ca.pem`, `cert.pem`, `key.pem`) to copy to
-that machine (`scp -r pki/node1 node1:/etc/raidish/tls`). Then in its config:
+That writes node 0's certificate to its `tls:` paths, an admin bundle for
+the command line, `root.enc` (the root, sealed) and a single-use join token
+per other node, and prints the **recovery key** (unseals the CA after the
+whole cluster was down) and the **root key** (opens `root.enc`, to make a
+new issuer). Write both down: they're stored nowhere. Then start node 0,
+and give each other node its token before it first starts:
+
+```
+raidish -c node1.yaml join https://node0:8881 --token-file node-1.token
+```
+
+The members are the hosts in the pool's disk URLs, so a node's certificate
+names its host (plus `localhost` and `127.0.0.1`, and any `--san` /
+`--peer-san`). Each node's config then points at its bundle:
 
 ```yaml
 tls:
@@ -401,31 +412,42 @@ pool:
     - https://node2:8883/api/v1/disks/2
 ```
 
-Node certificates name the host in the URLs (plus `localhost` and
-`127.0.0.1`), so URLs must use the names (or `--san` addresses) the certs
-were issued for. Certificates don't expire unless you pass `--days`; a node
-warns at startup when its own is within 30 days.
+More certificates, from an admin config:
+
+```
+raidish ca issue alice --profile readonly --out alice      # a key made here
+raidish ca token create --client --profile admin --cn bob  # or a token, and on bob's machine:
+raidish enroll https://node0:8881 --token-stdin            # his own key, into ~/.raidish/tls
+raidish ca list; raidish ca revoke bob                     # every node refuses it at once
+raidish ca status                                          # seal, issuers, CRL, warnings
+```
+
+A node holds the key it signs with only in memory: after the whole cluster
+restarts, `raidish ca unseal` (the recovery key) on one node. Storage, mTLS
+and tokens work while it's sealed; only signing waits.
 
 ### Tokens (the dashboard, scripts)
 
 ```
-raidish token create alice                     # readonly, never expires
+raidish token create alice                     # readonly, as long as the token signer lasts
 raidish token create ci --role admin --expires 90d
 raidish token inspect <token>                  # who, role, expiry, and whether it's valid here
+raidish token revoke <id>                      # every node refuses it at once
 ```
 
-A token is signed by your admin certificate (from your config's `tls:`), and
-every node checks it against its own CA bundle, so there's no user database.
-Paste it into the dashboard's sign-in page, or send it as
-`Authorization: Bearer <token>`.
+The cluster's CA signs it (with its token signer, asked by your admin
+certificate from your config's `tls:`), and every node checks it against
+the CA, so there's no user database. Paste it into the dashboard's sign-in
+page, or send it as `Authorization: Bearer <token>`.
 
 ### Rotation
 
-Restart nodes one at a time.
-
-**A certificate** (lost key, new SAN, expiry): `cert issue <name> … --force`,
-copy the bundle, restart that node. Old and new are signed by the same CA,
-so nobody else changes.
+Nothing restarts. **Node certificates** renew themselves, live, at 2/3 of
+their life (30 days); `raidish ca renew --node` renews them now. **Your
+admin certificate**: `raidish ca renew`, in place. **A new issuer** (every
+couple of years, or after a leak): `raidish ca rotate-issuer --root
+root.enc --revoke-old` with the root key; nodes, the token signer and the
+CRL move to it by themselves, then the old one is revoked.
 
 ## Virtual Block Devices
 
@@ -757,7 +779,7 @@ GET /api/v1/events?before=<seq>       # older ones
   Writers on local disk paths (not served by `listen`) aren't fenced.
 * A killed writer's lease takes up to 10 s to expire before another writer (or
   node, for a placed volume) can start.
-* Authentication needs `tls:` (see [Security](#security)); without it the
+* Authentication needs `tls:` (see [Certificates](#certificates)); without it the
   HTTP/websocket ports are open. Certificates and `auth.revoked` are read at
   startup, so changes need a (rolling) restart. NBD and NVMe/TCP exports are
   unauthenticated.
