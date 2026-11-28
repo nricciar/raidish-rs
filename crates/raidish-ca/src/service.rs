@@ -340,6 +340,25 @@ impl CaService {
         Ok(pki)
     }
 
+    /// Linearizable revocation check for an `IsAdmin` caller (certificate or
+    /// bearer token, design note D8 / H-20): closes the trust-cache apply lag
+    /// window so a freshly revoked admin cert, token, token-signer, or issuer
+    /// cannot seal or revoke through a lagging follower.
+    pub(crate) async fn for_admin(&self, auth: &CallerAuth) -> Result<Arc<PkiState>, CaError> {
+        let pki = self.current_linearizable().await?;
+        match auth {
+            CallerAuth::Open => {}
+            CallerAuth::Cert(der) => caller_ok(&pki, der)?,
+            CallerAuth::Token { id, signer_der } => {
+                if pki.revoked_tokens.keys().any(|k| k.as_str() == id) {
+                    return Err(CaError::new(401, format!("token {} is revoked", id)));
+                }
+                caller_ok(&pki, signer_der)?;
+            }
+        }
+        Ok(pki)
+    }
+
     /// Whether this node holds the DEK at the CA's seal epoch (one from an
     /// older epoch, not yet dropped, doesn't count).
     pub fn unsealed(&self) -> bool {
@@ -966,7 +985,15 @@ pub(crate) fn open_signer(pki: &PkiState, dek: &[u8; 32]) -> Result<Signer, Stri
     Signer::new(id, &issuer.cert_pem, &key)
 }
 
-/// Does `dek` open the CA's active issuer?
+/// How an `IsAdmin` route's caller authenticated, for linearizable revocation
+/// checks (`CaService::for_admin`, H-20).
+#[derive(Clone, Debug)]
+pub(crate) enum CallerAuth {
+    Open,
+    Cert(Vec<u8>),
+    Token { id: String, signer_der: Vec<u8> },
+}
+
 /// Whether certificate `der` may still act, by `pki`: not revoked, and not
 /// from a revoked issuer (on record, or by its key id for one that isn't).
 fn caller_ok(pki: &PkiState, der: &[u8]) -> Result<(), CaError> {

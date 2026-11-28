@@ -1692,3 +1692,66 @@ fn migrations_are_recorded_once_and_ended_as_themselves() {
     let st: ClusterState = serde_json::from_str(old).unwrap();
     assert!(st.migrations.is_empty());
 }
+
+/// H-10: `HeldLease::adopt_renewed` refreshes the adopted lease's clock from a
+/// synchronous `Renew` after the transfer, so a slow sender drain/sync doesn't
+/// cause `HeldLease::hold()` to immediately expire the brand-new lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h10_adopt_renewed_starts_clock_fresh_after_slow_transfer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let pool = urls(&ports);
+    let nodes = vec![
+        start_node("n1", &pool, ports[0], dir.path()).await,
+        start_node("n2", &pool, ports[1], dir.path()).await,
+        start_node("n3", &pool, ports[2], dir.path()).await,
+    ];
+    let all: Vec<&TestNode> = nodes.iter().collect();
+    assert!(wait_until(10, || leader_of(&all).is_some()).await);
+    let client = LeaseClient::new(nodes.iter().map(|n| n.url.clone()).collect());
+    let resource = crate::types::res("ds/handoff-h10");
+    let a = Arc::new(
+        HeldLease::acquire(
+            client.clone(),
+            resource.clone(),
+            crate::types::Holder::default().with_detail("sender"),
+        )
+        .await
+        .unwrap(),
+    );
+    let b_owner = lease::owner_id() + ":receiver";
+    let new_epoch = a
+        .transfer(
+            &b_owner,
+            crate::types::Holder::default().with_detail("receiver"),
+        )
+        .await
+        .unwrap();
+
+    // Even if the caller started waiting for this handoff long ago, adopting
+    // via `adopt_renewed` starts the lease clock from the synchronous `Renew`.
+    let b = Arc::new(
+        HeldLease::adopt_renewed(client.clone(), resource.clone(), &b_owner, new_epoch)
+            .await
+            .unwrap(),
+    );
+    assert!(b.fresh(), "adopted lease must be immediately fresh");
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    b.hold(move |_| flag.store(true, Ordering::SeqCst));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !lost.load(Ordering::SeqCst),
+        "adopted lease must not be declared lost"
+    );
+
+    // Adopting an owner/epoch that doesn't hold the lease must be refused.
+    let bad = HeldLease::adopt_renewed(client, resource, "wrong-owner", new_epoch).await;
+    assert!(bad.is_err());
+
+    b.release().await;
+    drop(nodes);
+}

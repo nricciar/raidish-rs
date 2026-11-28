@@ -689,3 +689,61 @@ async fn read_modify_write_doesnt_read_a_member_that_missed_writes() {
         assert_eq!(&r[..], &new[BLOCK_SIZE..]);
     }
 }
+
+/// H-7: `RaidZ::read_block` must preserve fencing errors (`StaleEpoch`) and
+/// classify `IncompleteStripe` as transient (`UnhealthyDisk`), not erase them
+/// into permanent `IoError(InvalidData)`.
+#[tokio::test]
+async fn h7_read_block_preserves_fencing_and_incomplete_stripe_errors() {
+    let (raidz, handles, _files) = fault_raidz(3, 1);
+    let data = pattern(2, 5);
+    raidz
+        .write_blocks(VdevLba::new(0), crate::disk::as_blocks(&data).unwrap())
+        .await
+        .unwrap();
+    raidz.flush().await.unwrap();
+
+    // Case 1: primary shard returns StaleEpoch (e.g. a fencing error).
+    handles[0].fail_reads(Some(crate::test_util::FaultError::StaleEpoch));
+    let mut buf = [0u8; BLOCK_SIZE];
+    let err = raidz
+        .read_block(VdevLba::new(0), &mut buf)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::disk::DiskError::StaleEpoch),
+        "expected StaleEpoch, got {:?}",
+        err
+    );
+    handles[0].heal();
+
+    // Case 2: primary shard fails with Io, sibling shard returns StaleEpoch.
+    handles[0].fail_reads(Some(crate::test_util::FaultError::Io));
+    handles[1].fail_reads(Some(crate::test_util::FaultError::StaleEpoch));
+    let err = raidz
+        .read_block(VdevLba::new(0), &mut buf)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::disk::DiskError::StaleEpoch),
+        "expected StaleEpoch from sibling reconstruction, got {:?}",
+        err
+    );
+    handles[0].heal();
+    handles[1].heal();
+
+    // Case 3: too many disks offline -> IncompleteStripe mapped to transient UnhealthyDisk.
+    handles[0].set_offline(true);
+    handles[1].set_offline(true);
+    let err = raidz
+        .read_block(VdevLba::new(0), &mut buf)
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_transient(),
+        "IncompleteStripe must map to a transient DiskError, got {:?}",
+        err
+    );
+    let fs_err = crate::fs::FileSystemError::DiskError(err);
+    assert_eq!(fs_err.kind(), crate::types::ErrorKind::Unavailable);
+}

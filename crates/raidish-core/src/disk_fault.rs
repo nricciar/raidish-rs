@@ -93,6 +93,7 @@ struct State {
     /// Writes that still succeed before every later one fails.
     fail_writes_after: Option<u64>,
     write_error: Option<FaultError>,
+    read_error: Option<FaultError>,
     fail_flushes: Option<FaultError>,
     drop_writes: bool,
     hold_writes: bool,
@@ -179,6 +180,11 @@ impl FaultDisk {
         let mut st = self.st();
         st.fail_writes_after = Some(n);
         st.write_error = Some(err);
+    }
+
+    /// Every targeted read fails with `err` (`None`: back to normal).
+    pub fn fail_reads(&self, err: Option<FaultError>) {
+        self.st().read_error = err;
     }
 
     /// Every flush fails with `err` (`None`: back to normal).
@@ -280,6 +286,7 @@ impl FaultDisk {
         st.offline = false;
         st.fail_writes_after = None;
         st.write_error = None;
+        st.read_error = None;
         st.fail_flushes = None;
         st.drop_writes = false;
         st.hold_writes = false;
@@ -454,6 +461,11 @@ impl FaultDisk {
         let mut st = self.st();
         if st.offline {
             return Err(OFFLINE.to_error());
+        }
+        if let Some(err) = st.read_error
+            && Self::targeted(&st, start, n)
+        {
+            return Err(err.to_error());
         }
         st.stats.reads += 1;
         read_at_zero_fill(&self.file, buf, range.byte_offset())?;

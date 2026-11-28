@@ -262,3 +262,58 @@ async fn scrub_walks_snapshots() {
         report.records
     );
 }
+
+/// H-7: deleting a clone must propagate a transient error reading its origin
+/// snapshot's dnode rather than silently leaving a dangling clone reference.
+#[tokio::test]
+async fn h7_deleting_a_clone_does_not_swallow_origin_read_error() {
+    let fp = crate::test_util::FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.create_block(&ds("vol"), VOL, VOLBLOCK_ALIGN)
+        .await
+        .unwrap();
+    // Place the origin snapshot in a non-zero object-table leaf so `open`
+    // doesn't pre-populate it in the object-table cache.
+    fs.role.next_object.fetch_add(
+        crate::inode::DNODES_PER_LEAF,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    fs.create_snapshot(&ds("vol"), "s1").await.unwrap();
+    fs.clone_snapshot(&ds("vol"), "s1", &ds("clone"))
+        .await
+        .unwrap();
+    let clone_id = fs.dataset_entry(&ds("clone")).await.unwrap().root;
+    let clone_dnode = fs.read_dnode(clone_id).await.unwrap();
+    let origin = clone_dnode
+        .head()
+        .unwrap()
+        .origin
+        .as_ref()
+        .expect("clone origin")
+        .clone();
+    // Reopen with a cold object-table cache so `read_dnode(origin.id)` hits disk.
+    drop(fs);
+    let fs = fp.load().await;
+
+    // Take both disks offline so `read_dnode(origin.id)` fails with a transient
+    // error inside `unlink_dataset_lineage`.
+    fp.disk(0).set_offline(true);
+    fp.disk(1).set_offline(true);
+    let mut tx = fs.begin_tx().await;
+    let res = fs
+        .unlink_dataset_lineage(&mut tx, clone_id, &clone_dnode)
+        .await;
+    drop(tx);
+    assert!(
+        res.is_err(),
+        "origin dnode read failure must not be swallowed when unlinking clone"
+    );
+    fp.disk(0).heal();
+    fp.disk(1).heal();
+
+    // Origin snapshot still cleanly tracks the clone and normal delete works.
+    let snap = fs.read_dnode(origin.id).await.unwrap();
+    assert!(snap.snap().unwrap().clones.contains(&clone_id));
+    fs.delete_volume(&ds("clone")).await.unwrap();
+    fs.destroy_snapshot(&ds("vol"), "s1").await.unwrap();
+}

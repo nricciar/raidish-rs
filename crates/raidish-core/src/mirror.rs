@@ -60,6 +60,7 @@ impl Mirror {
         for d in order {
             match self.disks.read_shards(d, lba.mirror_shard(), buf).await {
                 Ok(()) => return Ok(()),
+                Err(e) if e.is_fencing() => return Err(e),
                 Err(e) => last = e,
             }
         }

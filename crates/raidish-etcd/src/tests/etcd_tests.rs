@@ -819,3 +819,192 @@ async fn a_watch_from_now_doesnt_replay_what_came_before_it() {
         );
     }
 }
+
+/// H-11: on a writer whose `ds/` lease is no longer provably fresh, `EtcdStore`
+/// and `ServiceTree` must refuse reads, no-op writes, and etcd lease
+/// keep-alives with `Unavailable` rather than serving potentially stale state.
+#[tokio::test]
+async fn h11_stale_lease_refuses_reads_noop_writes_and_keepalives() {
+    use raidish_core::fs::FileSystem;
+    use raidish_core::service_tree::{ServiceError, ServiceTree};
+    use raidish_core::types::{
+        DatasetName, Epoch, Holding, LeaseRef, LeaseResource, MetaslabIdx, Txg,
+    };
+    use raidish_core::writer::{
+        CommitError, CommitSink, Committed, DatasetCommit, FsCommit, FsCommitted, LentMetaslab,
+    };
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DummySink;
+    impl CommitSink for DummySink {
+        fn writer(&self) -> LeaseRef {
+            LeaseRef::new(LeaseResource::Writer("w".into()), Epoch::from_raw(1))
+        }
+        fn lease_metaslab<'a, 'b>(
+            &'a self,
+            _: u64,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<LentMetaslab, CommitError>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async { Err(CommitError::Retry("unused".into())) })
+        }
+        fn return_metaslab<'a, 'b>(
+            &'a self,
+            _: MetaslabIdx,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), CommitError>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async { Ok(()) })
+        }
+        fn commit<'a, 'b>(
+            &'a self,
+            _: DatasetCommit,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<Committed, CommitError>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async {
+                Ok(Committed {
+                    txg: Txg::from_raw(2),
+                })
+            })
+        }
+        fn commit_fs<'a, 'b>(
+            &'a self,
+            _: FsCommit,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<FsCommitted, CommitError>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async { Err(CommitError::Retry("unused".into())) })
+        }
+        fn claim_dataset<'a, 'b, 'c, 'd>(
+            &'a self,
+            _: &'b DatasetName,
+            _: &'c Holding,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), CommitError>> + Send + 'd>>
+        where
+            'a: 'd,
+            'b: 'd,
+            'c: 'd,
+            Self: 'd,
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestSvcErr(raidish_core::fs::FileSystemError);
+    impl From<raidish_core::fs::FileSystemError> for TestSvcErr {
+        fn from(e: raidish_core::fs::FileSystemError) -> Self {
+            TestSvcErr(e)
+        }
+    }
+    impl ServiceError for TestSvcErr {
+        fn stopped() -> Self {
+            TestSvcErr(raidish_core::fs::FileSystemError::Unavailable(
+                "stopped".into(),
+            ))
+        }
+    }
+
+    let pool = TestPool::new().await;
+    {
+        let fs = pool.format().await;
+        fs.create_service(&ds("e"), DatasetFormat::Etcd, Default::default())
+            .await
+            .unwrap();
+        fs.create_service(&ds("b"), DatasetFormat::S3, Default::default())
+            .await
+            .unwrap();
+        fs.sync().await.unwrap();
+    }
+
+    let writer = Arc::new(
+        FileSystem::load_writer(pool.dev().await, Arc::new(DummySink))
+            .await
+            .unwrap(),
+    );
+    let fresh = Arc::new(AtomicBool::new(true));
+    let f1 = fresh.clone();
+    writer
+        .attach_dataset_leased(
+            &ds("e"),
+            Holding::new("o1", Epoch::from_raw(2)),
+            None,
+            Some(Arc::new(move || f1.load(Ordering::SeqCst))),
+        )
+        .await
+        .unwrap();
+    let f2 = fresh.clone();
+    writer
+        .attach_dataset_leased(
+            &ds("b"),
+            Holding::new("o2", Epoch::from_raw(3)),
+            None,
+            Some(Arc::new(move || f2.load(Ordering::SeqCst))),
+        )
+        .await
+        .unwrap();
+
+    let etcd = EtcdStore::open(writer.clone(), &ds("e"), 7, 1)
+        .await
+        .unwrap();
+    let tree = ServiceTree::open(writer.clone(), &ds("b"), DatasetFormat::S3)
+        .await
+        .unwrap();
+
+    // While fresh: reads, no-op deletes, and keepalives succeed.
+    assert!(etcd.range(get("missing")).await.is_ok());
+    assert!(
+        etcd.delete_range(pb::DeleteRangeRequest {
+            key: b"missing".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .is_ok()
+    );
+    assert!(etcd.lease_keep_alive(999).await.is_ok());
+    assert!(
+        tree.read::<(), TestSvcErr, _>(|_| Box::pin(async { Ok(()) }))
+            .await
+            .is_ok()
+    );
+
+    // Once the lease is no longer provably fresh: all of them must fail Unavailable.
+    fresh.store(false, Ordering::SeqCst);
+    let err = etcd.range(get("missing")).await.unwrap_err();
+    assert_eq!(err.status().code(), tonic::Code::Unavailable);
+
+    let err = etcd
+        .delete_range(pb::DeleteRangeRequest {
+            key: b"missing".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.status().code(), tonic::Code::Unavailable);
+
+    let err = etcd.lease_keep_alive(999).await.unwrap_err();
+    assert_eq!(err.status().code(), tonic::Code::Unavailable);
+
+    let err = tree
+        .read::<(), TestSvcErr, _>(|_| Box::pin(async { Ok(()) }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.0.kind(), raidish_core::types::ErrorKind::Unavailable);
+
+    let err = tree
+        .write::<(), TestSvcErr, _>(|_| Box::pin(async { Ok(()) }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.0.kind(), raidish_core::types::ErrorKind::Unavailable);
+}

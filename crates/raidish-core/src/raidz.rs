@@ -56,11 +56,14 @@ fn io_err(e: impl fmt::Display) -> DiskError {
     DiskError::IoError(std::io::Error::other(format!("{}", e)))
 }
 
-/// A stripe write's error as the disk error it reports: a member's own
-/// error kept as is (a fencing refusal must stay one, see `fenced_any`).
-fn write_err(e: RaidZError) -> DiskError {
+/// A stripe op's error as the disk error it reports: a member's own
+/// error kept as is (a fencing refusal or timeout must stay one, see
+/// `fenced_any` and H-7), and `IncompleteStripe` mapped to transient
+/// `UnhealthyDisk` (`ErrorKind::Unavailable`).
+fn to_disk_err(e: RaidZError) -> DiskError {
     match e {
         RaidZError::DiskError(e) => e,
+        RaidZError::IncompleteStripe(_) => DiskError::UnhealthyDisk,
         e => io_err(e),
     }
 }
@@ -125,7 +128,7 @@ impl Vdev for RaidZ {
                 for (i, buf) in self
                     .rmw_shards(stripe_id, &missing)
                     .await
-                    .map_err(write_err)?
+                    .map_err(to_disk_err)?
                 {
                     stripe_buf.fill_shard(i, &buf);
                 }
@@ -136,7 +139,7 @@ impl Vdev for RaidZ {
             let data = stripe_buf.data.as_ref().expect("stripe without data");
             self.write_encoded(stripe_id, data)
                 .await
-                .map_err(write_err)?;
+                .map_err(to_disk_err)?;
 
             // Retire it: a write that picked this buffer up before it
             // leaves the map starts a new one instead of writing into this
@@ -210,16 +213,12 @@ impl Vdev for RaidZ {
             .await
         {
             Ok(()) => Ok(()),
+            Err(e) if e.is_fencing() => Err(e),
             // Primary disk failed, reconstruct
             Err(_) => self
                 .reconstruct_from_stripe(stripe, data_index, buf)
                 .await
-                .map_err(|e| {
-                    DiskError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{}", e),
-                    ))
-                }),
+                .map_err(to_disk_err),
         }
     }
 
@@ -329,7 +328,7 @@ impl Vdev for RaidZ {
             let (full, tail) = rest.split_at(full_blocks as usize);
             self.write_full_stripes(lba.stripe_of(self.data).0, full.as_flattened())
                 .await
-                .map_err(write_err)?;
+                .map_err(to_disk_err)?;
             lba += full_blocks;
             rest = tail;
         }
@@ -618,6 +617,7 @@ impl RaidZ {
                         );
                     }
                 }
+                Err(e) if e.is_fencing() => return Err(RaidZError::DiskError(e)),
                 Err(_) => {
                     failed_count += 1;
                     if failed_count > self.parity {

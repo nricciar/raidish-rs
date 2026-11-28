@@ -63,6 +63,12 @@ impl LeaseClient {
         LeaseClient(cluster)
     }
 
+    /// Any [`LeaseAuthority`] implementation (tests).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn custom(authority: Arc<dyn LeaseAuthority>) -> Self {
+        LeaseClient(authority)
+    }
+
     pub async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
         self.0.call(op).await
     }
@@ -351,6 +357,60 @@ impl HeldLease {
             epoch,
             state: Default::default(),
             renewed: std::sync::Mutex::new(sent),
+        }
+    }
+
+    /// Adopt a lease transferred to `owner` at `epoch` after confirming it
+    /// with a synchronous `Renew`: the lease's local clock starts from when
+    /// *this* process sent the renew, not from before a potentially long
+    /// sender drain/sync (H-10).
+    ///
+    /// Retries transient transport errors / timeouts (e.g. a leader election
+    /// landing right after `TRANSFERRED`) for up to `LEASE_TTL * 4 / 5`,
+    /// recording a fresh `sent` timestamp on each attempt. Stops immediately
+    /// on any definite non-`Granted` reply; on final timeout, sends a
+    /// best-effort `Release` so the lease isn't stranded until expiry.
+    pub async fn adopt_renewed(
+        client: LeaseClient,
+        resource: LeaseResource,
+        owner: &str,
+        epoch: Epoch,
+    ) -> Result<HeldLease, String> {
+        let ttl = LEASE_TTL;
+        let deadline = Instant::now() + ttl * 4 / 5;
+        let op = LeaseOp::Renew {
+            resource: resource.clone(),
+            holder: Holding::new(owner.to_string(), epoch),
+            ttl_ms: ttl.as_millis() as u64,
+        };
+        loop {
+            let sent = Instant::now();
+            let left = deadline.saturating_duration_since(sent);
+            let attempt = left.min(RENEW_ATTEMPT);
+            let result = match tokio::time::timeout(attempt, client.call(&op)).await {
+                Ok(r) => r,
+                Err(_) => Err("timed out".to_string()),
+            };
+            match result {
+                Ok(Response::Granted { epoch: got, .. }) if got == epoch => {
+                    return Ok(HeldLease::adopt(client, resource, owner, epoch, sent));
+                }
+                Ok(other) => {
+                    return Err(format!("confirming transferred lease: {:?}", other));
+                }
+                Err(e) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        let rel = LeaseOp::Release {
+                            resource,
+                            holder: Holding::new(owner.to_string(), epoch),
+                        };
+                        let _ = tokio::time::timeout(RENEW_ATTEMPT, client.call(&rel)).await;
+                        return Err(format!("confirming transferred lease: {}", e));
+                    }
+                    tokio::time::sleep(RETRY_PAUSE.min(left)).await;
+                }
+            }
         }
     }
 
