@@ -2593,3 +2593,80 @@ fn x509_lists(der: &[u8], serial: &raidish_types::pki::Serial) -> bool {
             == serial.to_string().trim_start_matches("00")
     })
 }
+
+/// H-20: `CaService::for_admin` enforces a linearizable revocation check for
+/// both admin certificates and bearer tokens (including their token signer),
+/// closing the trust-cache lag window on `IsAdmin` routes (seal, revoke).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h20_for_admin_refuses_revoked_cert_token_and_token_signer() {
+    let up = bring_up_with(None).await;
+    let admin = client(&up.admin_dir);
+    let url = &up.nodes[0].url;
+    assert!(
+        wait_for(10, || {
+            up.nodes[0]
+                .cluster
+                .pki()
+                .is_some_and(|p| p.token_signer.is_some())
+        })
+        .await,
+        "token signer ready"
+    );
+
+    // Mint an admin rdt2 token on node 0.
+    let created = mint(&admin, url, "admin", Some(3600)).await.unwrap();
+    let parsed = raidish_auth::auth::parse_token(&created.token).unwrap();
+    let token_auth = crate::service::CallerAuth::Token {
+        id: created.id.as_str().to_string(),
+        signer_der: parsed.signer.der.clone(),
+    };
+    let admin_pem = std::fs::read(up.admin_dir.join("cert.pem")).unwrap();
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&admin_pem).unwrap();
+    let cert_auth = crate::service::CallerAuth::Cert(pem.contents);
+
+    // Both are accepted before revocation (even queried on follower node 2).
+    up.nodes[2].ca.for_admin(&token_auth).await.unwrap();
+    up.nodes[2].ca.for_admin(&cert_auth).await.unwrap();
+
+    // Revoke the token on node 0; immediately check on node 2 linearizably.
+    let r = admin
+        .post(format!("{}/api/v1/pki/tokens/{}/revoke", url, created.id))
+        .json(&crate::api::RevokeTokenRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let err = up.nodes[2].ca.for_admin(&token_auth).await.unwrap_err();
+    assert_eq!(
+        err.status, 401,
+        "revoked token must be rejected: {}",
+        err.msg
+    );
+
+    // Mint a second token, then revoke the token-signer cert itself:
+    // the second token (even though its own id wasn't revoked) must be rejected.
+    let created2 = mint(&admin, url, "admin", Some(3600)).await.unwrap();
+    let parsed2 = raidish_auth::auth::parse_token(&created2.token).unwrap();
+    let token2_auth = crate::service::CallerAuth::Token {
+        id: created2.id.as_str().to_string(),
+        signer_der: parsed2.signer.der.clone(),
+    };
+    let signer_serial = raidish_auth::ca::facts(&parsed2.signer.der).unwrap().serial;
+    let r = admin
+        .post(format!("{}/api/v1/pki/certs/{}/revoke", url, signer_serial))
+        .json(&crate::api::RevokeCertRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let err = up.nodes[2].ca.for_admin(&token2_auth).await.unwrap_err();
+    assert_eq!(
+        err.status, 401,
+        "token signed by revoked signer must be rejected: {}",
+        err.msg
+    );
+
+    for n in &up.nodes {
+        n.stop().await;
+    }
+}

@@ -175,26 +175,38 @@ impl NodeSupervisor {
             }
         };
         let bind = c.config.bind();
-        let nbd = Arc::new(NbdServer::with_bind(
-            fs.clone(),
-            bind.clone(),
-            c.config.nbd_port(),
-        ));
-        let nvme = Arc::new(NvmeTcpServer::with_bind(
-            fs.clone(),
-            bind,
-            c.config.nvme_port(),
-        ));
+        let nbd_port = c.config.nbd_port();
+        let nvme_port = c.config.nvme_port();
+        // Bind synchronously before advertising the writer (H-14): a just-dropped
+        // writer's aborted tasks may take a moment to release their sockets, so
+        // retry `AddrInUse` briefly; any persistent failure fails `open_writer`.
+        let nbd_listener = match bind_listener(&bind, nbd_port).await {
+            Ok(l) => l,
+            Err(e) => {
+                lease.release().await;
+                return Err(format!("binding NBD on {}:{}: {}", bind, nbd_port, e));
+            }
+        };
+        let nvme_listener = match bind_listener(&bind, nvme_port).await {
+            Ok(l) => l,
+            Err(e) => {
+                drop(nbd_listener);
+                lease.release().await;
+                return Err(format!("binding NVMe/TCP on {}:{}: {}", bind, nvme_port, e));
+            }
+        };
+        let nbd = Arc::new(NbdServer::with_bind(fs.clone(), bind.clone(), nbd_port));
+        let nvme = Arc::new(NvmeTcpServer::with_bind(fs.clone(), bind, nvme_port));
         let mut tasks = Vec::new();
         let n = nbd.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = n.run().await {
+            if let Err(e) = n.serve(nbd_listener).await {
                 eprintln!("agent: NBD server: {}", e);
             }
         }));
         let n = nvme.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = n.run().await {
+            if let Err(e) = n.serve(nvme_listener).await {
                 eprintln!("agent: NVMe/TCP target: {}", e);
             }
         }));
@@ -214,5 +226,24 @@ impl NodeSupervisor {
             },
             tasks,
         })
+    }
+}
+
+/// Bind `(addr, port)`, retrying `AddrInUse` briefly so a just-dropped
+/// writer's aborted listener tasks have time to drop their sockets (H-14).
+pub(crate) async fn bind_listener(
+    addr: &str,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let mut attempts = 0u32;
+    loop {
+        match tokio::net::TcpListener::bind((addr, port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }

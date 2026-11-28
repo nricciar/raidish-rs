@@ -1147,3 +1147,76 @@ async fn a_queue_has_at_most_its_depth_of_commands_running() {
     }
     let _wr = send.await.unwrap();
 }
+
+/// H-12: NVMe/TCP must refuse disabling the volatile write cache (`WCE=0`),
+/// reject `ICReq` with `hpda > 31`, and fail short writes from the backend.
+#[tokio::test]
+async fn h12_nvme_rejects_vwc_disable_short_write_and_bad_hpda() {
+    struct ShortWriteIo;
+    #[async_trait::async_trait]
+    impl crate::volume_io::VolumeIo for ShortWriteIo {
+        async fn read(&self, _: u64, buf: &mut [u8]) -> Result<usize, crate::fs::FileSystemError> {
+            Ok(buf.len())
+        }
+        async fn write(&self, _: u64, data: &[u8]) -> Result<usize, crate::fs::FileSystemError> {
+            Ok(data.len() / 2)
+        }
+        async fn zero(&self, _: u64, _: usize) -> Result<(), crate::fs::FileSystemError> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), crate::fs::FileSystemError> {
+            Ok(())
+        }
+        async fn sync(&self) -> Result<(), crate::fs::FileSystemError> {
+            Ok(())
+        }
+    }
+
+    let pool = TestPool::new().await;
+    let (_fs, server, addr, _held) = serve_many(&pool, &[("vol", 1024 * 1024)]).await;
+
+    // 1. Bad HPDA (> 31) in ICReq must be rejected instead of truncating c2h_pdo.
+    {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        let mut ic = [0u8; 128];
+        ic[0] = PDU_IC_REQ;
+        ic[2] = 128;
+        ic[4..8].copy_from_slice(&128u32.to_le_bytes());
+        ic[10] = 64;
+        wr.write_all(&ic).await.unwrap();
+        assert!(
+            read_pdu(&mut rd).await.is_err(),
+            "ICReq with hpda=64 must be rejected"
+        );
+    }
+
+    // 2. SET_FEATURES FID=0x06: WCE=0 must be refused; WCE=1 succeeds.
+    let mut admin = Host::connect(addr).await;
+    let cntlid = admin.bring_up_admin(1).await;
+    let r = admin.admin(ADM_SET_FEATURES, 0, 0x06, 0, 0).await;
+    assert_eq!(
+        r.sc(),
+        SC_INVALID_FIELD,
+        "disabling VWC (WCE=0) must return SC_INVALID_FIELD"
+    );
+    let r = admin.admin(ADM_SET_FEATURES, 0, 0x06, 1, 0).await;
+    assert!(r.ok(), "enabling VWC (WCE=1) must succeed");
+    assert_eq!(r.dw0, 1);
+
+    // 3. Short write from VolumeIo must fail with SC_INTERNAL, not succeed.
+    server
+        .export_io(&ds("vol"))
+        .unwrap()
+        .switch(Arc::new(ShortWriteIo))
+        .await;
+    let mut q = Host::connect(addr).await;
+    assert!(q.fabrics_connect(1, cntlid, VOL_NQN).await.ok());
+    let data = pattern(4096, 3);
+    let r = q.io(IO_WRITE, 0, 1, &data, 0, true).await;
+    assert_eq!(
+        r.sc(),
+        SC_INTERNAL,
+        "short backend write must not return success"
+    );
+}

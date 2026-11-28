@@ -157,10 +157,9 @@ impl Shared {
     }
 }
 
-/// Hold volume `name`'s lease as `owner` at `epoch` (granted no earlier
-/// than `asked`) and attach its dataset on writer `w`: the first half of
-/// taking it over (the export is the caller's). Lost later, `wake` is
-/// poked.
+/// Hold volume `name`'s lease as `owner` at `epoch` (just transferred to
+/// us) and attach its dataset on writer `w`: the first half of taking it
+/// over (the export is the caller's). Lost later, `wake` is poked.
 pub(crate) async fn take_lease(
     leases: &LeaseClient,
     wake: &Arc<tokio::sync::Notify>,
@@ -168,15 +167,10 @@ pub(crate) async fn take_lease(
     name: &DatasetName,
     owner: &str,
     epoch: Epoch,
-    asked: Instant,
 ) -> Result<(Arc<HeldLease>, Lost), String> {
-    let lease = Arc::new(HeldLease::adopt(
-        leases.clone(),
-        dataset_resource(name),
-        owner,
-        epoch,
-        asked,
-    ));
+    let lease = Arc::new(
+        HeldLease::adopt_renewed(leases.clone(), dataset_resource(name), owner, epoch).await?,
+    );
     let lost = hold(&lease, None, wake);
     let l = lease.clone();
     if let Err(e) =
@@ -209,7 +203,6 @@ impl PeerVolumes for Shared {
         mut rd: PeerLines,
         mut wr: PeerOut,
     ) {
-        let asked = Instant::now();
         macro_rules! refuse {
             ($($why:tt)*) => {{
                 let why = format!($($why)*);
@@ -272,7 +265,6 @@ impl PeerVolumes for Shared {
             volume,
             &owner,
             new_epoch,
-            asked,
         )
         .await
         {

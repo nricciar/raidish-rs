@@ -966,7 +966,7 @@ impl<D: PoolDevice, R: Role> FileSystem<D, R> {
         *fs.degraded.lock().unwrap() = degraded;
         *fs.miss_seen.lock().unwrap() = fs.miss_counts();
         fs.adopt_disks().await;
-        let (metaslabs, missing) = fs.load_metaslabs(uber.txg).await?;
+        let (metaslabs, missing) = fs.load_metaslabs(uber.txg, !rewound).await?;
         // A committer's rewind rebuilds them (`settle_rewind`).
         if !missing.is_empty() && !(rewound && matches!(fs.by_role(), View::Committer(_))) {
             eprintln!(
@@ -1381,6 +1381,13 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
         self.sync_metaslabs(tx, txg).await?;
         span.mark("metaslabs");
 
+        // Everything the uberblock points at must be durable before recording
+        // degraded disks and writing the uberblock (H-1): a disk that took
+        // writes into volatile cache and fails this flush is marked degraded
+        // in this same TXG's uberblock.
+        self.dev.flush().await?;
+        span.mark("flush");
+
         // The uberblock-carrying flush below is the last write of this TXG;
         // misses from it are caught by the next commit (as `txg`).
         let degraded = self.account_misses(txg);
@@ -1574,9 +1581,8 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
         objects: TreeRoot,
         degraded: Vec<Option<Txg>>,
     ) -> Result<Uberblock, FileSystemError> {
-        // Everything the uberblock points at must be durable first.
-        self.dev.flush().await?;
-
+        // Caller (`commit_local`) already flushed data and space maps before
+        // snapshotting `degraded` (H-1).
         let uberblock = Uberblock {
             magic: UBERBLOCK_MAGIC,
             version: UBERBLOCK_VERSION,
@@ -2047,6 +2053,27 @@ impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
     /// (one refused, out of space, its disk writes failing) don't fail it.
     pub async fn sync_for(&self, name: &DatasetName) -> Result<(), FileSystemError> {
         self.sync_scoped(Some(name)).await
+    }
+
+    /// Confirm that this process's `ds/<name>` lease is still provably fresh
+    /// (on a writer; standalone/committer pools have no per-dataset writer
+    /// lease). Used by btree services (`ServiceTree`, `EtcdStore`) so reads,
+    /// no-op writes, and lease keep-alives refuse once the lease is no longer
+    /// provably held (H-11).
+    pub fn check_lease_fresh(&self, name: &DatasetName) -> Result<(), FileSystemError> {
+        match self.mutable() {
+            MutView::Committer(_) => Ok(()),
+            MutView::Writer(w) => {
+                if w.role.state.lease_fresh(name) {
+                    Ok(())
+                } else {
+                    Err(FileSystemError::Unavailable(format!(
+                        "can't confirm the lease on dataset '{}'",
+                        name
+                    )))
+                }
+            }
+        }
     }
 
     /// Create file or directory `name` in `dir` (see `create_at_locked`).

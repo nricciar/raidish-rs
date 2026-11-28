@@ -495,6 +495,11 @@ async fn handle_connection<D: PoolDevice + Send + Sync + 'static, R: Mutable>(
         return Err(invalid("expected ICReq"));
     }
     let hpda = ic[10] as usize;
+    // NVMe/TCP caps HPDA at 31 (max 128-byte alignment); larger values would
+    // overflow `c2h_pdo` past `u8::MAX` and corrupt C2H PDU headers (H-12).
+    if hpda > 31 {
+        return Err(invalid("ICReq hpda out of range"));
+    }
     let mut resp = [0u8; 128];
     resp[0] = PDU_IC_RESP;
     resp[2] = 128;
@@ -1092,8 +1097,17 @@ fn admin<D: PoolDevice, R: Mutable>(
                     let n = regs.io_queues.max(1) as u32 - 1;
                     Completion::with_dw0(n << 16 | n)
                 }
-                0x06 => Completion::with_dw0(1), // volatile write cache: enabled
-                0x0b => Completion::ok(),        // async event configuration
+                0x06 => {
+                    // Volatile write cache is always enabled; refuse attempts
+                    // to disable it rather than acknowledging write-through
+                    // while still buffering (H-12).
+                    if set && (sqe.cdw(11) & 1) == 0 {
+                        Completion::generic(SC_INVALID_FIELD)
+                    } else {
+                        Completion::with_dw0(1)
+                    }
+                }
+                0x0b => Completion::ok(), // async event configuration
                 0x0f => {
                     if set {
                         regs.kato = sqe.cdw(11);
@@ -1167,7 +1181,16 @@ async fn io(q: &QueueInfo, sqe: &Sqe, data: &[u8]) -> Completion {
                         return Completion::generic(SC_DATA_XFER_ERROR);
                     }
                     match io.write(offset, data).await {
-                        Ok(_) => fua(io, sqe, &fail).await,
+                        Ok(n) if n == data.len() => fua(io, sqe, &fail).await,
+                        Ok(n) => {
+                            eprintln!(
+                                "nvme: short write {} ({} of {} bytes)",
+                                sqe.cid(),
+                                n,
+                                data.len()
+                            );
+                            Completion::generic(SC_INTERNAL)
+                        }
                         Err(e) => fail("write", e),
                     }
                 }

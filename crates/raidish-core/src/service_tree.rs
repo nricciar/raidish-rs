@@ -133,8 +133,29 @@ impl<D: PoolDevice + 'static, R: Mutable> ServiceTree<D, R> {
         self.settler.settle(&self.fs, &self.name).await?;
         let t = Txn::begin(&self.fs, &ds.obj).await?;
         let held = OpsHeld::read(&r);
-        f(&t, &held).await
+        let out = f(&t, &held).await?;
+        // Confirm the lease was still provably fresh at the end of the read
+        // (H-11): no new owner could have acquired the lease and written
+        // before this read finished.
+        self.fs.check_lease_fresh(&self.name)?;
+        Ok(out)
     }
+}
+
+/// Flush `name`'s intent log in a spawned task so a cancelled client request
+/// doesn't cut an in-flight flush short, and confirm the lease is fresh.
+pub async fn flush_spawned<D: PoolDevice + 'static, R: Mutable>(
+    fs: &Arc<FileSystem<D, R>>,
+    name: &DatasetName,
+) -> Result<(), FileSystemError> {
+    let (fs_task, name_task) = (fs.clone(), name.clone());
+    tokio::spawn(async move {
+        fs_task.kv_settle().await?;
+        fs_task.flush_for(&name_task).await
+    })
+    .await
+    .map_err(|e| FileSystemError::Internal(format!("flush task: {}", e)))??;
+    fs.check_lease_fresh(name)
 }
 
 /// Where a store's writes are (applied, durable), so answers and reads
@@ -152,18 +173,18 @@ impl Settler {
         self.applied.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Make every applied write to dataset `name` durable.
-    pub async fn settle<D: PoolDevice, R: Mutable>(
+    /// Make every applied write to dataset `name` durable, and confirm
+    /// this node's lease is still provably fresh (H-11).
+    pub async fn settle<D: PoolDevice + 'static, R: Mutable>(
         &self,
-        fs: &FileSystem<D, R>,
+        fs: &Arc<FileSystem<D, R>>,
         name: &DatasetName,
     ) -> Result<(), FileSystemError> {
         let target = self.applied.load(Ordering::SeqCst);
         if self.durable.load(Ordering::SeqCst) >= target {
-            return Ok(());
+            return fs.check_lease_fresh(name);
         }
-        fs.kv_settle().await?;
-        fs.flush_for(name).await?;
+        flush_spawned(fs, name).await?;
         self.durable.fetch_max(target, Ordering::SeqCst);
         Ok(())
     }

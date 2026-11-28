@@ -9,19 +9,61 @@ use crate::api::{
     RemoveSlotQuery, RenewRequest, RevokeCertRequest, RevokeTokenRequest, RootCrlRequest,
     SealRequest, SignRequest, SlotCreated, SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
 };
-use crate::service::CaError;
-use axum::extract::{ConnectInfo, Extension, Path, State};
+use crate::service::{CaError, CallerAuth};
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use raidish_auth::auth::{CanRead, IsAdmin, IsAdminCert};
-use raidish_auth::http::{Json, Peer, Query};
+use raidish_auth::auth::{CanRead, IsAdmin, IsAdminCert, Principal, Via, bearer, parse_token};
+use raidish_auth::http::{Json, Peer, Query, Refusal};
 use raidish_types::pki::{CertListing, IssuerId, IssuerUse, PkiStatus, Serial, TokenId};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 type Ca = State<Arc<CaService>>;
+
+/// `IsAdmin` plus the credential (`CallerAuth`) needed for a linearizable
+/// revocation check (`CaService::for_admin`, H-20).
+pub struct AdminCaller {
+    pub principal: Principal,
+    pub(crate) auth: CallerAuth,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for AdminCaller {
+    type Rejection = Refusal;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Refusal> {
+        let IsAdmin(principal) = IsAdmin::from_request_parts(parts, state).await?;
+        let auth = match &principal.via {
+            Via::Open => CallerAuth::Open,
+            Via::Cert => {
+                let peer = parts.extensions.get::<Peer>().ok_or_else(|| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "client certificate missing from request".into(),
+                    )
+                })?;
+                CallerAuth::Cert(peer.cert().to_vec())
+            }
+            Via::Token(id) => {
+                let raw = bearer(parts).ok_or_else(|| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "bearer token missing from request".into(),
+                    )
+                })?;
+                let parsed = parse_token(&raw).map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+                CallerAuth::Token {
+                    id: id.clone(),
+                    signer_der: parsed.signer.der,
+                }
+            }
+        };
+        Ok(AdminCaller { principal, auth })
+    }
+}
 
 impl IntoResponse for CaError {
     fn into_response(self) -> Response {
@@ -116,8 +158,10 @@ pub async fn renew(
 }
 
 /// Renew this node's own certificate now (CA-4a): it changes nobody's
-/// authority, so an admin's certificate or token. It answers at once; the
-/// renewal is the renewer's (`ca status` and the log say how it went).
+/// authority, so an admin's certificate or token. Actual issuance still runs
+/// `for_caller` on the CA, so triggering the local renewer doesn't require a
+/// Raft leader. It answers at once; the renewal is the renewer's (`ca status`
+/// and the log say how it went).
 pub async fn renew_self(_admin: IsAdmin, State(ca): Ca) -> Result<StatusCode, CaError> {
     ca.renew_now()?;
     Ok(StatusCode::ACCEPTED)
@@ -168,10 +212,11 @@ pub async fn create_client_enrollment(
 }
 
 pub async fn cancel_enrollment(
-    _admin: IsAdmin,
+    admin: AdminCaller,
     Path(id): Path<String>,
     State(ca): Ca,
 ) -> Result<(), CaError> {
+    ca.for_admin(&admin.auth).await?;
     let id = TokenId::parse(&id).map_err(|e| CaError::new(400, e))?;
     ca.cancel_enrollment(id).await
 }
@@ -233,12 +278,13 @@ pub async fn certs(_auth: CanRead, State(ca): Ca) -> Result<Json<Vec<CertListing
 /// Revoke a certificate: by an admin's certificate or token (it only takes
 /// authority away, D8).
 pub async fn revoke_cert(
-    _admin: IsAdmin,
+    admin: AdminCaller,
     peer: Option<Extension<Peer>>,
     Path(serial): Path<String>,
     State(ca): Ca,
     req: Json<RevokeCertRequest>,
 ) -> Result<(), CaError> {
+    ca.for_admin(&admin.auth).await?;
     let serial = Serial::parse(&serial).map_err(|e| CaError::new(400, e))?;
     let caller = peer.as_ref().map(|Extension(p)| p.serial());
     ca.revoke_cert(serial, req.into_inner(), caller).await
@@ -260,11 +306,12 @@ pub async fn create_token(
 
 /// Revoke a token (or the S3/SQS keys made from it).
 pub async fn revoke_token(
-    _admin: IsAdmin,
+    admin: AdminCaller,
     Path(id): Path<String>,
     State(ca): Ca,
     req: Json<RevokeTokenRequest>,
 ) -> Result<(), CaError> {
+    ca.for_admin(&admin.auth).await?;
     let id = TokenId::parse(&id).map_err(|e| CaError::new(400, e))?;
     ca.revoke_token(id, req.into_inner()).await
 }
@@ -272,11 +319,13 @@ pub async fn revoke_token(
 /// Seal every node. It only takes authority away (D8): an admin's
 /// certificate or token.
 pub async fn seal(
-    admin: IsAdmin,
+    admin: AdminCaller,
     State(ca): Ca,
     req: Json<SealRequest>,
 ) -> Result<Json<PkiStatus>, CaError> {
-    ca.seal(req.into_inner(), Some(admin.0.name)).await?;
+    ca.for_admin(&admin.auth).await?;
+    ca.seal(req.into_inner(), Some(admin.principal.name))
+        .await?;
     Ok(Json(ca.status().await))
 }
 
@@ -361,12 +410,13 @@ pub struct Force {
 /// it signed with it, so it waits for the cluster's own to move
 /// (`?force=true` doesn't).
 pub async fn revoke_issuer(
-    admin: IsAdmin,
+    admin: AdminCaller,
     Path(id): Path<String>,
     Query(Force { force }): Query<Force>,
     State(ca): Ca,
 ) -> Result<Json<IssuerUse>, CaError> {
-    ca.revoke_issuer(issuer_id(&id)?, force, Some(admin.0.name))
+    ca.for_admin(&admin.auth).await?;
+    ca.revoke_issuer(issuer_id(&id)?, force, Some(admin.principal.name))
         .await
         .map(Json)
 }

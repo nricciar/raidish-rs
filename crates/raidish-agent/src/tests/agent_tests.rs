@@ -1128,3 +1128,227 @@ async fn services_go_with_their_writers_generation() {
         vec![dsn("c")]
     );
 }
+
+/// H-14: `bind_listener` fails loudly on a permanently occupied port and
+/// succeeds once a just-dropped listener releases its socket.
+#[tokio::test]
+async fn h14_bind_listener_fails_on_occupied_port_and_succeeds_after_drop() {
+    let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = held.local_addr().unwrap().port();
+
+    // Permanently occupied port: fails after retry budget instead of silently succeeding.
+    let err = crate::supervisor::bind_listener("127.0.0.1", port)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+    // Released shortly after (simulating a dropped writer's aborted task): succeeds.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        drop(held);
+    });
+    let bound = crate::supervisor::bind_listener("127.0.0.1", port)
+        .await
+        .expect("bind must succeed once previous listener drops");
+    assert_eq!(bound.local_addr().unwrap().port(), port);
+}
+
+/// H-10: end-to-end `Shared::handoff` test covering both (a) a sender drain
+/// delayed past `LEASE_TTL * 4 / 5` (8 s) and (b) transient transport errors on
+/// the receiver's post-transfer `Renew` (e.g. a leader election right after
+/// `TRANSFERRED`). Reverting `take_lease` to `HeldLease::adopt(..., asked)`
+/// fails immediately because `asked` is > 8 s old when `hold()` starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h10_slow_handoff_past_8s_survives_and_retries_transient_renew() {
+    use crate::cluster::LeaseOp;
+    use crate::cluster::lease::{LEASE_TTL, LeaseAuthority};
+    use crate::cluster::state::{POOL, Response};
+    use crate::committer::{Authority, Committer, DirectSink, LocalAuthority};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    struct FlakyLeaseAuth {
+        inner: Arc<LocalAuthority>,
+        fail_renews: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LeaseAuthority for FlakyLeaseAuth {
+        async fn call(&self, op: &LeaseOp) -> Result<Response, String> {
+            if matches!(op, LeaseOp::Renew { .. }) {
+                let left = self.fail_renews.load(Ordering::SeqCst);
+                if left > 0
+                    && self
+                        .fail_renews
+                        .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    return Err("leader election in progress".into());
+                }
+            }
+            self.inner.propose(op.clone()).await
+        }
+        async fn status(&self) -> Result<crate::cluster::Status, String> {
+            Err("unused".into())
+        }
+    }
+
+    let pool = crate::test_util::TestPool::new().await;
+    {
+        let fs = pool.format().await;
+        fs.create_block(&vol(), 16 << 20, fs.default_volblocksize())
+            .await
+            .unwrap();
+    }
+    let local_auth = Arc::new(LocalAuthority::default());
+    let grant = |resource: &str, owner: &str| {
+        let local_auth = local_auth.clone();
+        let resource = resource.to_string();
+        let owner = owner.to_string();
+        async move {
+            let op = LeaseOp::Acquire {
+                resource: crate::types::res(&resource),
+                owner: owner.clone(),
+                holder: crate::types::Holder::default().with_detail(owner),
+                ttl_ms: 600_000,
+            };
+            match local_auth.propose(op).await.unwrap() {
+                Response::Granted { epoch, .. } => epoch,
+                r => panic!("{} not granted: {:?}", resource, r),
+            }
+        }
+    };
+
+    let pool_epoch = grant(&POOL.to_string(), "committer").await;
+    let committer = Arc::new(
+        Committer::new(
+            Arc::new(pool.load().await),
+            local_auth.clone(),
+            "committer".into(),
+            pool_epoch,
+            "n0".into(),
+        )
+        .await,
+    );
+    let writer_epoch = grant("writer/recv", "recv").await;
+    let sink = Arc::new(DirectSink {
+        committer,
+        writer: crate::types::LeaseRef::new(crate::types::res("writer/recv"), writer_epoch),
+    });
+    let fs = Arc::new(
+        crate::fs::FileSystem::load_writer(pool.dev().await, sink)
+            .await
+            .unwrap(),
+    );
+    let parts = writer_on(fs);
+
+    let flaky = Arc::new(FlakyLeaseAuth {
+        inner: local_auth.clone(),
+        fail_renews: AtomicUsize::new(0),
+    });
+    let shared = Arc::new(volumes::handoff::Shared::new(LeaseClient::custom(
+        flaky.clone(),
+    )));
+    shared.volumes.set_writer(parts.clone());
+
+    let pki = raidish_auth::testing::Pki::new(vec![]);
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(Arc::new(pki.tls.server_config(true, &[]).unwrap()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peers: Arc<dyn crate::peer_io::PeerVolumes> = shared.clone();
+    tokio::spawn(crate::peer_io::serve(listener, acceptor, peers, None));
+
+    // Sender holds `ds/vol`.
+    let sender_epoch = grant(&dataset_resource(&vol()).to_string(), "sender").await;
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(pki.tls.client_config().unwrap()));
+    let tls = crate::peer_io::dial(&connector, "127.0.0.1", port)
+        .await
+        .unwrap();
+    let (rd, mut wr) = tokio::io::split(tls);
+    let mut rd = BufReader::new(rd);
+
+    wr.write_all(
+        format!(
+            "{} vol {} {}\n",
+            crate::peer_io::HANDOFF,
+            sender_epoch,
+            Transport::Nbd
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    wr.flush().await.unwrap();
+
+    let ready_line =
+        tokio::time::timeout(Duration::from_secs(5), crate::peer_io::read_line(&mut rd))
+            .await
+            .unwrap()
+            .unwrap();
+    let recv_owner = match volumes::handoff::Msg::parse(&ready_line).unwrap() {
+        volumes::handoff::Msg::Ready { owner, .. } => owner,
+        other => panic!("expected READY, got {:?}", other),
+    };
+
+    // Simulate a slow sender drain + sync that exceeds `LEASE_TTL * 4 / 5` (8 s).
+    tokio::time::sleep(LEASE_TTL * 4 / 5 + Duration::from_millis(200)).await;
+
+    // Transfer the lease to the receiver, and inject two transient Renew errors.
+    let new_epoch = match local_auth
+        .propose(LeaseOp::Transfer {
+            resource: dataset_resource(&vol()),
+            from: crate::types::Holding::new("sender", sender_epoch),
+            to_owner: recv_owner,
+            to_holder: crate::types::Holder::default().with_detail("recv"),
+            ttl_ms: LEASE_TTL.as_millis() as u64,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Granted { epoch, .. } => epoch,
+        other => panic!("transfer failed: {:?}", other),
+    };
+    flaky.fail_renews.store(2, Ordering::SeqCst);
+
+    wr.write_all(format!("TRANSFERRED {}\n", new_epoch).as_bytes())
+        .await
+        .unwrap();
+    wr.flush().await.unwrap();
+
+    let done_line =
+        tokio::time::timeout(Duration::from_secs(10), crate::peer_io::read_line(&mut rd))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        done_line, "DONE",
+        "handoff must succeed after slow drain and transient renew errors"
+    );
+    assert_eq!(
+        flaky.fail_renews.load(Ordering::SeqCst),
+        0,
+        "adopt_renewed must have retried through both transient renew failures"
+    );
+
+    // Give `HeldLease::hold()` a moment to run; the adopted lease must stay fresh and not lost.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (fresh, lost) = shared
+        .volumes
+        .owned(&vol(), |o| (o.lease.fresh(), o.lost.is_lost()))
+        .expect("volume should be owned after handoff");
+    assert!(fresh, "adopted lease must be fresh after slow handoff");
+    assert!(
+        !lost,
+        "adopted lease must not be declared lost after slow handoff"
+    );
+
+    // Clean up exported volume so Drop doesn't wait in background.
+    if let Some(o) = shared.volumes.take_owned(&vol()) {
+        o.lease.release().await;
+        let _ = o.export.close().await;
+    }
+}

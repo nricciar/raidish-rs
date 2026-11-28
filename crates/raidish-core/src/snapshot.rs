@@ -500,11 +500,15 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
         let Some(o) = origin else {
             return Ok(Txg::ZERO);
         };
-        if let Ok(mut s) = self.read_dnode(o.id).await {
-            if let Some(s) = s.snap_mut() {
-                s.clones.retain(|&c| c != id);
+        match self.read_dnode(o.id).await {
+            Ok(mut s) => {
+                if let Some(s) = s.snap_mut() {
+                    s.clones.retain(|&c| c != id);
+                }
+                self.write_dnode(tx, o.id, Some(s)).await?;
             }
-            self.write_dnode(tx, o.id, Some(s)).await?;
+            Err(FileSystemError::FileNotFound) => {}
+            Err(e) => return Err(e),
         }
         Ok(o.txg)
     }

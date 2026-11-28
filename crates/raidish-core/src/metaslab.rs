@@ -909,9 +909,13 @@ impl<D: PoolDevice, R: Role> FileSystem<D, R> {
 
     /// Load every metaslab from the newest valid slot not newer than `uber_txg`.
     /// Also returns the metaslabs that had no valid slot (loaded as full).
+    /// When `repair` is false (e.g. a rewind open before `settle_rewind`
+    /// validates it, H-6), stale slot blocks are read from parity without
+    /// writing repairs to disk.
     pub(crate) async fn load_metaslabs(
         &self,
         uber_txg: Txg,
+        repair: bool,
     ) -> Result<(Vec<MetaslabState>, Vec<usize>), FileSystemError> {
         let mut out = Vec::with_capacity(self.layout.metaslab_count as usize);
         let mut missing = Vec::new();
@@ -923,7 +927,7 @@ impl<D: PoolDevice, R: Role> FileSystem<D, R> {
             let mut best: Option<(Txg, u64, Vec<u8>)> = None;
             for slot in 0..SPACEMAP_SLOTS {
                 if let Some((txg, bytes)) = self
-                    .read_slot(self.layout.slot_lba(ms_idx, slot), uber_txg)
+                    .read_slot(self.layout.slot_lba(ms_idx, slot), uber_txg, repair)
                     .await
                     && txg <= uber_txg
                     && best.as_ref().is_none_or(|(t, _, _)| txg > *t)
@@ -971,7 +975,12 @@ impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// other copies / rebuilt from parity, and the slot is taken at the
     /// newest TXG (no newer than `max_txg`) that every block can reach.
     /// Blocks that came from elsewhere are repaired.
-    async fn read_slot(&self, lba: crate::coords::PoolLba, max_txg: Txg) -> Option<(Txg, Vec<u8>)> {
+    async fn read_slot(
+        &self,
+        lba: crate::coords::PoolLba,
+        max_txg: Txg,
+        repair: bool,
+    ) -> Option<(Txg, Vec<u8>)> {
         // versions[b]: every (txg, payload, came-from-parity) seen for block b.
         let mut versions: SlotVersions = Vec::new();
         for b in 0..self.layout.spacemap_slot_blocks {
@@ -1027,7 +1036,7 @@ impl<D: PoolDevice, R: Role> FileSystem<D, R> {
                         "space map: block {} was stale; rebuilt from parity",
                         lba + b as u64
                     );
-                    if let View::Committer(fs) = self.by_role() {
+                    if repair && let View::Committer(fs) = self.by_role() {
                         let _ = fs.dev.repair_block(lba + b as u64, block).await;
                     }
                 }

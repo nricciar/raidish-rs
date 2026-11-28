@@ -372,7 +372,7 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 
 /// A request's token: `Authorization: Bearer …`, or `?access_token=…`.
-fn bearer(parts: &Parts) -> Option<String> {
+pub fn bearer(parts: &Parts) -> Option<String> {
     if let Some(h) = parts.headers.get(axum::http::header::AUTHORIZATION) {
         return h
             .to_str()

@@ -1356,3 +1356,66 @@ async fn kv_the_next_writer_carries_on_after_a_replay() {
     drop(fresh);
     assert_clean(&s).await;
 }
+
+/// H-2: a mid-replay error (such as an Entry::Data with wrong length) must
+/// fail replay AND roll back earlier entries from `vol.obj.dirty` so the next
+/// unrelated commit doesn't persist half-replayed state.
+#[tokio::test]
+async fn h2_a_failed_replay_leaves_no_partial_dirty_records() {
+    let s = setup().await;
+    let w = writer(&s, "1", None).await;
+    // First write + flush registers a log region and cursor.
+    w.fs.block_write(&dsn("a"), 0, &pattern(1000, 1))
+        .await
+        .unwrap();
+    w.fs.flush().await.unwrap();
+    let c = cursor(&w.fs).await.unwrap();
+
+    // Plant seq c.seq (valid full-record Data for record 1) followed by
+    // seq c.seq + 1 (wrong-length Data for record 2).
+    let rec1 = encode_data_record(c.region.guid, c.seq, 1, pattern(48 * 1024, 7)).unwrap();
+    w.fs.write_record_blocks(PoolLba::new(c.region.start + c.used), &rec1)
+        .await
+        .unwrap();
+    let used1 = c.used + w.fs.align_blocks(rec1.len().div_ceil(BLOCK_SIZE) as u64);
+    let bad2 = encode_data_record(c.region.guid, c.seq + 1, 2, vec![1, 2, 3]).unwrap();
+    w.fs.write_record_blocks(PoolLba::new(c.region.start + used1), &bad2)
+        .await
+        .unwrap();
+    w.fs.dev.flush().await.unwrap();
+    let log =
+        w.fs.open_dataset(&dsn("a"))
+            .await
+            .unwrap()
+            .log
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+    w.die(&s).await;
+
+    let err = s
+        .committer
+        .fs()
+        .replay_dataset_log(&dsn("a"), &log)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::fs::FileSystemError::InvalidArgument(_)),
+        "unexpected replay error: {:?}",
+        err
+    );
+    let vol = s.committer.fs().open_dataset(&dsn("a")).await.unwrap();
+    assert!(
+        !vol.is_dirty(),
+        "failed replay must not leave earlier entries dirty in memory"
+    );
+    // An unrelated commit must not persist record 1 from the aborted replay.
+    s.committer
+        .fs()
+        .write_file(std::path::Path::new("/unrelated"), b"ok")
+        .await
+        .unwrap();
+    let fresh = s.pool.load().await;
+    assert_eq!(read(&fresh, 48 * 1024, 1000).await, vec![0u8; 1000]);
+}

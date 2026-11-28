@@ -485,6 +485,24 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
         let bs = vol.obj.blksz;
         // Keyed operations go through the tree, one at a time.
         let _ops = vol.ops.write().await;
+        // Stage dirty records behind a drop guard: a mid-replay error (or a
+        // dropped future) must not leave partial entries in `vol.obj.dirty`
+        // for the next unrelated commit to persist (H-2 / I-7).
+        struct RestoreRecords<'a> {
+            obj: &'a crate::object::ObjTree,
+            prior: Option<BTreeMap<u64, Dirty>>,
+        }
+        impl Drop for RestoreRecords<'_> {
+            fn drop(&mut self) {
+                if let Some(prior) = self.prior.take() {
+                    self.obj.dirty.lock().unwrap().records = prior;
+                }
+            }
+        }
+        let mut restore = RestoreRecords {
+            obj: &vol.obj,
+            prior: Some(vol.obj.dirty.lock().unwrap().records.clone()),
+        };
         for e in entries {
             let (i, at, bytes) = match e {
                 Entry::Keyed(op) => {
@@ -494,6 +512,15 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
                     continue;
                 }
                 Entry::Data(i, b) => {
+                    if b.len() != bs {
+                        return Err(FileSystemError::InvalidArgument(format!(
+                            "volume '{}': intent log record {} has {} bytes (expected {})",
+                            name,
+                            i,
+                            b.len(),
+                            bs
+                        )));
+                    }
                     vol.obj
                         .dirty
                         .lock()
@@ -508,7 +535,7 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
                 }
                 Entry::Patch(i, at, bytes) => (i, at as usize, bytes),
             };
-            if at + bytes.len() > bs {
+            if at.checked_add(bytes.len()).is_none_or(|end| end > bs) {
                 return Err(FileSystemError::InvalidArgument(format!(
                     "volume '{}': intent log patch past the end of record {}",
                     name, i
@@ -546,6 +573,7 @@ impl<D: PoolDevice> FileSystem<D, Committer> {
                     .insert(i, Dirty::Data(buf));
             }
         }
+        restore.prior = None;
         *vol.log.lock().unwrap() = None;
         if !vol.is_dirty() {
             // Nothing to commit for the tree: rewrite the dnode without the log.

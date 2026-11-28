@@ -514,22 +514,18 @@ impl<D: PoolDevice + 'static, R: Mutable> EtcdStore<D, R> {
         Ok(self.fs.open_btree(&self.name, DatasetFormat::Etcd).await?)
     }
 
-    /// Make every applied write durable (an intent log flush).
+    /// Make every applied write durable (an intent log flush) and confirm
+    /// this node's lease is still provably fresh (H-11).
     async fn settle(&self) -> Result<()> {
         let target = *self.applied.lock().unwrap();
         if self.durable.borrow().writes >= target.writes {
+            self.fs.check_lease_fresh(&self.name)?;
             return Ok(());
         }
         // In a task of its own: a client that gives up (its gRPC deadline
         // drops this request's future) doesn't cut the flush short; the
         // next request finds it done or waits on it.
-        let (fs, name) = (self.fs.clone(), self.name.clone());
-        tokio::spawn(async move {
-            fs.kv_settle().await?;
-            fs.flush_for(&name).await
-        })
-        .await
-        .map_err(|e| crate::fs::FileSystemError::InvalidArgument(format!("flush: {}", e)))??;
+        crate::service_tree::flush_spawned(&self.fs, &self.name).await?;
         self.durable.send_if_modified(|d| {
             if d.writes < target.writes {
                 *d = target;
@@ -541,12 +537,15 @@ impl<D: PoolDevice + 'static, R: Mutable> EtcdStore<D, R> {
         Ok(())
     }
 
-    /// Wait for reads to see only durable writes. Called with the
-    /// dataset's operations read-locked (no write is applied meanwhile).
+    /// Wait for reads to see only durable writes, and confirm the lease is
+    /// fresh. Called with the dataset's operations read-locked (no write is
+    /// applied meanwhile).
     async fn read_barrier(&self) -> Result<()> {
         let applied = *self.applied.lock().unwrap();
         if self.durable.borrow().writes < applied.writes {
             self.settle().await?;
+        } else {
+            self.fs.check_lease_fresh(&self.name)?;
         }
         Ok(())
     }
@@ -612,7 +611,9 @@ impl<D: PoolDevice + 'static, R: Mutable> EtcdStore<D, R> {
         self.read_barrier().await?;
         let t = Txn::begin(&self.fs, &ds.obj).await?;
         let meta = read_meta(&t).await?;
-        f(&t, &meta).await
+        let out = f(&t, &meta).await?;
+        self.fs.check_lease_fresh(&self.name)?;
+        Ok(out)
     }
 
     // ---- KV -----------------------------------------------------------
@@ -814,6 +815,7 @@ impl<D: PoolDevice + 'static, R: Mutable> EtcdStore<D, R> {
         let ds = self.ds().await?;
         let _r = ds.ops.read().await;
         self.read_barrier().await?;
+        self.fs.check_lease_fresh(&self.name)?;
         let rev = self.durable.borrow().rev;
         let ttl = {
             let mut l = self.leases.lock().unwrap();

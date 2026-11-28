@@ -2911,3 +2911,99 @@ async fn i6_a_dropped_commit_gives_an_open_files_writes_back() {
     let got = fs.read_file(Path::new("/f")).await.unwrap();
     assert_eq!(&got[..new.len()], &new[..]);
 }
+
+/// H-1: a disk that takes writes into volatile cache and fails the
+/// pre-uberblock flush must be recorded degraded in that same TXG's
+/// uberblock, so a crash before the next commit doesn't import it healthy.
+#[tokio::test]
+async fn h1_a_disk_failing_pre_uberblock_flush_is_marked_degraded_in_that_txg() {
+    use std::path::Path;
+    let fp = FaultPool::raidz(1, 3).await;
+    let fs = fp.format().await;
+    fs.write_file(Path::new("/seed"), &pattern(8192, 1))
+        .await
+        .unwrap();
+
+    // Disk 2 accepts TXG N's writes into its volatile cache, then fails flush.
+    fp.disk(2).cache_writes(true);
+    fp.disk(2).fail_flushes(Some(FaultError::Io));
+    fs.write_file(Path::new("/new"), &pattern(16384, 2))
+        .await
+        .unwrap();
+    // Simulate crash before any TXG N+1 commits: disk 2 loses its volatile cache.
+    drop(fs);
+    fp.disk(2).power_cut();
+    fp.disk(2).heal();
+
+    let reloaded = fp.load().await;
+    let status = reloaded.pool_report().await;
+    assert!(
+        status.disks[2].degraded_since.is_some(),
+        "disk 2 failed the pre-uberblock flush of TXG N and must be marked degraded in TXG N"
+    );
+    assert_eq!(
+        reloaded.read_file(Path::new("/new")).await.unwrap(),
+        pattern(16384, 2)
+    );
+}
+
+/// H-6: a rewind open must not write space-map repairs to disk before
+/// `settle_rewind` validates the rewind.
+#[tokio::test]
+async fn h6_a_rewind_open_does_not_repair_space_maps_before_settle() {
+    use std::path::Path;
+    let fp = FaultPool::mirror(2).await;
+    let fs = fp.format().await;
+    fs.write_file(Path::new("/a"), &pattern(16384, 1))
+        .await
+        .unwrap();
+    let txg_a = fs.uberblock().await.txg;
+    // Snapshot disk 1 at txg_a, then commit txg_b and corrupt disk 0's
+    // space-map slot for txg_a by overwriting it (txg_b + txg_c advance slots).
+    fp.disk(1).snapshot();
+    fs.write_file(Path::new("/b"), &pattern(16384, 2))
+        .await
+        .unwrap();
+    fs.write_file(Path::new("/c"), &pattern(16384, 3))
+        .await
+        .unwrap();
+    drop(fs);
+
+    // Restore disk 1 to txg_a: disk 0 has txg_c's space-map slots while disk 1
+    // has txg_a's. Reading slot txg_a on rewind finds it via `reconstruct_candidates`
+    // (healed = Some(block)) — it must NOT write repairs onto disk 0 before
+    // `settle_rewind` validates the rewind.
+    fp.disk(1).restore();
+    // Corrupt TXG `txg_a`'s object-table block on both disks so `settle_rewind`
+    // refuses the rewind (metadata unreadable).
+    let ro = FileSystem::load_readonly_with(fp.dev(), crate::fs::Rewind::Txg(txg_a))
+        .await
+        .unwrap();
+    let obj_ptr = ro.uberblock().await.objects.ptr.expect("objects ptr");
+    drop(ro);
+    for d in 0..2 {
+        let raw = DISK_LABEL_BLOCKS + obj_ptr.extent().start;
+        Disk::faulty(fp.disk(d).clone())
+            .write_block(RawDiskBlock::new(raw), &[0xFF; BLOCK_SIZE])
+            .await
+            .unwrap();
+    }
+
+    let before_writes = fp.disk(0).stats().writes + fp.disk(1).stats().writes;
+    let res = FileSystem::load_with(
+        fp.dev(),
+        crate::fs::LoadOptions {
+            rewind: crate::fs::Rewind::Txg(txg_a),
+        },
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "rewind to a damaged tree must be refused by settle_rewind"
+    );
+    let after_writes = fp.disk(0).stats().writes + fp.disk(1).stats().writes;
+    assert_eq!(
+        after_writes, before_writes,
+        "a refused rewind open must not have written space-map repairs to disk"
+    );
+}
