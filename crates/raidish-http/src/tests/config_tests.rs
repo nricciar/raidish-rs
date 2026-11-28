@@ -159,3 +159,22 @@ fn pool_map_names_this_nodes_disks_by_index() {
             .is_none()
     );
 }
+
+#[test]
+fn a_client_config_without_a_pool_asks_its_endpoints() {
+    let c = Config::parse(
+        "endpoints:\n  - https://node0:8881/\n  - https://node1:8882\ntls:\n  dir: /x\n",
+    )
+    .unwrap();
+    assert_eq!(
+        c.lease_endpoints().unwrap(),
+        vec!["https://node0:8881", "https://node1:8882"]
+    );
+    // With a pool, the pool's disk servers.
+    let c = Config::parse(
+        "endpoints: [https://elsewhere:1]\npool:\n  raidz1:\n    - https://a:1/api/v1/disks/0\n    - https://b:2/api/v1/disks/1\n    - https://c:3/api/v1/disks/2\n",
+    )
+    .unwrap();
+    assert_eq!(c.lease_endpoints().unwrap().len(), 3);
+    assert!(!c.lease_endpoints().unwrap()[0].contains("elsewhere"));
+}

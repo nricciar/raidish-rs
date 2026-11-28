@@ -27,6 +27,11 @@ pub struct Config {
     /// and no `pool`, the legacy raidz2 pool).
     #[serde(default)]
     pub disks: Option<Vec<String>>,
+    /// Nodes to ask, for a config without `pool:` (a client's, as
+    /// `raidish enroll` writes it): the CA and other API commands use them.
+    /// Commands that open the pool itself still need `pool:`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
     /// The pool layout.
     #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
     pub pool: Option<VdevConfig>,
@@ -279,7 +284,15 @@ impl Config {
         }
     }
 
+    /// The nodes to ask: the pool's disk servers, else `endpoints`.
     pub fn lease_endpoints(&self) -> Result<Vec<String>, String> {
+        if self.pool_spec()?.is_none() {
+            return Ok(self
+                .endpoints
+                .iter()
+                .map(|e| e.trim_end_matches('/').to_string())
+                .collect());
+        }
         let mut out: Vec<String> = Vec::new();
         for path in self.pool_spec()?.map(|s| s.paths).unwrap_or_default() {
             let Some(base) = disk_server_base(&path) else {

@@ -35,7 +35,7 @@ pub fn due(pki: &PkiState, now: u64) -> bool {
 }
 
 /// Whether `chain`'s last certificate is `issuer`'s.
-fn signed_by(chain: &str, issuer: &str) -> bool {
+pub(crate) fn signed_by(chain: &str, issuer: &str) -> bool {
     match (
         raidish_auth::ca::pem_certs(chain),
         raidish_auth::ca::pem_certs(issuer),

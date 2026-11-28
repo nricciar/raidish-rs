@@ -634,6 +634,40 @@ pub struct CrlRecord {
     pub generation: u64,
 }
 
+/// The root's CRL, as signed (CA-4d).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RootCrlRecord {
+    #[serde(with = "hex_vec")]
+    pub der: Vec<u8>,
+    /// Only ever goes up.
+    pub number: u64,
+    pub this_update_ms: u64,
+    pub next_update_ms: u64,
+}
+
+/// What still depends on an issuer, at a time (`GET
+/// /api/v1/pki/issuers/<id>`): revoking it waits for the cluster's own
+/// to move.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct IssuerUse {
+    /// Members whose only live node certificates are from it.
+    pub nodes: Vec<NodeId>,
+    /// The token signer is from it.
+    pub token_signer: bool,
+    /// The CRL is signed by it.
+    pub crl: bool,
+    /// Every other live certificate from it (clients, admins, libvirt...):
+    /// they stop working when it's revoked.
+    pub others: Vec<CertListing>,
+}
+
+impl IssuerUse {
+    /// Nothing of the cluster's own is left on it.
+    pub fn clear(&self) -> bool {
+        self.nodes.is_empty() && !self.token_signer && !self.crl
+    }
+}
+
 /// What [`CertChecker::crl`] reads off a signed CRL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrlFacts {
@@ -668,6 +702,11 @@ pub struct PkiState {
     /// don't read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crl: Option<CrlRecord>,
+    /// The root's CRL (CA-4d): the issuers it revoked, signed by the root
+    /// offline (`ca revoke-issuer`). For verifiers outside the cluster
+    /// (GnuTLS); the cluster's own go by `IssuerStatus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_crl: Option<RootCrlRecord>,
     /// Bumped by every change a verifier must see.
     #[serde(default)]
     pub generation: u64,
@@ -744,6 +783,8 @@ pub enum PkiOp {
     },
     /// A newer CRL, signed by the active issuer.
     SetCrl(Box<CrlRecord>),
+    /// A newer root CRL, signed by the root (offline, by the admin).
+    SetRootCrl(Box<RootCrlRecord>),
     /// The identity that signs `rdt2` tokens, issued by the active issuer
     /// (D6). Replaces the one there is.
     SetTokenSigner(Box<TokenSignerRecord>),
@@ -1392,8 +1433,81 @@ impl PkiState {
                 }
                 self.crl = Some((**record).clone());
             }
+            PkiOp::SetRootCrl(record) => {
+                let facts = checker
+                    .crl(&record.der, &self.anchor.cert_pem)
+                    .map_err(|e| format!("root CRL: {}", e))?;
+                if facts.number != record.number
+                    || facts.this_update_ms != record.this_update_ms
+                    || facts.next_update_ms != record.next_update_ms
+                {
+                    return Err("root CRL: record doesn't match the CRL".into());
+                }
+                if let Some(cur) = &self.root_crl
+                    && record.number <= cur.number
+                {
+                    return Err(format!(
+                        "root CRL {} is no newer than the current {}",
+                        record.number, cur.number
+                    ));
+                }
+                if record.next_update_ms <= now_ms || record.this_update_ms > now_ms + 5 * 60_000 {
+                    return Err("root CRL: not current at this time".into());
+                }
+                self.root_crl = Some((**record).clone());
+            }
         }
         Ok(())
+    }
+
+    /// What depends on issuer `id` at `now_ms`. `signed_by(chain, issuer)`
+    /// says whether a token signer's chain is that issuer's (this crate
+    /// reads no certificates).
+    pub fn issuer_use(
+        &self,
+        id: IssuerId,
+        now_ms: u64,
+        signed_by: impl Fn(&str, &str) -> bool,
+    ) -> IssuerUse {
+        let mut out = IssuerUse::default();
+        let Some(issuer) = self.issuers.get(&id) else {
+            return out;
+        };
+        let mut members: BTreeMap<NodeId, bool> = BTreeMap::new();
+        for (serial, c) in &self.certs {
+            if !self.is_live(serial, now_ms) {
+                continue;
+            }
+            match (c.identity.profile, c.identity.member) {
+                (ProfileKind::Node, Some(m)) => {
+                    // On it only if it has no live one from another.
+                    let elsewhere = c.issuer != id;
+                    *members.entry(m).or_insert(false) |= elsewhere;
+                }
+                _ if c.issuer == id => out.others.push(CertListing {
+                    serial: serial.clone(),
+                    cert: c.clone(),
+                    revoked: None,
+                }),
+                _ => {}
+            }
+        }
+        out.nodes = members
+            .into_iter()
+            .filter(|(m, moved)| {
+                !moved
+                    && self
+                        .member_certs(*m, now_ms)
+                        .any(|(_, c)| c.issuer == id && c.identity.profile == ProfileKind::Node)
+            })
+            .map(|(m, _)| m)
+            .collect();
+        out.token_signer = self
+            .token_signer
+            .as_ref()
+            .is_some_and(|t| signed_by(&t.chain_pem, &issuer.cert_pem));
+        out.crl = self.crl.as_ref().is_some_and(|c| c.issuer == id);
+        out
     }
 
     /// Forget what no longer matters: certificates and revocations a day
@@ -1449,6 +1563,7 @@ impl PkiState {
                 not_after_ms: t.not_after_ms,
                 revoked: self.is_revoked(&t.serial),
             }),
+            root_crl: self.root_crl.as_ref().map(|c| (c.number, c.next_update_ms)),
             generation: self.generation,
         }
     }
@@ -1549,6 +1664,9 @@ pub struct PkiView {
     /// What signs `rdt2` tokens (revoke it by its serial to end them all).
     #[serde(default)]
     pub token_signer: Option<TokenSignerView>,
+    /// The root CRL's number and when it runs out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_crl: Option<(u64, u64)>,
     pub generation: u64,
 }
 

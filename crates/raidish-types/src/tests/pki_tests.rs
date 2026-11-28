@@ -167,6 +167,7 @@ fn fresh() -> PkiState {
         enrollments: BTreeMap::new(),
         profiles: BTreeMap::new(),
         crl: None,
+        root_crl: None,
         generation: 0,
     }
 }
@@ -1402,4 +1403,79 @@ fn a_consume_made_before_a_seal_leaves_the_token_and_the_member_alone() {
             .contains("seal epoch")
     );
     assert_eq!(pki, before, "the token's left, the old cert unrevoked");
+}
+
+fn root_crl(by: &str, number: u64, this: u64, next: u64) -> PkiOp {
+    PkiOp::SetRootCrl(Box::new(RootCrlRecord {
+        der: format!("{}|{}|{}|{}", by, number, this, next).into_bytes(),
+        number,
+        this_update_ms: this,
+        next_update_ms: next,
+    }))
+}
+
+#[test]
+fn the_root_crl_is_the_roots_and_only_goes_forward() {
+    let mut pki = installed();
+    let next = T0 + 7000 * DAY;
+    // Signed by an issuer, or another root: refused.
+    assert!(run(&mut pki, root_crl("ISSUER1", 1, T0, next), T0).is_err());
+    assert!(run(&mut pki, root_crl("FOREIGN-ROOT", 1, T0, next), T0).is_err());
+    // A record that says other than its CRL.
+    let mut lying = root_crl("ROOT", 1, T0, next);
+    if let PkiOp::SetRootCrl(r) = &mut lying {
+        r.number = 7;
+    }
+    assert!(run(&mut pki, lying, T0).is_err());
+    // Already out of date.
+    assert!(run(&mut pki, root_crl("ROOT", 1, T0 - 2 * DAY, T0 - DAY), T0).is_err());
+    run(&mut pki, root_crl("ROOT", 1, T0, next), T0).unwrap();
+    assert_eq!(pki.as_deref().unwrap().root_crl.as_ref().unwrap().number, 1);
+    assert_eq!(pki.as_deref().unwrap().view().root_crl, Some((1, next)));
+    assert!(run(&mut pki, root_crl("ROOT", 1, T0, next), T0).is_err());
+    run(&mut pki, root_crl("ROOT", 2, T0, next), T0).unwrap();
+    // Not a verifier's concern.
+    assert_eq!(pki.as_deref().unwrap().generation, 0);
+}
+
+#[test]
+fn an_issuer_is_in_use_until_every_member_has_moved_off() {
+    let mut pki = installed();
+    record(&mut pki, 10, node_cert(1, T0 + 30 * DAY));
+    record(&mut pki, 11, node_cert(2, T0 + 30 * DAY));
+    let mut client = node_cert(9, T0 + 30 * DAY);
+    client.identity = Identity {
+        profile: ProfileKind::Admin,
+        cn: "alice".into(),
+        sans: vec![],
+        member: None,
+    };
+    record(&mut pki, 12, client);
+    run(
+        &mut pki,
+        PkiOp::AddIssuer {
+            id: IssuerId(2),
+            record: Box::new(issuer("ISSUER2", 3, T0 + 1460 * DAY)),
+            activate: true,
+        },
+        T0,
+    )
+    .unwrap();
+    let none = |_: &str, _: &str| false;
+    let u = pki.as_deref().unwrap().issuer_use(IssuerId(1), T0, none);
+    assert_eq!(u.nodes, vec![m(1), m(2)]);
+    assert!(!u.clear());
+    assert_eq!(u.others.len(), 1);
+    // Node 1 renews onto issuer 2 (its old certificate still live).
+    let mut renewed = node_cert(1, T0 + 30 * DAY);
+    renewed.issuer = IssuerId(2);
+    record(&mut pki, 13, renewed);
+    let u = pki.as_deref().unwrap().issuer_use(IssuerId(1), T0, none);
+    assert_eq!(u.nodes, vec![m(2)]);
+    // Node 2's runs out: nothing of the cluster's is on it.
+    let u = pki
+        .as_deref()
+        .unwrap()
+        .issuer_use(IssuerId(1), T0 + 31 * DAY, none);
+    assert!(u.nodes.is_empty() && u.others.is_empty() && u.clear());
 }

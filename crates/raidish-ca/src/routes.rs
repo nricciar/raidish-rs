@@ -4,9 +4,10 @@
 
 use crate::CaService;
 use crate::api::{
-    EnrollmentCreated, EnrollmentRequest, Issued, JoinRequest, RekeyRequest, Rekeyed,
-    RemoveSlotQuery, RenewRequest, RevokeCertRequest, RevokeTokenRequest, SealRequest, SignRequest,
-    SlotCreated, SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
+    ClientEnrollmentCreated, ClientEnrollmentRequest, EnrollRequest, Enrolled, EnrollmentCreated,
+    EnrollmentRequest, Issued, IssuerAdded, JoinRequest, NewIssuerRequest, RekeyRequest, Rekeyed,
+    RemoveSlotQuery, RenewRequest, RevokeCertRequest, RevokeTokenRequest, RootCrlRequest,
+    SealRequest, SignRequest, SlotCreated, SlotRequest, TokenCreated, TokenRequest, UnsealRequest,
 };
 use crate::service::CaError;
 use axum::extract::{ConnectInfo, Extension, Path, State};
@@ -15,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use raidish_auth::auth::{CanRead, IsAdmin, IsAdminCert};
 use raidish_auth::http::{Json, Peer, Query};
-use raidish_types::pki::{CertListing, PkiStatus, Serial, TokenId};
+use raidish_types::pki::{CertListing, IssuerId, IssuerUse, PkiStatus, Serial, TokenId};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -82,6 +83,23 @@ pub async fn join(
     ca.join(req.into_inner(), forwarded).await.map(Json)
 }
 
+/// A client's certificate, by its enrollment token (CA-4c): as `/join`.
+pub async fn enroll(
+    addr: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Query(Forwarded { forwarded }): Query<Forwarded>,
+    State(ca): Ca,
+    req: Json<EnrollRequest>,
+) -> Result<Json<Enrolled>, CaError> {
+    let ip = addr.map(|Extension(ConnectInfo(a))| a.ip());
+    if !ca.join_allowed(ip) {
+        return Err(CaError::new(
+            429,
+            "too many enrollments from this address: wait a minute",
+        ));
+    }
+    ca.enroll(req.into_inner(), forwarded).await.map(Json)
+}
+
 /// The caller's own certificate (by TLS, never a token), renewed.
 pub async fn renew(
     peer: Option<Extension<Peer>>,
@@ -131,6 +149,20 @@ pub async fn create_enrollment(
 ) -> Result<Json<EnrollmentCreated>, CaError> {
     let peer = presented(peer)?;
     ca.create_enrollment(&admin.0, peer.cert(), req.into_inner())
+        .await
+        .map(Json)
+}
+
+/// A client enrollment token: it grants a certificate, so an admin's own
+/// certificate only (D8).
+pub async fn create_client_enrollment(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
+    req: Json<ClientEnrollmentRequest>,
+) -> Result<Json<ClientEnrollmentCreated>, CaError> {
+    let peer = presented(peer)?;
+    ca.create_client_enrollment(&admin.0, peer.cert(), req.into_inner())
         .await
         .map(Json)
 }
@@ -289,16 +321,107 @@ pub async fn remove_slot(
     ca.remove_slot(&id, q.force, Some(admin.0.name)).await
 }
 
+fn issuer_id(s: &str) -> Result<IssuerId, CaError> {
+    s.trim_start_matches("issuer-")
+        .parse()
+        .map(IssuerId)
+        .map_err(|_| CaError::new(400, format!("'{}': an issuer is issuer-N", s)))
+}
+
+/// A new active issuer (CA-4d): it grants authority, so an admin's own
+/// certificate only (D8), on an unsealed node.
+pub async fn add_issuer(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
+    req: Json<NewIssuerRequest>,
+) -> Result<Json<IssuerAdded>, CaError> {
+    let peer = presented(peer)?;
+    ca.add_issuer(peer.cert(), req.into_inner(), Some(admin.0.name))
+        .await
+        .map(Json)
+}
+
+/// What still depends on an issuer.
+pub async fn issuer_use(
+    _auth: CanRead,
+    Path(id): Path<String>,
+    State(ca): Ca,
+) -> Result<Json<IssuerUse>, CaError> {
+    ca.issuer_use(issuer_id(&id)?).await.map(Json)
+}
+
+#[derive(Deserialize, Default)]
+pub struct Force {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Revoke an issuer: it takes authority away (D8), but every certificate
+/// it signed with it, so it waits for the cluster's own to move
+/// (`?force=true` doesn't).
+pub async fn revoke_issuer(
+    admin: IsAdmin,
+    Path(id): Path<String>,
+    Query(Force { force }): Query<Force>,
+    State(ca): Ca,
+) -> Result<Json<IssuerUse>, CaError> {
+    ca.revoke_issuer(issuer_id(&id)?, force, Some(admin.0.name))
+        .await
+        .map(Json)
+}
+
+/// The root's CRL, signed by the admin with the root.
+pub async fn set_root_crl(
+    admin: IsAdminCert,
+    peer: Option<Extension<Peer>>,
+    State(ca): Ca,
+    req: Json<RootCrlRequest>,
+) -> Result<(), CaError> {
+    let peer = presented(peer)?;
+    ca.set_root_crl(peer.cert(), &req.crl_pem, Some(admin.0.name))
+        .await
+        .map(|_| ())
+}
+
+/// The root's CRL, for anyone (DER; `?format=pem`). `404` before the
+/// first issuer is revoked.
+pub async fn root_crl(
+    Query(CrlFormat { format }): Query<CrlFormat>,
+    State(ca): Ca,
+) -> Result<Response, CaError> {
+    let crl = ca
+        .root_crl()
+        .await
+        .ok_or_else(|| CaError::new(404, "no root CRL: no issuer has been revoked"))?;
+    Ok(match format.as_deref() {
+        Some("pem") => (
+            [(header::CONTENT_TYPE, "application/x-pem-file")],
+            crate::crl_pem(&crl.der),
+        )
+            .into_response(),
+        None | Some("der") => {
+            ([(header::CONTENT_TYPE, "application/pkix-crl")], crl.der).into_response()
+        }
+        Some(f) => return Err(CaError::new(400, format!("format '{}': der or pem", f))),
+    })
+}
+
 /// The routes, on this node's CA service.
 pub fn router(ca: Arc<CaService>) -> axum::Router {
     axum::Router::new()
         .route("/api/v1/pki/ca.pem", get(ca_pem))
         .route("/api/v1/pki/status", get(status))
         .route("/api/v1/pki/join", post(join))
+        .route("/api/v1/pki/enroll", post(enroll))
         .route("/api/v1/pki/renew", post(renew))
         .route("/api/v1/pki/self/renew", post(renew_self))
         .route("/api/v1/pki/sign", post(sign))
         .route("/api/v1/pki/enrollments", post(create_enrollment))
+        .route(
+            "/api/v1/pki/enrollments/client",
+            post(create_client_enrollment),
+        )
         .route("/api/v1/pki/enrollments/{id}", delete(cancel_enrollment))
         .route("/api/v1/pki/unseal", post(unseal))
         .route("/api/v1/pki/seal", post(seal))
@@ -307,6 +430,10 @@ pub fn router(ca: Arc<CaService>) -> axum::Router {
         .route("/api/v1/pki/slots/{id}", delete(remove_slot))
         .route("/api/v1/pki/certs", get(certs))
         .route("/api/v1/pki/crl", get(crl))
+        .route("/api/v1/pki/root-crl", get(root_crl).post(set_root_crl))
+        .route("/api/v1/pki/issuers", post(add_issuer))
+        .route("/api/v1/pki/issuers/{id}", get(issuer_use))
+        .route("/api/v1/pki/issuers/{id}/revoke", post(revoke_issuer))
         .route("/api/v1/pki/certs/{serial}/revoke", post(revoke_cert))
         .route("/api/v1/pki/tokens", post(create_token))
         .route("/api/v1/pki/tokens/{id}/revoke", post(revoke_token))

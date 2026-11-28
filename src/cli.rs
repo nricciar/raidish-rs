@@ -194,6 +194,26 @@ enum Commands {
         #[command(subcommand)]
         command: crate::cli_ca::CaCommands,
     },
+    /// Get a client certificate from the cluster CA with an enrollment
+    /// token (`raidish ca token create --client`): the key is made here
+    /// and never leaves. Writes the bundle to `--dir`, and the config
+    /// (`-c`, default ~/.raidish.yaml) pointing at it, unless there is one.
+    Enroll {
+        /// A running node (`https://node0:8881`).
+        url: String,
+        /// Read the token from stdin.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Read the token from a file.
+        #[arg(long, conflicts_with = "token_stdin")]
+        token_file: Option<PathBuf>,
+        /// Where the bundle goes (default ~/.raidish/tls).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Replace a bundle that's there.
+        #[arg(long)]
+        force: bool,
+    },
     /// Get this node's certificate from the cluster CA with a join token
     /// (from `ca init` or `ca token create`), before its first `listen`.
     Join {
@@ -517,6 +537,26 @@ pub async fn main() -> std::io::Result<()> {
                 .map(|s| s.paths)
                 .unwrap_or_default()
         });
+        return Ok(());
+    }
+    // A client's first certificate, before it has a config.
+    if let Commands::Enroll {
+        url,
+        token_stdin,
+        token_file,
+        dir,
+        force,
+    } = &cli.command
+    {
+        crate::cli_ca::enroll(
+            url,
+            *token_stdin,
+            token_file.as_deref(),
+            dir.as_deref(),
+            *force,
+            &cli.config,
+        )
+        .await;
         return Ok(());
     }
     let config = load_config(&cli.config)?;
@@ -939,6 +979,7 @@ pub async fn main() -> std::io::Result<()> {
         | Commands::Token { .. }
         | Commands::Ca { .. }
         | Commands::Join { .. }
+        | Commands::Enroll { .. }
         | Commands::Dataset { .. } => unreachable!(),
     }
     if let Some(lease) = lease {

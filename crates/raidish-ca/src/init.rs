@@ -146,6 +146,7 @@ pub fn init(opts: &InitOptions) -> Result<InitOutput, String> {
         enrollments: BTreeMap::new(),
         profiles: BTreeMap::new(),
         crl: None,
+        root_crl: None,
         generation: 0,
     };
     // Everything after the anchor goes in as the ops the daemon would

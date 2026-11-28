@@ -663,6 +663,9 @@ struct Up {
     raft: [u16; 3],
     tls: [u16; 3],
     renewing: Option<Renewing>,
+    /// `root.enc` and the root key, as `ca init` left them.
+    root_env: Vec<u8>,
+    root_key: String,
 }
 
 impl Up {
@@ -757,6 +760,8 @@ async fn bring_up_full(node_days: Option<u32>, life: Option<u64>) -> Up {
         raft,
         tls,
         renewing,
+        root_env: serde_json::to_vec(&out.root_envelope).unwrap(),
+        root_key: out.root_key.to_string(),
     }
 }
 
@@ -968,6 +973,14 @@ async fn revocations_apply_everywhere_at_once() {
         "node 2's connections to node 0 are closed"
     );
     assert!(!let_in(&node2, &urls[0]).await);
+    // Node 1 refuses it once it has applied the revocation.
+    assert!(
+        wait_for(5, || up.nodes[1]
+            .cluster
+            .pki()
+            .is_some_and(|p| p.is_revoked(&node2_serial)))
+        .await
+    );
     assert!(!let_in(&node2, &urls[1]).await);
     // The others are unaffected.
     assert!(let_in(&client(&up.tls_dirs[1]), &urls[0]).await);
@@ -2215,4 +2228,368 @@ async fn nodes_renew_their_own_certificates_live() {
     for n in &up.nodes {
         n.stop().await;
     }
+}
+
+async fn client_token(
+    admin: &reqwest::Client,
+    url: &str,
+    profile: ProfileKind,
+    cn: &str,
+) -> Result<JoinToken, (u16, String)> {
+    let r = admin
+        .post(format!("{}/api/v1/pki/enrollments/client", url))
+        .json(&crate::api::ClientEnrollmentRequest {
+            profile,
+            cn: cn.into(),
+            ttl_secs: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    if !r.status().is_success() {
+        return Err((r.status().as_u16(), r.text().await.unwrap()));
+    }
+    let e: crate::api::ClientEnrollmentCreated = r.json().await.unwrap();
+    assert_eq!((e.profile, e.cn.as_str()), (profile, cn));
+    Ok(JoinToken::parse(&e.token).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clients_enroll_once_with_a_token() {
+    let up = bring_up().await;
+    let admin = client(&up.admin_dir);
+    let (n0, n1, n2) = (&up.nodes[0], &up.nodes[1], &up.nodes[2]);
+    assert!(!n1.ca.unsealed(), "node 1 passes it on");
+    let pending = |id: &TokenId| {
+        n0.cluster
+            .pki()
+            .is_some_and(|p| p.enrollments.contains_key(id))
+    };
+
+    // Only client profiles with no host names.
+    for p in [
+        ProfileKind::Node,
+        ProfileKind::TokenSigner,
+        ProfileKind::Server,
+        ProfileKind::Libvirt,
+    ] {
+        let (status, _) = client_token(&admin, &n0.url, p, "x").await.err().unwrap();
+        assert_eq!(status, 400, "{}", p);
+    }
+    assert_eq!(
+        client_token(&admin, &n0.url, ProfileKind::Readonly, " ")
+            .await
+            .err()
+            .unwrap()
+            .0,
+        400
+    );
+    // An admin's certificate, not just anyone's.
+    let token = client_token(&admin, &n0.url, ProfileKind::Readonly, "alice")
+        .await
+        .unwrap();
+    assert!(pending(&token.id));
+
+    // A token naming another root is refused before it's sent.
+    let wrong = JoinToken {
+        root: raidish_types::pki::CertFingerprint([7; 32]),
+        id: token.id.clone(),
+        secret: token.secret.clone(),
+    };
+    let e = crate::join::enroll(&n1.url, &wrong).await.err().unwrap();
+    assert!(e.contains("another CA"), "{}", e);
+    // Not a node's: /join refuses it, and it isn't used up.
+    let m1 = members(&up.paths, up.raft[1]);
+    let e = crate::join::join(&n1.url, &token, m1.me, &m1.fingerprint)
+        .await
+        .err()
+        .unwrap();
+    assert!(e.contains("not a node join token"), "{}", e);
+    // A bad CSR doesn't use it up either.
+    let r = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/pki/enroll", n0.url))
+        .json(&crate::api::EnrollRequest {
+            id: token.id.clone(),
+            secret: token.secret_b64().to_string(),
+            csr_pem: "not a CSR".into(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "{:?}", r.text().await);
+    assert!(pending(&token.id));
+
+    // Through a sealed node: passed on to node 0, which signs.
+    let got = crate::join::enroll(&n1.url, &token).await.unwrap();
+    let e = &got.enrolled;
+    assert_eq!((e.profile, e.cn.as_str()), (ProfileKind::Readonly, "alice"));
+    // The signer's peers, and node 1's (which name the signer): all three.
+    assert_eq!(e.endpoints.len(), 3, "{:?}", e.endpoints);
+    assert!(
+        wait_for(10, || !pending(&token.id)).await,
+        "the token is used up"
+    );
+    let dir = up.base.join("alice");
+    got.bundle.write_dir(&dir).unwrap();
+    let who = whoami(&client(&dir), &n2.url).await;
+    assert_eq!(
+        (who["name"].as_str(), who["role"].as_str()),
+        (Some("alice"), Some("readonly"))
+    );
+    let pki = n0.ca.current_linearizable().await.unwrap();
+    let rec = &pki.certs[&e.issued.serial];
+    assert_eq!(rec.identity.profile, ProfileKind::Readonly);
+    assert_eq!(rec.identity.cn, "alice");
+    assert!(rec.identity.member.is_none() && rec.identity.sans.is_empty());
+    // Read-only means read-only.
+    let r = client(&dir)
+        .post(format!("{}/api/v1/pki/self/renew", n2.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // Once only.
+    let e = crate::join::enroll(&n0.url, &token).await.err().unwrap();
+    assert!(e.contains("403"), "{}", e);
+
+    // A node's join token is refused at /enroll, and kept.
+    let node = make_token(&admin, &n0.url, &node_token(1, true)).await;
+    let e = crate::join::enroll(&n0.url, &node).await.err().unwrap();
+    assert!(e.contains("raidish join"), "{}", e);
+    assert!(pending(&node.id));
+
+    for n in &up.nodes {
+        n.stop().await;
+    }
+}
+
+async fn post_issuer(
+    admin: &reqwest::Client,
+    url: &str,
+    req: &crate::api::NewIssuerRequest,
+) -> Result<crate::api::IssuerAdded, u16> {
+    let r = admin
+        .post(format!("{}/api/v1/pki/issuers", url))
+        .json(req)
+        .send()
+        .await
+        .unwrap();
+    match r.status().is_success() {
+        true => Ok(r.json().await.unwrap()),
+        false => Err(r.status().as_u16()),
+    }
+}
+
+/// The issuer of node `i`'s certificate as served now.
+fn served_issuer(up: &Up, i: usize) -> Option<raidish_types::pki::IssuerId> {
+    let leaf = up.nodes[i].ca.identity.as_ref()?.live.leaf();
+    let serial = raidish_auth::ca::facts(&leaf).ok()?.serial;
+    up.nodes[0]
+        .cluster
+        .pki()?
+        .certs
+        .get(&serial)
+        .map(|c| c.issuer)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_issuer_is_rotated_and_the_old_one_revoked() {
+    use raidish_types::pki::{IssuerId, IssuerStatus, IssuerUse};
+    // Renewing nodes, with node certificates as long as usual: only the
+    // rotation makes them renew.
+    let up = bring_up_renewing(30 * 86_400).await;
+    let admin = client(&up.admin_dir);
+    let n0 = &up.nodes[0];
+    let pki = n0.cluster.pki().unwrap();
+    let anchor = pki.anchor.fingerprint;
+    assert!(crate::rotate::Root::open(&up.root_env, &up.recovery_key, &anchor).is_err());
+    assert!(
+        crate::rotate::Root::open(
+            &up.root_env,
+            &up.root_key,
+            &raidish_types::pki::CertFingerprint([1; 32])
+        )
+        .is_err(),
+        "another CA's root.enc"
+    );
+    let root = crate::rotate::Root::open(&up.root_env, &up.root_key, &anchor).unwrap();
+    (0..3).for_each(|i| assert_eq!(served_issuer(&up, i), Some(IssuerId(1))));
+
+    // The wrong id, or a key that isn't the certificate's: refused.
+    let req = root.issuer(IssuerId(3), 365).unwrap();
+    assert_eq!(post_issuer(&admin, &n0.url, &req).await.err(), Some(409));
+    let mut req = root.issuer(IssuerId(2), 365).unwrap();
+    let other = root.issuer(IssuerId(2), 365).unwrap();
+    let good_key = std::mem::replace(&mut req.key_pem, other.key_pem.clone());
+    assert_eq!(post_issuer(&admin, &n0.url, &req).await.err(), Some(400));
+    req.key_pem = good_key;
+    // Through a sealed node: 503, nothing changed.
+    assert_eq!(
+        post_issuer(&admin, &up.nodes[1].url, &req).await.err(),
+        Some(503)
+    );
+
+    let added = post_issuer(&admin, &n0.url, &req).await.unwrap();
+    assert_eq!(
+        (added.id, added.retired.clone()),
+        (IssuerId(2), vec![IssuerId(1)])
+    );
+    // Everything moves by itself: nodes renew (two of them sealed, through
+    // node 0), the token signer and the CRL are made anew.
+    let use_of = |id: u32| {
+        let pki = n0.cluster.pki().unwrap();
+        pki.issuer_use(
+            IssuerId(id),
+            crate::now_ms(),
+            crate::token_signer::signed_by,
+        )
+    };
+    assert!(
+        wait_for(30, || (0..3)
+            .all(|i| served_issuer(&up, i) == Some(IssuerId(2)))
+            && use_of(1).clear())
+        .await,
+        "everything of the cluster's moved: {:?}",
+        use_of(1)
+    );
+    let pki = n0.cluster.pki().unwrap();
+    assert_eq!(pki.crl.as_ref().unwrap().issuer, IssuerId(2));
+    assert!(matches!(
+        pki.issuers[&IssuerId(1)].status,
+        IssuerStatus::Retired
+    ));
+    // The old issuer's certificates still work (the admin's is one).
+    assert!(let_in(&admin, &up.nodes[2].url).await);
+    let u: IssuerUse = admin
+        .get(format!("{}/api/v1/pki/issuers/issuer-1", up.nodes[2].url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(u.clear());
+    let admin_serial = {
+        let (chain, _) = tls_in(&up.admin_dir).identity().unwrap().unwrap();
+        raidish_auth::ca::facts(&chain[0]).unwrap().serial
+    };
+    assert!(u.others.iter().any(|c| c.serial == admin_serial));
+
+    // A new admin certificate (from issuer 2), then the old issuer goes.
+    let admin2_dir = up.base.join("admin2");
+    let issued = issue(&admin, &n0.url, ProfileKind::Admin, "admin2", &admin2_dir).await;
+    assert_eq!(
+        n0.ca.current_linearizable().await.unwrap().certs[&issued.serial].issuer,
+        IssuerId(2)
+    );
+    let admin2 = client(&admin2_dir);
+    let r = admin2
+        .post(format!(
+            "{}/api/v1/pki/issuers/issuer-1/revoke",
+            up.nodes[1].url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{:?}", r.text().await);
+    for n in &up.nodes {
+        assert!(
+            wait_for(5, || n.cluster.pki().is_some_and(|p| matches!(
+                p.issuers[&IssuerId(1)].status,
+                IssuerStatus::Revoked { .. }
+            )))
+            .await
+        );
+    }
+    // The old one's certificates are refused everywhere; the cluster's own
+    // carry on.
+    for n in &up.nodes {
+        assert!(!let_in(&client(&up.admin_dir), &n.url).await, "{}", n.url);
+        assert!(let_in(&admin2, &n.url).await);
+    }
+    for i in 0..3 {
+        let who = whoami(&client(&up.tls_dirs[i]), &up.nodes[(i + 1) % 3].url).await;
+        assert_eq!(who["role"], "node");
+    }
+
+    // The root's CRL, signed here with the root.
+    let at = match n0.cluster.pki().unwrap().issuers[&IssuerId(1)].status {
+        IssuerStatus::Revoked { at_ms } => at_ms,
+        _ => unreachable!(),
+    };
+    let old_serial = pki.issuers[&IssuerId(1)].serial.clone();
+    let crl = root.crl(&[(old_serial.clone(), at)], 1).unwrap();
+    let send = |pem: String| {
+        let admin2 = admin2.clone();
+        let url = n0.url.clone();
+        async move {
+            admin2
+                .post(format!("{}/api/v1/pki/root-crl", url))
+                .json(&crate::api::RootCrlRequest { crl_pem: pem })
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(send(crl.clone()).await, 200);
+    assert_eq!(send(crl.clone()).await, 409, "no newer than the current");
+    // A CRL the root didn't sign.
+    let (other_root, other_key) = raidish_auth::ca::create_root("other", 30).unwrap();
+    let forged = raidish_auth::ca::Signer::new(IssuerId(0), &other_root, &other_key)
+        .unwrap()
+        .sign_crl(&[], 5, crate::now_ms() + 86_400_000)
+        .unwrap()
+        .0;
+    assert_eq!(send(crate::crl_pem(&forged)).await, 400);
+    let got = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/pki/root-crl", up.nodes[2].url))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let parsed = raidish_auth::ca::X509Checker;
+    use raidish_types::pki::CertChecker;
+    let f = parsed.crl(&got, &root.cert_pem).unwrap();
+    assert_eq!(f.number, 1);
+    assert_eq!(f.next_update_ms / 1000, root.not_after_ms / 1000);
+    assert!(
+        x509_lists(&got, &old_serial),
+        "the root CRL lists the old issuer"
+    );
+    let status = status_of(&admin2, &n0.url).await;
+    assert_eq!(status.pki.unwrap().root_crl.map(|(n, _)| n), Some(1));
+
+    // And again: issuer 3.
+    let req = root.issuer(IssuerId(3), 365).unwrap();
+    let added = post_issuer(&admin2, &n0.url, &req).await.unwrap();
+    assert_eq!(added.retired, vec![IssuerId(2)]);
+    assert!(
+        wait_for(30, || (0..3)
+            .all(|i| served_issuer(&up, i) == Some(IssuerId(3))))
+        .await
+    );
+    for n in &up.nodes {
+        n.stop().await;
+    }
+}
+
+/// Whether the CRL `der` lists `serial`.
+fn x509_lists(der: &[u8], serial: &raidish_types::pki::Serial) -> bool {
+    use x509_parser::prelude::*;
+    let (_, crl) = CertificateRevocationList::from_der(der).unwrap();
+    crl.iter_revoked_certificates().any(|r| {
+        hex::encode(r.raw_serial()).trim_start_matches("00")
+            == serial.to_string().trim_start_matches("00")
+    })
 }

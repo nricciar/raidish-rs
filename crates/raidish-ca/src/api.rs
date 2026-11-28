@@ -1,6 +1,6 @@
 //! The `/api/v1/pki/*` request and answer bodies.
 
-use raidish_types::pki::{ProfileKind, Serial, TokenId};
+use raidish_types::pki::{IssuerId, ProfileKind, Serial, TokenId};
 use raidish_types::types::NodeId;
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,74 @@ pub struct EnrollmentCreated {
     /// The `rdj1.…` token: shown once, never stored.
     pub token: String,
     pub expires_ms: u64,
+}
+
+/// `POST /api/v1/pki/enrollments/client`: a token a client enrolls with
+/// (`ca token create --client`, CA-4c).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClientEnrollmentRequest {
+    /// `admin`, `readonly` or `client`.
+    pub profile: ProfileKind,
+    pub cn: String,
+    /// How long the token is good for (default a day).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClientEnrollmentCreated {
+    pub id: TokenId,
+    pub profile: ProfileKind,
+    pub cn: String,
+    /// The `rdj1.…` token: shown once, never stored.
+    pub token: String,
+    pub expires_ms: u64,
+}
+
+/// `POST /api/v1/pki/enroll`: a client's certificate, by its token.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EnrollRequest {
+    pub id: TokenId,
+    /// The token's secret (base64url, as in the token).
+    pub secret: String,
+    /// Only its key is used: the name and profile are the token's.
+    pub csr_pem: String,
+}
+
+/// What `/enroll` answers.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Enrolled {
+    #[serde(flatten)]
+    pub issued: Issued,
+    pub profile: ProfileKind,
+    pub cn: String,
+    /// The nodes the signer knows of (by its pool config), to ask later.
+    pub endpoints: Vec<String>,
+}
+
+/// `POST /api/v1/pki/issuers`: a new issuer, made by the admin with the
+/// root (`ca rotate-issuer`, CA-4d). It becomes the active one.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NewIssuerRequest {
+    /// The id it's made for (the next one): its key is sealed under it.
+    pub id: IssuerId,
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct IssuerAdded {
+    pub id: IssuerId,
+    pub serial: Serial,
+    pub not_after_ms: u64,
+    /// Was active, now retired.
+    pub retired: Vec<IssuerId>,
+}
+
+/// `POST /api/v1/pki/root-crl`: the root's CRL, signed by the admin.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RootCrlRequest {
+    pub crl_pem: String,
 }
 
 /// `POST /api/v1/pki/unseal`.

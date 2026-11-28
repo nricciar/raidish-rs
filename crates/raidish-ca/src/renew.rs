@@ -52,7 +52,7 @@ pub(crate) struct Renewer {
 /// The client a node renews through a peer with: the certificate it
 /// presents is the one renewed, so never a pooled connection or a resumed
 /// TLS session, which would carry the one before.
-pub(crate) fn client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<reqwest::Client, String> {
+pub fn client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<reqwest::Client, String> {
     let b = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .connect_timeout(raidish_auth::tls::CONNECT_TIMEOUT)

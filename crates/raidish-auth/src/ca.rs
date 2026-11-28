@@ -121,6 +121,18 @@ fn as_issuer(cert_pem: &str, key_pem: &str) -> Result<(rcgen::Certificate, KeyPa
     Ok((cert, key))
 }
 
+/// Whether `key_pem` is the key of `cert_pem`'s certificate (its public
+/// half is the one certified).
+pub fn key_matches(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    let key = KeyPair::from_pem(key_pem).map_err(|e| format!("bad key: {}", e))?;
+    let der = first_der(cert_pem)?;
+    let cert = parse(&der)?;
+    if cert.public_key().subject_public_key.data.as_ref() != key.public_key_raw() {
+        return Err("the key isn't the certificate's".into());
+    }
+    Ok(())
+}
+
 /// A new root CA: its certificate and key (PEM), `pathLen=1`.
 pub fn create_root(name: &str, days: u32) -> Result<(String, Zeroizing<String>), String> {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(err)?;

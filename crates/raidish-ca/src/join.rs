@@ -1,4 +1,5 @@
-//! `raidish join`: get this node's certificate with a join token.
+//! `raidish join`: get this node's certificate with a join token; and
+//! `raidish enroll`, a client's (CA-4c).
 //!
 //! The joiner has no CA bundle yet. It fetches `/api/v1/pki/ca.pem` without
 //! verifying the server, and keeps it only if its SHA-256 is the
@@ -7,7 +8,7 @@
 //! the token is sent.
 
 use crate::Bundle;
-use crate::api::{Issued, JoinRequest};
+use crate::api::{EnrollRequest, Enrolled, Issued, JoinRequest};
 use crate::token::JoinToken;
 use raidish_auth::ca::{fingerprint, pem_certs};
 use raidish_auth::envelope::ct_eq;
@@ -138,6 +139,84 @@ pub async fn join(
     layout_fingerprint: &str,
 ) -> Result<Joined, String> {
     let base = base.trim_end_matches('/');
+    let (ca_pem, http) = pinned_client(base, token).await?;
+    let (key_pem, csr_pem) = raidish_auth::ca::generate_csr(&member.name())?;
+    let req = JoinRequest {
+        id: token.id.clone(),
+        secret: token.secret_b64().to_string(),
+        member,
+        fingerprint: layout_fingerprint.to_string(),
+        csr_pem,
+    };
+    let issued: Issued = post(&http, base, "join", &req).await?;
+    if issued.ca_pem.trim() != ca_pem.trim() {
+        return Err("the answer names another root than the pinned one".into());
+    }
+    Ok(Joined {
+        bundle: Bundle {
+            ca_pem,
+            cert_pem: issued.cert_pem,
+            key_pem,
+        },
+        serial: issued.serial,
+        not_after_ms: issued.not_after_ms,
+    })
+}
+
+/// What `enroll` got.
+pub struct EnrolledBundle {
+    pub bundle: Bundle,
+    pub enrolled: Enrolled,
+}
+
+/// Enroll a client at `base` with `token` (CA-4c): a key made here, signed
+/// for the name and profile the token was made for. Nothing is written.
+pub async fn enroll(base: &str, token: &JoinToken) -> Result<EnrolledBundle, String> {
+    let base = base.trim_end_matches('/');
+    let (ca_pem, http) = pinned_client(base, token).await?;
+    let (key_pem, csr_pem) = raidish_auth::ca::generate_csr("client")?;
+    let req = EnrollRequest {
+        id: token.id.clone(),
+        secret: token.secret_b64().to_string(),
+        csr_pem,
+    };
+    let enrolled: Enrolled = post(&http, base, "enroll", &req).await?;
+    if enrolled.issued.ca_pem.trim() != ca_pem.trim() {
+        return Err("the answer names another root than the pinned one".into());
+    }
+    Ok(EnrolledBundle {
+        bundle: Bundle {
+            ca_pem,
+            cert_pem: enrolled.issued.cert_pem.clone(),
+            key_pem,
+        },
+        enrolled,
+    })
+}
+
+async fn post<B: serde::Serialize, R: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    base: &str,
+    route: &str,
+    req: &B,
+) -> Result<R, String> {
+    let resp = http
+        .post(format!("{}/api/v1/pki/{}", base, route))
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| format!("{}: {}", base, e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{}: {}: {}", base, status, text.trim()));
+    }
+    resp.json().await.map_err(|e| format!("{}: {}", base, e))
+}
+
+/// The root at `base`, pinned by `token`, and a client that verifies
+/// `base` against it (the token is sent only on that).
+async fn pinned_client(base: &str, token: &JoinToken) -> Result<(String, reqwest::Client), String> {
     let (ca_pem, server_cert) = pinned_root(base, token).await?;
     // Say plainly if the address won't pass verification, rather than as
     // a TLS error.
@@ -145,7 +224,7 @@ pub async fn join(
     let info = raidish_auth::pki::inspect_der(&server_cert)?;
     if !info.sans.iter().any(|s| s.eq_ignore_ascii_case(&host)) {
         return Err(format!(
-            "{}'s certificate is for {} — not '{}'. Join with one of those addresses, or \
+            "{}'s certificate is for {} — not '{}'. Use one of those addresses, or \
              reissue node 0's with `raidish ca init --san {}`.",
             base,
             info.sans.join(", "),
@@ -161,36 +240,5 @@ pub async fn join(
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let (key_pem, csr_pem) = raidish_auth::ca::generate_csr(&member.name())?;
-    let req = JoinRequest {
-        id: token.id.clone(),
-        secret: token.secret_b64().to_string(),
-        member,
-        fingerprint: layout_fingerprint.to_string(),
-        csr_pem,
-    };
-    let resp = client(tls)?
-        .post(format!("{}/api/v1/pki/join", base))
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| format!("{}: {}", base, e))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("{}: {}: {}", base, status, text.trim()));
-    }
-    let issued: Issued = resp.json().await.map_err(|e| format!("{}: {}", base, e))?;
-    if issued.ca_pem.trim() != ca_pem.trim() {
-        return Err("the answer names another root than the pinned one".into());
-    }
-    Ok(Joined {
-        bundle: Bundle {
-            ca_pem,
-            cert_pem: issued.cert_pem,
-            key_pem,
-        },
-        serial: issued.serial,
-        not_after_ms: issued.not_after_ms,
-    })
+    Ok((ca_pem, client(tls)?))
 }

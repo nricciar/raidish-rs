@@ -96,6 +96,7 @@ fn state(ca: &Ca) -> PkiState {
         enrollments: BTreeMap::new(),
         profiles: BTreeMap::new(),
         crl: None,
+        root_crl: None,
         generation: 1,
     }
 }

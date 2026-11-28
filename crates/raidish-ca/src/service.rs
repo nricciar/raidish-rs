@@ -40,20 +40,20 @@ impl CaError {
     pub(crate) fn bad(msg: impl Into<String>) -> CaError {
         CaError::new(400, msg)
     }
-    fn denied(msg: impl Into<String>) -> CaError {
+    pub(crate) fn denied(msg: impl Into<String>) -> CaError {
         CaError::new(403, msg)
     }
     pub(crate) fn conflict(msg: impl Into<String>) -> CaError {
         CaError::new(409, msg)
     }
-    fn internal(msg: impl Into<String>) -> CaError {
+    pub(crate) fn internal(msg: impl Into<String>) -> CaError {
         CaError::new(500, msg)
     }
     /// This node can't do it now; another may (`503`: try the next).
     pub(crate) fn unavailable(msg: impl Into<String>) -> CaError {
         CaError::new(503, msg)
     }
-    fn sealed() -> CaError {
+    pub(crate) fn sealed() -> CaError {
         CaError::unavailable(
             "this node is sealed (it can't sign): ask another node, or unseal this one \
              with `raidish ca unseal`",
@@ -548,7 +548,7 @@ impl CaService {
             if forwarded {
                 return Err(CaError::sealed());
             }
-            return self.forward_join(&req).await;
+            return self.forward("join", &req).await;
         }
         let secret = crate::token::decode_secret(&req.secret).map_err(CaError::denied)?;
         let hash = envelope::sha256(&secret);
@@ -628,10 +628,16 @@ impl CaService {
         Ok(answer(&pki, &signer, issued))
     }
 
-    async fn forward_join(&self, req: &JoinRequest) -> Result<Issued, CaError> {
+    /// A token-authenticated request (`join`, `enroll`) passed on to the
+    /// first peer that can sign it.
+    pub(crate) async fn forward<B: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        route: &str,
+        req: &B,
+    ) -> Result<R, CaError> {
         let mut why = Vec::new();
         for (id, base) in &self.peer_urls() {
-            let url = format!("{}/api/v1/pki/join?forwarded=true", base);
+            let url = format!("{}/api/v1/pki/{}?forwarded=true", base, route);
             match self.http.post(&url).json(req).send().await {
                 Err(e) => why.push(format!("{}: {}", id, e)),
                 Ok(r) if r.status().as_u16() == 503 => {
@@ -670,7 +676,7 @@ impl CaService {
         url_host(base).ok_or_else(|| CaError::internal(format!("no host in {}", base)))
     }
 
-    async fn record(
+    pub(crate) async fn record(
         &self,
         pki: &PkiState,
         signer: &Signer,
@@ -761,12 +767,7 @@ impl CaService {
                 }
             )));
         }
-        let cn = req.cn.trim().to_string();
-        if cn.is_empty() || cn.len() > 64 || cn.chars().any(|c| c.is_control()) {
-            return Err(CaError::bad(
-                "a certificate needs a name (CN) of 1-64 characters",
-            ));
-        }
+        let cn = crate::enroll::check_cn(&req.cn)?;
         let params = pki.params(req.profile);
         let days = req.days.unwrap_or(params.default_days);
         if days == 0 || days > params.max_days {
@@ -906,7 +907,7 @@ pub(crate) struct NodeScope {
     pub compromised: bool,
 }
 
-/// A single-use enrollment for `token`, MACed under `dek`.
+/// A single-use node enrollment for `token`, MACed under `dek`.
 pub(crate) fn node_enrollment(
     dek: &[u8; 32],
     token: &JoinToken,
@@ -914,14 +915,31 @@ pub(crate) fn node_enrollment(
     expires_ms: u64,
     created_by: &str,
 ) -> Enrollment {
-    let mut e = Enrollment {
-        scope: EnrollScope::Node {
+    enrollment(
+        dek,
+        token,
+        EnrollScope::Node {
             fingerprint: scope.fingerprint,
             member: Some(scope.member),
             extra_sans: scope.extra_sans,
             replace: scope.replace,
             compromised: scope.compromised,
         },
+        expires_ms,
+        created_by,
+    )
+}
+
+/// A single-use enrollment of `scope` for `token`, MACed under `dek`.
+pub(crate) fn enrollment(
+    dek: &[u8; 32],
+    token: &JoinToken,
+    scope: EnrollScope,
+    expires_ms: u64,
+    created_by: &str,
+) -> Enrollment {
+    let mut e = Enrollment {
+        scope,
         secret_sha256: token.secret_sha256(),
         uses: 1,
         uses_left: 1,
@@ -1001,7 +1019,7 @@ fn parse_dek(text: &str) -> Result<Key, String> {
     Ok(Zeroizing::new(k))
 }
 
-fn sign(
+pub(crate) fn sign(
     signer: &Signer,
     csr_pem: &str,
     identity: &Identity,
@@ -1022,7 +1040,7 @@ fn sign(
         .map_err(CaError::bad)
 }
 
-fn answer(pki: &PkiState, signer: &Signer, issued: raidish_auth::ca::Issued) -> Issued {
+pub(crate) fn answer(pki: &PkiState, signer: &Signer, issued: raidish_auth::ca::Issued) -> Issued {
     Issued {
         serial: issued.serial,
         cert_pem: signer.chain(&issued.cert_pem),

@@ -145,6 +145,12 @@ event_kinds! {
     CaRenewFailed => "ca.renew_failed",
     /// It renewed again after failing.
     CaRenewed => "ca.renewed",
+    /// A new issuer is the active one (`ca rotate-issuer`).
+    CaIssuerAdded => "ca.issuer_added",
+    /// An issuer was revoked: its certificates stop working.
+    CaIssuerRevoked => "ca.issuer_revoked",
+    /// The root's CRL was replaced.
+    CaRootCrl => "ca.root_crl",
 }
 
 impl std::fmt::Display for EventKind {

@@ -16,17 +16,21 @@
 
 pub mod api;
 pub mod crl;
+mod enroll;
 pub mod init;
+pub mod issuers;
 pub mod join;
 pub mod loud;
 pub mod renew;
 mod revoke;
+pub mod rotate;
 pub mod routes;
 mod seal;
 mod service;
 pub mod token;
 pub mod token_signer;
 
+pub use enroll::enrollable;
 pub use loud::CaEvents;
 pub use renew::NodeIdentity;
 pub use seal::NodeKeySource;
@@ -85,9 +89,14 @@ pub struct Bundle {
 impl Bundle {
     /// Write `ca.pem`, `cert.pem` and `key.pem` (`0600`) to the given paths.
     pub fn write(&self, ca: &Path, cert: &Path, key: &Path) -> Result<(), String> {
-        write_file(key, self.key_pem.as_bytes(), 0o600)?;
-        write_file(cert, self.cert_pem.as_bytes(), 0o644)?;
-        write_file(ca, self.ca_pem.as_bytes(), 0o644)
+        write_file(ca, self.ca_pem.as_bytes(), 0o644)?;
+        for dir in [cert.parent(), key.parent()].into_iter().flatten() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+            }
+        }
+        // The certificate and key as a pair (see `swap_identity`).
+        raidish_auth::tls::swap_identity(cert, key, &self.cert_pem, &self.key_pem)
     }
 
     /// Write the bundle into `dir` (`ca.pem`, `cert.pem`, `key.pem`).

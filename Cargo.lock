@@ -2254,6 +2254,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+ "x509-parser",
  "zeroize",
 ]
 

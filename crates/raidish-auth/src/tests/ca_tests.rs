@@ -287,3 +287,14 @@ fn a_crl_verifies_against_its_issuer_and_lists_its_serials() {
 fn facts_of(pem: &str) -> KeyId {
     facts(&first_der(pem).unwrap()).unwrap().ski
 }
+
+#[test]
+fn a_key_matches_only_its_own_certificate() {
+    crate::tls::install_provider();
+    let (root, root_key) = create_root("r", 30).unwrap();
+    let (issuer, issuer_key) = create_issuer("i", &root, &root_key, 10).unwrap();
+    assert!(key_matches(&issuer, &issuer_key).is_ok());
+    assert!(key_matches(&root, &root_key).is_ok());
+    assert!(key_matches(&issuer, &root_key).is_err());
+    assert!(key_matches(&root, "not a key").is_err());
+}
