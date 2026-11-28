@@ -3,7 +3,8 @@
 //! With `tls:` configured, every request to a `listen` node must come with
 //! one of:
 //!
-//! * a **client certificate** issued by a trusted CA (`raidish cert issue`).
+//! * a **client certificate** issued by the cluster's CA (`raidish ca issue`,
+//!   `raidish enroll`).
 //!   Its OU is the role. Nodes and the command line use these.
 //! * a **token** (`raidish token create`), as `Authorization: Bearer …` or,
 //!   for websockets (browsers can't set headers on them), `?access_token=…`.
@@ -70,8 +71,11 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Mint a token for `sub` with `role`, signed by the admin identity
-/// (`cert_der`, `key_pkcs8`). `ttl` in seconds; None: never expires.
+/// Mint an `rdt1` token for `sub` with `role`, signed by an admin
+/// certificate (`cert_der`, `key_pkcs8`). `ttl` in seconds; None: never
+/// expires. Only tests make these now: nodes still accept them, but the
+/// cluster mints `rdt2` ([`create_token_rdt2`]).
+#[cfg(any(test, feature = "testutil"))]
 pub fn create_token(
     sub: &str,
     role: Role,

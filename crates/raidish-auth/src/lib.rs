@@ -1,5 +1,5 @@
 //! Identity and transport for RAIDish nodes and clients: the cluster PKI
-//! (`pki`, offline; `ca` and `envelope`, the managed CA's X.509 and sealing), TLS setup and HTTP clients (`tls`), who a request is from and
+//! (`pki`, reading certificates; `ca` and `envelope`, the managed CA's X.509 and sealing), TLS setup and HTTP clients (`tls`), who a request is from and
 //! what it may do (`auth`, request extractors), serving HTTP(S) with axum
 //! (`http`), and the shared TCP accept loop (`net`).
 
@@ -8,6 +8,8 @@ pub(crate) use raidish_types::api_types;
 pub mod auth;
 pub mod ca;
 pub mod envelope;
+#[cfg(any(test, feature = "testutil"))]
+mod fixture_ca;
 pub mod http;
 pub mod net;
 pub mod pki;

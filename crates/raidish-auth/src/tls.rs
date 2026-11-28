@@ -2,7 +2,7 @@
 //!
 //! ```yaml
 //! tls:
-//!   dir: /etc/raidish/tls     # ca.pem, cert.pem, key.pem (a `cert issue` bundle)
+//!   dir: /etc/raidish/tls     # ca.pem, cert.pem, key.pem (from `raidish join`)
 //!   # or name the files:  ca: …  cert: …  key: …
 //! ```
 //!

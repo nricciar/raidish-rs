@@ -40,50 +40,6 @@ fn ca_issue_and_inspect() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
-
-    let (cas, issued) = status(dir.path()).unwrap();
-    assert_eq!(cas.len(), 1);
-    assert_eq!(issued.len(), 2);
-}
-
-#[test]
-fn trust_and_untrust_rewrite_bundles() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
-    Ca::init(a.path(), "old", None, false).unwrap();
-    let new = Ca::init(b.path(), "new", None, false).unwrap();
-    Ca::load(a.path())
-        .unwrap()
-        .issue("n", Role::Node, &[], None, false)
-        .unwrap();
-
-    let pem = std::fs::read_to_string(b.path().join("ca.pem")).unwrap();
-    assert_eq!(trust(a.path(), &pem).unwrap().len(), 1);
-    // Idempotent.
-    assert!(trust(a.path(), &pem).unwrap().is_empty());
-    let leaf_bundle = std::fs::read_to_string(a.path().join("n/ca.pem")).unwrap();
-    assert_eq!(read_pem_certs(&leaf_bundle).unwrap().len(), 2);
-    // The signing CA is still found in a multi-CA bundle.
-    assert!(Ca::load(a.path()).is_ok());
-
-    assert!(untrust(a.path(), "old").is_err(), "own CA can't be dropped");
-    assert_eq!(untrust(a.path(), &new.fingerprint).unwrap().len(), 1);
-    let leaf_bundle = std::fs::read_to_string(a.path().join("n/ca.pem")).unwrap();
-    assert_eq!(read_pem_certs(&leaf_bundle).unwrap().len(), 1);
-}
-
-#[test]
-fn hosts_from_urls() {
-    let paths = vec![
-        "/data/disk".to_string(),
-        "https://node1:8882/api/v1/disks/0".to_string(),
-        "https://node1:8882/api/v1/disks/1".to_string(),
-        "http://[::1]:8883/api/v1/disks/0".to_string(),
-    ];
-    assert_eq!(
-        hosts_in(&paths),
-        vec!["node1".to_string(), "::1".to_string()]
-    );
 }
 
 #[test]

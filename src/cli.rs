@@ -179,12 +179,7 @@ enum Commands {
         #[command(subcommand)]
         command: crate::cli_vm::NodeCommands,
     },
-    /// The cluster's certificate authority: issue node and client certs.
-    Cert {
-        #[command(subcommand)]
-        command: crate::cli_pki::CertCommands,
-    },
-    /// Tokens for the dashboard and scripts (signed by your admin cert).
+    /// Tokens for the dashboard and scripts (from the cluster CA).
     Token {
         #[command(subcommand)]
         command: crate::cli_pki::TokenCommands,
@@ -526,19 +521,6 @@ pub async fn main() -> std::io::Result<()> {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    // Certificates are managed without (or before there is) a config.
-    if let Commands::Cert { command } = &cli.command {
-        let config_path = cli.config.clone();
-        crate::cli_pki::run(command, &move || {
-            let config = load_config(&config_path).unwrap_or_else(|e| fail(e));
-            config
-                .pool_spec()
-                .unwrap_or_else(|e| fail(e))
-                .map(|s| s.paths)
-                .unwrap_or_default()
-        });
-        return Ok(());
-    }
     // A client's first certificate, before it has a config.
     if let Commands::Enroll {
         url,
@@ -610,7 +592,6 @@ pub async fn main() -> std::io::Result<()> {
             name,
             role,
             expires,
-            offline: false,
             url,
         } = command
         {
@@ -975,7 +956,6 @@ pub async fn main() -> std::io::Result<()> {
         | Commands::Node { .. }
         | Commands::Cluster { .. }
         | Commands::Csi { .. }
-        | Commands::Cert { .. }
         | Commands::Token { .. }
         | Commands::Ca { .. }
         | Commands::Join { .. }

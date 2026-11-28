@@ -37,8 +37,8 @@ pub enum CaCommands {
         /// config: `node-1=10.0.0.2` (repeatable; commas for several).
         #[arg(long = "peer-san")]
         peer_sans: Vec<String>,
-        /// Node certificates' lifetime in days (default 30; until CA-4
-        /// renews them live, `ca renew` and a restart).
+        /// Node certificates' lifetime in days (default 30; nodes renew
+        /// their own, live, at 2/3 of it).
         #[arg(long)]
         node_days: Option<u32>,
         /// Don't leave the one-shot unseal file: run `ca unseal` after
@@ -950,12 +950,7 @@ pub async fn create_token(
         c.post(format!("{}/api/v1/pki/tokens", ep)).json(&req)
     })
     .await
-    .unwrap_or_else(|e| {
-        fail(format!(
-            "{}\n(`--offline` signs an rdt1 token with this config's admin certificate instead)",
-            e
-        ))
-    });
+    .unwrap_or_else(|e| fail(e));
     eprintln!(
         "token {} for '{}' ({}), expires {}",
         t.id,

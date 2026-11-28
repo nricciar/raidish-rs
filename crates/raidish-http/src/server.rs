@@ -347,15 +347,16 @@ fn warn_expiry(tls: &crate::tls::TlsConfig) {
     let soon: ::time::Duration = std::cmp::min(life / 3, ::time::Duration::days(30));
     if left < soon {
         eprintln!(
-            "WARNING: this node's certificate {} on {}: renew it with `raidish ca renew` \
-             (then restart), or, from a `cert` CA, `raidish cert issue {} --role node --force`",
+            "WARNING: this node's certificate ('{}') {} on {}: nodes renew their own, \
+             so see why not in `raidish ca status` and this log; `raidish ca renew --node` \
+             renews it now",
+            info.name,
             if left.is_negative() {
                 "expired"
             } else {
                 "expires"
             },
-            info.not_after.date(),
-            info.name
+            info.not_after.date()
         );
     }
 }
