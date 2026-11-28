@@ -15,6 +15,7 @@ use crate::coords::PoolLba;
 use crate::disk::{BLOCK_SIZE, PoolDevice, zeroed_blocks};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
+use crate::role::{Mutable, Role, View};
 use crate::types::Txg;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -101,71 +102,7 @@ pub fn object_size(ptrs: &[BlockPtr]) -> u64 {
     ptrs.iter().map(|p| p.lsize as u64).sum()
 }
 
-impl<D: PoolDevice> FileSystem<D> {
-    /// Allocate space for `data` (scattered if need be), write it, and
-    /// return the record pointers. The records belong to the open TXG.
-    /// (Objects are trees of records now; only tests still use this.)
-    #[cfg(test)]
-    pub(crate) async fn write_object(&self, data: &[u8]) -> Result<Vec<BlockPtr>, FileSystemError> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let txg = self.open_txg().await?;
-        let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u64;
-        let extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
-
-        let mut ptrs = Vec::new();
-        let mut rest = data;
-        for extent in extents {
-            let mut lba = PoolLba::new(extent.start);
-            let end = lba + extent.len;
-            while lba < end {
-                let asize = self.max_record_blocks().min(end - lba);
-                let take = rest.len().min(asize as usize * BLOCK_SIZE);
-                let (chunk, tail) = rest.split_at(take);
-                rest = tail;
-
-                self.write_record_blocks(lba, chunk).await?;
-                ptrs.push(BlockPtr::new(lba, asize, chunk, txg)?);
-                lba += asize;
-            }
-        }
-        debug_assert!(rest.is_empty());
-
-        Ok(ptrs)
-    }
-
-    /// Write a record's data, zero-padded to whole stripes so the device can
-    /// write full stripes directly instead of read-modify-writing parity.
-    /// Write `data` as a single contiguous record (at most `max_record_blocks()`).
-    pub async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
-        let blocks = data.len().div_ceil(BLOCK_SIZE) as u64;
-        assert!(
-            blocks > 0 && blocks <= self.max_record_blocks(),
-            "record of {} blocks",
-            blocks
-        );
-        let txg = self.open_txg().await?;
-        let extent = self.allocate_contiguous(blocks).await?;
-        let unwritten = crate::tx::Unwritten::new(
-            extent.start,
-            extent.len,
-            self.metaslabs.clone(),
-            self.layout,
-            self.writer.is_some(),
-        );
-        let r = self
-            .write_record_blocks(PoolLba::new(extent.start), data)
-            .await;
-        unwritten.disarm();
-        if let Err(e) = r {
-            self.release_unsettled(extent.start, extent.len).await;
-            return Err(e);
-        }
-        BlockPtr::new(PoolLba::new(extent.start), extent.len, data, txg)
-    }
-
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Write `records` back to back at `start`, each in `record_blocks`
     /// (stripe aligned) blocks, with a single device write. The space must
     /// already be allocated; returns one pointer per record.
@@ -176,7 +113,7 @@ impl<D: PoolDevice> FileSystem<D> {
         records: &[&[u8]],
     ) -> Result<Vec<BlockPtr>, FileSystemError> {
         debug_assert_eq!(record_blocks, self.align_blocks(record_blocks));
-        let txg = self.open_txg().await?;
+        let txg = self.open_txg().await;
         let stride = record_blocks as usize * BLOCK_SIZE;
         let mut blocks = zeroed_blocks(record_blocks as usize * records.len());
         let buf = blocks.as_flattened_mut();
@@ -193,18 +130,6 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         self.dev.write_blocks(start, &blocks).await?;
         Ok(ptrs)
-    }
-
-    pub async fn write_record_blocks(
-        &self,
-        lba: PoolLba,
-        data: &[u8],
-    ) -> Result<(), FileSystemError> {
-        let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
-        let mut buf = zeroed_blocks(blocks as usize);
-        buf.as_flattened_mut()[..data.len()].copy_from_slice(data);
-        self.dev.write_blocks(lba, &buf).await?;
-        Ok(())
     }
 
     /// Read and verify a whole object.
@@ -265,9 +190,11 @@ impl<D: PoolDevice> FileSystem<D> {
 
     /// Read and verify one record. On a checksum mismatch, try rebuilding each
     /// block from parity; if that yields the right checksum, repair the bad
-    /// shard on disk and return the good data.
+    /// shard on disk (on a committer: the only role that may rewrite any
+    /// block) and return the good data.
     pub(crate) async fn read_record(&self, ptr: &BlockPtr) -> Result<Vec<u8>, FileSystemError> {
-        self.read_record_healing(ptr, !self.read_only).await
+        let heal = matches!(self.by_role(), View::Committer(_));
+        self.read_record_healing(ptr, heal).await
     }
 
     /// `read_record`, choosing whether bad shards found on the way are
@@ -397,6 +324,84 @@ impl<D: PoolDevice> FileSystem<D> {
         }
 
         Err(FileSystemError::ChecksumMismatch)
+    }
+}
+
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    /// Write a record's data, zero-padded to whole stripes so the device can
+    /// write full stripes directly instead of read-modify-writing parity.
+    /// Write `data` as a single contiguous record (at most `max_record_blocks()`).
+    pub async fn write_record(&self, data: &[u8]) -> Result<BlockPtr, FileSystemError> {
+        let blocks = data.len().div_ceil(BLOCK_SIZE) as u64;
+        assert!(
+            blocks > 0 && blocks <= self.max_record_blocks(),
+            "record of {} blocks",
+            blocks
+        );
+        let txg = self.open_txg().await;
+        let extent = self.allocate_contiguous(blocks).await?;
+        let unwritten = crate::tx::Unwritten::new(
+            extent.start,
+            extent.len,
+            self.metaslabs.clone(),
+            self.layout,
+            self.role.writer().is_some(),
+        );
+        let r = self
+            .write_record_blocks(PoolLba::new(extent.start), data)
+            .await;
+        unwritten.disarm();
+        if let Err(e) = r {
+            self.release_unsettled(extent.start, extent.len).await;
+            return Err(e);
+        }
+        BlockPtr::new(PoolLba::new(extent.start), extent.len, data, txg)
+    }
+
+    pub async fn write_record_blocks(
+        &self,
+        lba: PoolLba,
+        data: &[u8],
+    ) -> Result<(), FileSystemError> {
+        let blocks = self.align_blocks(data.len().div_ceil(BLOCK_SIZE) as u64);
+        let mut buf = zeroed_blocks(blocks as usize);
+        buf.as_flattened_mut()[..data.len()].copy_from_slice(data);
+        self.dev.write_blocks(lba, &buf).await?;
+        Ok(())
+    }
+
+    /// Allocate space for `data` (scattered if need be), write it, and
+    /// return the record pointers. The records belong to the open TXG.
+    /// (Objects are trees of records now; only tests still use this.)
+    #[cfg(test)]
+    pub(crate) async fn write_object(&self, data: &[u8]) -> Result<Vec<BlockPtr>, FileSystemError> {
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txg = self.open_txg().await;
+        let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u64;
+        let extents = self.allocate_blocks_stripe_aligned(blocks_needed).await?;
+
+        let mut ptrs = Vec::new();
+        let mut rest = data;
+        for extent in extents {
+            let mut lba = PoolLba::new(extent.start);
+            let end = lba + extent.len;
+            while lba < end {
+                let asize = self.max_record_blocks().min(end - lba);
+                let take = rest.len().min(asize as usize * BLOCK_SIZE);
+                let (chunk, tail) = rest.split_at(take);
+                rest = tail;
+
+                self.write_record_blocks(lba, chunk).await?;
+                ptrs.push(BlockPtr::new(lba, asize, chunk, txg)?);
+                lba += asize;
+            }
+        }
+        debug_assert!(rest.is_empty());
+
+        Ok(ptrs)
     }
 }
 

@@ -39,6 +39,7 @@ use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, DatasetProps, Dnode, ObjType};
 use crate::object::{Dirty, ObjTree, Sizing};
+use crate::role::{Committer, MutView, Mutable, Role, View};
 use crate::types::DatasetName;
 use crate::types::Txg;
 use serde::{Deserialize, Serialize};
@@ -157,7 +158,7 @@ pub(crate) fn decode_datasets(data: &[u8]) -> Result<DatasetIndex, FileSystemErr
     Ok(bincode::deserialize(data)?)
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// The dataset directory's contents (uncommitted changes included).
     pub async fn datasets(&self) -> Result<DatasetIndex, FileSystemError> {
         let dnode = self.read_dnode(self.datasets_object()).await?;
@@ -177,22 +178,6 @@ impl<D: PoolDevice> FileSystem<D> {
             .read_tree(&dnode.tree, dnode.blksz as usize, dnode.size)
             .await?;
         decode_datasets(&data)
-    }
-
-    /// Replace the dataset directory's contents (in the open TXG).
-    pub(crate) async fn write_datasets(
-        &self,
-        tx: &mut crate::tx::Tx,
-        index: &DatasetIndex,
-    ) -> Result<(), FileSystemError> {
-        let id = self.datasets_object();
-        let mut dnode = self.read_dnode(id).await?;
-        let data = if index.datasets.is_empty() {
-            Vec::new()
-        } else {
-            bincode::serialize(index)?
-        };
-        self.replace_contents(tx, id, &mut dnode, &data).await
     }
 
     /// The object number of the dataset directory.
@@ -233,7 +218,8 @@ impl<D: PoolDevice> FileSystem<D> {
     /// ever commit, which then fail every later unscoped `sync` and count
     /// against the dirty limit (structural triage I-23).
     pub async fn open_dataset(&self, name: &DatasetName) -> Result<Arc<Dataset>, FileSystemError> {
-        if let Some(w) = &self.writer {
+        if let View::Writer(fs) = self.by_role() {
+            let w = fs.writer_state();
             // Attached means open (`attach_dataset` opens before it records
             // the attachment; only `abandon_dataset` closes one, after it
             // drops the attachment). So it's looked up, never loaded, under
@@ -348,6 +334,116 @@ impl<D: PoolDevice> FileSystem<D> {
             .collect())
     }
 
+    pub(crate) fn datasets_dirty_bytes(&self) -> usize {
+        self.open_datasets
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.dirty_bytes())
+            .sum()
+    }
+
+    pub fn has_dirty_datasets(&self) -> bool {
+        self.open_datasets
+            .lock()
+            .unwrap()
+            .values()
+            .any(|v| v.is_dirty())
+    }
+
+    /// Blocks a sync of `records` may allocate, worst case.
+    pub(crate) fn sync_reservation(&self, vol: &Dataset, records: &BTreeMap<u64, Dirty>) -> u64 {
+        // The tree, plus the object table records the dnode rewrite takes.
+        self.tree_sync_reservation(&vol.obj, records) + 3 * self.max_record_blocks()
+    }
+
+    /// Forget an open dataset (on delete); its unsynced writes are discarded.
+    pub(crate) fn close_dataset(&self, name: &DatasetName) {
+        self.open_datasets.lock().unwrap().remove(name);
+    }
+
+    /// Find the default posix dataset's root in `index`.
+    pub(crate) fn default_root(index: &DatasetIndex) -> Result<FileId, FileSystemError> {
+        match index.datasets.get(DEFAULT_FS) {
+            Some(e) if e.format == DatasetFormat::Posix => Ok(e.root),
+            Some(e) => Err(FileSystemError::InvalidArgument(format!(
+                "dataset '{}' is {}, not posix",
+                DEFAULT_FS,
+                e.format.name()
+            ))),
+            None => Err(FileSystemError::InvalidArgument(format!(
+                "no '{}' dataset",
+                DEFAULT_FS
+            ))),
+        }
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// `sync_dataset` on the committer: `need` blocks are what it may take.
+    async fn sync_dataset_local(
+        &self,
+        tx: &mut crate::tx::Tx,
+        vol: &Dataset,
+        records: &BTreeMap<u64, Dirty>,
+        fold: bool,
+        need: u64,
+    ) -> Result<(), FileSystemError> {
+        if self.allocatable_blocks().await < need {
+            return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
+        }
+
+        // Everything allocated here, so a failure can hand it all back, and
+        // everything this sync replaces, freed only once it has succeeded.
+        let mut allocated: Vec<BlockPtr> = Vec::new();
+        let mut replaced: Vec<BlockPtr> = Vec::new();
+        let result = self
+            .build_tree(&vol.obj, records, &mut allocated, &mut replaced)
+            .await;
+        let new_root = match result {
+            Ok(root) => root,
+            Err(e) => {
+                self.release_ptrs(&allocated).await;
+                return Err(e);
+            }
+        };
+
+        // Given up on before the dnode points at it, the new tree is
+        // given back (structural triage I-1).
+        let mut unsettled = crate::object::Unsettled::all(self, &mut allocated);
+        // Point the dnode at the new tree; only then is anything freed.
+        // Not folding: the log stays as the dnode has it, whatever `vol.log`
+        // says (a replay clears that before the commit that makes its
+        // writes durable: a holes-only retry mustn't drop the log under
+        // writes it didn't commit, audit S4b).
+        let held = match self
+            .update_dataset_dnode_with(tx, vol, new_root.ptr.clone(), !fold)
+            .await
+        {
+            Ok(held) => held,
+            Err(e) => {
+                unsettled.disarm();
+                self.release_ptrs(unsettled.ptrs).await;
+                return Err(e);
+            }
+        };
+        unsettled.disarm();
+        // Readers switch to the new tree only now (they see `syncing` until then).
+        vol.obj.set_root(new_root);
+        // What a snapshot still has stays (see `crate::snapshot`): dropped
+        // from the list before it's guarded, so a give back on cancel can
+        // never free a snapshot's block.
+        replaced.retain(|p| p.birth_txg > held);
+        // As in `sync_table`: the rest freed all the same if given up on (I-1).
+        let mut left = crate::object::Unsettled::all(self, &mut replaced);
+        while let Some(p) = left.ptrs.last().cloned() {
+            self.free_record(tx, &p).await?;
+            left.ptrs.pop();
+        }
+        left.disarm();
+        Ok(())
+    }
+
     /// Create dataset `name` of `format` with root object `root` (under
     /// `begin_tx`, without committing). Returns the root's object number.
     pub(crate) async fn create_dataset_locked(
@@ -377,7 +473,7 @@ impl<D: PoolDevice> FileSystem<D> {
                 root: id,
                 format,
                 guid: crate::fs::new_guid(id.get()),
-                created_txg: self.open_txg().await?,
+                created_txg: self.open_txg().await,
                 created_ms: crate::fs::now_ms(),
             },
         );
@@ -456,21 +552,80 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(())
     }
 
-    pub(crate) fn datasets_dirty_bytes(&self) -> usize {
-        self.open_datasets
-            .lock()
-            .unwrap()
-            .values()
-            .map(|v| v.dirty_bytes())
-            .sum()
+    /// `update_dataset_dnode`; with `keep_log`, the intent log stays as the
+    /// dnode has it rather than `vol.log`. Returns the dataset's held TXG
+    /// (`snapshot::held_txg`: blocks born at or before it are its
+    /// snapshots', not the head's to free), read from the same dnode.
+    pub(crate) async fn update_dataset_dnode_with(
+        &self,
+        tx: &mut crate::tx::Tx,
+        vol: &Dataset,
+        root: Option<BlockPtr>,
+        keep_log: bool,
+    ) -> Result<crate::types::Txg, FileSystemError> {
+        let mut dnode = self.read_dnode(vol.id).await?;
+        let held = crate::snapshot::held_txg(&dnode);
+        dnode.tree = crate::object::TreeRoot {
+            ptr: root,
+            levels: vol.obj.levels(),
+        };
+        let Some(head) = dnode.head_mut() else {
+            return Err(FileSystemError::Internal(format!(
+                "dataset '{}' (object {}) isn't a tree root",
+                vol.name, vol.id
+            )));
+        };
+        head.props = vol.props.lock().unwrap().clone();
+        if !keep_log {
+            head.log = vol.log.lock().unwrap().clone();
+        }
+        self.write_dnode(tx, vol.id, Some(dnode)).await?;
+        Ok(held)
     }
 
-    pub fn has_dirty_datasets(&self) -> bool {
-        self.open_datasets
-            .lock()
-            .unwrap()
-            .values()
-            .any(|v| v.is_dirty())
+    /// Replace the dataset directory's contents (in the open TXG).
+    pub(crate) async fn write_datasets(
+        &self,
+        tx: &mut crate::tx::Tx,
+        index: &DatasetIndex,
+    ) -> Result<(), FileSystemError> {
+        let id = self.datasets_object();
+        let mut dnode = self.read_dnode(id).await?;
+        let data = if index.datasets.is_empty() {
+            Vec::new()
+        } else {
+            bincode::serialize(index)?
+        };
+        self.replace_contents(tx, id, &mut dnode, &data).await
+    }
+
+    /// Rewrite `vol`'s dnode (in the open TXG) with tree root `root` and
+    /// its current settings and intent log. On failure nothing changed.
+    pub(crate) async fn update_dataset_dnode(
+        &self,
+        tx: &mut crate::tx::Tx,
+        vol: &Dataset,
+        root: Option<BlockPtr>,
+    ) -> Result<(), FileSystemError> {
+        self.update_dataset_dnode_with(tx, vol, root, false)
+            .await
+            .map(|_| ())
+    }
+}
+
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    async fn sync_dataset(
+        &self,
+        tx: &mut crate::tx::Tx,
+        vol: &Dataset,
+        records: &BTreeMap<u64, Dirty>,
+        fold: bool,
+    ) -> Result<(), FileSystemError> {
+        let need = self.sync_reservation(vol, records);
+        match self.mutable() {
+            MutView::Writer(fs) => fs.writer_sync_dataset(vol, records, need, fold).await,
+            MutView::Committer(fs) => fs.sync_dataset_local(tx, vol, records, fold, need).await,
+        }
     }
 
     /// Write every dirty dataset into the open TXG. Called by `commit_txg`
@@ -501,8 +656,8 @@ impl<D: PoolDevice> FileSystem<D> {
             // A writer settles an earlier commit's unknown outcome first:
             // a sync built on the root from before it would be refused for
             // good if that commit was in fact applied.
-            if let Some(w) = &self.writer
-                && let Err(e) = self.resolve_in_doubt(w, &vol).await
+            if let View::Writer(fs) = self.by_role()
+                && let Err(e) = fs.resolve_in_doubt(&vol).await
             {
                 eprintln!("dataset '{}': sync failed: {}", vol.name, e);
                 first_err.get_or_insert(e);
@@ -555,143 +710,6 @@ impl<D: PoolDevice> FileSystem<D> {
             }
         }
         (clean, first_err.map_or(Ok(()), Err))
-    }
-
-    /// Blocks a sync of `records` may allocate, worst case.
-    pub(crate) fn sync_reservation(&self, vol: &Dataset, records: &BTreeMap<u64, Dirty>) -> u64 {
-        // The tree, plus the object table records the dnode rewrite takes.
-        self.tree_sync_reservation(&vol.obj, records) + 3 * self.max_record_blocks()
-    }
-
-    async fn sync_dataset(
-        &self,
-        tx: &mut crate::tx::Tx,
-        vol: &Dataset,
-        records: &BTreeMap<u64, Dirty>,
-        fold: bool,
-    ) -> Result<(), FileSystemError> {
-        let need = self.sync_reservation(vol, records);
-        if let Some(w) = self.writer.clone() {
-            return self.writer_sync_dataset(&w, vol, records, need, fold).await;
-        }
-        if self.allocatable_blocks().await < need {
-            return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
-        }
-
-        // Everything allocated here, so a failure can hand it all back, and
-        // everything this sync replaces, freed only once it has succeeded.
-        let mut allocated: Vec<BlockPtr> = Vec::new();
-        let mut replaced: Vec<BlockPtr> = Vec::new();
-        let result = self
-            .build_tree(&vol.obj, records, &mut allocated, &mut replaced)
-            .await;
-        let new_root = match result {
-            Ok(root) => root,
-            Err(e) => {
-                self.release_ptrs(&allocated).await;
-                return Err(e);
-            }
-        };
-
-        // Given up on before the dnode points at it, the new tree is
-        // given back (structural triage I-1).
-        let mut unsettled = crate::object::Unsettled::all(self, &mut allocated);
-        // Point the dnode at the new tree; only then is anything freed.
-        // Not folding: the log stays as the dnode has it, whatever `vol.log`
-        // says (a replay clears that before the commit that makes its
-        // writes durable: a holes-only retry mustn't drop the log under
-        // writes it didn't commit, audit S4b).
-        let held = match self
-            .update_dataset_dnode_with(tx, vol, new_root.ptr.clone(), !fold)
-            .await
-        {
-            Ok(held) => held,
-            Err(e) => {
-                unsettled.disarm();
-                self.release_ptrs(unsettled.ptrs).await;
-                return Err(e);
-            }
-        };
-        unsettled.disarm();
-        // Readers switch to the new tree only now (they see `syncing` until then).
-        vol.obj.set_root(new_root);
-        // What a snapshot still has stays (see `crate::snapshot`): dropped
-        // from the list before it's guarded, so a give back on cancel can
-        // never free a snapshot's block.
-        replaced.retain(|p| p.birth_txg > held);
-        // As in `sync_table`: the rest freed all the same if given up on (I-1).
-        let mut left = crate::object::Unsettled::all(self, &mut replaced);
-        while let Some(p) = left.ptrs.last().cloned() {
-            self.free_record(tx, &p).await?;
-            left.ptrs.pop();
-        }
-        left.disarm();
-        Ok(())
-    }
-
-    /// Rewrite `vol`'s dnode (in the open TXG) with tree root `root` and
-    /// its current settings and intent log. On failure nothing changed.
-    pub(crate) async fn update_dataset_dnode(
-        &self,
-        tx: &mut crate::tx::Tx,
-        vol: &Dataset,
-        root: Option<BlockPtr>,
-    ) -> Result<(), FileSystemError> {
-        self.update_dataset_dnode_with(tx, vol, root, false)
-            .await
-            .map(|_| ())
-    }
-
-    /// `update_dataset_dnode`; with `keep_log`, the intent log stays as the
-    /// dnode has it rather than `vol.log`. Returns the dataset's held TXG
-    /// (`snapshot::held_txg`: blocks born at or before it are its
-    /// snapshots', not the head's to free), read from the same dnode.
-    pub(crate) async fn update_dataset_dnode_with(
-        &self,
-        tx: &mut crate::tx::Tx,
-        vol: &Dataset,
-        root: Option<BlockPtr>,
-        keep_log: bool,
-    ) -> Result<crate::types::Txg, FileSystemError> {
-        let mut dnode = self.read_dnode(vol.id).await?;
-        let held = crate::snapshot::held_txg(&dnode);
-        dnode.tree = crate::object::TreeRoot {
-            ptr: root,
-            levels: vol.obj.levels(),
-        };
-        let Some(head) = dnode.head_mut() else {
-            return Err(FileSystemError::Internal(format!(
-                "dataset '{}' (object {}) isn't a tree root",
-                vol.name, vol.id
-            )));
-        };
-        head.props = vol.props.lock().unwrap().clone();
-        if !keep_log {
-            head.log = vol.log.lock().unwrap().clone();
-        }
-        self.write_dnode(tx, vol.id, Some(dnode)).await?;
-        Ok(held)
-    }
-
-    /// Forget an open dataset (on delete); its unsynced writes are discarded.
-    pub(crate) fn close_dataset(&self, name: &DatasetName) {
-        self.open_datasets.lock().unwrap().remove(name);
-    }
-
-    /// Find the default posix dataset's root in `index`.
-    pub(crate) fn default_root(index: &DatasetIndex) -> Result<FileId, FileSystemError> {
-        match index.datasets.get(DEFAULT_FS) {
-            Some(e) if e.format == DatasetFormat::Posix => Ok(e.root),
-            Some(e) => Err(FileSystemError::InvalidArgument(format!(
-                "dataset '{}' is {}, not posix",
-                DEFAULT_FS,
-                e.format.name()
-            ))),
-            None => Err(FileSystemError::InvalidArgument(format!(
-                "no '{}' dataset",
-                DEFAULT_FS
-            ))),
-        }
     }
 }
 

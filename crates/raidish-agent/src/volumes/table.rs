@@ -25,7 +25,6 @@ use crate::Lost;
 use crate::api_types::{Attach, RunningVolume};
 use crate::cluster::lease::HeldLease;
 use crate::export::{BlockExporter, ExportHandle};
-use crate::fs::FileSystem;
 use crate::inode::Transport;
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
@@ -33,6 +32,7 @@ use crate::peer_io::{PeerExport, PeerIo};
 use crate::types::{DatasetName, Epoch};
 use crate::vdev::Pool;
 use crate::volume_io::SwitchableIo;
+use raidish_core::role::{Writer, WriterFs};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,9 +56,9 @@ impl WriterGen {
 #[derive(Clone)]
 pub(crate) struct WriterParts {
     pub wgen: WriterGen,
-    pub fs: Arc<FileSystem<Pool>>,
-    pub nbd: Arc<NbdServer<Pool>>,
-    pub nvme: Arc<NvmeTcpServer<Pool>>,
+    pub fs: Arc<WriterFs<Pool>>,
+    pub nbd: Arc<NbdServer<Pool, Writer>>,
+    pub nvme: Arc<NvmeTcpServer<Pool, Writer>>,
 }
 
 impl WriterParts {

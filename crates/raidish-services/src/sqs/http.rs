@@ -26,6 +26,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
+use raidish_core::role::Mutable;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -35,7 +36,7 @@ pub const ACCOUNT: &str = "000000000000";
 const MAX_REQUEST: usize = 4 << 20;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-pub async fn serve(fe: Arc<Frontend>, l: tokio::net::TcpListener) {
+pub async fn serve<R: Mutable>(fe: Arc<Frontend<R>>, l: tokio::net::TcpListener) {
     fhttp::serve(l, fe.tls().https.clone(), move |req| {
         let fe = fe.clone();
         async move { handle(fe, req).await }
@@ -84,7 +85,7 @@ fn bad_value(m: impl Into<String>) -> ErrQ {
 }
 
 /// This node's SQS host, as queue URLs name it.
-fn host_of(fe: &Frontend) -> String {
+fn host_of<R: Mutable>(fe: &Frontend<R>) -> String {
     match fe.config().sqs_port() {
         Some(p) => format!("{}:{}", fe.addr(), p),
         None => fe.addr(),
@@ -210,7 +211,7 @@ pub fn queue_of_url(url: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-pub fn arn(fe: &Frontend, name: &str) -> String {
+pub fn arn<R: Mutable>(fe: &Frontend<R>, name: &str) -> String {
     format!("arn:aws:sqs:{}:{}:{}", fe.config().region(), ACCOUNT, name)
 }
 
@@ -218,7 +219,7 @@ fn url(host: &str, name: &str) -> String {
     format!("https://{}/{}/{}", host, ACCOUNT, name)
 }
 
-fn exists(fe: &Frontend, name: &str) -> bool {
+fn exists<R: Mutable>(fe: &Frontend<R>, name: &str) -> bool {
     fe.route(name)
         .is_some_and(|r| r.format == DatasetFormat::Queue)
 }
@@ -339,14 +340,17 @@ fn sender_of(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-async fn handle(fe: Arc<Frontend>, req: Request<Incoming>) -> Response<Body> {
+async fn handle<R: Mutable>(fe: Arc<Frontend<R>>, req: Request<Incoming>) -> Response<Body> {
     match handle_inner(&fe, req).await {
         Ok(r) => r,
         Err(e) => error_response(&e),
     }
 }
 
-async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Response<Body>, ErrQ> {
+async fn handle_inner<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>, ErrQ> {
     let (parts, body) = req.into_parts();
     let target = parts
         .headers
@@ -458,8 +462,8 @@ async fn handle_inner(fe: &Arc<Frontend>, req: Request<Incoming>) -> Result<Resp
 }
 
 /// Run one action (here, or for a queue served elsewhere, there).
-pub async fn dispatch(
-    fe: &Arc<Frontend>,
+pub async fn dispatch<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
     target: &str,
     input: &Value,
     host: &str,
@@ -504,8 +508,8 @@ pub async fn dispatch(
 
 /// Ask the node serving queue `name` to run an action (signed as one of
 /// a short-lived key of our own).
-pub fn call<'a>(
-    fe: &'a Arc<Frontend>,
+pub fn call<'a, R: Mutable>(
+    fe: &'a Arc<Frontend<R>>,
     name: &'a str,
     target: &'a str,
     input: Value,
@@ -513,8 +517,8 @@ pub fn call<'a>(
     Box::pin(call_inner(fe, name, target, input))
 }
 
-async fn call_inner(
-    fe: &Arc<Frontend>,
+async fn call_inner<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
     name: &str,
     target: &str,
     mut input: Value,
@@ -602,7 +606,10 @@ async fn call_inner(
 
 // ---- queues -----------------------------------------------------------------
 
-fn check_redrive_target(fe: &Frontend, attrs: &[(String, String)]) -> Result<(), ErrQ> {
+fn check_redrive_target<R: Mutable>(
+    fe: &Frontend<R>,
+    attrs: &[(String, String)],
+) -> Result<(), ErrQ> {
     for (k, v) in attrs {
         if k == "RedrivePolicy" && !v.is_empty() {
             let r = super::parse_redrive(v).map_err(ErrQ::from)?;
@@ -618,7 +625,11 @@ fn check_redrive_target(fe: &Frontend, attrs: &[(String, String)]) -> Result<(),
     Ok(())
 }
 
-async fn create_queue(fe: &Arc<Frontend>, input: &Value, host: &str) -> Result<Value, ErrQ> {
+async fn create_queue<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    input: &Value,
+    host: &str,
+) -> Result<Value, ErrQ> {
     let name = need(input, "QueueName")?.to_string();
     if name.ends_with(".fifo") {
         return Err(bad_value("FIFO queues aren't supported by raidish."));
@@ -719,7 +730,7 @@ fn normalize(k: &str, v: &str) -> String {
     }
 }
 
-fn list_queues(fe: &Frontend, input: &Value, host: &str) -> Result<Value, ErrQ> {
+fn list_queues<R: Mutable>(fe: &Frontend<R>, input: &Value, host: &str) -> Result<Value, ErrQ> {
     let prefix = s(input, "QueueNamePrefix").unwrap_or("");
     let max = int(input, "MaxResults", 1, 1000)?;
     let after = match s(input, "NextToken") {
@@ -896,9 +907,9 @@ fn sent_json(sent: &super::Sent) -> Map<String, Value> {
     o
 }
 
-async fn queue_op(
-    fe: &Arc<Frontend>,
-    q: &Arc<Queue<Pool>>,
+async fn queue_op<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    q: &Arc<Queue<Pool, R>>,
     target: &str,
     input: &Value,
     host: &str,
@@ -1130,7 +1141,11 @@ fn wanted(names: &[String], n: &str) -> bool {
     })
 }
 
-async fn receive(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, input: &Value) -> Result<Value, ErrQ> {
+async fn receive<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    q: &Arc<Queue<Pool, R>>,
+    input: &Value,
+) -> Result<Value, ErrQ> {
     let max = int(input, "MaxNumberOfMessages", 1, MAX_BATCH as u32)?.unwrap_or(1) as usize;
     let vis = int(input, "VisibilityTimeout", 0, MAX_VISIBILITY)?;
     let wait = int(input, "WaitTimeSeconds", 0, MAX_WAIT_SECS)?;
@@ -1153,9 +1168,9 @@ async fn receive(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, input: &Value) -> Res
     Ok(json!({ "Messages": msgs }))
 }
 
-fn message_json(
-    fe: &Frontend,
-    q: &Queue<Pool>,
+fn message_json<R: Mutable>(
+    fe: &Frontend<R>,
+    q: &Queue<Pool, R>,
     r: &Received,
     sys: &[String],
     user: &[String],
@@ -1218,7 +1233,11 @@ fn message_json(
 
 /// Move messages received too often to the dead-letter queue (they stay
 /// hidden a while meanwhile; if the move fails they come back).
-async fn move_dead(fe: &Arc<Frontend>, q: &Arc<Queue<Pool>>, dead: Vec<super::Dead>) {
+async fn move_dead<R: Mutable>(
+    fe: &Arc<Frontend<R>>,
+    q: &Arc<Queue<Pool, R>>,
+    dead: Vec<super::Dead>,
+) {
     let Ok(meta) = q.meta().await else { return };
     let Some(target) = meta
         .attrs

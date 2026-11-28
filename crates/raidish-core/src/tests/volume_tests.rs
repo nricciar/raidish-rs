@@ -1,5 +1,7 @@
 use super::*;
 use crate::object::INDIRECT_FANOUT;
+use crate::role::CommitterFs;
+use crate::role::Role;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, MAX_VOLBLOCKSIZE, VOLBLOCK_ALIGN};
@@ -13,7 +15,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn allocated(fs: &FileSystem<Pool>) -> u64 {
+async fn allocated(fs: &CommitterFs<Pool>) -> u64 {
     let mut used = 0;
     for ms in fs.metaslabs.iter() {
         let ms = ms.read().await;
@@ -23,13 +25,13 @@ async fn allocated(fs: &FileSystem<Pool>) -> u64 {
 }
 
 /// Commit enough TXGs that every deferred free is released.
-async fn settle(fs: &FileSystem<Pool>) {
+async fn settle(fs: &CommitterFs<Pool>) {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
 }
 
-async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
+async fn read(fs: &CommitterFs<Pool>, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = fs.block_read(&ds("vol"), offset, &mut buf).await.unwrap();
     buf.truncate(n);
@@ -105,7 +107,7 @@ async fn writes_visible_before_and_after_sync_and_reload() {
         .await
         .unwrap();
 
-    async fn check(fs: &FileSystem<Pool>, a: &[u8], b: &[u8], c: &[u8]) {
+    async fn check(fs: &CommitterFs<Pool>, a: &[u8], b: &[u8], c: &[u8]) {
         assert_eq!(read(fs, 8192, a.len()).await, a);
         assert_eq!(read(fs, 100_003, b.len()).await, b);
         assert_eq!(read(fs, 10 * DEFAULT_VOLBLOCKSIZE as u64, c.len()).await, c);
@@ -467,7 +469,7 @@ async fn concurrent_flushes_share_commits() {
     fs.create_block(&ds("vol"), 64 * MB, DEFAULT_VOLBLOCKSIZE)
         .await
         .unwrap();
-    let txg_before = fs.uberblock().await.unwrap().txg;
+    let txg_before = fs.uberblock().await.txg;
 
     let mut tasks = tokio::task::JoinSet::new();
     for t in 0..32u64 {
@@ -483,7 +485,7 @@ async fn concurrent_flushes_share_commits() {
     while let Some(r) = tasks.join_next().await {
         r.unwrap();
     }
-    let commits = fs.uberblock().await.unwrap().txg.since(txg_before);
+    let commits = fs.uberblock().await.txg.since(txg_before);
     assert!(commits < 32, "{} commits for 32 flushes", commits);
     drop(fs);
 
@@ -530,8 +532,8 @@ async fn failed_sync_retry_does_not_serve_stale_cached_indirects() {
     assert!(read_any(&fs, rec * vbs as u64, vbs).await == second);
 }
 
-async fn read_any<D: crate::disk::PoolDevice + Send + Sync + 'static>(
-    fs: &FileSystem<D>,
+async fn read_any<D: crate::disk::PoolDevice + Send + Sync + 'static, R: Role>(
+    fs: &FileSystem<D, R>,
     offset: u64,
     len: usize,
 ) -> Vec<u8> {

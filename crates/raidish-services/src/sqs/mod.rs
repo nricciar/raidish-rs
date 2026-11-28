@@ -34,6 +34,7 @@ use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
 use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use md5::{Digest, Md5};
+use raidish_core::role::Mutable;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -78,7 +79,7 @@ impl ServiceError for SqsError {
     }
 }
 
-impl<D: PoolDevice + 'static> Served for Queue<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Served for Queue<D, R> {
     fn is_stopped(&self) -> bool {
         self.tree.is_stopped()
     }
@@ -562,16 +563,16 @@ fn nonce(seq: u64) -> u64 {
 use crate::types::now_ms;
 
 /// A queue, served from this node.
-pub struct Queue<D: PoolDevice> {
-    pub tree: ServiceTree<D>,
+pub struct Queue<D: PoolDevice, R: Mutable> {
+    pub tree: ServiceTree<D, R>,
     /// Signalled when messages may have become receivable.
     arrived: tokio::sync::Notify,
 }
 
-impl<D: PoolDevice + 'static> Queue<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Queue<D, R> {
     /// Serve queue `name` of `fs`.
     pub async fn open(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<FileSystem<D, R>>,
         name: &DatasetName,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
         let q = Arc::new(Queue {
@@ -619,7 +620,7 @@ impl<D: PoolDevice + 'static> Queue<D> {
     async fn write<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a, 'b> FnOnce(
-            &'a mut Txn<'b, D>,
+            &'a mut Txn<'b, D, R>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
@@ -631,7 +632,7 @@ impl<D: PoolDevice + 'static> Queue<D> {
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(
-            &'a Txn<'a, D>,
+            &'a Txn<'a, D, R>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
@@ -704,7 +705,7 @@ impl<D: PoolDevice + 'static> Queue<D> {
     }
 
     async fn send_one(
-        t: &mut Txn<'_, D>,
+        t: &mut Txn<'_, D, R>,
         m: &mut Meta,
         n: NewMsg,
         now: u64,
@@ -1117,7 +1118,7 @@ impl<D: PoolDevice + 'static> Queue<D> {
     }
 }
 
-async fn meta_of<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
+async fn meta_of<D: PoolDevice, R: Mutable>(t: &Txn<'_, D, R>) -> Result<Meta> {
     match t.get(b"M").await? {
         Some(raw) => Ok(bincode::deserialize(&raw)?),
         None => Ok(Meta {
@@ -1127,7 +1128,7 @@ async fn meta_of<D: PoolDevice>(t: &Txn<'_, D>) -> Result<Meta> {
     }
 }
 
-async fn put_meta<D: PoolDevice>(t: &mut Txn<'_, D>, m: &Meta) -> Result<()> {
+async fn put_meta<D: PoolDevice, R: Mutable>(t: &mut Txn<'_, D, R>, m: &Meta) -> Result<()> {
     t.put(b"M", &bincode::serialize(m)?).await?;
     Ok(())
 }

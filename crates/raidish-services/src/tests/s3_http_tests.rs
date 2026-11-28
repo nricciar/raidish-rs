@@ -8,6 +8,7 @@ use crate::pki::Role;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::types::ep;
+use raidish_core::role::CommitterFs;
 use std::collections::BTreeMap;
 
 struct S3 {
@@ -15,8 +16,8 @@ struct S3 {
     http: reqwest::Client,
     key: (String, String),
     fx: Fixture,
-    _fe: Arc<Frontend>,
-    _fs: Arc<crate::fs::FileSystem<Pool>>,
+    _fe: Arc<Frontend<raidish_core::role::Committer>>,
+    _fs: Arc<CommitterFs<Pool>>,
 }
 
 struct Resp {
@@ -591,7 +592,7 @@ async fn a_cancelled_delete_service_enables_it_again() {
     let slot: crate::committer::CommitterSlot =
         Arc::new(tokio::sync::RwLock::new(Some(committer.clone())));
     let fx = Fixture::new(vec![]);
-    let fe = fx.frontend_with(slot);
+    let fe: Arc<Frontend> = fx.frontend_with(slot);
     let mut routes = BTreeMap::new();
     routes.insert(
         "b".to_string(),

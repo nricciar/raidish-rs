@@ -39,6 +39,7 @@ use crate::disk::{FileId, PoolDevice};
 use crate::inode::{ObjType, SetAttrs};
 use crate::rpc::{Call, Cred, Reply};
 use crate::xdr::{Reader, Writer, XdrError, XdrResult};
+use raidish_core::role::Mutable;
 use state::{Exchanged, Locker, Range, Sequenced, StateTable, Stateid};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -393,8 +394,8 @@ fn skip_cb_sec(r: &mut Reader<'_>) -> XdrResult<()> {
     Ok(())
 }
 
-pub struct Server<D: PoolDevice> {
-    backend: Arc<Backend<D>>,
+pub struct Server<D: PoolDevice, R: Mutable> {
+    backend: Arc<Backend<D, R>>,
     node: String,
     state: std::sync::RwLock<Arc<StateTable>>,
     cluster: Option<Arc<dyn V4Cluster>>,
@@ -402,19 +403,23 @@ pub struct Server<D: PoolDevice> {
     owning: AtomicBool,
 }
 
-impl<D: PoolDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
     /// A server that owns its state (a pool only this node serves).
-    pub fn new(backend: Arc<Backend<D>>, node: &str) -> Self {
+    pub fn new(backend: Arc<Backend<D, R>>, node: &str) -> Self {
         Self::make(backend, node, None, true)
     }
 
     /// A server on a cluster node: a follower until `become_owner`.
-    pub fn with_cluster(backend: Arc<Backend<D>>, node: &str, cluster: Arc<dyn V4Cluster>) -> Self {
+    pub fn with_cluster(
+        backend: Arc<Backend<D, R>>,
+        node: &str,
+        cluster: Arc<dyn V4Cluster>,
+    ) -> Self {
         Self::make(backend, node, Some(cluster), false)
     }
 
     fn make(
-        backend: Arc<Backend<D>>,
+        backend: Arc<Backend<D, R>>,
         node: &str,
         cluster: Option<Arc<dyn V4Cluster>>,
         owning: bool,

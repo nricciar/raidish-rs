@@ -1,5 +1,6 @@
 use super::*;
 use crate::coords::PoolLba;
+use crate::role::CommitterFs;
 use crate::test_util::TestPool;
 use crate::test_util::VOLBLOCK_ALIGN;
 use crate::vdev::Pool;
@@ -10,7 +11,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn allocated(fs: &FileSystem<Pool>) -> u64 {
+async fn allocated(fs: &CommitterFs<Pool>) -> u64 {
     let mut used = 0;
     for ms in fs.metaslabs.iter() {
         let ms = ms.read().await;
@@ -20,7 +21,7 @@ async fn allocated(fs: &FileSystem<Pool>) -> u64 {
 }
 
 /// Commit enough TXGs that every deferred free is released.
-async fn settle(fs: &FileSystem<Pool>) {
+async fn settle(fs: &CommitterFs<Pool>) {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
@@ -28,7 +29,7 @@ async fn settle(fs: &FileSystem<Pool>) {
 
 /// Sync `obj`'s dirty records into a new tree and commit, the way an
 /// owner of the tree does: switch to the new root, free what it replaced.
-async fn sync_obj(fs: &FileSystem<Pool>, obj: &ObjTree) {
+async fn sync_obj(fs: &CommitterFs<Pool>, obj: &ObjTree) {
     if let Some(taken) = obj.begin_sync() {
         let (mut allocated, mut replaced) = (Vec::new(), Vec::new());
         let root = fs
@@ -46,14 +47,14 @@ async fn sync_obj(fs: &FileSystem<Pool>, obj: &ObjTree) {
     fs.sync().await.unwrap();
 }
 
-async fn read(fs: &FileSystem<Pool>, obj: &ObjTree, offset: u64, len: usize) -> Vec<u8> {
+async fn read(fs: &CommitterFs<Pool>, obj: &ObjTree, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = fs.object_read(obj, offset, &mut buf).await.unwrap();
     buf.truncate(n);
     buf
 }
 
-async fn tree_blocks(fs: &FileSystem<Pool>, obj: &ObjTree) -> u64 {
+async fn tree_blocks(fs: &CommitterFs<Pool>, obj: &ObjTree) -> u64 {
     let ext = fs.tree_extents(&obj.root()).await.unwrap();
     ext.iter().map(|e| e.len).sum()
 }

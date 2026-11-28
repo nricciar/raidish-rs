@@ -24,6 +24,7 @@ use crate::inode::{Dnode, ObjType, SetAttrs};
 use crate::object::{ObjTree, Sizing};
 use crate::object_lease::{ObjectGuard, ObjectLeases};
 use crate::open_file::OpenFile;
+use raidish_core::role::Mutable;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -232,10 +233,10 @@ struct Held {
 }
 
 /// Where the pool is (on a `listen` node: its writer, once it has one).
-pub type FsSource<D> = Arc<dyn Fn() -> Option<Arc<FileSystem<D>>> + Send + Sync>;
+pub type FsSource<D, R> = Arc<dyn Fn() -> Option<Arc<FileSystem<D, R>>> + Send + Sync>;
 
-pub struct Backend<D: PoolDevice> {
-    source: FsSource<D>,
+pub struct Backend<D: PoolDevice, R: Mutable> {
+    source: FsSource<D, R>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: String,
     /// This node's write verifier: changed whenever unstable writes
@@ -252,10 +253,14 @@ pub struct Backend<D: PoolDevice> {
     peers: Option<Arc<dyn Peers>>,
 }
 
-impl<D: PoolDevice + 'static> Backend<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Backend<D, R> {
     /// `leases`: where per-file write leases come from (None: a pool only
     /// this process writes).
-    pub fn new(source: FsSource<D>, leases: Option<Arc<dyn ObjectLeases>>, node: String) -> Self {
+    pub fn new(
+        source: FsSource<D, R>,
+        leases: Option<Arc<dyn ObjectLeases>>,
+        node: String,
+    ) -> Self {
         Backend {
             source,
             leases,
@@ -375,12 +380,12 @@ impl<D: PoolDevice + 'static> Backend<D> {
 
     /// Whether `f` is still the file the pool has open as `id` (writes to
     /// it can still be committed).
-    fn still_open(fs: &FileSystem<D>, id: FileId, f: &Arc<OpenFile>) -> bool {
+    fn still_open(fs: &FileSystem<D, R>, id: FileId, f: &Arc<OpenFile>) -> bool {
         !f.dropped() && fs.opened(id).is_some_and(|o| Arc::ptr_eq(&o, f))
     }
 
     /// The pool, caught up with what's committed.
-    pub async fn fs(&self) -> NfsResult<Arc<FileSystem<D>>> {
+    pub async fn fs(&self) -> NfsResult<Arc<FileSystem<D, R>>> {
         let fs = (self.source)().ok_or(status::JUKEBOX)?;
         let due = {
             let mut last = self.last_refresh.lock().unwrap();
@@ -396,8 +401,8 @@ impl<D: PoolDevice + 'static> Backend<D> {
         Ok(fs)
     }
 
-    async fn pool_guid(&self, fs: &FileSystem<D>) -> u64 {
-        fs.superblock().await.map_or(0, |sb| sb.pool_guid)
+    async fn pool_guid(&self, fs: &FileSystem<D, R>) -> u64 {
+        fs.superblock().pool_guid
     }
 
     // ---- handles ----
@@ -428,7 +433,7 @@ impl<D: PoolDevice + 'static> Backend<D> {
 
     // ---- reading ----
 
-    async fn dnode(&self, fs: &FileSystem<D>, id: FileId) -> NfsResult<Dnode> {
+    async fn dnode(&self, fs: &FileSystem<D, R>, id: FileId) -> NfsResult<Dnode> {
         let mut found = fs.try_read_dnode(id).await.map_err(err)?;
         if found.is_none() {
             // Made through another node a moment ago? Catch up, look again.
@@ -445,7 +450,7 @@ impl<D: PoolDevice + 'static> Backend<D> {
 
     /// Catch up with the committed state now (not waiting for the next
     /// periodic refresh).
-    async fn catch_up(&self, fs: &FileSystem<D>) -> NfsResult<()> {
+    async fn catch_up(&self, fs: &FileSystem<D, R>) -> NfsResult<()> {
         fs.refresh_root().await.map_err(err)?;
         *self.last_refresh.lock().unwrap() = Some(Instant::now());
         Ok(())
@@ -455,7 +460,7 @@ impl<D: PoolDevice + 'static> Backend<D> {
     /// have been made through another node a moment ago).
     async fn entry(
         &self,
-        fs: &FileSystem<D>,
+        fs: &FileSystem<D, R>,
         dir: FileId,
         name: &str,
     ) -> NfsResult<Option<(FileId, Dnode)>> {
@@ -466,7 +471,7 @@ impl<D: PoolDevice + 'static> Backend<D> {
         fs.lookup_in(dir, name).await.map_err(err)
     }
 
-    fn attr_of(&self, fs: &FileSystem<D>, guid: u64, id: FileId, d: &Dnode) -> Attr {
+    fn attr_of(&self, fs: &FileSystem<D, R>, guid: u64, id: FileId, d: &Dnode) -> Attr {
         let size = match fs.opened(id) {
             Some(f) => f.size(),
             None if d.is_directory() => d.size,
@@ -613,7 +618,7 @@ impl<D: PoolDevice + 'static> Backend<D> {
     // ---- writing ----
 
     /// File `id` open for writing here, taking its lease first if need be.
-    async fn writable(&self, fs: &FileSystem<D>, id: FileId) -> NfsResult<Arc<OpenFile>> {
+    async fn writable(&self, fs: &FileSystem<D, R>, id: FileId) -> NfsResult<Arc<OpenFile>> {
         let mut held = self.held.lock().await;
         if let Some(h) = held.get_mut(&id) {
             if Self::still_open(fs, id, &h.file) {

@@ -16,6 +16,7 @@ use crate::writer::{
     CommitError, CommitSink, Committed, DatasetCommit, FsCommit, FsCommitted, LentMetaslab,
 };
 use async_trait::async_trait;
+use raidish_core::role::WriterFs;
 use std::sync::Arc;
 
 const MB: usize = 1024 * 1024;
@@ -82,7 +83,7 @@ async fn setup(volumes: &[&str]) -> Setup {
 }
 
 struct Writer {
-    fs: FileSystem<Pool>,
+    fs: WriterFs<Pool>,
     resource: String,
     epoch: Epoch,
 }
@@ -111,7 +112,12 @@ async fn attach(s: &Setup, w: &Writer, vol: &str, owner: &str) -> Epoch {
     epoch
 }
 
-async fn read(fs: &FileSystem<Pool>, vol: &str, offset: u64, len: usize) -> Vec<u8> {
+async fn read<R: raidish_core::role::Role>(
+    fs: &FileSystem<Pool, R>,
+    vol: &str,
+    offset: u64,
+    len: usize,
+) -> Vec<u8> {
     let vol = &dsn(vol);
     let mut buf = vec![0xEEu8; len];
     let n = fs.block_read(vol, offset, &mut buf).await.unwrap();
@@ -182,7 +188,7 @@ async fn two_writers_two_volumes() {
     let fs = s.pool.load().await;
     assert_eq!(read(&fs, "a", 0, want_a.len()).await, want_a);
     assert_eq!(read(&fs, "b", 0, want_b.len()).await, want_b);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -302,7 +308,7 @@ async fn a_writer_without_its_leases_cannot_commit() {
     // What was committed is what's there.
     let fs = s.pool.load().await;
     assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// Feed the disk server what the cluster knows (a real one learns it through Raft).
@@ -360,7 +366,7 @@ async fn a_writer_that_lost_its_metaslab_is_fenced() {
     let mut want = first.clone();
     want[..second.len()].copy_from_slice(&second);
     assert_eq!(read(&fs, "a", 0, want.len()).await, want);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// R2b, over the wire: a committer write spanning a metaslab returned to it
@@ -446,7 +452,7 @@ async fn a_writers_repairs_pin_its_lent_space() {
     a.fs.sync().await.unwrap();
     // Done with the volume: its intent log no longer pins its metaslab.
     a.fs.detach_dataset(&dsn("a")).await.unwrap();
-    let w = a.fs.writer.clone().unwrap();
+    let w = a.fs.writer_state().clone();
     let lent = w.lent.lock().unwrap().clone();
     assert!(w.pinned.lock().unwrap().is_empty());
     let idx = lent[0];
@@ -634,7 +640,7 @@ async fn a_sync_stops_waiting_once_its_volume_lease_is_lost() {
     // Only what was committed is there.
     let fs = s.pool.load().await;
     assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 // ---- files and directories from writers ----
@@ -684,7 +690,7 @@ async fn two_writers_write_files_concurrently() {
         .unwrap();
     w1.fs.delete(Path::new("shared/b3")).await.unwrap();
 
-    let check = async |fs: &FileSystem<Pool>| {
+    async fn check<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) {
         assert_eq!(
             fs.read_file(Path::new("shared/a0")).await.unwrap(),
             pattern(5000, 99)
@@ -712,7 +718,7 @@ async fn two_writers_write_files_concurrently() {
             fs.read_file(Path::new("two/x")).await.unwrap(),
             pattern(MB + 7, 41)
         );
-    };
+    }
     w1.fs.reload_root_index().await.unwrap();
     w2.fs.reload_root_index().await.unwrap();
     check(&w1.fs).await;
@@ -723,7 +729,7 @@ async fn two_writers_write_files_concurrently() {
     drop((w1, w2));
     let fs = s.pool.load().await;
     check(&fs).await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -811,7 +817,7 @@ async fn file_commits_are_compare_and_swap() {
         pattern(2000, 2)
     );
     assert!(fs.read_file(Path::new("g")).await.is_err());
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -881,7 +887,7 @@ async fn offset_writes_are_compare_and_swap() {
     drop(fs);
     let fs = s.pool.load().await;
     assert_eq!(fs.read_file(Path::new("f")).await.unwrap(), b"theirs");
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -953,7 +959,7 @@ async fn concurrent_commits_share_a_txg() {
 
     // All of them arrive while a commit is in progress: they apply one after
     // another, then share a single TXG.
-    let before = s.committer.fs.uberblock().await.unwrap().txg;
+    let before = s.committer.fs.uberblock().await.txg;
     let busy = s.committer.fs.begin_tx().await;
     let commits = futures::future::join_all(held.iter().map(|c| s.committer.commit_fs(c)));
     let (results, ()) = tokio::join!(commits, async move {
@@ -961,7 +967,7 @@ async fn concurrent_commits_share_a_txg() {
         drop(busy);
     });
     let txgs: Vec<Txg> = results.into_iter().map(|r| r.unwrap().txg).collect();
-    let after = s.committer.fs.uberblock().await.unwrap().txg;
+    let after = s.committer.fs.uberblock().await.txg;
     assert_eq!(
         after.since(before),
         1,
@@ -985,7 +991,7 @@ async fn concurrent_commits_share_a_txg() {
         }
         fs.ls(Path::new(&format!("d{}", id))).await.unwrap();
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -994,8 +1000,8 @@ async fn concurrent_commits_share_a_txg() {
 use crate::writer::ObjLease;
 
 /// Write `data` through a `FileWriter` in uneven chunks.
-async fn stream(
-    fs: &FileSystem<Pool>,
+async fn stream<R: raidish_core::role::Mutable>(
+    fs: &FileSystem<Pool, R>,
     path: &str,
     data: &[u8],
     lease: Option<ObjLease>,
@@ -1045,7 +1051,7 @@ async fn a_writer_streams_a_large_file() {
         fs.read_file(Path::new("small")).await.unwrap(),
         pattern(70_000, 2)
     );
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1081,7 +1087,7 @@ async fn a_stale_upload_is_refused_and_its_space_released() {
     w2.fs.return_metaslabs().await;
     drop((w1, w2));
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1182,7 +1188,7 @@ async fn an_object_lease_keeps_others_out() {
     w2.fs.return_metaslabs().await;
     drop((w1, w2));
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1205,7 +1211,7 @@ async fn a_standalone_pool_streams_files_too() {
     drop(fs);
     let fs = pool.load().await;
     assert_eq!(fs.read_file(Path::new("big")).await.unwrap(), b"tiny");
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1298,13 +1304,16 @@ async fn lag_and_raise(s: &Setup) -> u64 {
     for _ in 0..3 {
         s.committer.fs.sync().await.unwrap();
     }
-    let floor = s.committer.fs.open_txg().await.unwrap();
+    let floor = s.committer.fs.open_txg().await;
     s.committer.fs.raise_birth_floor(floor);
     floor.get()
 }
 
 /// The births of a tree's root and data records.
-async fn births(fs: &FileSystem<Pool>, tree: &crate::object::TreeRoot) -> Vec<Txg> {
+async fn births<R: raidish_core::role::Role>(
+    fs: &FileSystem<Pool, R>,
+    tree: &crate::object::TreeRoot,
+) -> Vec<Txg> {
     let mut out: Vec<Txg> = tree.ptr.iter().map(|p| p.birth_txg).collect();
     for (_, p) in fs.tree_leaves(tree).await.unwrap() {
         out.push(p.birth_txg);
@@ -1325,10 +1334,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
     let data = pattern(200_000, 2);
     w.fs.block_write(&dsn("vol"), 0, &data).await.unwrap();
     let floor = lag_and_raise(&s).await;
-    assert!(
-        w.fs.open_txg().await.unwrap() < floor,
-        "the writer's view lags"
-    );
+    assert!(w.fs.open_txg().await < floor, "the writer's view lags");
 
     w.fs.sync().await.unwrap();
     let vol = s.committer.fs.open_dataset(&dsn("vol")).await.unwrap();
@@ -1343,7 +1349,7 @@ async fn volume_syncs_are_restamped_above_the_birth_floor() {
     w.fs.detach_dataset(&dsn("vol")).await.unwrap();
     w.fs.return_metaslabs().await;
     drop(w);
-    let report = s.pool.load().await.fsck(false).await.unwrap();
+    let report = s.pool.load().await.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1373,7 +1379,7 @@ async fn streamed_files_are_restamped_above_the_birth_floor() {
     );
     w.fs.return_metaslabs().await;
     drop(w);
-    let report = s.pool.load().await.fsck(false).await.unwrap();
+    let report = s.pool.load().await.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1425,7 +1431,7 @@ async fn the_committer_checks_births() {
         .await
         .unwrap();
     let mut c = sink.last_fs.lock().unwrap().clone().unwrap();
-    let open = s.committer.fs.open_txg().await.unwrap();
+    let open = s.committer.fs.open_txg().await;
     if let FsOp::WriteFile {
         path,
         base,
@@ -1463,14 +1469,14 @@ async fn local_uploads_are_restamped_above_the_birth_floor() {
     for _ in 0..3 {
         fs.sync().await.unwrap();
     }
-    let floor = fs.open_txg().await.unwrap();
+    let floor = fs.open_txg().await;
     fs.raise_birth_floor(floor);
     f.finish().await.unwrap();
     let (_, d) = fs.stat_file(Path::new("up")).await.unwrap();
     let b = births(&fs, &d.tree).await;
     assert!(b.iter().all(|&t| t >= floor), "{:?} vs floor {}", b, floor);
     assert_eq!(fs.read_file(Path::new("up")).await.unwrap(), data);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1517,7 +1523,7 @@ async fn snapshots_of_a_volume_a_writer_runs() {
         .await
         .unwrap();
     assert_eq!(snap, a);
-    let report = s.pool.load().await.fsck(false).await.unwrap();
+    let report = s.pool.load().await.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 
     s.committer
@@ -1529,7 +1535,7 @@ async fn snapshots_of_a_volume_a_writer_runs() {
     w.fs.return_metaslabs().await;
     drop(w);
     assert_eq!(read(&s.committer.fs, "vol", 0, c.len()).await, c);
-    let report = s.pool.load().await.fsck(false).await.unwrap();
+    let report = s.pool.load().await.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -1538,7 +1544,7 @@ async fn snapshots_of_a_volume_a_writer_runs() {
 #[tokio::test]
 async fn a_new_committer_raises_the_birth_floor() {
     let s = setup(&[]).await;
-    let open = s.committer.fs.open_txg().await.unwrap();
+    let open = s.committer.fs.open_txg().await;
     assert!(s.committer.fs.birth_floor() >= open);
 }
 
@@ -1634,7 +1640,7 @@ async fn a_sync_while_one_is_still_waiting_doesnt_wedge_the_volume() {
     assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
     assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
     assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 3));
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// Refuses every commit of dataset `bad`.
@@ -1798,7 +1804,7 @@ async fn a_sync_given_up_on_after_the_committer_applied_it_doesnt_wedge_the_volu
     assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 3));
     assert_eq!(read(&fs, "b", 200_000, 100_000).await, pattern(100_000, 4));
     assert_eq!(read(&fs, "a", 400_000, 100_000).await, pattern(100_000, 5));
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// Applies the first commit that drops a dataset's log (a detach's
@@ -1889,7 +1895,7 @@ async fn a_detach_whose_answer_was_lost_doesnt_ack_into_the_retired_log() {
         pattern(100_000, 3),
         "an acked flush was lost"
     );
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// The same, where the committer never got the commit before the caller
@@ -1931,7 +1937,7 @@ async fn a_sync_given_up_on_before_it_reached_the_committer_is_sent_again() {
     let fs = s.pool.load().await;
     assert_eq!(read(&fs, "a", 0, 100_000).await, pattern(100_000, 1));
     assert_eq!(read(&fs, "a", 200_000, 100_000).await, pattern(100_000, 2));
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 /// Holds commits back before they reach the committer.

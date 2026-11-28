@@ -4,6 +4,7 @@ use crate::inode::{DatasetProps, Transport};
 use crate::nbd::NbdServer;
 use crate::nvme::NvmeTcpServer;
 use crate::test_util::dsn;
+use raidish_core::role::WriterFs;
 use std::collections::BTreeSet;
 
 fn props(nodes: &[&str]) -> DatasetProps {
@@ -272,11 +273,13 @@ fn vol() -> DatasetName {
 /// listening) as this node's writer.
 async fn node() -> Node {
     let pool = crate::test_util::TestPool::new().await;
-    let fs = Arc::new(pool.format().await);
-    fs.create_block(&vol(), 16 << 20, fs.default_volblocksize())
-        .await
-        .unwrap();
-    let parts = writer_on(fs);
+    {
+        let fs = pool.format().await;
+        fs.create_block(&vol(), 16 << 20, fs.default_volblocksize())
+            .await
+            .unwrap();
+    }
+    let parts = writer_on(Arc::new(standalone_writer(&pool).await));
     let shared = Arc::new(volumes::handoff::Shared::new(LeaseClient::new(vec![])));
     shared.volumes.set_writer(parts.clone());
     Node {
@@ -287,8 +290,60 @@ async fn node() -> Node {
     }
 }
 
+/// The pool opened as a volume writer, committing through a committer in
+/// this process (holding its pool and writer leases).
+async fn standalone_writer(pool: &crate::test_util::TestPool) -> WriterFs<crate::vdev::Pool> {
+    use crate::cluster::LeaseOp;
+    use crate::cluster::state::{POOL, Response};
+    use crate::committer::{Authority, Committer, DirectSink, LocalAuthority};
+    async fn grant(auth: &LocalAuthority, resource: &str, owner: &str) -> crate::types::Epoch {
+        let op = LeaseOp::Acquire {
+            resource: crate::types::res(resource),
+            owner: owner.into(),
+            holder: crate::types::Holder::default().with_detail(owner),
+            ttl_ms: 600_000,
+        };
+        match auth.propose(op).await.unwrap() {
+            Response::Granted { epoch, .. } => epoch,
+            r => panic!("{} not granted: {:?}", resource, r),
+        }
+    }
+    let auth = Arc::new(LocalAuthority::default());
+    let epoch = grant(&auth, &POOL.to_string(), "c").await;
+    let committer = Arc::new(
+        Committer::new(
+            Arc::new(pool.load().await),
+            auth.clone(),
+            "c".into(),
+            epoch,
+            "n0".into(),
+        )
+        .await,
+    );
+    let epoch = grant(&auth, "writer/w", "w").await;
+    let sink = Arc::new(DirectSink {
+        committer,
+        writer: crate::types::LeaseRef::new(crate::types::res("writer/w"), epoch),
+    });
+    let fs = crate::fs::FileSystem::load_writer(pool.dev().await, sink)
+        .await
+        .unwrap();
+    // "vol" runs on this writer, under a `ds/vol` lease of its own.
+    let resource = dataset_resource(&vol()).to_string();
+    let epoch = grant(&auth, &resource, "owner").await;
+    fs.attach_dataset_leased(
+        &vol(),
+        crate::types::Holding::new("owner", epoch),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    fs
+}
+
 /// A writer (new servers, new generation) on `fs`.
-fn writer_on(fs: Arc<crate::fs::FileSystem<crate::vdev::Pool>>) -> WriterParts {
+fn writer_on(fs: Arc<WriterFs<crate::vdev::Pool>>) -> WriterParts {
     WriterParts {
         wgen: WriterGen::next(),
         nbd: Arc::new(NbdServer::with_bind(fs.clone(), "127.0.0.1", 0)),

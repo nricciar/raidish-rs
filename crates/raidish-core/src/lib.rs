@@ -27,6 +27,7 @@ pub mod mirror;
 pub mod object;
 pub mod open_file;
 pub mod raidz;
+pub mod role;
 pub mod rt;
 pub mod scan;
 #[cfg(not(target_arch = "wasm32"))]

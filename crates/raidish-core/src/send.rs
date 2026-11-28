@@ -28,6 +28,7 @@ use crate::blkptr::BlockPtr;
 use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, INDIRECT_FANOUT, Indirect, ObjTree, Sizing, TreeRoot};
+use crate::role::{Committer, Role};
 use crate::types::DatasetName;
 use crate::types::Txg;
 use crate::volume::DIRTY_LIMIT_BYTES;
@@ -149,7 +150,7 @@ struct Pending {
     hole: Option<(u64, u64)>,
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Snapshot `name@snap` and its dnode's tree, size and record size.
     async fn snapshot_tree(
         &self,
@@ -372,17 +373,84 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         Ok(())
     }
+}
 
+async fn read_header<R: AsyncRead + Unpin + Send>(
+    inp: &mut In<'_, R>,
+) -> Result<SendHeader, FileSystemError> {
+    if inp.get(8).await?.as_slice() != MAGIC {
+        return Err(bad("not a send stream"));
+    }
+    let version = inp.u32().await?;
+    if version != VERSION {
+        return Err(bad(format!(
+            "version {} (this build reads {})",
+            version, VERSION
+        )));
+    }
+    let len = inp.u32().await?;
+    if len > MAX_HEADER {
+        return Err(bad("header too large"));
+    }
+    Ok(bincode::deserialize(&inp.get(len as usize).await?)?)
+}
+
+/// Read a stream's header from `r`: the header, and the bytes read (to
+/// send on ahead of the rest).
+pub async fn peek_header<R: AsyncRead + Unpin + Send>(
+    r: &mut R,
+) -> Result<(SendHeader, Vec<u8>), FileSystemError> {
+    let mut raw = Vec::new();
+    let mut tee = Tee { r, raw: &mut raw };
+    let mut inp = In {
+        r: &mut tee,
+        hash: blake3::Hasher::new(),
+    };
+    let header = read_header(&mut inp).await?;
+    Ok((header, raw))
+}
+
+/// Keeps a copy of what's read through it.
+struct Tee<'a, R> {
+    r: &'a mut R,
+    raw: &'a mut Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Tee<'_, R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = &mut *self;
+        let r = std::pin::Pin::new(&mut *this.r).poll_read(cx, buf);
+        this.raw.extend_from_slice(&buf.filled()[before..]);
+        r
+    }
+}
+
+async fn write_hole<W: AsyncWrite + Unpin + Send>(
+    out: &mut Out<'_, W>,
+    first: u64,
+    count: u64,
+) -> Result<(), FileSystemError> {
+    out.put(&[HOLE]).await?;
+    out.put(&first.to_le_bytes()).await?;
+    out.put(&count.to_le_bytes()).await
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
     /// Receive a stream from `r` as a snapshot of volume `name`: a full
     /// stream makes a new volume; an incremental one goes onto `name`,
     /// whose newest snapshot must be the stream's base. `force`: roll
     /// `name` back to that snapshot first if it was written since (else
     /// that's refused). The volume must not be running. On any failure the
     /// volume is left as it was (a full receive's volume is deleted).
-    pub async fn recv_snapshot<R: AsyncRead + Unpin + Send>(
+    pub async fn recv_snapshot<Rd: AsyncRead + Unpin + Send>(
         &self,
         name: &DatasetName,
-        r: &mut R,
+        r: &mut Rd,
         force: bool,
     ) -> Result<StreamReport, FileSystemError> {
         let mut inp = In {
@@ -561,11 +629,11 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(())
     }
 
-    async fn recv_frames<R: AsyncRead + Unpin + Send>(
+    async fn recv_frames<Rd: AsyncRead + Unpin + Send>(
         &self,
         name: &DatasetName,
         header: &SendHeader,
-        inp: &mut In<'_, R>,
+        inp: &mut In<'_, Rd>,
     ) -> Result<StreamReport, FileSystemError> {
         let bs = header.volblocksize as u64;
         let records = header.size_bytes.div_ceil(bs);
@@ -642,71 +710,6 @@ impl<D: PoolDevice> FileSystem<D> {
             }
         }
     }
-}
-
-async fn read_header<R: AsyncRead + Unpin + Send>(
-    inp: &mut In<'_, R>,
-) -> Result<SendHeader, FileSystemError> {
-    if inp.get(8).await?.as_slice() != MAGIC {
-        return Err(bad("not a send stream"));
-    }
-    let version = inp.u32().await?;
-    if version != VERSION {
-        return Err(bad(format!(
-            "version {} (this build reads {})",
-            version, VERSION
-        )));
-    }
-    let len = inp.u32().await?;
-    if len > MAX_HEADER {
-        return Err(bad("header too large"));
-    }
-    Ok(bincode::deserialize(&inp.get(len as usize).await?)?)
-}
-
-/// Read a stream's header from `r`: the header, and the bytes read (to
-/// send on ahead of the rest).
-pub async fn peek_header<R: AsyncRead + Unpin + Send>(
-    r: &mut R,
-) -> Result<(SendHeader, Vec<u8>), FileSystemError> {
-    let mut raw = Vec::new();
-    let mut tee = Tee { r, raw: &mut raw };
-    let mut inp = In {
-        r: &mut tee,
-        hash: blake3::Hasher::new(),
-    };
-    let header = read_header(&mut inp).await?;
-    Ok((header, raw))
-}
-
-/// Keeps a copy of what's read through it.
-struct Tee<'a, R> {
-    r: &'a mut R,
-    raw: &'a mut Vec<u8>,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Tee<'_, R> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let this = &mut *self;
-        let r = std::pin::Pin::new(&mut *this.r).poll_read(cx, buf);
-        this.raw.extend_from_slice(&buf.filled()[before..]);
-        r
-    }
-}
-
-async fn write_hole<W: AsyncWrite + Unpin + Send>(
-    out: &mut Out<'_, W>,
-    first: u64,
-    count: u64,
-) -> Result<(), FileSystemError> {
-    out.put(&[HOLE]).await?;
-    out.put(&first.to_le_bytes()).await?;
-    out.put(&count.to_le_bytes()).await
 }
 
 #[cfg(test)]

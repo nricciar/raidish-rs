@@ -13,6 +13,7 @@ use crate::types::Txg;
 use crate::types::{Epoch, Holding, LeaseRef, MetaslabIdx};
 use crate::vdev::Pool;
 use crate::zil::*;
+use raidish_core::role::WriterFs;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,7 +80,7 @@ async fn setup() -> Setup {
 }
 
 struct Writer {
-    fs: FileSystem<Pool>,
+    fs: WriterFs<Pool>,
     id: String,
     epoch: Epoch,
     ds_owner: String,
@@ -138,17 +139,21 @@ async fn writer(s: &Setup, id: &str, fresh: Option<crate::writer::LeaseCheck>) -
 }
 
 async fn txg(s: &Setup) -> u64 {
-    (s.committer.fs().uberblock().await.unwrap().txg).get()
+    (s.committer.fs().uberblock().await.txg).get()
 }
 
-async fn read(fs: &FileSystem<Pool>, offset: u64, len: usize) -> Vec<u8> {
+async fn read<R: raidish_core::role::Role>(
+    fs: &FileSystem<Pool, R>,
+    offset: u64,
+    len: usize,
+) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = fs.block_read(&dsn("a"), offset, &mut buf).await.unwrap();
     buf.truncate(n);
     buf
 }
 
-async fn cursor(fs: &FileSystem<Pool>) -> Option<LogCursor> {
+async fn cursor<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) -> Option<LogCursor> {
     fs.open_dataset(&dsn("a"))
         .await
         .unwrap()
@@ -160,7 +165,7 @@ async fn cursor(fs: &FileSystem<Pool>) -> Option<LogCursor> {
 
 async fn assert_clean(s: &Setup) {
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -685,20 +690,20 @@ async fn a_writer_heals_what_a_disk_missed_in_its_lent_space() {
         .unwrap();
     a.sync().await.unwrap();
     assert!(s.committer.fs().degraded_disks()[1].is_some());
-    let lent = a.writer.as_ref().unwrap().lent.lock().unwrap().clone();
+    let lent = a.writer_state().lent.lock().unwrap().clone();
     assert!(!lent.is_empty());
 
     // The same writer, once it reaches disk 1 again, repairs its lent space.
     let b = FileSystem::load_writer(s.pool.dev().await, sink())
         .await
         .unwrap();
-    b.writer.as_ref().unwrap().lent.lock().unwrap().extend(lent);
+    b.writer_state().lent.lock().unwrap().extend(lent);
     let report = b.heal_lent().await.unwrap().expect("a heal pass");
     assert!(report.repaired() > 0, "{}", report);
     assert!(report.is_clean(), "{}", report);
 
     // Nothing left for the committer to find.
-    let scrub = s.committer.fs().scrub(false).await.unwrap();
+    let scrub = s.committer.fs().scrub().await.unwrap();
     assert_eq!(scrub.mismatched(), 0, "{}", scrub);
 }
 
@@ -717,7 +722,7 @@ async fn a_failed_disk_flush_leaves_no_gap_before_later_records() {
     fs.attach_dataset_leased(&dsn("a"), Holding::new("o1", ds_epoch), None, None)
         .await
         .unwrap();
-    let cursor = |fs: &FileSystem<FaultyDev<Pool>>| {
+    let cursor = |fs: &FileSystem<FaultyDev<Pool>, _>| {
         let vol = fs.open_datasets.lock().unwrap().get("a").cloned().unwrap();
         vol.cursor.lock().unwrap().clone()
     };
@@ -1023,7 +1028,7 @@ async fn setup_kv() -> Setup {
     }
 }
 
-async fn kv_all(fs: &FileSystem<Pool>) -> Vec<(Vec<u8>, Vec<u8>)> {
+async fn kv_all<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) -> Vec<(Vec<u8>, Vec<u8>)> {
     fs.kv_range(
         &dsn("k"),
         std::ops::Bound::Unbounded,
@@ -1038,7 +1043,7 @@ fn model_vec(m: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
     m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-async fn kv_cursor(fs: &FileSystem<Pool>) -> Option<LogCursor> {
+async fn kv_cursor<R: raidish_core::role::Role>(fs: &FileSystem<Pool, R>) -> Option<LogCursor> {
     fs.open_dataset(&dsn("k"))
         .await
         .unwrap()
@@ -1259,11 +1264,10 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
         .await
         .unwrap();
     fs.flush().await.unwrap(); // commits (and reports disk 2)
-    let w = fs.writer.clone().unwrap();
     let vol = fs.open_dataset(&dsn("a")).await.unwrap();
     // Nothing unreported: nothing to commit.
     let before = txg(&s).await;
-    fs.writer_report_misses(&w, &vol).await.unwrap();
+    fs.writer_report_misses(&vol).await.unwrap();
     assert_eq!(txg(&s).await, before);
     // A write disk 2 misses, that no commit carries (the free slot after
     // the log's last record: the next append overwrites it).
@@ -1273,7 +1277,7 @@ async fn misses_no_commit_carried_are_reported_on_their_own() {
         .unwrap();
     assert!(fs.unaccounted_misses()[2]);
     *s.committer.fs().degraded.lock().unwrap() = vec![None; s.committer.fs().disk_count()];
-    fs.writer_report_misses(&w, &vol).await.unwrap();
+    fs.writer_report_misses(&vol).await.unwrap();
     assert!(txg(&s).await > before, "committed");
     assert!(!fs.unaccounted_misses()[2]);
     assert!(s.committer.fs().degraded_disks()[2].is_some());

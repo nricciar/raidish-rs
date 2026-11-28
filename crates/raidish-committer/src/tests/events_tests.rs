@@ -85,7 +85,7 @@ async fn append_read_and_reopen() {
     assert!(log.read(&q).await.unwrap().events.is_empty());
     log.append(vec![ev("n1", "e11")], None).await.unwrap();
     assert_eq!(msgs(&log.read(&q).await.unwrap()), vec!["e11"]);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 

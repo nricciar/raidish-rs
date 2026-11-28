@@ -1,4 +1,5 @@
 use super::*;
+use crate::role::Role;
 use crate::test_util::TestPool;
 use crate::test_util::{DATA_SHARDS, MAX_RECORD_BLOCKS};
 use std::path::Path;
@@ -9,7 +10,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn file_ptrs<D: PoolDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
+async fn file_ptrs<D: PoolDevice, R: Role>(fs: &FileSystem<D, R>, path: &str) -> Vec<BlockPtr> {
     let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
     leaves.into_iter().map(|(_, p)| p).collect()
@@ -19,7 +20,7 @@ async fn file_ptrs<D: PoolDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPt
 async fn objects_round_trip_with_aligned_records() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    let txg = fs.open_txg().await.unwrap();
+    let txg = fs.open_txg().await;
 
     let max = MAX_RECORD_BLOCKS as usize * BLOCK_SIZE;
     for len in [

@@ -19,6 +19,7 @@ use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{Dnode, Lookup};
 use crate::object::TreeRoot;
+use crate::role::{Committer, CommitterFs, MutView, Mutable, WriterFs};
 use crate::types::MetaslabIdx;
 use crate::types::Txg;
 use crate::writer::{CommitError, FsOp, ObjLease, path_string};
@@ -27,8 +28,8 @@ use std::path::{Path, PathBuf};
 /// A file being written. Call `finish` to commit it or `abort` to give its
 /// space back; dropped without either, its records are left unreferenced
 /// until the pool is reopened (a writer's never reach the committer).
-pub struct FileWriter<'a, D: PoolDevice> {
-    fs: &'a FileSystem<D>,
+pub struct FileWriter<'a, D: PoolDevice, R: Mutable> {
+    fs: &'a FileSystem<D, R>,
     path: PathBuf,
     /// The file and its contents when opened (None: it didn't exist).
     base: Option<(FileId, TreeRoot)>,
@@ -48,15 +49,15 @@ pub struct FileWriter<'a, D: PoolDevice> {
 /// (other writes on this node may take what was borrowed first).
 const ALLOC_ATTEMPTS: usize = 4;
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
     /// Start writing `path` (created on `finish` if it doesn't exist,
     /// replaced if it does), optionally under the file's `obj/<id>` lease.
     pub async fn file_writer(
         &self,
         path: &Path,
         lease: Option<ObjLease>,
-    ) -> Result<FileWriter<'_, D>, FileSystemError> {
-        if self.writer.is_some() {
+    ) -> Result<FileWriter<'_, D, R>, FileSystemError> {
+        if self.role.writer().is_some() {
             // See what's committed now: that's what `finish` swaps against.
             self.reload_root_index().await?;
         }
@@ -116,35 +117,6 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(entry.ok_or(FileSystemError::FileNotFound)?.id)
     }
 
-    /// Give file contents written elsewhere (`tree`, `size` bytes of
-    /// `blksz` records) to the file at `l`: replace `current`'s (freeing
-    /// the old), or create the file. Under `begin_tx`; the caller has done
-    /// the compare-and-swap. Returns the file's object number.
-    pub async fn set_file_contents(
-        &self,
-        tx: &mut crate::tx::Tx,
-        l: Lookup,
-        current: Option<(FileId, Dnode)>,
-        blksz: u32,
-        size: u64,
-        tree: TreeRoot,
-    ) -> Result<FileId, FileSystemError> {
-        match current {
-            Some((id, mut dnode)) => {
-                dnode.blksz = blksz;
-                self.replace_file_contents(tx, id, dnode, size, tree)
-                    .await?;
-                Ok(id)
-            }
-            None => {
-                let mut dnode = Dnode::file(blksz);
-                dnode.size = size;
-                dnode.tree = tree;
-                self.link_new(tx, l, dnode).await
-            }
-        }
-    }
-
     /// The file at `l` with its dnode (None: nothing there). Refused if
     /// something else is there.
     pub async fn current_file(
@@ -162,7 +134,7 @@ impl<D: PoolDevice> FileSystem<D> {
     }
 }
 
-impl<'a, D: PoolDevice> FileWriter<'a, D> {
+impl<'a, D: PoolDevice, R: Mutable> FileWriter<'a, D, R> {
     /// Bytes written so far.
     pub fn len(&self) -> u64 {
         self.size + self.pending.len() as u64
@@ -196,10 +168,8 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
 
     /// On a writer, borrow space for `blocks` more before allocating.
     async fn reserve(&self, blocks: u64) -> Result<(), FileSystemError> {
-        if let Some(w) = &self.fs.writer {
-            self.fs
-                .lease_space(w, blocks + self.fs.max_record_blocks())
-                .await?;
+        if let MutView::Writer(fs) = self.fs.mutable() {
+            fs.lease_space(blocks + fs.max_record_blocks()).await?;
         }
         Ok(())
     }
@@ -210,7 +180,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
     /// too, until this writer is done: that only delays a return.
     async fn pinning<T>(&mut self, f: impl Future<Output = T>) -> T {
         // Dropped part way, the scope unpins what it took (`PinScope`).
-        let scope = crate::metaslab::PinScope::new(self.fs.writer.clone());
+        let scope = crate::metaslab::PinScope::new(self.fs.role.writer().cloned());
         let (out, pins) = crate::metaslab::PIN_ALLOCS
             .scope(scope, async {
                 let out = f.await;
@@ -229,7 +199,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
             self.reserve(blocks).await?;
             match self.pinning(fs.write_record(chunk)).await {
                 Err(FileSystemError::NoSpace(_))
-                    if fs.writer.is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
+                    if fs.role.writer().is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
                 {
                     attempt += 1;
                 }
@@ -258,7 +228,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
                     return Ok(tree);
                 }
                 Err(FileSystemError::NoSpace(_))
-                    if fs.writer.is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
+                    if fs.role.writer().is_some() && attempt + 1 < ALLOC_ATTEMPTS =>
                 {
                     fs.release_ptrs(&indirects).await;
                     attempt += 1;
@@ -272,7 +242,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
     }
 
     fn unpin(&mut self) {
-        if let Some(w) = &self.fs.writer {
+        if let Some(w) = self.fs.role.writer() {
             for idx in self.pinned.drain(..) {
                 w.unpin(idx);
             }
@@ -282,12 +252,12 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
     /// Give the space written so far back, linking nothing in.
     pub async fn abort(mut self) {
         self.release().await;
-        if self.fs.writer.is_none() {
+        if let MutView::Committer(fs) = self.fs.mutable() {
             // A commit since a record was written may have recorded it as
             // allocated: record it free again.
-            let mut tx = self.fs.begin_tx().await;
+            let mut tx = fs.begin_tx().await;
             let tx = &mut tx;
-            if let Err(e) = self.fs.commit_locked(tx).await {
+            if let Err(e) = fs.commit_locked(tx).await {
                 eprintln!("file writer: committing released space: {}", e);
             }
         }
@@ -323,14 +293,14 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
             self.abort().await;
             return Err(e.into());
         }
-        let r = match self.fs.writer.clone() {
-            Some(w) => self.finish_writer(&w, tree).await,
-            None => self.finish_local(tree).await,
+        let r = match self.fs.mutable() {
+            MutView::Writer(fs) => self.finish_writer(fs, tree).await,
+            MutView::Committer(fs) => self.finish_local(fs, tree).await,
         };
         self.unpin();
-        if let Some(w) = &self.fs.writer {
-            let _tx = self.fs.begin_tx().await;
-            self.fs.return_full(w).await;
+        if let MutView::Writer(fs) = self.fs.mutable() {
+            let _tx = fs.begin_tx().await;
+            fs.return_full().await;
         }
         r
     }
@@ -360,7 +330,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
 
     async fn finish_writer(
         &mut self,
-        w: &crate::writer::WriterState,
+        fs: &WriterFs<D>,
         tree: TreeRoot,
     ) -> Result<FileId, FileSystemError> {
         let mut tree = tree;
@@ -380,7 +350,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
                 base: self.base.clone(),
                 min_birth: self.min_birth(),
             };
-            match self.fs.writer_commit_fs(w, op, self.lease.clone()).await {
+            match fs.writer_commit_fs(op, self.lease.clone()).await {
                 Ok(c) => return Ok(c.file_id),
                 Err(e @ CommitError::Refused { .. }) => {
                     // Definitely not applied: the space is ours to reuse.
@@ -391,7 +361,7 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
                     // Stamped below the birth floor (a snapshot was taken
                     // meanwhile): restamp and send again.
                     attempts += 1;
-                    self.fs.note_open_txg(open).await;
+                    fs.note_open_txg(open).await;
                     tree = match self.restamp(open).await {
                         Ok(t) => t,
                         Err(e) => {
@@ -408,15 +378,18 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
         }
     }
 
-    async fn finish_local(&mut self, tree: TreeRoot) -> Result<FileId, FileSystemError> {
-        let fs = self.fs;
+    async fn finish_local(
+        &mut self,
+        fs: &CommitterFs<D>,
+        tree: TreeRoot,
+    ) -> Result<FileId, FileSystemError> {
         let mut tx = fs.begin_tx().await;
         let tx = &mut tx;
         // Records written before a snapshot raised the birth floor are
         // restamped (no commit can run now: the open TXG is final).
         let mut tree = tree;
         if self.min_birth().is_some_and(|b| b < fs.birth_floor()) {
-            let open = fs.open_txg().await?;
+            let open = fs.open_txg().await;
             tree = match self.restamp(open).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -468,8 +441,39 @@ impl<'a, D: PoolDevice> FileWriter<'a, D> {
     }
 }
 
-impl<D: PoolDevice> Drop for FileWriter<'_, D> {
+impl<D: PoolDevice, R: Mutable> Drop for FileWriter<'_, D, R> {
     fn drop(&mut self) {
         self.unpin();
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// Give file contents written elsewhere (`tree`, `size` bytes of
+    /// `blksz` records) to the file at `l`: replace `current`'s (freeing
+    /// the old), or create the file. Under `begin_tx`; the caller has done
+    /// the compare-and-swap. Returns the file's object number.
+    pub async fn set_file_contents(
+        &self,
+        tx: &mut crate::tx::Tx,
+        l: Lookup,
+        current: Option<(FileId, Dnode)>,
+        blksz: u32,
+        size: u64,
+        tree: TreeRoot,
+    ) -> Result<FileId, FileSystemError> {
+        match current {
+            Some((id, mut dnode)) => {
+                dnode.blksz = blksz;
+                self.replace_file_contents(tx, id, dnode, size, tree)
+                    .await?;
+                Ok(id)
+            }
+            None => {
+                let mut dnode = Dnode::file(blksz);
+                dnode.size = size;
+                dnode.tree = tree;
+                self.link_new(tx, l, dnode).await
+            }
+        }
     }
 }

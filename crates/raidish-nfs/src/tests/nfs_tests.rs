@@ -25,30 +25,30 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 /// An NFS server on 127.0.0.1 over `fs`, and a client connected to it.
-async fn serve(
-    fs: Arc<FileSystem<Pool>>,
+async fn serve<R: raidish_core::role::Mutable>(
+    fs: Arc<FileSystem<Pool, R>>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: &str,
-) -> (Nfs, Arc<Backend<Pool>>) {
+) -> (Nfs, Arc<Backend<Pool, R>>) {
     serve_with(fs, leases, node, std::time::Duration::from_secs(3)).await
 }
 
-async fn serve_with(
-    fs: Arc<FileSystem<Pool>>,
+async fn serve_with<R: raidish_core::role::Mutable>(
+    fs: Arc<FileSystem<Pool, R>>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: &str,
     close_after: std::time::Duration,
-) -> (Nfs, Arc<Backend<Pool>>) {
+) -> (Nfs, Arc<Backend<Pool, R>>) {
     serve_full(fs, leases, node, close_after, None).await
 }
 
-async fn serve_full(
-    fs: Arc<FileSystem<Pool>>,
+async fn serve_full<R: raidish_core::role::Mutable>(
+    fs: Arc<FileSystem<Pool, R>>,
     leases: Option<Arc<dyn ObjectLeases>>,
     node: &str,
     close_after: std::time::Duration,
     peers: Option<Arc<dyn Peers>>,
-) -> (Nfs, Arc<Backend<Pool>>) {
+) -> (Nfs, Arc<Backend<Pool, R>>) {
     let mut backend = Backend::new(Arc::new(move || Some(fs.clone())), leases, node.into())
         .with_close_after(close_after);
     if let Some(p) = peers {
@@ -430,7 +430,7 @@ async fn mount_create_write_read_commit() {
     let (mut c, _) = serve(fs.clone(), None, "n1").await;
     assert_eq!(c.read(&f, 0, 11).await.unwrap().0, expect[..11]);
     assert_eq!(c.lookup(&root, "vm1").await.unwrap(), dir);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -497,7 +497,7 @@ async fn namespace_operations() {
     assert_eq!(c.access(&f, 0x3f).await, 0, "others ---");
 
     drop(c);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -752,7 +752,9 @@ async fn two_nodes_share_handles_and_hand_files_over() {
 /// `Peers` between backends in this process, over the in-memory leases.
 struct TestPeers {
     auth: Arc<LocalAuthority>,
-    nodes: std::sync::Mutex<std::collections::HashMap<String, Arc<Backend<Pool>>>>,
+    nodes: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<Backend<Pool, raidish_core::role::Writer>>>,
+    >,
     down: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
@@ -893,7 +895,7 @@ async fn the_forward_route_serves_this_nodes_backend() {
         None,
         "n0".into(),
     ));
-    let app = |b: Option<Arc<Backend<Pool>>>| {
+    let app = |b: Option<Arc<Backend<Pool, raidish_core::role::Committer>>>| {
         let st = super::peers::NfsForwarding(b.map(|b| {
             let v4 = Arc::new(super::v4::Server::new(b.clone(), "n0"));
             (b, v4)

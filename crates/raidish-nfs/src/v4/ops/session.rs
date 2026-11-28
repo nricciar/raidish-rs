@@ -1,8 +1,9 @@
 //! Client IDs and sessions: EXCHANGE_ID, CREATE_SESSION and the SEQUENCE every other request starts with.
 
 use super::super::*;
+use raidish_core::role::Mutable;
 
-impl<D: PoolDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
     pub(in crate::v4) async fn sequence(
         &self,
         ctx: &mut Ctx,

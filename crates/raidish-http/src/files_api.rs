@@ -41,6 +41,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream::{BoxStream, StreamExt};
 use raidish_auth::http::{Json, Query};
+use raidish_core::role::{ReadOnlyFs, Role, WriterFs};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,7 +53,7 @@ pub struct FilesState {
     pub node: String,
     pub writer: WriterSlot,
     /// For reads before this node has a writer (no committer yet).
-    pub read_only: Option<Arc<FileSystem<Arc<Pool>>>>,
+    pub read_only: Option<Arc<ReadOnlyFs<Arc<Pool>>>>,
     pub leases: Arc<dyn ObjectLeases>,
     /// The largest upload (or PATCH body) taken, in bytes.
     pub upload_limit: u64,
@@ -66,12 +67,12 @@ fn unavailable() -> ApiError {
 }
 
 enum Reader {
-    Writer(Arc<FileSystem<Pool>>),
-    ReadOnly(Arc<FileSystem<Arc<Pool>>>),
+    Writer(Arc<WriterFs<Pool>>),
+    ReadOnly(Arc<ReadOnlyFs<Arc<Pool>>>),
 }
 
 impl FilesState {
-    fn writer(&self) -> Result<Arc<FileSystem<Pool>>, ApiError> {
+    fn writer(&self) -> Result<Arc<WriterFs<Pool>>, ApiError> {
         self.writer.read().unwrap().clone().ok_or_else(unavailable)
     }
 
@@ -89,8 +90,8 @@ impl FilesState {
 // ---- reads ----
 
 /// A file's dnode, as of the newest committed root.
-async fn file_dnode<D: PoolDevice>(
-    fs: &FileSystem<D>,
+async fn file_dnode<D: PoolDevice, R: Role>(
+    fs: &FileSystem<D, R>,
     path: &Path,
 ) -> Result<Dnode, FileSystemError> {
     fs.refresh_root().await?;
@@ -102,8 +103,8 @@ pub(crate) const STREAM_RECORDS: usize = 8;
 
 /// Bytes `range` of the file, read a few records at a time. A piece that
 /// can't be read is an error, which ends the stream.
-fn record_stream<D: PoolDevice + 'static>(
-    fs: Arc<FileSystem<D>>,
+fn record_stream<D: PoolDevice + 'static, R: Role>(
+    fs: Arc<FileSystem<D, R>>,
     dnode: Dnode,
     range: std::ops::Range<u64>,
 ) -> BoxStream<'static, Result<Vec<u8>, FileSystemError>> {
@@ -182,8 +183,8 @@ impl IntoResponse for FileBody {
     }
 }
 
-async fn file_body<D: PoolDevice + 'static>(
-    fs: Arc<FileSystem<D>>,
+async fn file_body<D: PoolDevice + 'static, R: Role>(
+    fs: Arc<FileSystem<D, R>>,
     path: &Path,
     range: Option<&str>,
 ) -> Result<FileBody, ApiError> {
@@ -251,8 +252,8 @@ fn stat_of(id: FileId, d: &Dnode) -> Stat {
     }
 }
 
-async fn list<D: PoolDevice>(
-    fs: &FileSystem<D>,
+async fn list<D: PoolDevice, R: Role>(
+    fs: &FileSystem<D, R>,
     path: &Path,
 ) -> Result<Vec<DirEntry>, FileSystemError> {
     fs.refresh_root().await?;
@@ -310,7 +311,7 @@ const UPLOAD_CHUNK: usize = 1 << 20;
 
 /// Stream `data` into `path` under `lease`.
 async fn upload(
-    fs: &FileSystem<Pool>,
+    fs: &WriterFs<Pool>,
     path: &Path,
     data: Body,
     limit: u64,
@@ -407,7 +408,7 @@ async fn put_file(
 
 /// Write `data` at `offset` of the open file `f`, then set its size.
 async fn patch_body(
-    fs: &FileSystem<Pool>,
+    fs: &WriterFs<Pool>,
     f: &crate::open_file::OpenFile,
     data: Body,
     limit: u64,
@@ -501,7 +502,10 @@ async fn patch_file(
     Ok(Json(Written { id, size }))
 }
 
-async fn stat<D: PoolDevice>(fs: &FileSystem<D>, path: &Path) -> Result<Stat, FileSystemError> {
+async fn stat<D: PoolDevice, R: Role>(
+    fs: &FileSystem<D, R>,
+    path: &Path,
+) -> Result<Stat, FileSystemError> {
     fs.refresh_root().await?;
     let (id, d) = fs.stat(path).await?;
     Ok(stat_of(id, &d))

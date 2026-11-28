@@ -4,18 +4,42 @@
 
 use crate::disk::PoolDevice;
 use crate::events::{EventKind, Subject};
-use crate::fs::{FileSystem, LabelState};
+use crate::fs::LabelState;
 use crate::types::Txg;
 use raidish_core::coords::PoolDiskIdx;
+use raidish_core::role::{CommitterFs, WriterFs};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A volume writer's half of keeping the pool healthy: the committer's
+/// health monitor resilvers the pool except the space lent to writers (its
+/// writes are fenced out of it), so each writer repairs its own lent space
+/// every `interval` (see `FileSystem::heal_lent`). `who` prefixes the log.
+pub fn spawn_lent_healer<D: PoolDevice + 'static>(
+    fs: Arc<WriterFs<D>>,
+    interval: Duration,
+    who: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match fs.heal_lent().await {
+                Ok(Some(r)) if r.repaired() > 0 || !r.is_clean() => {
+                    eprintln!("{}: lent space: {}", who, r);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("{}: healing lent space: {}", who, e),
+            }
+        }
+    })
+}
 
 /// Keep a served pool healthy: whenever a disk (re)connects, check its label
 /// (a replaced disk is fenced and fully resilvered), and whenever an online
 /// disk is degraded, resilver it. Also re-checks periodically, since misses
 /// are only noticed at commit time.
 pub fn spawn_health_monitor<D: PoolDevice + 'static>(
-    fs: Arc<FileSystem<D>>,
+    fs: Arc<CommitterFs<D>>,
     interval: Duration,
     events: Option<crate::events::EventSink>,
 ) -> tokio::task::JoinHandle<()> {

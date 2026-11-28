@@ -7,6 +7,7 @@ use crate::btree::Txn;
 use crate::dataset::{Dataset, DatasetFormat};
 use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
+use crate::role::Mutable;
 use crate::types::DatasetName;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -44,18 +45,18 @@ pub trait ServiceError: From<FileSystemError> {
 /// A dataset served from this node as one btree: stoppable, with writes
 /// made durable before they're answered and reads that only ever see
 /// durable writes.
-pub struct ServiceTree<D: PoolDevice> {
-    pub fs: Arc<FileSystem<D>>,
+pub struct ServiceTree<D: PoolDevice, R: Mutable> {
+    pub fs: Arc<FileSystem<D, R>>,
     pub name: DatasetName,
     format: DatasetFormat,
     stopped: AtomicBool,
     pub settler: Settler,
 }
 
-impl<D: PoolDevice + 'static> ServiceTree<D> {
+impl<D: PoolDevice + 'static, R: Mutable> ServiceTree<D, R> {
     /// Serve `name` (a `format` dataset) of `fs`.
     pub async fn open(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<FileSystem<D, R>>,
         name: &DatasetName,
         format: DatasetFormat,
     ) -> Result<Self, FileSystemError> {
@@ -89,7 +90,7 @@ impl<D: PoolDevice + 'static> ServiceTree<D> {
     where
         E: ServiceError,
         F: for<'a, 'b> FnOnce(
-            &'a mut Txn<'b, D>,
+            &'a mut Txn<'b, D, R>,
         ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
     {
         let ds = self.ds::<E>().await?;
@@ -112,7 +113,7 @@ impl<D: PoolDevice + 'static> ServiceTree<D> {
     where
         E: ServiceError,
         F: for<'a> FnOnce(
-            &'a Txn<'a, D>,
+            &'a Txn<'a, D, R>,
         ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
     {
         self.read_held(|t, _| f(t)).await
@@ -123,7 +124,7 @@ impl<D: PoolDevice + 'static> ServiceTree<D> {
     where
         E: ServiceError,
         F: for<'a> FnOnce(
-            &'a Txn<'a, D>,
+            &'a Txn<'a, D, R>,
             &'a OpsHeld<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
     {
@@ -152,9 +153,9 @@ impl Settler {
     }
 
     /// Make every applied write to dataset `name` durable.
-    pub async fn settle<D: PoolDevice>(
+    pub async fn settle<D: PoolDevice, R: Mutable>(
         &self,
-        fs: &FileSystem<D>,
+        fs: &FileSystem<D, R>,
         name: &DatasetName,
     ) -> Result<(), FileSystemError> {
         let target = self.applied.load(Ordering::SeqCst);
@@ -171,7 +172,7 @@ impl Settler {
 /// Btree dataset `name` of `fs`, made empty if the pool has none yet (the
 /// committer's own stores: `.vms`, `.events`).
 pub async fn ensure_btree<D: PoolDevice>(
-    fs: &FileSystem<D>,
+    fs: &crate::role::CommitterFs<D>,
     name: &DatasetName,
     format: DatasetFormat,
 ) -> Result<Arc<Dataset>, FileSystemError> {

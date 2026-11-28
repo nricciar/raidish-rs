@@ -41,6 +41,7 @@ use crate::writer::{
     CommitError, CommitSink, Committed, DatasetCommit, FsCommit, FsCommitted, LentMetaslab,
 };
 use async_trait::async_trait;
+use raidish_core::role::CommitterFs;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -287,7 +288,7 @@ pub fn orphan_state(
 }
 
 pub struct Committer<D: PoolDevice> {
-    pub fs: Arc<FileSystem<D>>,
+    pub fs: Arc<CommitterFs<D>>,
     auth: Arc<dyn Authority>,
     /// Its `pool` lease.
     pool: Holding,
@@ -418,7 +419,7 @@ impl<D: PoolDevice> Committer<D> {
     /// Become the committer of `fs`, which was opened writable under the
     /// `pool` lease (`owner`, `epoch`).
     pub async fn new(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<CommitterFs<D>>,
         auth: Arc<dyn Authority>,
         owner: String,
         epoch: Epoch,
@@ -451,9 +452,7 @@ impl<D: PoolDevice> Committer<D> {
             .collect();
         // Writers' views of the TXG may lag a previous committer's: from
         // here on, blocks are born after any snapshot it took.
-        if let Ok(t) = fs.open_txg().await {
-            fs.raise_birth_floor(t);
-        }
+        fs.raise_birth_floor(fs.open_txg().await);
         Committer {
             fs,
             auth,
@@ -474,7 +473,7 @@ impl<D: PoolDevice> Committer<D> {
 
     /// The pool it commits.
     #[cfg(any(test, feature = "testutil"))]
-    pub fn fs(&self) -> &Arc<FileSystem<D>> {
+    pub fn fs(&self) -> &Arc<CommitterFs<D>> {
         &self.fs
     }
 
@@ -666,11 +665,7 @@ impl<D: PoolDevice> Committer<D> {
                     idx,
                     epoch,
                     free,
-                    open_txg: self
-                        .fs
-                        .open_txg()
-                        .await
-                        .map_err(|e| CommitError::Retry(e.to_string()))?,
+                    open_txg: self.fs.open_txg().await,
                 })
             }
             Ok(Response::Refused(m)) => {

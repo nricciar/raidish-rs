@@ -3,6 +3,8 @@ use crate::coords::PoolLba;
 use crate::disk::PoolDevice;
 use crate::disk::{Block, Candidates, DiskError};
 use crate::fs::{LoadOptions, Rewind};
+use crate::role::CommitterFs;
+use crate::role::Role;
 use crate::test_util::ds;
 use crate::test_util::{DEFAULT_VOLBLOCKSIZE, TestPool};
 use crate::types::Txg;
@@ -23,7 +25,7 @@ fn content(name: &str, generation: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn file_blocks<D: PoolDevice>(fs: &FileSystem<D>, path: &str) -> Vec<BlockPtr> {
+async fn file_blocks<D: PoolDevice, R: Role>(fs: &FileSystem<D, R>, path: &str) -> Vec<BlockPtr> {
     let (_, d) = fs.stat_file(Path::new(path)).await.unwrap();
     let leaves = fs.tree_leaves(&d.tree).await.unwrap();
     leaves.into_iter().map(|(_, p)| p).collect()
@@ -38,13 +40,13 @@ fn destroy_stripe(pool: &TestPool, lba: PoolLba) {
 }
 
 /// Commit until every deferred free is released.
-async fn settle<D: PoolDevice>(fs: &FileSystem<D>) {
+async fn settle<D: PoolDevice, R: crate::role::Mutable>(fs: &FileSystem<D, R>) {
     for _ in 0..=TXG_DEFER_SIZE {
         fs.commit_txg().await.unwrap();
     }
 }
 
-async fn workload(fs: &FileSystem<Pool>) {
+async fn workload(fs: &CommitterFs<Pool>) {
     fs.mkdir(Path::new("/d")).await.unwrap();
     for i in 0..4 {
         let name = format!("/d/f{i}");
@@ -77,18 +79,18 @@ async fn clean_pool_is_clean() {
     let fs = pool.format().await;
     workload(&fs).await;
 
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     assert!(report.leaks.is_empty() && report.referenced_free.is_empty());
     assert!(report.live_blocks > 0);
 
-    let report = fs.fsck(true).await.unwrap();
+    let report = fs.fsck_repair().await.unwrap();
     assert!(report.is_clean() && !report.leaks_repaired && !report.referenced_free_repaired);
 
     // And from a fresh, read-only import.
     drop(fs);
     let fs = FileSystem::load_readonly(pool.dev().await).await.unwrap();
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -104,19 +106,19 @@ async fn leaks_are_found_and_freed() {
     let leaked = fs.allocate_contiguous(30).await.unwrap();
     fs.commit_txg().await.unwrap();
 
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(!report.is_clean());
     assert_eq!(report.leaks, vec![leaked]);
     assert_eq!(fs.find_orphaned_blocks().await.unwrap().len(), 1);
 
-    let report = fs.fsck(true).await.unwrap();
+    let report = fs.fsck_repair().await.unwrap();
     assert!(report.leaks_repaired && report.is_clean(), "{}", report);
     settle(&fs).await;
     assert_eq!(fs.allocatable_blocks().await, before);
 
     drop(fs);
     let fs = pool.load().await;
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 #[tokio::test]
@@ -131,9 +133,9 @@ async fn referenced_free_blocks_are_reallocated() {
     fs.unallocate(victim.lba.get(), victim.asize as u64).await;
     fs.commit_txg().await.unwrap();
 
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert_eq!(report.referenced_free, vec![victim.extent()]);
-    let report = fs.fsck(true).await.unwrap();
+    let report = fs.fsck_repair().await.unwrap();
     assert!(
         report.referenced_free_repaired && report.is_clean(),
         "{}",
@@ -156,7 +158,7 @@ async fn referenced_free_blocks_are_reallocated() {
         i += 1;
     }
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), data);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 #[tokio::test]
@@ -191,7 +193,7 @@ async fn space_maps_are_rebuilt_from_the_tree() {
     assert!(report.reclaimed > 0, "{}", report);
     settle(&fs).await;
     assert_eq!(fs.allocatable_blocks().await, free_before);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 
     drop(fs);
     let fs = pool.load().await;
@@ -205,7 +207,7 @@ async fn space_maps_are_rebuilt_from_the_tree() {
             content(&name, generation, len)
         );
     }
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 #[tokio::test]
@@ -216,11 +218,11 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     let b1 = content("/b", 1, 90_000);
     fs.write_file(Path::new("/a"), &a1).await.unwrap();
     fs.write_file(Path::new("/b"), &b1).await.unwrap();
-    let good_txg = fs.uberblock().await.unwrap().txg;
+    let good_txg = fs.uberblock().await.txg;
     fs.write_file(Path::new("/a"), &content("/a", 2, 250_000))
         .await
         .unwrap();
-    let newest = fs.uberblock().await.unwrap().txg;
+    let newest = fs.uberblock().await.txg;
     assert!(newest > good_txg);
     let damaged = file_blocks(&fs, "/a").await[0].lba;
     drop(fs);
@@ -233,22 +235,15 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
 
     // An unknown TXG is refused.
     assert!(
-        FileSystem::load_with(
-            pool.dev().await,
-            LoadOptions {
-                read_only: true,
-                rewind: Rewind::Txg(newest.after(100)),
-            },
-        )
-        .await
-        .is_err()
+        FileSystem::load_readonly_with(pool.dev().await, Rewind::Txg(newest.after(100)))
+            .await
+            .is_err()
     );
 
     // Auto rewind finds the last intact state and commits past the ring.
     let fs = FileSystem::load_with(
         pool.dev().await,
         LoadOptions {
-            read_only: false,
             rewind: Rewind::Auto,
         },
     )
@@ -256,8 +251,8 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     .unwrap();
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert_eq!(fs.read_file(Path::new("/b")).await.unwrap(), b1);
-    assert!(fs.uberblock().await.unwrap().txg > newest);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.uberblock().await.txg > newest);
+    assert!(fs.fsck().await.unwrap().is_clean());
     // The discarded TXGs are gone from the ring, so nothing can go back to them.
     let ring: Vec<Txg> = fs.uberblock_ring().await.iter().map(|u| u.txg).collect();
     assert!(
@@ -273,7 +268,7 @@ async fn rewind_skips_damaged_txgs_and_sticks() {
     let fs = pool.load().await;
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert_eq!(fs.read_file(Path::new("/c")).await.unwrap(), c);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 }
 
 #[tokio::test]
@@ -284,7 +279,7 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     // Several records: the file's tree has an indirect block.
     let a = content("/d/a", 1, 300_000);
     fs.write_file(Path::new("/d/a"), &a).await.unwrap();
-    let txg = fs.uberblock().await.unwrap().txg;
+    let txg = fs.uberblock().await.txg;
     fs.write_file(Path::new("/top"), b"top").await.unwrap();
     // /d/a's indirect block is shared by both TXGs; destroy it.
     let (_, d) = fs.stat_file(Path::new("/d/a")).await.unwrap();
@@ -294,19 +289,20 @@ async fn writable_rewind_to_a_damaged_tree_is_refused() {
     drop(fs);
     destroy_stripe(&pool, indirect.lba);
 
-    let opts = |read_only| LoadOptions {
-        read_only,
-        rewind: Rewind::Txg(txg),
-    };
     // Writable: refused, rather than freeing /d/a's records (which nothing
     // readable references any more).
     assert!(
-        FileSystem::load_with(pool.dev().await, opts(false))
-            .await
-            .is_err()
+        FileSystem::load_with(
+            pool.dev().await,
+            LoadOptions {
+                rewind: Rewind::Txg(txg)
+            }
+        )
+        .await
+        .is_err()
     );
     // Read-only still opens it for salvage, and nothing was freed.
-    let fs = FileSystem::load_with(pool.dev().await, opts(true))
+    let fs = FileSystem::load_readonly_with(pool.dev().await, Rewind::Txg(txg))
         .await
         .unwrap();
     assert!(fs.read_file(Path::new("/d/a")).await.is_err());
@@ -344,7 +340,7 @@ async fn damaged_directory_hides_no_space() {
     }
 
     let fs = pool.load().await;
-    let report = fs.fsck(true).await.unwrap();
+    let report = fs.fsck_repair().await.unwrap();
     assert!(!report.incomplete, "{}", report);
     assert!(report.leaks.is_empty() && report.referenced_free.is_empty());
     assert!(!report.errors.is_empty(), "the directory is reported");
@@ -367,22 +363,16 @@ async fn rewind_to_an_explicit_txg_read_only() {
     let fs = pool.format().await;
     let a1 = content("/a", 1, 50_000);
     fs.write_file(Path::new("/a"), &a1).await.unwrap();
-    let txg = fs.uberblock().await.unwrap().txg;
+    let txg = fs.uberblock().await.txg;
     fs.write_file(Path::new("/a"), &content("/a", 2, 50_000))
         .await
         .unwrap();
     fs.write_file(Path::new("/b"), b"bee").await.unwrap();
     drop(fs);
 
-    let fs = FileSystem::load_with(
-        pool.dev().await,
-        LoadOptions {
-            read_only: true,
-            rewind: Rewind::Txg(txg),
-        },
-    )
-    .await
-    .unwrap();
+    let fs = FileSystem::load_readonly_with(pool.dev().await, Rewind::Txg(txg))
+        .await
+        .unwrap();
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), a1);
     assert!(fs.read_file(Path::new("/b")).await.is_err());
     drop(fs);
@@ -565,7 +555,7 @@ async fn defrag_makes_a_volume_contiguous() {
     let mut buf = vec![0u8; expect.len()];
     fs.block_read(&ds("vol"), 0, &mut buf).await.unwrap();
     assert_eq!(buf, expect);
-    assert!(fs.fsck(false).await.unwrap().is_clean());
+    assert!(fs.fsck().await.unwrap().is_clean());
 
     // Already contiguous: nothing to do.
     let (_, again) = fs.defrag(&ds("vol"), 4096).await.unwrap();

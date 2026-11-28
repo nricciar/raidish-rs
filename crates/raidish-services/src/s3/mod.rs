@@ -33,6 +33,7 @@ use crate::fs::{FileSystem, FileSystemError};
 use crate::service_tree::{Served, ServiceError, ServiceTree, spawn_while_alive};
 use crate::types::DatasetName;
 use md5::{Digest, Md5};
+use raidish_core::role::Mutable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -82,7 +83,7 @@ impl ServiceError for S3Error {
     }
 }
 
-impl<D: PoolDevice + 'static> Served for Bucket<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Served for Bucket<D, R> {
     fn is_stopped(&self) -> bool {
         self.tree.is_stopped()
     }
@@ -189,8 +190,8 @@ fn p_key(upload: &str, part: u32) -> Vec<u8> {
 }
 
 /// Every entry in `[lo, hi)`, up to `limit`.
-async fn scan<D: PoolDevice>(
-    t: &Txn<'_, D>,
+async fn scan<D: PoolDevice, R: Mutable>(
+    t: &Txn<'_, D, R>,
     lo: Bound<&[u8]>,
     hi: &[u8],
     limit: usize,
@@ -210,8 +211,8 @@ pub struct Listing {
 }
 
 /// A bucket, served from this node.
-pub struct Bucket<D: PoolDevice> {
-    pub tree: ServiceTree<D>,
+pub struct Bucket<D: PoolDevice, R: Mutable> {
+    pub tree: ServiceTree<D, R>,
     /// Bodies being read: not to be deleted yet.
     readers: Mutex<HashMap<u64, usize>>,
     gc: Arc<tokio::sync::Notify>,
@@ -221,12 +222,12 @@ pub struct Bucket<D: PoolDevice> {
 }
 
 /// Holds bodies against deletion while they're read.
-pub struct Reading<D: PoolDevice + 'static> {
-    bucket: Arc<Bucket<D>>,
+pub struct Reading<D: PoolDevice + 'static, R: Mutable> {
+    bucket: Arc<Bucket<D, R>>,
     bodies: Vec<u64>,
 }
 
-impl<D: PoolDevice + 'static> Drop for Reading<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Drop for Reading<D, R> {
     fn drop(&mut self) {
         let mut r = self.bucket.readers.lock().unwrap();
         for b in &self.bodies {
@@ -261,11 +262,11 @@ impl Drop for Closed<'_> {
     }
 }
 
-impl<D: PoolDevice + 'static> Bucket<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Bucket<D, R> {
     /// Serve bucket `name` of `fs`. Bodies left half-written by an earlier
     /// server are dropped.
     pub async fn open(
-        fs: Arc<FileSystem<D>>,
+        fs: Arc<FileSystem<D, R>>,
         name: &DatasetName,
     ) -> std::result::Result<Arc<Self>, FileSystemError> {
         let b = Arc::new(Bucket {
@@ -312,7 +313,7 @@ impl<D: PoolDevice + 'static> Bucket<D> {
     async fn write<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a, 'b> FnOnce(
-            &'a mut Txn<'b, D>,
+            &'a mut Txn<'b, D, R>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
@@ -324,7 +325,7 @@ impl<D: PoolDevice + 'static> Bucket<D> {
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: for<'a> FnOnce(
-            &'a Txn<'a, D>,
+            &'a Txn<'a, D, R>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
         >,
@@ -355,7 +356,7 @@ impl<D: PoolDevice + 'static> Bucket<D> {
     // ---- bodies --------------------------------------------------------
 
     /// Start writing a body of about `expected` bytes (None: unknown).
-    pub async fn new_body(self: &Arc<Self>, expected: Option<u64>) -> Result<BodyWriter<D>> {
+    pub async fn new_body(self: &Arc<Self>, expected: Option<u64>) -> Result<BodyWriter<D, R>> {
         self.check_writable()?;
         let body = self
             .write(|t| {
@@ -396,7 +397,7 @@ impl<D: PoolDevice + 'static> Bucket<D> {
         self: &Arc<Self>,
         _held: &crate::service_tree::OpsHeld<'_>,
         meta: &ObjectMeta,
-    ) -> Reading<D> {
+    ) -> Reading<D, R> {
         let bodies: Vec<u64> = meta.segments.iter().map(|s| s.body).collect();
         let mut r = self.readers.lock().unwrap();
         for b in &bodies {
@@ -475,7 +476,7 @@ impl<D: PoolDevice + 'static> Bucket<D> {
     pub async fn head_held(
         self: &Arc<Self>,
         key: &str,
-    ) -> Result<Option<(ObjectMeta, Reading<D>)>> {
+    ) -> Result<Option<(ObjectMeta, Reading<D, R>)>> {
         let k = o_key(key);
         let me = self.clone();
         self.tree
@@ -890,8 +891,8 @@ impl<D: PoolDevice + 'static> Bucket<D> {
 }
 
 /// A body being written: chunked into the tree as it comes.
-pub struct BodyWriter<D: PoolDevice + 'static> {
-    bucket: Arc<Bucket<D>>,
+pub struct BodyWriter<D: PoolDevice + 'static, R: Mutable> {
+    bucket: Arc<Bucket<D, R>>,
     pub body: u64,
     chunk: u64,
     buf: Vec<u8>,
@@ -902,7 +903,7 @@ pub struct BodyWriter<D: PoolDevice + 'static> {
     logged: bool,
 }
 
-impl<D: PoolDevice + 'static> BodyWriter<D> {
+impl<D: PoolDevice + 'static, R: Mutable> BodyWriter<D, R> {
     pub async fn write(&mut self, mut data: &[u8]) -> Result<()> {
         self.size += data.len() as u64;
         self.md5.update(data);

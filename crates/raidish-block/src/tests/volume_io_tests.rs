@@ -1,6 +1,7 @@
 //! `SwitchableIo`: pausing and switching backends under running requests.
 
 use super::*;
+use raidish_core::role::CommitterFs;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -151,7 +152,7 @@ async fn a_pause_dropped_without_a_new_backend_keeps_the_old_one() {
 async fn one_sync_loop_per_file_system() {
     let pool = crate::test_util::TestPool::new().await;
     let fs = Arc::new(pool.format().await);
-    let count = |fs: &Arc<crate::fs::FileSystem<crate::vdev::Pool>>| {
+    let count = |fs: &Arc<CommitterFs<crate::vdev::Pool>>| {
         let ptr = Arc::as_ptr(fs) as *const ();
         SYNC_LOOPS
             .lock()

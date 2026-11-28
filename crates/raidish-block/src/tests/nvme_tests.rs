@@ -7,6 +7,7 @@ use crate::test_util::DEFAULT_VOLBLOCKSIZE;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::vdev::Pool;
+use raidish_core::role::{Committer, CommitterFs};
 
 const MB: u64 = 1 << 20;
 const HOSTNQN: &str = "nqn.2024-01.com.raidish:host:unit";
@@ -308,8 +309,8 @@ async fn serve_many(
     pool: &TestPool,
     volumes: &[(&str, u64)],
 ) -> (
-    Arc<FileSystem<Pool>>,
-    Arc<NvmeTcpServer<Pool>>,
+    Arc<CommitterFs<Pool>>,
+    Arc<NvmeTcpServer<Pool, Committer>>,
     std::net::SocketAddr,
     Held,
 ) {
@@ -330,7 +331,7 @@ async fn serve_many(
     (fs, server, addr, held)
 }
 
-async fn serve(pool: &TestPool, size: u64) -> (Arc<FileSystem<Pool>>, std::net::SocketAddr) {
+async fn serve(pool: &TestPool, size: u64) -> (Arc<CommitterFs<Pool>>, std::net::SocketAddr) {
     let fs = Arc::new(pool.format().await);
     fs.create_block(&ds("vol"), size, DEFAULT_VOLBLOCKSIZE)
         .await

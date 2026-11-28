@@ -1,4 +1,5 @@
 use super::*;
+use crate::role::CommitterFs;
 use crate::test_util::{TOTAL_BLOCKS, TestPool};
 use crate::types::Txg;
 use crate::vdev::Pool;
@@ -7,7 +8,7 @@ use crate::vdev::Pool;
 const ALIGN: u64 = crate::test_util::DATA_SHARDS as u64;
 use std::path::{Path, PathBuf};
 
-async fn free_map(fs: &FileSystem<Pool>) -> Vec<BTreeMap<u64, u64>> {
+async fn free_map(fs: &CommitterFs<Pool>) -> Vec<BTreeMap<u64, u64>> {
     let mut out = Vec::new();
     for ms in fs.metaslabs.iter() {
         out.push(ms.read().await.free_extents.clone());
@@ -15,7 +16,7 @@ async fn free_map(fs: &FileSystem<Pool>) -> Vec<BTreeMap<u64, u64>> {
     out
 }
 
-async fn total_free(fs: &FileSystem<Pool>) -> (u64, u64) {
+async fn total_free(fs: &CommitterFs<Pool>) -> (u64, u64) {
     let mut free = 0;
     let mut pending = 0;
     for ms in fs.metaslabs.iter() {
@@ -82,17 +83,17 @@ fn insert_free_merges_neighbours() {
 async fn txg_advances_and_survives_reload() {
     let pool = TestPool::new().await;
     let fs = pool.format().await;
-    let t0 = fs.uberblock().await.unwrap().txg;
+    let t0 = fs.uberblock().await.txg;
     assert_eq!(t0, 1, "format commits TXG 1");
 
     fs.write_file(Path::new("/a"), b"hello").await.unwrap();
     fs.write_file(Path::new("/b"), b"world").await.unwrap();
-    let t1 = fs.uberblock().await.unwrap().txg;
+    let t1 = fs.uberblock().await.txg;
     assert_eq!(t1, t0.after(2));
     drop(fs);
 
     let fs = pool.load().await;
-    assert_eq!(fs.uberblock().await.unwrap().txg, t1);
+    assert_eq!(fs.uberblock().await.txg, t1);
     assert_eq!(fs.read_file(Path::new("/a")).await.unwrap(), b"hello");
     assert_eq!(fs.read_file(Path::new("/b")).await.unwrap(), b"world");
 }
@@ -213,7 +214,7 @@ async fn uncommitted_slot_write_is_ignored() {
     let fs = pool.format().await;
     fs.write_file(Path::new("/a"), b"data").await.unwrap();
     let committed = free_map(&fs).await;
-    let txg = fs.uberblock().await.unwrap().txg;
+    let txg = fs.uberblock().await.txg;
 
     // Simulate a crash after writing the inactive slot for TXG+1 but before
     // the uberblock: claim metaslab 0 is completely free.

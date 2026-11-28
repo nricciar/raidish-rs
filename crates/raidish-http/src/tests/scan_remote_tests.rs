@@ -11,6 +11,7 @@ use crate::test_util::{
     TOTAL_BLOCKS, TestDiskServer, TestPool, check_files, content, wait_until, write_files,
 };
 use crate::vdev::Pool;
+use raidish_core::role::CommitterFs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +20,7 @@ async fn format_remote(
     pool: &TestPool,
     server: &TestDiskServer,
     remote: &[usize],
-) -> FileSystem<Pool> {
+) -> CommitterFs<Pool> {
     FileSystem::format(pool.dev_remote(server, remote).await, TOTAL_BLOCKS)
         .await
         .unwrap()
@@ -67,7 +68,7 @@ async fn resilver_restores_redundancy_after_an_outage() {
         assert_eq!(fs.degraded_disks(), vec![None; crate::test_util::DISKS]);
 
         // A second pass finds nothing left to fix.
-        let again = fs.scrub(true).await.unwrap();
+        let again = fs.scrub_repair().await.unwrap();
         assert_eq!(again.mismatched(), 0, "{}", again);
     }
 
@@ -91,7 +92,7 @@ async fn resilver_skips_what_did_not_change() {
     let server = TestDiskServer::start(&pool.paths).await;
     let fs = format_remote(&pool, &server, &[4]).await;
     write_files(&fs, "old", 1, 8).await;
-    let full = fs.scrub(true).await.unwrap();
+    let full = fs.scrub_repair().await.unwrap();
 
     server.stop();
     let stripe = &fs.dev.pool().disks();

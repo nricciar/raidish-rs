@@ -8,6 +8,7 @@ use crate::pki::Role;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use crate::types::ep;
+use raidish_core::role::{Committer, CommitterFs};
 use std::collections::BTreeMap;
 
 struct Sqs {
@@ -15,8 +16,8 @@ struct Sqs {
     http: reqwest::Client,
     key: (String, String),
     fx: Fixture,
-    _fe: Arc<Frontend>,
-    _fs: Arc<crate::fs::FileSystem<Pool>>,
+    _fe: Arc<Frontend<Committer>>,
+    _fs: Arc<CommitterFs<Pool>>,
 }
 
 async fn server(pool: &TestPool) -> Sqs {

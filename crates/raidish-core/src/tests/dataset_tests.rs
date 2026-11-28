@@ -13,7 +13,7 @@ async fn format_makes_the_default_posix_dataset() {
     assert_eq!(e.format, DatasetFormat::Posix);
     assert_eq!(e.root, fs.root_dir());
     assert_ne!(fs.root_dir(), fs.datasets_object());
-    let ub = fs.uberblock().await.unwrap();
+    let ub = fs.uberblock().await;
     assert_eq!(ub.datasets, fs.datasets_object());
     assert_eq!(ub.version, crate::fs::UBERBLOCK_VERSION);
     // The root directory is its own parent.
@@ -36,7 +36,7 @@ async fn reload_finds_the_same_root() {
     assert_eq!(fs.datasets_object(), datasets);
     assert_eq!(fs.root_dir(), root);
     assert_eq!(fs.read_file(Path::new("/hello")).await.unwrap(), b"hi");
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -64,7 +64,7 @@ async fn fsck_reports_a_missing_default_dataset() {
             .unwrap();
         tx.applied();
     }
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(!report.is_clean());
     let text = report.to_string();
     assert!(text.contains("no 'fs' dataset"), "{}", text);
@@ -94,7 +94,7 @@ async fn a_volume_is_a_block_dataset_not_an_entry_in_root() {
     // A posix dataset isn't a volume.
     assert!(fs.block_read(&ds(DEFAULT_FS), 0, &mut buf).await.is_err());
     assert!(fs.delete_volume(&ds(DEFAULT_FS)).await.is_err());
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -140,7 +140,7 @@ async fn snapshots_and_clones_are_datasets_too() {
     let mut buf = [0u8; 6];
     fs.block_read(&ds("copy"), 0, &mut buf).await.unwrap();
     assert_eq!(&buf, b"before");
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 
     // Survives a reload; deleting the clone takes its entry away.
@@ -149,7 +149,7 @@ async fn snapshots_and_clones_are_datasets_too() {
     fs.delete_volume(&ds("copy")).await.unwrap();
     assert!(fs.dataset_entry(&ds("copy")).await.is_err());
     assert_eq!(fs.list_volumes().await.unwrap().len(), 1);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 

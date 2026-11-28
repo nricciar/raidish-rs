@@ -17,7 +17,8 @@ use crate::blkptr::BlockPtr;
 use crate::disk::{FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::object::{Dirty, ObjTree, Sizing};
-use crate::writer::{CommitError, FsOp, ObjLease, WriterState};
+use crate::role::{Committer, MutView, Mutable, Role, Writer};
+use crate::writer::{CommitError, FsOp, ObjLease};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -95,7 +96,7 @@ impl Drop for FileSyncOnDrop<'_> {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Open the file at `path` for reading and writing at any offset,
     /// optionally under its `obj/<id>` lease. Opening an open file returns
     /// the same one.
@@ -104,7 +105,7 @@ impl<D: PoolDevice> FileSystem<D> {
         path: &Path,
         lease: Option<ObjLease>,
     ) -> Result<Arc<OpenFile>, FileSystemError> {
-        if self.writer.is_some() {
+        if self.role.writer().is_some() {
             self.reload_root_index().await?;
         }
         let (id, _) = self.stat_file(path).await?;
@@ -163,6 +164,140 @@ impl<D: PoolDevice> FileSystem<D> {
         self.object_read(&f.obj, offset, buf).await
     }
 
+    /// Where the next data (`data`) or hole is at or after `offset` (see
+    /// `object_seek`).
+    pub async fn file_seek(
+        &self,
+        f: &OpenFile,
+        offset: u64,
+        data: bool,
+    ) -> Result<Option<u64>, FileSystemError> {
+        self.object_seek(&f.obj, offset, data).await
+    }
+
+    /// The file `id`, if it's open here.
+    pub fn opened(&self, id: FileId) -> Option<Arc<OpenFile>> {
+        self.files.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Forget an open file without syncing it (it was deleted).
+    pub(crate) fn discard_file(&self, id: FileId) {
+        self.files.lock().unwrap().remove(&id);
+    }
+
+    pub(crate) fn files_dirty_bytes(&self) -> usize {
+        self.files
+            .lock()
+            .unwrap()
+            .values()
+            .map(|f| f.obj.dirty_bytes())
+            .sum()
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Writer> {
+    /// `sync_file` for a writer: build the tree in lent space, then have
+    /// the committer point the dnode at it.
+    async fn writer_sync_file(
+        &self,
+        f: &OpenFile,
+        records: &BTreeMap<u64, Dirty>,
+        size: u64,
+        need: u64,
+    ) -> Result<(), FileSystemError> {
+        self.resolve_file_in_doubt(f).await?;
+        self.lease_space(need).await?;
+        let base = f.obj.root();
+        let (mut allocated, mut replaced) = (Vec::new(), Vec::new());
+        let tree = match self
+            .build_tree(&f.obj, records, &mut allocated, &mut replaced)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                self.release_ptrs(&allocated).await;
+                return Err(e);
+            }
+        };
+        // The records must be on disk before the committer points at them.
+        if let Err(e) = self.dev.flush().await {
+            self.release_ptrs(&allocated).await;
+            return Err(e.into());
+        }
+        let ext = |p: &BlockPtr| p.extent();
+        let op = FsOp::UpdateFile {
+            id: f.id,
+            base,
+            tree: tree.clone(),
+            size,
+            allocs: allocated.iter().map(ext).collect(),
+            frees: replaced.iter().map(ext).collect(),
+            min_birth: allocated.iter().map(|p| p.birth_txg).min(),
+        };
+        let sent = FileInDoubt {
+            op,
+            tree,
+            allocated,
+        };
+        *f.in_doubt.lock().unwrap() = Some(sent.clone());
+        self.send_file_update(f, sent).await
+    }
+
+    /// Send (or resend) `sent` and act on the answer.
+    async fn send_file_update(
+        &self,
+        f: &OpenFile,
+        sent: FileInDoubt,
+    ) -> Result<(), FileSystemError> {
+        let lease = f.lease.lock().unwrap().clone();
+        let r = self.writer_commit_fs(sent.op, lease).await;
+        match r {
+            Ok(_) => {
+                *f.in_doubt.lock().unwrap() = None;
+                f.obj.set_root(sent.tree);
+                Ok(())
+            }
+            Err(e @ CommitError::Refused { .. }) => {
+                // Definitely not applied: the space is ours to reuse.
+                *f.in_doubt.lock().unwrap() = None;
+                self.release_ptrs(&sent.allocated).await;
+                Err(e.into())
+            }
+            Err(CommitError::Restamp(open)) => {
+                // Not applied: rebuilt next round (the records stay dirty).
+                *f.in_doubt.lock().unwrap() = None;
+                self.release_ptrs(&sent.allocated).await;
+                self.note_open_txg(open).await;
+                Err(FileSystemError::Restamp(open))
+            }
+            // Unknown outcome: keep the space out of use (if it was applied,
+            // it's referenced; if not, the committer still has it as free),
+            // and the update in doubt for the next sync to resend.
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Settle `f`'s update in doubt, if any, by resending it: the committer
+    /// acknowledges one it applied, applies one it never saw, or refuses
+    /// one that can't be any more (then the next build starts from the
+    /// tree as it was, with the records, kept dirty, on top). Err: still
+    /// unknown.
+    async fn resolve_file_in_doubt(&self, f: &OpenFile) -> Result<(), FileSystemError> {
+        let Some(sent) = f.in_doubt.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        match self.send_file_update(f, sent).await {
+            Err(FileSystemError::Unavailable(m)) => Err(FileSystemError::Unavailable(m)),
+            Err(e) => {
+                eprintln!("file {}: an earlier update wasn't applied: {}", f.id, e);
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+}
+
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
     /// Write `data` at `offset`, extending the file if it ends before.
     pub async fn file_write(
         &self,
@@ -178,41 +313,6 @@ impl<D: PoolDevice> FileSystem<D> {
             self.commit_txg().await?;
         }
         Ok(n)
-    }
-
-    /// Set the file's size: cut it short, or extend it with zeros.
-    pub async fn file_truncate(&self, f: &OpenFile, size: u64) -> Result<(), FileSystemError> {
-        self.object_truncate(&f.obj, size).await?;
-        f.resized.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Zero `len` bytes at `offset` (within the file: it doesn't grow).
-    /// Whole records become holes and give their space back when synced.
-    pub async fn file_zero(
-        &self,
-        f: &OpenFile,
-        offset: u64,
-        len: u64,
-    ) -> Result<(), FileSystemError> {
-        let size = f.size();
-        if offset >= size || len == 0 {
-            return Ok(());
-        }
-        let len = len.min(size - offset).min(usize::MAX as u64) as usize;
-        self.object_modify(&f.obj, offset, len, None).await?;
-        Ok(())
-    }
-
-    /// Where the next data (`data`) or hole is at or after `offset` (see
-    /// `object_seek`).
-    pub async fn file_seek(
-        &self,
-        f: &OpenFile,
-        offset: u64,
-        data: bool,
-    ) -> Result<Option<u64>, FileSystemError> {
-        self.object_seek(&f.obj, offset, data).await
     }
 
     /// Return once everything written to `f` so far is committed. Fails
@@ -255,44 +355,20 @@ impl<D: PoolDevice> FileSystem<D> {
         r
     }
 
-    /// Forget an open file and every change to it not committed yet: for
-    /// a writer of `f` (under its lease, so the only one) whose writes
-    /// failed partway, so they aren't committed after. Taken under the
-    /// commit lock, so no sync of them is under way. What a commit already
-    /// took stays (a write too big to hold may have been partly committed,
-    /// like a `pwrite` that fails), and so does what the intent log has
-    /// until the next commit.
-    pub async fn file_discard(&self, f: &Arc<OpenFile>) {
-        let _tx = self.begin_tx().await;
-        {
-            let mut d = f.obj.dirty.lock().unwrap();
-            d.records.clear();
-            d.unlogged.clear();
+    /// Sync `records` (taken from `f`) and `size`, the file's size as of
+    /// them.
+    async fn sync_file(
+        &self,
+        tx: &mut crate::tx::Tx,
+        f: &OpenFile,
+        records: &BTreeMap<u64, Dirty>,
+        size: u64,
+    ) -> Result<(), FileSystemError> {
+        let need = self.tree_sync_reservation(&f.obj, records) + 2 * self.max_record_blocks();
+        match self.mutable() {
+            MutView::Writer(fs) => fs.writer_sync_file(f, records, size, need).await,
+            MutView::Committer(fs) => fs.sync_file_local(tx, f, records, size, need).await,
         }
-        f.resized.store(false, Ordering::SeqCst);
-        let mut files = self.files.lock().unwrap();
-        if files.get(&f.id).is_some_and(|o| Arc::ptr_eq(o, f)) {
-            files.remove(&f.id);
-        }
-    }
-
-    /// The file `id`, if it's open here.
-    pub fn opened(&self, id: FileId) -> Option<Arc<OpenFile>> {
-        self.files.lock().unwrap().get(&id).cloned()
-    }
-
-    /// Forget an open file without syncing it (it was deleted).
-    pub(crate) fn discard_file(&self, id: FileId) {
-        self.files.lock().unwrap().remove(&id);
-    }
-
-    pub(crate) fn files_dirty_bytes(&self) -> usize {
-        self.files
-            .lock()
-            .unwrap()
-            .values()
-            .map(|f| f.obj.dirty_bytes())
-            .sum()
     }
 
     /// Sync every open file with changes into the open TXG. Called by
@@ -347,19 +423,62 @@ impl<D: PoolDevice> FileSystem<D> {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Sync `records` (taken from `f`) and `size`, the file's size as of
-    /// them.
-    async fn sync_file(
+    /// Set the file's size: cut it short, or extend it with zeros.
+    pub async fn file_truncate(&self, f: &OpenFile, size: u64) -> Result<(), FileSystemError> {
+        self.object_truncate(&f.obj, size).await?;
+        f.resized.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Zero `len` bytes at `offset` (within the file: it doesn't grow).
+    /// Whole records become holes and give their space back when synced.
+    pub async fn file_zero(
+        &self,
+        f: &OpenFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), FileSystemError> {
+        let size = f.size();
+        if offset >= size || len == 0 {
+            return Ok(());
+        }
+        let len = len.min(size - offset).min(usize::MAX as u64) as usize;
+        self.object_modify(&f.obj, offset, len, None).await?;
+        Ok(())
+    }
+
+    /// Forget an open file and every change to it not committed yet: for
+    /// a writer of `f` (under its lease, so the only one) whose writes
+    /// failed partway, so they aren't committed after. Taken under the
+    /// commit lock, so no sync of them is under way. What a commit already
+    /// took stays (a write too big to hold may have been partly committed,
+    /// like a `pwrite` that fails), and so does what the intent log has
+    /// until the next commit.
+    pub async fn file_discard(&self, f: &Arc<OpenFile>) {
+        let _tx = self.begin_tx().await;
+        {
+            let mut d = f.obj.dirty.lock().unwrap();
+            d.records.clear();
+            d.unlogged.clear();
+        }
+        f.resized.store(false, Ordering::SeqCst);
+        let mut files = self.files.lock().unwrap();
+        if files.get(&f.id).is_some_and(|o| Arc::ptr_eq(o, f)) {
+            files.remove(&f.id);
+        }
+    }
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
+    /// `sync_file` on the committer: `need` blocks are what it may take.
+    async fn sync_file_local(
         &self,
         tx: &mut crate::tx::Tx,
         f: &OpenFile,
         records: &BTreeMap<u64, Dirty>,
         size: u64,
+        need: u64,
     ) -> Result<(), FileSystemError> {
-        let need = self.tree_sync_reservation(&f.obj, records) + 2 * self.max_record_blocks();
-        if let Some(w) = self.writer.clone() {
-            return self.writer_sync_file(&w, f, records, size, need).await;
-        }
         if self.allocatable_blocks().await < need {
             return Err(FileSystemError::NoSpace(format!("{} blocks", need)));
         }
@@ -410,112 +529,6 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         left.disarm();
         Ok(())
-    }
-
-    /// `sync_file` for a writer: build the tree in lent space, then have
-    /// the committer point the dnode at it.
-    async fn writer_sync_file(
-        &self,
-        w: &WriterState,
-        f: &OpenFile,
-        records: &BTreeMap<u64, Dirty>,
-        size: u64,
-        need: u64,
-    ) -> Result<(), FileSystemError> {
-        self.resolve_file_in_doubt(w, f).await?;
-        self.lease_space(w, need).await?;
-        let base = f.obj.root();
-        let (mut allocated, mut replaced) = (Vec::new(), Vec::new());
-        let tree = match self
-            .build_tree(&f.obj, records, &mut allocated, &mut replaced)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                self.release_ptrs(&allocated).await;
-                return Err(e);
-            }
-        };
-        // The records must be on disk before the committer points at them.
-        if let Err(e) = self.dev.flush().await {
-            self.release_ptrs(&allocated).await;
-            return Err(e.into());
-        }
-        let ext = |p: &BlockPtr| p.extent();
-        let op = FsOp::UpdateFile {
-            id: f.id,
-            base,
-            tree: tree.clone(),
-            size,
-            allocs: allocated.iter().map(ext).collect(),
-            frees: replaced.iter().map(ext).collect(),
-            min_birth: allocated.iter().map(|p| p.birth_txg).min(),
-        };
-        let sent = FileInDoubt {
-            op,
-            tree,
-            allocated,
-        };
-        *f.in_doubt.lock().unwrap() = Some(sent.clone());
-        self.send_file_update(w, f, sent).await
-    }
-
-    /// Send (or resend) `sent` and act on the answer.
-    async fn send_file_update(
-        &self,
-        w: &WriterState,
-        f: &OpenFile,
-        sent: FileInDoubt,
-    ) -> Result<(), FileSystemError> {
-        let lease = f.lease.lock().unwrap().clone();
-        let r = self.writer_commit_fs(w, sent.op, lease).await;
-        match r {
-            Ok(_) => {
-                *f.in_doubt.lock().unwrap() = None;
-                f.obj.set_root(sent.tree);
-                Ok(())
-            }
-            Err(e @ CommitError::Refused { .. }) => {
-                // Definitely not applied: the space is ours to reuse.
-                *f.in_doubt.lock().unwrap() = None;
-                self.release_ptrs(&sent.allocated).await;
-                Err(e.into())
-            }
-            Err(CommitError::Restamp(open)) => {
-                // Not applied: rebuilt next round (the records stay dirty).
-                *f.in_doubt.lock().unwrap() = None;
-                self.release_ptrs(&sent.allocated).await;
-                self.note_open_txg(open).await;
-                Err(FileSystemError::Restamp(open))
-            }
-            // Unknown outcome: keep the space out of use (if it was applied,
-            // it's referenced; if not, the committer still has it as free),
-            // and the update in doubt for the next sync to resend.
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Settle `f`'s update in doubt, if any, by resending it: the committer
-    /// acknowledges one it applied, applies one it never saw, or refuses
-    /// one that can't be any more (then the next build starts from the
-    /// tree as it was, with the records, kept dirty, on top). Err: still
-    /// unknown.
-    async fn resolve_file_in_doubt(
-        &self,
-        w: &WriterState,
-        f: &OpenFile,
-    ) -> Result<(), FileSystemError> {
-        let Some(sent) = f.in_doubt.lock().unwrap().clone() else {
-            return Ok(());
-        };
-        match self.send_file_update(w, f, sent).await {
-            Err(FileSystemError::Unavailable(m)) => Err(FileSystemError::Unavailable(m)),
-            Err(e) => {
-                eprintln!("file {}: an earlier update wasn't applied: {}", f.id, e);
-                Ok(())
-            }
-            Ok(()) => Ok(()),
-        }
     }
 }
 

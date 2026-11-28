@@ -63,6 +63,7 @@ use crate::disk::{BLOCK_SIZE, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::{DatasetLog, LogRegion};
 use crate::object::{Dirty, Unlogged};
+use crate::role::{Committer, MutView, Mutable, Role, Writer};
 use crate::types::DatasetName;
 use crate::writer::WriterState;
 use serde::{Deserialize, Serialize};
@@ -227,7 +228,7 @@ impl Drop for Unaccounted<'_, '_> {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// Take the intent log append lock (one flush appends at a time).
     pub(crate) async fn lock_log_io(&self) -> LogIoGuard<'_> {
         LogIoGuard(self.log_io.lock().await)
@@ -236,180 +237,6 @@ impl<D: PoolDevice> FileSystem<D> {
     /// Size of a new log region, in blocks.
     pub(crate) fn log_region_blocks(&self) -> u64 {
         self.align_blocks(LOG_REGION_BLOCKS.min(self.layout.metaslab_size_blocks / 4))
-    }
-
-    /// Make every volume write completed before this call durable.
-    ///
-    /// On a writer, through the intent log: one record per changed volume
-    /// and one disk flush, without the committer (and without waiting for a
-    /// commit in progress). Where that can't be done (no log registered yet,
-    /// it's full, a log write failed), it commits instead, like `sync`.
-    /// Elsewhere it is `sync`.
-    pub async fn flush(&self) -> Result<(), FileSystemError> {
-        self.flush_scoped(None).await
-    }
-
-    /// `flush` for dataset `name` alone: other datasets' failures (a commit
-    /// of theirs refused, their lease unconfirmed) don't fail it.
-    pub async fn flush_for(&self, name: &DatasetName) -> Result<(), FileSystemError> {
-        self.flush_scoped(Some(name)).await
-    }
-
-    async fn flush_scoped(&self, only: Option<&DatasetName>) -> Result<(), FileSystemError> {
-        let Some(w) = self.writer.clone() else {
-            return self.sync_scoped(only).await;
-        };
-        let mut span = crate::trace::Span::new("zil.flush");
-        // One flush appends at a time: a record must never follow a gap.
-        let io = self.lock_log_io().await;
-        span.mark("lock");
-        let vols: Vec<Arc<Dataset>> = self
-            .open_datasets
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        // From here until each append is accounted for, a caller that gives
-        // up (a dropped future: a gRPC client's deadline) mustn't leave
-        // records taken but neither logged nor unlogged, nor a reserved
-        // slot unwritten (see `Unaccounted`).
-        let mut planned = Unaccounted(Vec::new(), &io);
-        let mut commit = false;
-        for vol in vols {
-            match self.plan_append(&vol) {
-                Ok(Some(p)) => planned.0.push(p),
-                Ok(None) => {}
-                Err(()) => {
-                    let why = match vol.cursor.lock().unwrap().as_ref() {
-                        None => "no_log",
-                        Some(_) => "log_full",
-                    };
-                    span.note("fallback", why);
-                    commit = true
-                }
-            }
-        }
-        span.note(
-            "bytes",
-            planned.0.iter().map(|p| p.bytes.len()).sum::<usize>(),
-        );
-        span.mark("plan");
-        let mut failed = Vec::new();
-        // Committing anyway (a volume can't log): the appends planned
-        // aren't written at all, but go back below.
-        let to_write = if commit { 0 } else { planned.0.len() };
-        for (i, p) in planned.0.iter().enumerate().take(to_write) {
-            if let Err(e) = self.write_record_blocks(p.lba, &p.bytes).await {
-                eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
-                failed.push(i);
-            }
-        }
-        if !failed.is_empty() {
-            // Those slots are spent: later records would follow a gap.
-            for i in failed.into_iter().rev() {
-                planned.0.remove(i).put_back(&io);
-            }
-            commit = true;
-        }
-        span.mark("log_write");
-        if commit {
-            // The records written are in the log but not flushed, and the
-            // commit below may not cover their volumes (it can be scoped
-            // to another, or fail): keep them unlogged, so the next flush
-            // of theirs logs and flushes them again (or a commit takes
-            // them) rather than finding nothing to do and acknowledging.
-            // And log nothing after their slots: unflushed (or never
-            // written), a slot can be lost while later ones are flushed,
-            // and replay stops at the gap (audit S4a).
-            for p in planned.give_back() {
-                p.put_back(&io);
-            }
-            drop(io);
-            // Commits what was logged too.
-            let r = self.sync_scoped(only).await;
-            span.mark("commit");
-            return r;
-        }
-        if planned.0.is_empty() {
-            return Ok(());
-        }
-        let flushed = self.dev.flush().await;
-        span.mark("dev_flush");
-        if let Err(e) = flushed {
-            // These records may or may not be on disk. One that isn't would
-            // be a gap, hiding every later record from replay: log nothing
-            // more here (flushes commit until the next fold starts a region).
-            for p in planned.give_back() {
-                p.put_back(&io);
-            }
-            return Err(e.into());
-        }
-        // A disk that missed these records (unreachable, or failing) leaves
-        // them only as safe as the disks that have them, and nobody but this
-        // writer knows: the committer counts that disk healthy until a commit
-        // reports the miss. Lose this node (and its disk) and a replay would
-        // read a record it can't rebuild, take it for the end of the log and
-        // drop what was acknowledged. So acknowledge only records every disk
-        // has; otherwise commit, which reports the miss as it makes the
-        // writes durable (the log records stay, harmless: replay redoes them).
-        if self.unaccounted_misses().iter().any(|&m| m) {
-            span.note("fallback", "missed");
-            let vol = planned.0[0].vol.clone();
-            for p in planned.give_back() {
-                p.restore(&io);
-            }
-            drop(io);
-            let r = self.sync_scoped(only).await;
-            span.mark("commit");
-            // The commit reported the misses, unless nothing was left for it
-            // to commit (a commit in progress took the records).
-            let vol = only
-                .and_then(|n| self.open_datasets.lock().unwrap().get(n).cloned())
-                .unwrap_or(vol);
-            let r = match r {
-                Ok(()) => self.writer_report_misses(&w, &vol).await,
-                e => e,
-            };
-            return r;
-        }
-        let written = planned.give_back();
-        if written.iter().any(|p| {
-            p.vol
-                .cursor
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|c| c.used * 100 >= c.region.len * FOLD_AT_PERCENT)
-        }) {
-            span.note("fold", "wanted");
-            self.fold_wanted.raise();
-        }
-        // Acknowledge only under a lease nobody can have taken over yet (a
-        // replay after it lapses then sees every acknowledged record).
-        // A record that isn't acknowledged stays unlogged, so a retried
-        // flush logs it again and checks the lease again (rather than
-        // finding nothing to log and acknowledging it).
-        // Still holding the append lock: an op put back must be logged
-        // before any op that came after it, never after a newer one.
-        let mut stale = None;
-        for p in written {
-            if !w.lease_fresh(&p.vol.name) {
-                let name = p.vol.name.clone();
-                p.restore(&io);
-                if only.is_none_or(|n| *n == name) {
-                    stale.get_or_insert(name);
-                }
-            }
-        }
-        drop(io);
-        match stale {
-            Some(name) => Err(FileSystemError::Unavailable(format!(
-                "can't confirm the lease on volume '{}'; flush not acknowledged",
-                name
-            ))),
-            None => Ok(()),
-        }
     }
 
     /// Take `vol`'s unlogged records and reserve the next slot of its log
@@ -503,7 +330,25 @@ impl<D: PoolDevice> FileSystem<D> {
         });
     }
 
-    // ---- the committer's side ----
+    // ---- reading logs (the committer replays them; scans check them) ----
+
+    /// The records of `region` from `from_seq` on, in order, up to the first
+    /// that doesn't verify (the end of the log, or a write that never
+    /// completed).
+    async fn read_region(
+        &self,
+        region: &LogRegion,
+        from_seq: u64,
+    ) -> Result<Vec<Entry>, FileSystemError> {
+        let mut out = Vec::new();
+        for rec in self.region_records(region, from_seq).await? {
+            let Ok(entries) = bincode::deserialize::<Vec<Entry>>(&rec.bytes[HEADER_BYTES..]) else {
+                break;
+            };
+            out.extend(entries);
+        }
+        Ok(out)
+    }
 
     /// The intent log of every tree dataset that has one.
     pub async fn dataset_logs(&self) -> Result<Vec<(DatasetName, DatasetLog)>, FileSystemError> {
@@ -529,24 +374,6 @@ impl<D: PoolDevice> FileSystem<D> {
             if let Some(log) = vol.log.lock().unwrap().clone() {
                 out.push((name, log));
             }
-        }
-        Ok(out)
-    }
-
-    /// The records of `region` from `from_seq` on, in order, up to the first
-    /// that doesn't verify (the end of the log, or a write that never
-    /// completed).
-    async fn read_region(
-        &self,
-        region: &LogRegion,
-        from_seq: u64,
-    ) -> Result<Vec<Entry>, FileSystemError> {
-        let mut out = Vec::new();
-        for rec in self.region_records(region, from_seq).await? {
-            let Ok(entries) = bincode::deserialize::<Vec<Entry>>(&rec.bytes[HEADER_BYTES..]) else {
-                break;
-            };
-            out.extend(entries);
         }
         Ok(out)
     }
@@ -608,7 +435,22 @@ impl<D: PoolDevice> FileSystem<D> {
         }
         Ok(out)
     }
+}
 
+/// One intent log record as written: at `lba`, `bytes` (header and
+/// payload) zero-padded to whole stripes on disk.
+pub struct LogRecord {
+    pub lba: crate::coords::PoolLba,
+    pub bytes: Vec<u8>,
+}
+
+/// The extent of a log region, as a commit's allocation.
+pub fn region_alloc(r: &LogRegion) -> crate::types::Extent {
+    crate::types::Extent::new(r.start, r.len)
+}
+
+/// The committer's side: replaying a log whose writer is gone.
+impl<D: PoolDevice> FileSystem<D, Committer> {
     /// Apply volume `name`'s intent log `log` and commit, dropping the log
     /// (its writer's lease must be gone). Returns how many record writes it
     /// replayed. A no-op if the volume no longer has that log.
@@ -719,9 +561,9 @@ impl<D: PoolDevice> FileSystem<D> {
         // writes (and the dnode without the log) durable: a commit can
         // succeed for the pool yet fail for this volume (no space for its
         // records), and its durable dnode still names the log then.
-        let before = self.uberblock().await.map(|u| u.txg);
+        let before = self.uberblock().await.txg;
         let committed = self.commit_locked(tx).await;
-        let after = self.uberblock().await.map(|u| u.txg);
+        let after = self.uberblock().await.txg;
         if vol.is_dirty() || after == before {
             // Not durable: keep the log (the next sync of the volume writes
             // its dnode with it again) and replay later.
@@ -759,14 +601,187 @@ impl<D: PoolDevice> FileSystem<D> {
     }
 }
 
-/// One intent log record as written: at `lba`, `bytes` (header and
-/// payload) zero-padded to whole stripes on disk.
-pub struct LogRecord {
-    pub lba: crate::coords::PoolLba,
-    pub bytes: Vec<u8>,
+impl<D: PoolDevice> FileSystem<D, Writer> {
+    /// `flush_scoped` on a writer: append the dirty records to each
+    /// volume's intent log, then commit.
+    async fn zil_flush(&self, only: Option<&DatasetName>) -> Result<(), FileSystemError> {
+        let w = self.writer_state().clone();
+        let mut span = crate::trace::Span::new("zil.flush");
+        // One flush appends at a time: a record must never follow a gap.
+        let io = self.lock_log_io().await;
+        span.mark("lock");
+        let vols: Vec<Arc<Dataset>> = self
+            .open_datasets
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        // From here until each append is accounted for, a caller that gives
+        // up (a dropped future: a gRPC client's deadline) mustn't leave
+        // records taken but neither logged nor unlogged, nor a reserved
+        // slot unwritten (see `Unaccounted`).
+        let mut planned = Unaccounted(Vec::new(), &io);
+        let mut commit = false;
+        for vol in vols {
+            match self.plan_append(&vol) {
+                Ok(Some(p)) => planned.0.push(p),
+                Ok(None) => {}
+                Err(()) => {
+                    let why = match vol.cursor.lock().unwrap().as_ref() {
+                        None => "no_log",
+                        Some(_) => "log_full",
+                    };
+                    span.note("fallback", why);
+                    commit = true
+                }
+            }
+        }
+        span.note(
+            "bytes",
+            planned.0.iter().map(|p| p.bytes.len()).sum::<usize>(),
+        );
+        span.mark("plan");
+        let mut failed = Vec::new();
+        // Committing anyway (a volume can't log): the appends planned
+        // aren't written at all, but go back below.
+        let to_write = if commit { 0 } else { planned.0.len() };
+        for (i, p) in planned.0.iter().enumerate().take(to_write) {
+            if let Err(e) = self.write_record_blocks(p.lba, &p.bytes).await {
+                eprintln!("volume '{}': intent log write failed: {}", p.vol.name, e);
+                failed.push(i);
+            }
+        }
+        if !failed.is_empty() {
+            // Those slots are spent: later records would follow a gap.
+            for i in failed.into_iter().rev() {
+                planned.0.remove(i).put_back(&io);
+            }
+            commit = true;
+        }
+        span.mark("log_write");
+        if commit {
+            // The records written are in the log but not flushed, and the
+            // commit below may not cover their volumes (it can be scoped
+            // to another, or fail): keep them unlogged, so the next flush
+            // of theirs logs and flushes them again (or a commit takes
+            // them) rather than finding nothing to do and acknowledging.
+            // And log nothing after their slots: unflushed (or never
+            // written), a slot can be lost while later ones are flushed,
+            // and replay stops at the gap (audit S4a).
+            for p in planned.give_back() {
+                p.put_back(&io);
+            }
+            drop(io);
+            // Commits what was logged too.
+            let r = self.sync_scoped(only).await;
+            span.mark("commit");
+            return r;
+        }
+        if planned.0.is_empty() {
+            return Ok(());
+        }
+        let flushed = self.dev.flush().await;
+        span.mark("dev_flush");
+        if let Err(e) = flushed {
+            // These records may or may not be on disk. One that isn't would
+            // be a gap, hiding every later record from replay: log nothing
+            // more here (flushes commit until the next fold starts a region).
+            for p in planned.give_back() {
+                p.put_back(&io);
+            }
+            return Err(e.into());
+        }
+        // A disk that missed these records (unreachable, or failing) leaves
+        // them only as safe as the disks that have them, and nobody but this
+        // writer knows: the committer counts that disk healthy until a commit
+        // reports the miss. Lose this node (and its disk) and a replay would
+        // read a record it can't rebuild, take it for the end of the log and
+        // drop what was acknowledged. So acknowledge only records every disk
+        // has; otherwise commit, which reports the miss as it makes the
+        // writes durable (the log records stay, harmless: replay redoes them).
+        if self.unaccounted_misses().iter().any(|&m| m) {
+            span.note("fallback", "missed");
+            let vol = planned.0[0].vol.clone();
+            for p in planned.give_back() {
+                p.restore(&io);
+            }
+            drop(io);
+            let r = self.sync_scoped(only).await;
+            span.mark("commit");
+            // The commit reported the misses, unless nothing was left for it
+            // to commit (a commit in progress took the records).
+            let vol = only
+                .and_then(|n| self.open_datasets.lock().unwrap().get(n).cloned())
+                .unwrap_or(vol);
+            let r = match r {
+                Ok(()) => self.writer_report_misses(&vol).await,
+                e => e,
+            };
+            return r;
+        }
+        let written = planned.give_back();
+        if written.iter().any(|p| {
+            p.vol
+                .cursor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.used * 100 >= c.region.len * FOLD_AT_PERCENT)
+        }) {
+            span.note("fold", "wanted");
+            self.fold_wanted.raise();
+        }
+        // Acknowledge only under a lease nobody can have taken over yet (a
+        // replay after it lapses then sees every acknowledged record).
+        // A record that isn't acknowledged stays unlogged, so a retried
+        // flush logs it again and checks the lease again (rather than
+        // finding nothing to log and acknowledging it).
+        // Still holding the append lock: an op put back must be logged
+        // before any op that came after it, never after a newer one.
+        let mut stale = None;
+        for p in written {
+            if !w.lease_fresh(&p.vol.name) {
+                let name = p.vol.name.clone();
+                p.restore(&io);
+                if only.is_none_or(|n| *n == name) {
+                    stale.get_or_insert(name);
+                }
+            }
+        }
+        drop(io);
+        match stale {
+            Some(name) => Err(FileSystemError::Unavailable(format!(
+                "can't confirm the lease on volume '{}'; flush not acknowledged",
+                name
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
-/// The extent of a log region, as a commit's allocation.
-pub fn region_alloc(r: &LogRegion) -> crate::types::Extent {
-    crate::types::Extent::new(r.start, r.len)
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    /// Make every volume write completed before this call durable.
+    ///
+    /// On a writer, through the intent log: one record per changed volume
+    /// and one disk flush, without the committer (and without waiting for a
+    /// commit in progress). Where that can't be done (no log registered yet,
+    /// it's full, a log write failed), it commits instead, like `sync`.
+    /// Elsewhere it is `sync`.
+    pub async fn flush(&self) -> Result<(), FileSystemError> {
+        self.flush_scoped(None).await
+    }
+
+    /// `flush` for dataset `name` alone: other datasets' failures (a commit
+    /// of theirs refused, their lease unconfirmed) don't fail it.
+    pub async fn flush_for(&self, name: &DatasetName) -> Result<(), FileSystemError> {
+        self.flush_scoped(Some(name)).await
+    }
+
+    async fn flush_scoped(&self, only: Option<&DatasetName>) -> Result<(), FileSystemError> {
+        match self.mutable() {
+            MutView::Committer(fs) => fs.sync_scoped(only).await,
+            MutView::Writer(fs) => fs.zil_flush(only).await,
+        }
+    }
 }

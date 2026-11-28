@@ -4,6 +4,7 @@ use crate::coords::PoolLba;
 use crate::disk::{Block, Candidates, DiskError, PoolDevice};
 use crate::disks::DiskSet;
 use crate::fs::FileSystem;
+use crate::role::CommitterFs;
 use crate::vdev::{Pool, Topology};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,7 +82,7 @@ impl TestPool {
     }
 
     /// Format `TOTAL_BLOCKS` (or the pool's capacity, if smaller).
-    pub async fn format(&self) -> FileSystem<Pool> {
+    pub async fn format(&self) -> CommitterFs<Pool> {
         let dev = self.dev().await;
         let blocks = self.format_blocks(&dev).await;
         FileSystem::format(dev, blocks).await.unwrap()
@@ -91,7 +92,7 @@ impl TestPool {
         TOTAL_BLOCKS.min(dev.capacity_blocks().await.unwrap())
     }
 
-    pub async fn load(&self) -> FileSystem<Pool> {
+    pub async fn load(&self) -> CommitterFs<Pool> {
         FileSystem::load(self.dev().await).await.unwrap()
     }
 
@@ -285,7 +286,7 @@ impl<D: PoolDevice> PoolDevice for FaultyDev<D> {
 }
 
 impl TestPool {
-    pub async fn format_faulty(&self) -> (FileSystem<FaultyDev<Pool>>, FaultSwitch) {
+    pub async fn format_faulty(&self) -> (CommitterFs<FaultyDev<Pool>>, FaultSwitch) {
         let dev = self.dev().await;
         let blocks = self.format_blocks(&dev).await;
         let (dev, switch) = FaultyDev::new(dev);
@@ -515,13 +516,13 @@ impl FaultPool {
         .unwrap()
     }
 
-    pub async fn format(&self) -> FileSystem<Pool> {
+    pub async fn format(&self) -> CommitterFs<Pool> {
         let dev = self.dev();
         let blocks = self.pool.format_blocks(&dev).await;
         FileSystem::format(dev, blocks).await.unwrap()
     }
 
-    pub async fn load(&self) -> FileSystem<Pool> {
+    pub async fn load(&self) -> CommitterFs<Pool> {
         FileSystem::load(self.dev()).await.unwrap()
     }
 }
@@ -541,7 +542,7 @@ pub fn content(name: &str, generation: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-pub async fn write_files(fs: &FileSystem<Pool>, prefix: &str, generation: u8, n: usize) {
+pub async fn write_files(fs: &CommitterFs<Pool>, prefix: &str, generation: u8, n: usize) {
     for i in 0..n {
         let name = format!("/{}{}", prefix, i);
         fs.write_file(
@@ -553,7 +554,12 @@ pub async fn write_files(fs: &FileSystem<Pool>, prefix: &str, generation: u8, n:
     }
 }
 
-pub async fn check_files(fs: &FileSystem<Pool>, prefix: &str, generation: u8, n: usize) {
+pub async fn check_files<R: crate::role::Role>(
+    fs: &FileSystem<Pool, R>,
+    prefix: &str,
+    generation: u8,
+    n: usize,
+) {
     for i in 0..n {
         let name = format!("/{}{}", prefix, i);
         let data = fs.read_file(Path::new(&name)).await.unwrap();

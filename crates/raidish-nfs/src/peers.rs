@@ -17,6 +17,7 @@ use crate::vdev::Pool;
 use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::StatusCode as Status;
+use raidish_core::role::{Mutable, Writer};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -215,7 +216,11 @@ impl V4Cluster for ClusterPeers {
 
 /// Hold the `nfs4` lease whenever this node can, and own the NFSv4 state
 /// while it does (handing it back if the lease is lost).
-pub async fn own_v4_state(server: Arc<v4::Server<Pool>>, peers: Arc<ClusterPeers>, node: String) {
+pub async fn own_v4_state(
+    server: Arc<v4::Server<Pool, Writer>>,
+    peers: Arc<ClusterPeers>,
+    node: String,
+) {
     loop {
         let held = match HeldLease::acquire(
             peers.leases.clone(),
@@ -253,14 +258,14 @@ pub async fn own_v4_state(server: Arc<v4::Server<Pool>>, peers: Arc<ClusterPeers
 }
 
 /// This node's NFS server: the shared backend and the NFSv4 server.
-pub type NfsServers = (Arc<Backend<Pool>>, Arc<v4::Server<Pool>>);
+pub type NfsServers<R = Writer> = (Arc<Backend<Pool, R>>, Arc<v4::Server<Pool, R>>);
 
 /// This node's NFS server, if it runs one (for forwarded requests).
-pub struct NfsForwarding(pub Option<NfsServers>);
+pub struct NfsForwarding<R: Mutable = Writer>(pub Option<NfsServers<R>>);
 
-async fn forward(
+async fn forward<R: Mutable>(
     _auth: crate::auth::IsNode,
-    State(st): State<Arc<NfsForwarding>>,
+    State(st): State<Arc<NfsForwarding<R>>>,
     body: axum::body::Body,
 ) -> Result<Vec<u8>, (Status, String)> {
     let Some((backend, _)) = &st.0 else {
@@ -273,9 +278,9 @@ async fn forward(
     bincode::serialize(&reply).map_err(|e| (Status::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-async fn forward_v4(
+async fn forward_v4<R: Mutable>(
     _auth: crate::auth::IsNode,
-    State(st): State<Arc<NfsForwarding>>,
+    State(st): State<Arc<NfsForwarding<R>>>,
     body: axum::body::Body,
 ) -> Result<Vec<u8>, (Status, String)> {
     let Some((_, server)) = &st.0 else {
@@ -289,9 +294,9 @@ async fn forward_v4(
 }
 
 /// The routes, on this node's NFS servers (if it runs them).
-pub fn router(st: NfsForwarding) -> axum::Router {
+pub fn router<R: Mutable>(st: NfsForwarding<R>) -> axum::Router {
     axum::Router::new()
-        .route("/api/v1/nfs/forward", axum::routing::post(forward))
-        .route("/api/v1/nfs/v4", axum::routing::post(forward_v4))
+        .route("/api/v1/nfs/forward", axum::routing::post(forward::<R>))
+        .route("/api/v1/nfs/v4", axum::routing::post(forward_v4::<R>))
         .with_state(Arc::new(st))
 }

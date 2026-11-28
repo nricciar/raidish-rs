@@ -198,22 +198,11 @@ impl NodeSupervisor {
                 eprintln!("agent: NVMe/TCP target: {}", e);
             }
         }));
-        // The committer's health monitor resilvers the pool, except the
-        // space lent here: its writes are fenced out of it. This node
-        // repairs that itself (see `FileSystem::heal_lent`).
-        let healer = fs.clone();
-        tasks.push(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(HEAL_INTERVAL).await;
-                match healer.heal_lent().await {
-                    Ok(Some(r)) if r.repaired() > 0 || !r.is_clean() => {
-                        eprintln!("agent: lent space: {}", r);
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("agent: healing lent space: {}", e),
-                }
-            }
-        }));
+        tasks.push(crate::committer::health::spawn_lent_healer(
+            fs.clone(),
+            HEAL_INTERVAL,
+            "agent",
+        ));
         Ok(NodeWriter {
             _lease: lease,
             lost,

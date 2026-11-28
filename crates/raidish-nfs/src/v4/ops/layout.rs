@@ -1,8 +1,9 @@
 //! pNFS: flexfiles layouts and the devices (nodes) they name.
 
 use super::super::*;
+use raidish_core::role::Mutable;
 
-impl<D: PoolDevice + 'static> Server<D> {
+impl<D: PoolDevice + 'static, R: Mutable> Server<D, R> {
     /// The nodes as pNFS data servers (none: no pNFS).
     pub(in crate::v4) fn devices(&self) -> Vec<Device> {
         self.cluster.as_ref().map_or(Vec::new(), |c| c.devices())

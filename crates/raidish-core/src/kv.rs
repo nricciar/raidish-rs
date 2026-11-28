@@ -20,6 +20,7 @@ use crate::disk::{BLOCK_SIZE, FileId, PoolDevice};
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Dnode;
 use crate::object::{ObjTree, Sizing};
+use crate::role::{Committer, Mutable, Role};
 use crate::types::DatasetName;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::volume::DIRTY_LIMIT_BYTES;
@@ -33,12 +34,149 @@ pub const TARGET_NODE_BYTES: usize = 16 * 1024;
 /// Node ids a `kv` dataset can hold. Unused ones are holes (no space).
 pub const NODE_CAPACITY: u64 = 1 << 27;
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
     /// The node size of new `kv` datasets on this pool.
     pub fn default_kv_blksz(&self) -> u32 {
         self.btree_blksz(TARGET_NODE_BYTES)
     }
 
+    /// The node size and capacity (in nodes) of new datasets of service
+    /// format `format` (see `DatasetFormat::is_service`).
+    pub fn service_shape(&self, format: DatasetFormat) -> (u32, u64) {
+        match format {
+            // Room for etcd's keys (escaped, with a revision) and S3's
+            // (up to 1024 bytes, prefixed).
+            DatasetFormat::Etcd | DatasetFormat::S3 => {
+                (self.btree_blksz(32 * 1024), NODE_CAPACITY << 3)
+            }
+            _ => (self.default_kv_blksz(), NODE_CAPACITY),
+        }
+    }
+
+    /// Node size for new B+tree datasets of at least `bytes` (rounded up to
+    /// the pool's alignment, at most its largest record).
+    pub fn btree_blksz(&self, bytes: usize) -> u32 {
+        let blocks = self
+            .align_blocks(bytes.div_ceil(BLOCK_SIZE) as u64)
+            .min(self.max_record_blocks());
+        (blocks as usize * BLOCK_SIZE) as u32
+    }
+
+    /// B+tree dataset `name` of format `format`, opened.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_btree(
+        &self,
+        name: &DatasetName,
+        format: DatasetFormat,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
+        let ds = self.open_dataset(name).await?;
+        if ds.format != format {
+            return Err(FileSystemError::InvalidArgument(format!(
+                "'{}' is a {} dataset, not {}",
+                name,
+                ds.format.name(),
+                format.name()
+            )));
+        }
+        Ok(ds)
+    }
+
+    /// `kv` dataset `name`, opened.
+    #[cfg(any(test, feature = "testutil"))]
+    pub(crate) async fn open_kv(
+        &self,
+        name: &DatasetName,
+    ) -> Result<Arc<Dataset>, FileSystemError> {
+        self.open_btree(name, DatasetFormat::Kv).await
+    }
+
+    /// The value of `key` (uncommitted changes included).
+    #[cfg(any(test, feature = "testutil"))]
+    pub async fn kv_get(
+        &self,
+        name: &DatasetName,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, FileSystemError> {
+        let ds = self.open_kv(name).await?;
+        let _r = ds.ops.read().await;
+        Txn::begin(self, &ds.obj).await?.get(key).await
+    }
+
+    /// Up to `limit` entries with keys within `start` and `end`, in order.
+    #[cfg(any(test, feature = "testutil"))]
+    pub async fn kv_range(
+        &self,
+        name: &DatasetName,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FileSystemError> {
+        let ds = self.open_kv(name).await?;
+        let _r = ds.ops.read().await;
+        Txn::begin(self, &ds.obj)
+            .await?
+            .range(start, end, limit)
+            .await
+    }
+
+    /// Up to `limit` entries whose keys start with `prefix`, after `after`
+    /// (exclusive; None: from the first).
+    #[cfg(any(test, feature = "testutil"))]
+    pub async fn kv_scan_prefix(
+        &self,
+        name: &DatasetName,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FileSystemError> {
+        let end = prefix_end(prefix);
+        let start = match after {
+            Some(a) if a >= prefix => Bound::Excluded(a),
+            _ => Bound::Included(prefix),
+        };
+        let end = match &end {
+            Some(e) => Bound::Excluded(e.as_slice()),
+            None => Bound::Unbounded,
+        };
+        self.kv_range(name, start, end, limit).await
+    }
+
+    /// How many keys `name` holds.
+    #[cfg(any(test, feature = "testutil"))]
+    pub async fn kv_len(&self, name: &DatasetName) -> Result<u64, FileSystemError> {
+        let ds = self.open_kv(name).await?;
+        let _r = ds.ops.read().await;
+        Ok(Txn::begin(self, &ds.obj).await?.header.entries)
+    }
+
+    /// Verify the committed B+tree of object `dnode` (a `kv` dataset's
+    /// root or a snapshot of one).
+    pub(crate) async fn check_kv_tree(&self, dnode: &Dnode) -> CheckReport {
+        let obj = ObjTree::new(
+            dnode.blksz as usize,
+            Sizing::Fixed,
+            dnode.size,
+            dnode.tree.clone(),
+        );
+        crate::btree::check(self, &obj).await
+    }
+}
+
+/// The smallest key greater than every key starting with `prefix` (None:
+/// there is none, the prefix is all 0xff or empty).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+impl<D: PoolDevice> FileSystem<D, Committer> {
     /// Create an empty `kv` dataset.
     pub async fn create_kv(&self, name: &DatasetName) -> Result<FileId, FileSystemError> {
         self.create_kv_with(name, self.default_kv_blksz(), NODE_CAPACITY)
@@ -98,19 +236,6 @@ impl<D: PoolDevice> FileSystem<D> {
         Ok(id)
     }
 
-    /// The node size and capacity (in nodes) of new datasets of service
-    /// format `format` (see `DatasetFormat::is_service`).
-    pub fn service_shape(&self, format: DatasetFormat) -> (u32, u64) {
-        match format {
-            // Room for etcd's keys (escaped, with a revision) and S3's
-            // (up to 1024 bytes, prefixed).
-            DatasetFormat::Etcd | DatasetFormat::S3 => {
-                (self.btree_blksz(32 * 1024), NODE_CAPACITY << 3)
-            }
-            _ => (self.default_kv_blksz(), NODE_CAPACITY),
-        }
-    }
-
     /// Create an empty dataset of service format `format` (etcd, s3,
     /// queue), with properties `props`.
     pub async fn create_service(
@@ -129,54 +254,20 @@ impl<D: PoolDevice> FileSystem<D> {
         self.create_btree(name, format, blksz, capacity, props)
             .await
     }
+}
 
-    /// Node size for new B+tree datasets of at least `bytes` (rounded up to
-    /// the pool's alignment, at most its largest record).
-    pub fn btree_blksz(&self, bytes: usize) -> u32 {
-        let blocks = self
-            .align_blocks(bytes.div_ceil(BLOCK_SIZE) as u64)
-            .min(self.max_record_blocks());
-        (blocks as usize * BLOCK_SIZE) as u32
-    }
-
-    /// B+tree dataset `name` of format `format`, opened.
+impl<D: PoolDevice, R: Mutable> FileSystem<D, R> {
+    /// Commit early if too much is dirty (as volume writes do). Best
+    /// effort: whether the caller's own dataset is durable is the flush's
+    /// answer, and another dataset failing its sync mustn't fail this one.
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn open_btree(
-        &self,
-        name: &DatasetName,
-        format: DatasetFormat,
-    ) -> Result<Arc<Dataset>, FileSystemError> {
-        let ds = self.open_dataset(name).await?;
-        if ds.format != format {
-            return Err(FileSystemError::InvalidArgument(format!(
-                "'{}' is a {} dataset, not {}",
-                name,
-                ds.format.name(),
-                format.name()
-            )));
+    pub async fn kv_settle(&self) -> Result<(), FileSystemError> {
+        if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
+            let _ = self
+                .commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
+                .await;
         }
-        Ok(ds)
-    }
-
-    /// `kv` dataset `name`, opened.
-    #[cfg(any(test, feature = "testutil"))]
-    pub(crate) async fn open_kv(
-        &self,
-        name: &DatasetName,
-    ) -> Result<Arc<Dataset>, FileSystemError> {
-        self.open_btree(name, DatasetFormat::Kv).await
-    }
-
-    /// The value of `key` (uncommitted changes included).
-    #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_get(
-        &self,
-        name: &DatasetName,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>, FileSystemError> {
-        let ds = self.open_kv(name).await?;
-        let _r = ds.ops.read().await;
-        Txn::begin(self, &ds.obj).await?.get(key).await
+        Ok(())
     }
 
     /// Set `key` to `value`. Returns whether it replaced a value.
@@ -213,92 +304,6 @@ impl<D: PoolDevice> FileSystem<D> {
         self.kv_settle().await?;
         Ok(removed)
     }
-
-    /// Up to `limit` entries with keys within `start` and `end`, in order.
-    #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_range(
-        &self,
-        name: &DatasetName,
-        start: Bound<&[u8]>,
-        end: Bound<&[u8]>,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FileSystemError> {
-        let ds = self.open_kv(name).await?;
-        let _r = ds.ops.read().await;
-        Txn::begin(self, &ds.obj)
-            .await?
-            .range(start, end, limit)
-            .await
-    }
-
-    /// Up to `limit` entries whose keys start with `prefix`, after `after`
-    /// (exclusive; None: from the first).
-    #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_scan_prefix(
-        &self,
-        name: &DatasetName,
-        prefix: &[u8],
-        after: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FileSystemError> {
-        let end = prefix_end(prefix);
-        let start = match after {
-            Some(a) if a >= prefix => Bound::Excluded(a),
-            _ => Bound::Included(prefix),
-        };
-        let end = match &end {
-            Some(e) => Bound::Excluded(e.as_slice()),
-            None => Bound::Unbounded,
-        };
-        self.kv_range(name, start, end, limit).await
-    }
-
-    /// How many keys `name` holds.
-    #[cfg(any(test, feature = "testutil"))]
-    pub async fn kv_len(&self, name: &DatasetName) -> Result<u64, FileSystemError> {
-        let ds = self.open_kv(name).await?;
-        let _r = ds.ops.read().await;
-        Ok(Txn::begin(self, &ds.obj).await?.header.entries)
-    }
-
-    /// Commit early if too much is dirty (as volume writes do). Best
-    /// effort: whether the caller's own dataset is durable is the flush's
-    /// answer, and another dataset failing its sync mustn't fail this one.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn kv_settle(&self) -> Result<(), FileSystemError> {
-        if self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES {
-            let _ = self
-                .commit_if(|| self.datasets_dirty_bytes() > DIRTY_LIMIT_BYTES)
-                .await;
-        }
-        Ok(())
-    }
-
-    /// Verify the committed B+tree of object `dnode` (a `kv` dataset's
-    /// root or a snapshot of one).
-    pub(crate) async fn check_kv_tree(&self, dnode: &Dnode) -> CheckReport {
-        let obj = ObjTree::new(
-            dnode.blksz as usize,
-            Sizing::Fixed,
-            dnode.size,
-            dnode.tree.clone(),
-        );
-        crate::btree::check(self, &obj).await
-    }
-}
-
-/// The smallest key greater than every key starting with `prefix` (None:
-/// there is none, the prefix is all 0xff or empty).
-#[cfg(not(target_arch = "wasm32"))]
-pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < 0xff {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

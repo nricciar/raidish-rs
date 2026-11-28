@@ -10,6 +10,7 @@ use crate::types::{Epoch, Holding, LeaseRef};
 use async_trait::async_trait;
 use axum::http::StatusCode as Status;
 use raidish_auth::testing::Client;
+use raidish_core::role::WriterFs;
 
 const MB: usize = 1024 * 1024;
 
@@ -112,7 +113,7 @@ async fn setup() -> Setup {
 }
 
 /// A node's file API, with its own writer (None: no writer yet).
-async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<FileSystem<Pool>>>) {
+async fn node(s: &Setup, id: &str, with_writer: bool) -> (Client, Option<Arc<WriterFs<Pool>>>) {
     let (app, writer) = node_app(s, id, with_writer).await;
     (
         Client::new(app, raidish_auth::auth::AuthState(None)),
@@ -125,7 +126,7 @@ async fn node_app(
     s: &Setup,
     id: &str,
     with_writer: bool,
-) -> (axum::Router, Option<Arc<FileSystem<Pool>>>) {
+) -> (axum::Router, Option<Arc<WriterFs<Pool>>>) {
     let writer = if with_writer {
         let resource = format!("writer/{}", id);
         let epoch = lease(&s.auth, &resource, id).await;
@@ -224,7 +225,7 @@ async fn any_node_reads_and_writes_files() {
         fs.read_file(Path::new("big")).await.unwrap(),
         b"small now".to_vec()
     );
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -264,7 +265,7 @@ async fn uploads_are_refused_cleanly() {
     wa.unwrap().return_metaslabs().await;
     drop(a);
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -293,7 +294,7 @@ async fn a_failed_upload_leaves_a_file_another_wrote() {
     wa.return_metaslabs().await;
     drop(a);
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -457,7 +458,7 @@ async fn partial_writes_rename_and_attributes() {
     drop((a, b));
     let fs = s.pool.load().await;
     assert_eq!(fs.read_file(Path::new("e/g")).await.unwrap(), expect);
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -498,7 +499,7 @@ async fn a_refused_patch_changes_nothing() {
     wa.unwrap().return_metaslabs().await;
     drop(a);
     let fs = s.pool.load().await;
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 

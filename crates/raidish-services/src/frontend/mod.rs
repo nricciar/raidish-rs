@@ -40,6 +40,7 @@ use crate::pki::Role;
 use crate::types::DatasetName;
 use crate::types::Epoch;
 use crate::vdev::Pool;
+use raidish_core::role::{Mutable, Writer};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -184,25 +185,25 @@ pub enum Located<T> {
 }
 
 /// A dataset served here.
-pub enum Local {
+pub enum Local<R: Mutable = Writer> {
     Etcd {
-        store: Arc<EtcdStore<Pool>>,
+        store: Arc<EtcdStore<Pool, R>>,
         /// Connections for its gRPC server.
         conns: mpsc::Sender<std::io::Result<EtcdConn>>,
     },
-    S3(Arc<crate::s3::Bucket<Pool>>),
-    Queue(Arc<crate::sqs::Queue<Pool>>),
+    S3(Arc<crate::s3::Bucket<Pool, R>>),
+    Queue(Arc<crate::sqs::Queue<Pool, R>>),
 }
 
-impl Local {
-    pub fn bucket(&self) -> Option<Arc<crate::s3::Bucket<Pool>>> {
+impl<R: Mutable> Local<R> {
+    pub fn bucket(&self) -> Option<Arc<crate::s3::Bucket<Pool, R>>> {
         match self {
             Local::S3(b) => Some(b.clone()),
             _ => None,
         }
     }
 
-    pub fn queue(&self) -> Option<Arc<crate::sqs::Queue<Pool>>> {
+    pub fn queue(&self) -> Option<Arc<crate::sqs::Queue<Pool, R>>> {
         match self {
             Local::Queue(q) => Some(q.clone()),
             _ => None,
@@ -218,7 +219,7 @@ impl Local {
     }
 }
 
-impl Local {
+impl<R: Mutable> Local<R> {
     fn stop(&self) {
         match self {
             Local::Etcd { store, .. } => store.stop(),
@@ -236,7 +237,7 @@ struct Routing {
 }
 
 /// This node's front ends.
-pub struct Frontend {
+pub struct Frontend<R: Mutable = Writer> {
     node: String,
     config: ServicesConfig,
     tls: ServiceTls,
@@ -244,7 +245,7 @@ pub struct Frontend {
     auth: keys::ServiceAuth,
     committer: crate::committer::Admin,
     routing: RwLock<Routing>,
-    local: RwLock<BTreeMap<String, Arc<Local>>>,
+    local: RwLock<BTreeMap<String, Arc<Local<R>>>>,
     etcd_ports: Mutex<BTreeMap<u16, tokio::task::JoinHandle<()>>>,
     /// Signalled when the routes change (a waiting CreateBucket...).
     changed: tokio::sync::Notify,
@@ -259,7 +260,7 @@ pub fn member_id(node: &str) -> u64 {
     )
 }
 
-impl Frontend {
+impl<R: Mutable> Frontend<R> {
     /// The services and their ports.
     pub fn config(&self) -> &ServicesConfig {
         &self.config
@@ -355,7 +356,7 @@ impl Frontend {
         self.routing.read().unwrap().nodes.clone()
     }
 
-    pub fn local(&self, name: &str) -> Option<Arc<Local>> {
+    pub fn local(&self, name: &str) -> Option<Arc<Local<R>>> {
         self.local.read().unwrap().get(name).cloned()
     }
 
@@ -368,7 +369,7 @@ impl Frontend {
         name: &str,
         format: DatasetFormat,
         forwarded: bool,
-        pick: impl FnOnce(&Local) -> Option<T>,
+        pick: impl FnOnce(&Local<R>) -> Option<T>,
     ) -> Located<T> {
         if let Some(t) = self.local(name).as_deref().and_then(pick) {
             return Located::Here(t);
@@ -482,7 +483,7 @@ impl Frontend {
         self: &Arc<Self>,
         name: &DatasetName,
         format: DatasetFormat,
-        fs: Arc<FileSystem<Pool>>,
+        fs: Arc<FileSystem<Pool, R>>,
         epoch: Epoch,
     ) -> Result<(), FileSystemError> {
         let local = match format {
@@ -790,12 +791,15 @@ pub mod testing {
             }
         }
 
-        pub fn frontend(&self) -> Arc<Frontend> {
+        pub fn frontend<R: Mutable>(&self) -> Arc<Frontend<R>> {
             self.frontend_with(Default::default())
         }
 
         /// `frontend`, with `slot` as its committer.
-        pub fn frontend_with(&self, slot: crate::committer::CommitterSlot) -> Arc<Frontend> {
+        pub fn frontend_with<R: Mutable>(
+            &self,
+            slot: crate::committer::CommitterSlot,
+        ) -> Arc<Frontend<R>> {
             let config = ServicesConfig {
                 advertise: Some("127.0.0.1".into()),
                 ..Default::default()

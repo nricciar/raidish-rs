@@ -3,11 +3,17 @@
 
 use super::*;
 use crate::disk::PoolDevice;
+use crate::role::Role;
 use crate::test_util::TestPool;
 use crate::test_util::ds;
 use std::ops::Bound;
 
-async fn fill<D: PoolDevice>(fs: &FileSystem<D>, name: &str, n: u64, tag: &str) {
+async fn fill<D: PoolDevice, R: crate::role::Mutable>(
+    fs: &FileSystem<D, R>,
+    name: &str,
+    n: u64,
+    tag: &str,
+) {
     let name = &ds(name);
     for i in 0..n {
         let k = format!("k{:05}", i);
@@ -16,15 +22,15 @@ async fn fill<D: PoolDevice>(fs: &FileSystem<D>, name: &str, n: u64, tag: &str) 
     }
 }
 
-async fn all<D: PoolDevice>(fs: &FileSystem<D>, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+async fn all<D: PoolDevice, R: Role>(fs: &FileSystem<D, R>, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let name = &ds(name);
     fs.kv_range(name, Bound::Unbounded, Bound::Unbounded, usize::MAX)
         .await
         .unwrap()
 }
 
-async fn clean<D: PoolDevice>(fs: &FileSystem<D>) {
-    let report = fs.fsck(false).await.unwrap();
+async fn clean<D: PoolDevice, R: Role>(fs: &FileSystem<D, R>) {
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
@@ -240,7 +246,7 @@ async fn fsck_finds_a_damaged_tree() {
         crate::object::Dirty::Data(vec![1, 2, 3]),
     );
     fs.sync().await.unwrap();
-    let report = fs.fsck(false).await.unwrap();
+    let report = fs.fsck().await.unwrap();
     let text = report.to_string();
     assert!(!report.is_clean());
     assert!(text.contains("out of order"), "{}", text);

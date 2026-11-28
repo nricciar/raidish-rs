@@ -24,6 +24,7 @@ use crate::disk::PoolDevice;
 use crate::fs::{FileSystem, FileSystemError};
 use crate::inode::Extent;
 use crate::object::TreeRoot;
+use crate::role::{Committer, Role, View, Writer};
 use crate::types::DatasetName;
 use crate::types::ErrorKind;
 use crate::types::MetaslabIdx;
@@ -412,12 +413,21 @@ async fn lease_lost(mut lost: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-impl<D: PoolDevice> FileSystem<D> {
+impl<D: PoolDevice> FileSystem<D, Writer> {
     /// Open the pool as a volume writer: read-only, except for the records
     /// and indirect blocks of volumes it runs, which go into metaslabs
     /// `sink`'s committer lends it.
     pub async fn load_writer(dev: D, sink: Arc<dyn CommitSink>) -> Result<Self, FileSystemError> {
-        let mut fs = Self::load_readonly(dev).await?;
+        let role = Writer {
+            state: Arc::new(WriterState {
+                sink,
+                datasets: Default::default(),
+                lent: Default::default(),
+                pinned: Default::default(),
+            }),
+            commits: Default::default(),
+        };
+        let (fs, _) = Self::open(dev, crate::fs::Rewind::None, role).await?;
         for ms in fs.metaslabs.iter() {
             let mut ms = ms.write().await;
             ms.free_extents.clear();
@@ -425,17 +435,13 @@ impl<D: PoolDevice> FileSystem<D> {
             ms.deferred.clear();
             ms.dirty = false;
         }
-        fs.writer = Some(Arc::new(WriterState {
-            sink,
-            datasets: Default::default(),
-            lent: Default::default(),
-            pinned: Default::default(),
-        }));
         Ok(fs)
     }
 
-    pub fn is_writer(&self) -> bool {
-        self.writer.is_some()
+    /// This writer's state: its sink, the volumes it runs, the metaslabs
+    /// lent to it.
+    pub fn writer_state(&self) -> &Arc<WriterState> {
+        &self.role.state
     }
 
     /// Start running volume `name` under its `ds/<name>` lease.
@@ -469,12 +475,7 @@ impl<D: PoolDevice> FileSystem<D> {
         lost: Option<tokio::sync::watch::Receiver<bool>>,
         fresh: Option<LeaseCheck>,
     ) -> Result<(), FileSystemError> {
-        let w = self
-            .writer
-            .as_ref()
-            .ok_or(FileSystemError::InvalidArgument(
-                "not a volume writer".into(),
-            ))?;
+        let w = self.writer_state();
         // Whatever the last holder logged and acknowledged comes first.
         w.sink.claim_dataset(name, &ds).await?;
         // Reload the index: the volume may have been created, moved here or
@@ -496,9 +497,7 @@ impl<D: PoolDevice> FileSystem<D> {
 
     /// Stop running `name`: sync what's dirty, then forget it.
     pub async fn detach_dataset(&self, name: &DatasetName) -> Result<(), FileSystemError> {
-        if let Some(w) = &self.writer
-            && let Some(a) = w.datasets.lock().unwrap().get_mut(name)
-        {
+        if let Some(a) = self.writer_state().datasets.lock().unwrap().get_mut(name) {
             a.detaching = true;
         }
         // Commit until nothing is left (a flush during a commit may have
@@ -517,10 +516,8 @@ impl<D: PoolDevice> FileSystem<D> {
             }
             r = self.sync().await;
         }
-        if r.is_ok()
-            && let Some(w) = self.writer.clone()
-        {
-            r = self.retire_log(&w, name).await;
+        if r.is_ok() {
+            r = self.retire_log(name).await;
         }
         if r.is_err() {
             // Not all of it is committed: it stays attached, writes and
@@ -528,9 +525,7 @@ impl<D: PoolDevice> FileSystem<D> {
             // called off) or drop it knowingly (`abandon_dataset`: its log
             // is replayed once the lease goes). Closing it here lost the
             // unsynced writes and its log state (audit A5).
-            if let Some(w) = &self.writer
-                && let Some(a) = w.datasets.lock().unwrap().get_mut(name)
-            {
+            if let Some(a) = self.writer_state().datasets.lock().unwrap().get_mut(name) {
                 a.detaching = false;
             }
             return r;
@@ -540,7 +535,8 @@ impl<D: PoolDevice> FileSystem<D> {
     }
 
     /// Commit `name` unchanged but without its intent log (a detach).
-    async fn retire_log(&self, w: &WriterState, name: &DatasetName) -> Result<(), FileSystemError> {
+    async fn retire_log(&self, name: &DatasetName) -> Result<(), FileSystemError> {
+        let w = self.writer_state();
         let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() else {
             return Ok(());
         };
@@ -554,7 +550,7 @@ impl<D: PoolDevice> FileSystem<D> {
         let _io = self.lock_log_io().await;
         let _tx = self.begin_tx().await;
         // Its commit is built on the root: settle one in doubt first.
-        self.resolve_in_doubt(w, &vol).await?;
+        self.resolve_in_doubt(&vol).await?;
         if vol.is_dirty() {
             return Err(FileSystemError::InvalidArgument(format!(
                 "volume '{}' was written to while being detached",
@@ -574,7 +570,7 @@ impl<D: PoolDevice> FileSystem<D> {
             frees: Vec::new(),
             free_births: Vec::new(),
             missed: misses.disks.clone(),
-            birth_txg: self.open_txg().await?,
+            birth_txg: self.open_txg().await,
             log: None,
             min_birth: None,
         };
@@ -592,9 +588,9 @@ impl<D: PoolDevice> FileSystem<D> {
         };
         *vol.in_doubt.lock().unwrap() = Some(sent.clone());
         let mut waiting = LogNowhereOnDrop(Some(&vol));
-        let outcome = self.send_commit(w, name, sent.commit.clone()).await;
+        let outcome = self.send_commit(name, sent.commit.clone()).await;
         waiting.0 = None;
-        self.settle_commit(w, &vol, sent, outcome).await
+        self.settle_commit(&vol, sent, outcome).await
     }
 
     /// Report disk misses no commit has reported yet to the committer, in
@@ -604,12 +600,12 @@ impl<D: PoolDevice> FileSystem<D> {
     /// progress, which may have reported them already.
     pub async fn writer_report_misses(
         &self,
-        w: &WriterState,
         vol: &crate::dataset::Dataset,
     ) -> Result<(), FileSystemError> {
+        let w = self.writer_state();
         let _tx = self.begin_tx().await;
         // Its commit is built on the root: settle one in doubt first.
-        self.resolve_in_doubt(w, vol).await?;
+        self.resolve_in_doubt(vol).await?;
         let counts = self.miss_counts();
         let missed: Vec<usize> = {
             let seen = self.miss_seen.lock().unwrap();
@@ -641,7 +637,7 @@ impl<D: PoolDevice> FileSystem<D> {
             frees: Vec::new(),
             free_births: Vec::new(),
             missed: missed.clone(),
-            birth_txg: self.open_txg().await?,
+            birth_txg: self.open_txg().await,
             // The log as registered: unchanged.
             log: vol.log.lock().unwrap().clone(),
             min_birth: None,
@@ -659,20 +655,19 @@ impl<D: PoolDevice> FileSystem<D> {
     /// Drop `name` without syncing (its lease is gone: nothing may be
     /// written). Its intent log is left for the committer to replay.
     pub fn abandon_dataset(&self, name: &DatasetName) {
-        if let Some(w) = &self.writer {
-            if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
-                self.set_dataset_log(w, &vol, None);
-                self.set_cursor(&vol, None);
-            }
-            w.datasets.lock().unwrap().remove(name);
+        let w = self.writer_state();
+        if let Some(vol) = self.open_datasets.lock().unwrap().get(name).cloned() {
+            self.set_dataset_log(w, &vol, None);
+            self.set_cursor(&vol, None);
         }
+        w.datasets.lock().unwrap().remove(name);
         self.close_dataset(name);
     }
 
     /// Give every lent metaslab back (after the last sync), except those
     /// a file still being written is using.
     pub async fn return_metaslabs(&self) {
-        let Some(w) = &self.writer else { return };
+        let w = self.writer_state();
         let _tx = self.begin_tx().await;
         let lent: Vec<MetaslabIdx> = {
             let mut l = w.lent.lock().unwrap();
@@ -689,41 +684,6 @@ impl<D: PoolDevice> FileSystem<D> {
         }
     }
 
-    /// Follow the newest committed object table (a writer's view of the
-    /// pool goes stale as the committer commits).
-    pub async fn reload_root_index(&self) -> Result<(), FileSystemError> {
-        let ring = self.read_uberblock_ring().await;
-        let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
-        self.objects.follow_root(newest.objects.clone());
-        self.note_open_txg(newest.txg.next()).await;
-        Ok(())
-    }
-
-    /// Catch up with the newest committed root, if it moved since this
-    /// process last looked (cheap otherwise: one uberblock ring read). For
-    /// processes that don't commit themselves (writers, read-only opens);
-    /// a no-op where this process is the one committing.
-    pub async fn refresh_root(&self) -> Result<(), FileSystemError> {
-        if self.writer.is_none() && !self.read_only {
-            return Ok(());
-        }
-        let ring = self.read_uberblock_ring().await;
-        let newest = ring.first().ok_or(FileSystemError::NotFormatted)?;
-        if self.objects.root() == newest.objects {
-            return Ok(());
-        }
-        self.objects.follow_root(newest.objects.clone());
-        self.note_open_txg(newest.txg.next()).await;
-        Ok(())
-    }
-
-    /// Note the committer's open TXG: new blocks are stamped with it.
-    pub(crate) async fn note_open_txg(&self, open_txg: Txg) {
-        if let Some(u) = self.uberblock.lock().await.as_mut() {
-            u.txg = u.txg.max(open_txg.prev());
-        }
-    }
-
     async fn drop_lent(&self, idx: MetaslabIdx) {
         if let Some(ms) = self.metaslabs.get(idx.index()) {
             ms.write().await.free_extents.clear();
@@ -732,11 +692,8 @@ impl<D: PoolDevice> FileSystem<D> {
     }
 
     /// Borrow metaslabs until `need` blocks are allocatable.
-    pub(crate) async fn lease_space(
-        &self,
-        w: &WriterState,
-        need: u64,
-    ) -> Result<(), FileSystemError> {
+    pub(crate) async fn lease_space(&self, need: u64) -> Result<(), FileSystemError> {
+        let w = self.writer_state();
         loop {
             let have = self.allocatable_blocks().await;
             if have >= need {
@@ -774,7 +731,8 @@ impl<D: PoolDevice> FileSystem<D> {
     }
 
     /// Return lent metaslabs that are nearly full (between syncs only).
-    pub(crate) async fn return_full(&self, w: &WriterState) {
+    pub(crate) async fn return_full(&self) {
+        let w = self.writer_state();
         let threshold = RETURN_BELOW_RECORDS * self.max_record_blocks();
         let lent: Vec<MetaslabIdx> = w.lent.lock().unwrap().clone();
         for idx in lent {
@@ -827,7 +785,6 @@ impl<D: PoolDevice> FileSystem<D> {
     pub(crate) async fn writer_commit(
         &self,
         tx: &mut crate::tx::Tx,
-        w: &WriterState,
     ) -> (Result<Txg, FileSystemError>, Vec<DatasetName>) {
         // A sync stamped below the birth floor is rebuilt (with the TXG
         // the committer sent back) and sent again.
@@ -849,9 +806,9 @@ impl<D: PoolDevice> FileSystem<D> {
                 r => break r,
             }
         };
-        self.return_full(w).await;
+        self.return_full().await;
         let r = match result {
-            Ok(()) => self.open_txg().await.map(Txg::prev),
+            Ok(()) => Ok(self.open_txg().await.prev()),
             Err(e) => Err(e),
         };
         (r, clean)
@@ -861,12 +818,12 @@ impl<D: PoolDevice> FileSystem<D> {
     /// the committer commit it.
     pub(crate) async fn writer_sync_dataset(
         &self,
-        w: &WriterState,
         vol: &crate::dataset::Dataset,
         records: &std::collections::BTreeMap<u64, crate::object::Dirty>,
         need: u64,
         fold: bool,
     ) -> Result<(), FileSystemError> {
+        let w = self.writer_state();
         let (ds, detaching) = w
             .datasets
             .lock()
@@ -883,7 +840,7 @@ impl<D: PoolDevice> FileSystem<D> {
         } else {
             self.log_region_blocks()
         };
-        self.lease_space(w, need + log_blocks).await?;
+        self.lease_space(need + log_blocks).await?;
         span.mark("lease_space");
         // The log from now on (see `crate::zil`): what was appended after
         // the cut this sync took its records at, then a new region flushes
@@ -924,7 +881,7 @@ impl<D: PoolDevice> FileSystem<D> {
             }
         };
 
-        let birth_txg = self.open_txg().await?;
+        let birth_txg = self.open_txg().await;
         let base_root = vol.obj.root_ptr();
         let mut allocated: Vec<BlockPtr> = Vec::new();
         let mut replaced: Vec<BlockPtr> = Vec::new();
@@ -979,10 +936,10 @@ impl<D: PoolDevice> FileSystem<D> {
         };
         *vol.in_doubt.lock().unwrap() = Some(sent.clone());
         let mut waiting = LogNowhereOnDrop(Some(vol));
-        let outcome = self.send_commit(w, &vol.name, sent.commit.clone()).await;
+        let outcome = self.send_commit(&vol.name, sent.commit.clone()).await;
         waiting.0 = None;
         span.mark("commit_rpc");
-        self.settle_commit(w, vol, sent, outcome).await
+        self.settle_commit(vol, sent, outcome).await
     }
 
     /// Send `commit` of dataset `name`; a lost `ds/<name>` lease ends the
@@ -990,10 +947,10 @@ impl<D: PoolDevice> FileSystem<D> {
     /// the lease over).
     async fn send_commit(
         &self,
-        w: &WriterState,
         name: &DatasetName,
         commit: DatasetCommit,
     ) -> Result<Committed, CommitError> {
+        let w = self.writer_state();
         let lost = w
             .datasets
             .lock()
@@ -1017,11 +974,11 @@ impl<D: PoolDevice> FileSystem<D> {
     /// halfway can't leave it half-settled.
     async fn settle_commit(
         &self,
-        w: &WriterState,
         vol: &crate::dataset::Dataset,
         sent: InDoubt,
         outcome: Result<Committed, CommitError>,
     ) -> Result<(), FileSystemError> {
+        let w = self.writer_state();
         let InDoubt {
             misses,
             new_root,
@@ -1088,15 +1045,14 @@ impl<D: PoolDevice> FileSystem<D> {
     /// for good if it had been applied. Err: still unknown (no committer).
     pub(crate) async fn resolve_in_doubt(
         &self,
-        w: &WriterState,
         vol: &crate::dataset::Dataset,
     ) -> Result<(), FileSystemError> {
         let Some(sent) = vol.in_doubt.lock().unwrap().clone() else {
             return Ok(());
         };
-        let outcome = self.send_commit(w, &vol.name, sent.commit.clone()).await;
+        let outcome = self.send_commit(&vol.name, sent.commit.clone()).await;
         let known = !matches!(outcome, Err(CommitError::Retry(_)));
-        match self.settle_commit(w, vol, sent, outcome).await {
+        match self.settle_commit(vol, sent, outcome).await {
             Err(e) if known => {
                 // Not applied, and settled: the next sync builds anew.
                 eprintln!(
@@ -1113,10 +1069,10 @@ impl<D: PoolDevice> FileSystem<D> {
     /// writer sees the result (and other writers' changes).
     pub(crate) async fn writer_commit_fs(
         &self,
-        w: &WriterState,
         op: FsOp,
         lease: Option<ObjLease>,
     ) -> Result<FsCommitted, CommitError> {
+        let w = self.writer_state();
         let writer = w.sink.writer();
         let misses = self.new_misses();
         let commit = FsCommit {
@@ -1124,7 +1080,7 @@ impl<D: PoolDevice> FileSystem<D> {
             op,
             lease,
             missed: misses.disks.clone(),
-            birth_txg: self.open_txg().await.unwrap_or(Txg::ZERO),
+            birth_txg: self.open_txg().await,
         };
         let r = w.sink.commit_fs(commit).await;
         if let Ok(c) = &r {
@@ -1139,14 +1095,13 @@ impl<D: PoolDevice> FileSystem<D> {
 
     pub(crate) async fn writer_mkdir(
         &self,
-        w: &WriterState,
         path: &std::path::Path,
     ) -> Result<crate::disk::FileId, FileSystemError> {
         let _tx = self.begin_tx().await;
         let op = FsOp::Mkdir {
             path: path_string(path)?,
         };
-        Ok(self.writer_commit_fs(w, op, None).await?.file_id)
+        Ok(self.writer_commit_fs(op, None).await?.file_id)
     }
 
     /// `delete` on a writer, under the file's `obj/<id>` lease if one is held.
@@ -1155,16 +1110,11 @@ impl<D: PoolDevice> FileSystem<D> {
         path: &std::path::Path,
         lease: Option<ObjLease>,
     ) -> Result<crate::disk::FileId, FileSystemError> {
-        let w = self
-            .writer
-            .clone()
-            .ok_or(FileSystemError::InvalidArgument("not a writer".into()))?;
-        self.writer_delete(&w, path, lease).await
+        self.writer_delete(path, lease).await
     }
 
     pub(crate) async fn writer_delete(
         &self,
-        w: &WriterState,
         path: &std::path::Path,
         lease: Option<ObjLease>,
     ) -> Result<crate::disk::FileId, FileSystemError> {
@@ -1180,22 +1130,12 @@ impl<D: PoolDevice> FileSystem<D> {
             path: path_string(path)?,
             base: Some((entry.id, tree)),
         };
-        self.writer_commit_fs(w, op, lease).await?;
+        self.writer_commit_fs(op, lease).await?;
         Ok(entry.id)
-    }
-
-    /// The object at `path`, if there is one.
-    async fn id_at(&self, path: &std::path::Path) -> Option<crate::disk::FileId> {
-        self.lookup(path)
-            .await
-            .ok()
-            .and_then(|l| l.entry)
-            .map(|e| e.id)
     }
 
     pub(crate) async fn writer_rename(
         &self,
-        w: &WriterState,
         from: &std::path::Path,
         to: &std::path::Path,
     ) -> Result<crate::disk::FileId, FileSystemError> {
@@ -1207,13 +1147,12 @@ impl<D: PoolDevice> FileSystem<D> {
             to: path_string(to)?,
             id,
         };
-        self.writer_commit_fs(w, op, None).await?;
+        self.writer_commit_fs(op, None).await?;
         Ok(id)
     }
 
     pub(crate) async fn writer_set_attrs(
         &self,
-        w: &WriterState,
         path: &std::path::Path,
         attrs: &crate::inode::SetAttrs,
     ) -> Result<crate::disk::FileId, FileSystemError> {
@@ -1222,11 +1161,64 @@ impl<D: PoolDevice> FileSystem<D> {
             path: path_string(path)?,
             attrs: attrs.clone(),
         };
-        Ok(self.writer_commit_fs(w, op, None).await?.file_id)
+        Ok(self.writer_commit_fs(op, None).await?.file_id)
+    }
+}
+
+impl<D: PoolDevice, R: Role> FileSystem<D, R> {
+    /// Follow the newest committed object table (a writer's view of the
+    /// pool goes stale as the committer commits).
+    pub async fn reload_root_index(&self) -> Result<(), FileSystemError> {
+        let ring = self.read_uberblock_ring().await;
+        let newest = ring.first().ok_or_else(no_uberblock)?;
+        self.objects.follow_root(newest.objects.clone());
+        self.note_open_txg(newest.txg.next()).await;
+        Ok(())
     }
 
-    // ---- the committer's side ----
+    /// Catch up with the newest committed root, if it moved since this
+    /// process last looked (cheap otherwise: one uberblock ring read). For
+    /// processes that don't commit themselves (writers, read-only opens);
+    /// a no-op where this process is the one committing.
+    pub async fn refresh_root(&self) -> Result<(), FileSystemError> {
+        if let View::Committer(_) = self.by_role() {
+            return Ok(());
+        }
+        let ring = self.read_uberblock_ring().await;
+        let newest = ring.first().ok_or_else(no_uberblock)?;
+        if self.objects.root() == newest.objects {
+            return Ok(());
+        }
+        self.objects.follow_root(newest.objects.clone());
+        self.note_open_txg(newest.txg.next()).await;
+        Ok(())
+    }
 
+    /// Note the committer's open TXG: new blocks are stamped with it.
+    pub(crate) async fn note_open_txg(&self, open_txg: Txg) {
+        let mut u = self.uberblock.lock().await;
+        u.txg = u.txg.max(open_txg.prev());
+    }
+
+    /// The object at `path`, if there is one.
+    async fn id_at(&self, path: &std::path::Path) -> Option<crate::disk::FileId> {
+        self.lookup(path)
+            .await
+            .ok()
+            .and_then(|l| l.entry)
+            .map(|e| e.id)
+    }
+}
+
+/// No uberblock in the ring could be read (every copy unreadable, say):
+/// the pool is formatted (it was loaded), just not readable right now.
+fn no_uberblock() -> FileSystemError {
+    FileSystemError::Unavailable("no uberblock in the ring could be read".into())
+}
+
+/// The committer's side: applying writers' commits and lending them
+/// metaslabs.
+impl<D: PoolDevice> FileSystem<D, Committer> {
     /// Check the TXGs a writer stamped its new blocks with: none from the
     /// future (past the open TXG), and none below the birth floor (else
     /// `Restamp`: rebuild with the open TXG).
@@ -1234,10 +1226,7 @@ impl<D: PoolDevice> FileSystem<D> {
         let Some(min) = min_birth else {
             return Ok(());
         };
-        let open = self
-            .open_txg()
-            .await
-            .map_err(|e| CommitError::Retry(e.to_string()))?;
+        let open = self.open_txg().await;
         if min > open || stamped > open {
             return Err(CommitError::refused(
                 ErrorKind::Invalid,
@@ -1610,7 +1599,7 @@ impl<D: PoolDevice> FileSystem<D> {
         self.sync()
             .await
             .map_err(|e| CommitError::Retry(e.to_string()))?;
-        Ok(self.open_txg().await.unwrap_or(Txg::from_raw(1)).prev())
+        Ok(self.open_txg().await.prev())
     }
 
     /// Mark the metaslabs a cluster has lent out (after a committer start).

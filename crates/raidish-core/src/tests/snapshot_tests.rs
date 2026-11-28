@@ -1,4 +1,5 @@
 use super::*;
+use crate::role::CommitterFs;
 use crate::test_util::ds;
 use crate::test_util::{TestPool, VOLBLOCK_ALIGN};
 use crate::vdev::Pool;
@@ -13,7 +14,7 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-async fn allocated(fs: &FileSystem<Pool>) -> u64 {
+async fn allocated(fs: &CommitterFs<Pool>) -> u64 {
     let mut used = 0;
     for ms in fs.metaslabs.iter() {
         let ms = ms.read().await;
@@ -23,13 +24,13 @@ async fn allocated(fs: &FileSystem<Pool>) -> u64 {
 }
 
 /// Commit enough TXGs that every deferred free is released.
-async fn settle(fs: &FileSystem<Pool>) {
+async fn settle(fs: &CommitterFs<Pool>) {
     for _ in 0..=crate::metaslab::TXG_DEFER_SIZE {
         fs.sync().await.unwrap();
     }
 }
 
-async fn read(fs: &FileSystem<Pool>, name: &str, len: usize) -> Vec<u8> {
+async fn read(fs: &CommitterFs<Pool>, name: &str, len: usize) -> Vec<u8> {
     let mut buf = vec![0xEEu8; len];
     let n = match name.split_once('@') {
         Some((v, s)) => fs.snapshot_read(&ds(v), s, 0, &mut buf).await.unwrap(),
@@ -39,20 +40,20 @@ async fn read(fs: &FileSystem<Pool>, name: &str, len: usize) -> Vec<u8> {
     buf
 }
 
-async fn clean(fs: &FileSystem<Pool>) {
-    let report = fs.fsck(false).await.unwrap();
+async fn clean(fs: &CommitterFs<Pool>) {
+    let report = fs.fsck().await.unwrap();
     assert!(report.is_clean(), "{}", report);
 }
 
 /// Write `data` at `offset` of `want` too (what the volume should hold).
-async fn write(fs: &FileSystem<Pool>, want: &mut [u8], offset: usize, data: &[u8]) {
+async fn write(fs: &CommitterFs<Pool>, want: &mut [u8], offset: usize, data: &[u8]) {
     fs.block_write(&ds("vol"), offset as u64, data)
         .await
         .unwrap();
     want[offset..offset + data.len()].copy_from_slice(data);
 }
 
-async fn volume(fs: &FileSystem<Pool>) -> Vec<u8> {
+async fn volume(fs: &CommitterFs<Pool>) -> Vec<u8> {
     fs.create_block(&ds("vol"), VOL, VOLBLOCK_ALIGN)
         .await
         .unwrap();
@@ -250,7 +251,7 @@ async fn scrub_walks_snapshots() {
     fs.create_snapshot(&ds("vol"), "s").await.unwrap();
     write(&fs, &mut want, 0, &pattern(MB as usize, 3)).await;
     fs.sync().await.unwrap();
-    let report = fs.scrub(false).await.unwrap();
+    let report = fs.scrub().await.unwrap();
     assert!(report.is_clean(), "{}", report);
     // Volume (8 MiB) plus the overwritten MiB, once each, plus metadata.
     let records = VOL / VOLBLOCK_ALIGN as u64;
